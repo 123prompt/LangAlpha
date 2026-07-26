@@ -183,6 +183,20 @@
         }
       },
       {
+        "id": "claude-opus-5",
+        "name": "Claude Opus 5",
+        "is_reasoning": true,
+        "description": "Claude Opus 5 model",
+        "pricing": {
+          "input": 5.0,
+          "cached_input": 0.5,
+          "cache_5m": 6.25,
+          "cache_1h": 10.0,
+          "output": 25.0,
+          "unit": "per_1m_tokens"
+        }
+      },
+      {
         "id": "claude-sonnet-5",
         "name": "Claude Sonnet 5",
         "is_reasoning": true,
