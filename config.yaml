@@ -19,7 +19,7 @@ ptc_recursion_limit: 2000
 flash_recursion_limit: 500
 
 # Workflow Settings
-workflow_timeout: 3200  # seconds (53 minutes)
+workflow_timeout: 21600  # seconds (6 hours) — matches background_execution.abandoned_workflow_timeout
 sse_keepalive_interval: 15  # seconds
 
 # Feature Flags (operator-only infra toggles; never exposed to users)

@@ -285,7 +285,7 @@ class InfrastructureConfig(BaseModel):
     debug: bool = Field(default=False, description="Debug mode flag")
     ptc_recursion_limit: int = Field(default=2000, ge=1, le=10000, description="PTC agent recursion limit")
     flash_recursion_limit: int = Field(default=500, ge=1, le=10000, description="Flash agent recursion limit")
-    workflow_timeout: int = Field(default=3200, description="Workflow timeout in seconds")
+    workflow_timeout: int = Field(default=21600, description="Workflow timeout in seconds")
     sse_keepalive_interval: float = Field(
         default=15.0, description="SSE keepalive interval in seconds"
     )
