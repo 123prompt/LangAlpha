@@ -201,18 +201,11 @@ class RedisCacheClient:
             await self.pool.disconnect()
 
     def _log_error(self, context: str, err: Exception) -> None:
-        """Log a Redis error, with pool stats if the error is pool exhaustion.
-
-        Pool-internal attributes are underscore-prefixed in redis-py; we guard
-        with getattr so a future rename degrades gracefully to a plain log line.
-        """
+        """Log a Redis error, with pool stats if the error is pool exhaustion."""
         if is_pool_exhaustion(err):
-            in_use = len(getattr(self.pool, "_in_use_connections", []) or [])
-            avail = len(getattr(self.pool, "_available_connections", []) or [])
             logger.error(
                 f"{context} — {type(err).__name__}: {err} "
-                f"(pool: in_use={in_use}, available={avail}, "
-                f"max={self.max_connections})"
+                f"(pool: {self.pool_snapshot()})"
             )
         else:
             logger.error(f"{context}: {err}")
@@ -626,8 +619,8 @@ class RedisCacheClient:
 
     async def stream_tail(
         self, stream_key: str
-    ) -> Optional[tuple[int, Optional[bytes]]]:
-        """Newest entry's integer id and ``event`` payload; None if empty.
+    ) -> Optional[tuple[int, Optional[bytes], Optional[bytes]]]:
+        """Newest entry's integer id, ``event`` and ``record``; None if empty.
 
         The disambiguator for an ambiguous write: MAXLEN trims from the head,
         never the tail, so the newest entry is a stable witness of what landed.
@@ -635,10 +628,12 @@ class RedisCacheClient:
         and therefore compare far above any event id — which is exactly the
         signal that something other than this writer appended.
 
-        The payload rides along because the id alone cannot prove authorship:
+        Both fields ride along because the id alone cannot prove authorship:
         a run's stream is reset at event 1, so a crashed predecessor's frame
-        can sit under the very id the caller is about to write. One XREVRANGE
-        returns both, so proving the bytes costs no extra round trip.
+        can sit under the very id the caller is about to write. ``record`` is
+        returned as well as ``event`` because it is the only field carrying
+        the writer's ownership ids — the rendered SSE frame does not. One
+        XREVRANGE returns all three, so proving the bytes costs no round trip.
         """
         if not self.enabled or not self.client:
             return None
@@ -648,10 +643,16 @@ class RedisCacheClient:
         raw, fields = entries[0][0], entries[0][1]
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
-        payload = (fields or {}).get(b"event")
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        return int(str(raw).split("-", 1)[0]), payload
+        fields = fields or {}
+
+        def _as_bytes(value: Any) -> Optional[bytes]:
+            return value.encode("utf-8") if isinstance(value, str) else value
+
+        return (
+            int(str(raw).split("-", 1)[0]),
+            _as_bytes(fields.get(b"event")),
+            _as_bytes(fields.get(b"record")),
+        )
 
     async def clear_all(self) -> bool:
         """

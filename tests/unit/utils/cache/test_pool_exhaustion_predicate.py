@@ -38,3 +38,17 @@ def test_unrelated_redis_errors_are_not_exhaustion():
         redis_exceptions.ConnectionError("Connection closed by server")
     )
     assert not is_pool_exhaustion(RuntimeError("boom"))
+
+
+def test_loading_is_not_exhaustion_but_is_a_connection_error():
+    """The boundary ``stream_append`` relies on to classify LOADING.
+
+    ``BusyLoadingError`` is a ``ConnectionError`` subclass, not a
+    ``ResponseError``, so it reaches the append policy's ambiguous branch by
+    default and has to be named there explicitly. It is not pool exhaustion —
+    the message shares no wording with any exhaustion spelling.
+    """
+    exc = redis_exceptions.BusyLoadingError("Redis is loading the dataset in memory")
+    assert isinstance(exc, redis_exceptions.ConnectionError)
+    assert not isinstance(exc, redis_exceptions.ResponseError)
+    assert not is_pool_exhaustion(exc)

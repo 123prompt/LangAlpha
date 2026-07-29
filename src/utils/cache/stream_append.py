@@ -20,7 +20,7 @@ import random
 import time
 from typing import Optional
 
-from redis.exceptions import ResponseError
+from redis.exceptions import BusyLoadingError, ResponseError
 
 from src.utils.cache.redis_cache import (
     EventBufferUnavailableError,
@@ -28,6 +28,11 @@ from src.utils.cache.redis_cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Redis's own wording for a duplicate/backwards explicit id. ResponseError also
+# carries OOM, READONLY, NOPERM, EXECABORT and MISCONF, so the text is what
+# separates "the fence rejected us" from "the server refused for other reasons".
+_DUPLICATE_ID_TEXT = "equal or smaller than the target stream top item"
 
 
 class StreamAppendError(RuntimeError):
@@ -54,6 +59,20 @@ _BACKOFF_MIN_S = 0.05
 _BACKOFF_MAX_S = 0.2
 
 
+def _nothing_was_written(exc: BaseException) -> bool:
+    """True when the server provably never touched the stream.
+
+    Pool exhaustion never produced a connection, so the write never left the
+    process. ``LOADING`` is answered before the dataset is even readable, so it
+    is equally definitive — but it arrives as a ``ConnectionError`` subclass,
+    which without this check would classify a certain rejection as ambiguous:
+    that latches ``bare`` and buys a tail probe, the one path that can mistake
+    a foreign frame for our own. Both are safe to replay identically, epoch DEL
+    included, because that DEL never ran either.
+    """
+    return is_pool_exhaustion(exc) or isinstance(exc, BusyLoadingError)
+
+
 def _acquire_timeout_s() -> float:
     from src.config.settings import get_redis_pool_timeout
 
@@ -73,12 +92,24 @@ def _default_budget_s() -> float:
 
 # Recovered writes are invisible by design (the run survives), so they are
 # counted: a steady trickle means Redis is degrading even while nothing fails.
+# The fleet-wide count is the OTel counter in ``_note_recovery``; this int is a
+# per-process log throttle only — under ``--workers N`` it sees 1/N of the
+# traffic and would understate degradation if it were the signal.
 _recovered_writes = 0
 
 
 def _note_recovery(label: str, event_id: int, attempt: int, how: str) -> None:
     global _recovered_writes
     _recovered_writes += 1
+    try:
+        # Lazy: ``src.observability.metrics`` reaches back into this package
+        # through its Redis-pool callbacks, so importing it at module level
+        # from the cache layer would close an import cycle.
+        from src.observability.metrics import redis_stream_writes_recovered
+
+        redis_stream_writes_recovered.add(1, {"via": how})
+    except Exception:  # telemetry must never fail a write that just survived
+        logger.debug("[EventBuffer] recovery counter unavailable", exc_info=True)
     logger.info(
         "[EventBuffer] write recovered on attempt %d for %s (id=%d, via=%s)",
         attempt,
@@ -96,7 +127,7 @@ def _note_recovery(label: str, event_id: int, attempt: int, how: str) -> None:
 
 async def _probe_tail(
     cache, stream_key: str, deadline: float
-) -> Optional[tuple[int, Optional[bytes]]]:
+) -> Optional[tuple[int, Optional[bytes], Optional[bytes]]]:
     """Best-effort tail read; a failed probe reads as "unknown", not "empty"."""
     budget = min(_PROBE_TIMEOUT_S, deadline - time.monotonic())
     if budget <= 0:
@@ -122,16 +153,21 @@ async def stream_append_with_retry(
 
     Failures split by what the server can have seen:
 
-    * **Nothing was sent** (pool exhaustion) — replay the identical write.
+    * **Nothing was written** (pool exhaustion, or a ``LOADING`` refusal) —
+      replay the identical write.
+    * **The server refused** (any other ``ResponseError`` on a first attempt)
+      — fatal immediately. Probing would be worse than useless: it classifies
+      a provably-refused write as ambiguous.
     * **The reply was lost** (timeout, reset, or a duplicate-id rejection after
       an earlier ambiguous attempt) — read the tail. Our write landed only when
-      the tail carries our id *and* our bytes; the id alone proves nothing,
-      because the stream is reset at event 1 and a crashed predecessor's frame
-      can sit under the very id being written. Our id with other bytes, or a
-      *greater* tail (an auto-id error/run_end frame somebody else appended),
-      both mean the frame can no longer be placed — fatal, because calling
-      either one success is precisely how a run completes with an archive it
-      never wrote. Anything lower means the write is still missing, so retry.
+      the tail carries our id *and* every field we wrote; the id alone proves
+      nothing, because the stream is reset at event 1 and a crashed
+      predecessor's frame can sit under the very id being written. Our id with
+      any other content, or a *greater* tail (an auto-id error/run_end frame
+      somebody else appended), both mean the frame can no longer be placed —
+      fatal, because calling either one success is precisely how a run
+      completes with an archive it never wrote. Anything lower means the write
+      is still missing, so retry.
 
     Retries carry only the bare XADD: repeating the epoch DEL could erase a
     frame this process never wrote, and repeating the retention heal could
@@ -145,6 +181,13 @@ async def stream_append_with_retry(
         if isinstance(stream_event, str)
         else bytes(stream_event)
     )
+    record_bytes: bytes | None = None
+    if stream_record is not None:
+        record_bytes = (
+            stream_record.encode("utf-8")
+            if isinstance(stream_record, str)
+            else bytes(stream_record)
+        )
     budget_s = _default_budget_s()
     attempt_timeout_s = _attempt_timeout_s()
     deadline = time.monotonic() + budget_s
@@ -182,24 +225,44 @@ async def stream_append_with_retry(
             ) from exc
         except Exception as exc:
             last_exc = exc
-            if not is_pool_exhaustion(exc):
+            if not _nothing_was_written(exc):
                 if not may_have_landed and isinstance(exc, ResponseError):
-                    # Nothing ambiguous has happened yet, so a rejected id
-                    # means the stream already holds state this run did not
-                    # write.
+                    # Fatal for every ResponseError, not just the duplicate id:
+                    # the server answered "no", so falling through would set
+                    # may_have_landed, latch bare (suppressing the epoch DEL)
+                    # and probe the tail for a write that provably never
+                    # happened. Only the wording branches — OOM / READONLY /
+                    # NOPERM / EXECABORT / MISCONF all land here too, and
+                    # calling those "rejected id" sends the reader hunting for
+                    # a fence conflict that does not exist.
+                    detail = (
+                        f"rejected id {event_id} on a first attempt"
+                        if _DUPLICATE_ID_TEXT in str(exc)
+                        else "the server rejected the write on a first attempt"
+                    )
                     raise StreamAppendError(
-                        f"transport_lost: {label} rejected id {event_id} on a "
-                        f"first attempt ({exc})"
+                        f"transport_lost: {label} {detail} ({exc})"
                     ) from exc
                 may_have_landed = True
                 tail = await _probe_tail(cache, stream_key, deadline)
                 if tail is not None:
-                    tail_id, tail_event = tail
+                    tail_id, tail_event, tail_record = tail
                     if tail_id == event_id:
-                        if tail_event == payload:
+                        # The witness is the whole entry, not the rendered
+                        # frame. ``record`` carries the ownership ids (which
+                        # run, which task_run) that the SSE bytes never show,
+                        # so matching on ``event`` alone can accept another
+                        # writer's frame — and one falsely-accepted frame
+                        # costs the entire subagent archive, which the
+                        # collector withholds whole on any mismatch. An entry
+                        # missing ``record`` while we are writing one is
+                        # therefore not ours.
+                        if tail_event == payload and (
+                            record_bytes is None or tail_record == record_bytes
+                        ):
                             _note_recovery(label, event_id, attempt, "tail_probe")
                             return
-                        # Our id, someone else's bytes. At event 1 that is a
+                        # Our id, someone else's entry. At event 1 that is a
                         # crashed predecessor's frame the epoch DEL never got
                         # to clear; later it is a second writer on this run.
                         # Either way the frame we are holding cannot be placed,

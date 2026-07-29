@@ -253,12 +253,29 @@ async def test_disabled_cache_raises_a_distinct_unretryable_error():
 
 @pytest.mark.asyncio
 async def test_stream_tail_returns_the_entry_id_and_its_payload():
-    """Both, from one XREVRANGE: the id alone cannot prove authorship."""
+    """All three, from one XREVRANGE: the id alone cannot prove authorship."""
     _, pipeline_ctx = _make_pipeline_mock()
     cache = _make_client(pipeline_ctx)
     cache.client.xrevrange = AsyncMock(return_value=[(b"41-0", {b"event": b"x"})])
 
-    assert await cache.stream_tail("workflow:stream:t1") == (41, b"x")
+    assert await cache.stream_tail("workflow:stream:t1") == (41, b"x", None)
+
+
+@pytest.mark.asyncio
+async def test_stream_tail_returns_the_record_field_too():
+    """The rendered frame omits the writer's ownership ids; ``record`` carries
+    them, so the ambiguous-write witness needs it in the same round trip."""
+    _, pipeline_ctx = _make_pipeline_mock()
+    cache = _make_client(pipeline_ctx)
+    cache.client.xrevrange = AsyncMock(
+        return_value=[(b"41-0", {b"event": b"x", b"record": b'{"seq": 41}'})]
+    )
+
+    assert await cache.stream_tail("workflow:stream:t1") == (
+        41,
+        b"x",
+        b'{"seq": 41}',
+    )
 
 
 @pytest.mark.asyncio
@@ -278,7 +295,7 @@ async def test_stream_tail_payload_is_none_when_the_entry_has_no_event_field():
     cache = _make_client(pipeline_ctx)
     cache.client.xrevrange = AsyncMock(return_value=[(b"7-0", {b"other": b"x"})])
 
-    assert await cache.stream_tail("workflow:stream:t1") == (7, None)
+    assert await cache.stream_tail("workflow:stream:t1") == (7, None, None)
 
 
 @pytest.mark.asyncio

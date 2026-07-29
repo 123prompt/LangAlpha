@@ -280,6 +280,16 @@ redis_pool_max = meter.create_observable_gauge(
     unit="{connection}",
 )
 
+# A recovered event write leaves no trace in run outcomes — the run survives —
+# so a degrading Redis is only visible here. Counted centrally rather than in
+# the writer's process-local int, which under --workers N sees 1/N of the fleet.
+# via: tail_probe (the write had landed) | rewrite (a later attempt succeeded).
+redis_stream_writes_recovered = meter.create_counter(
+    "langalpha.redis.stream.writes_recovered",
+    description="Event-stream writes that needed a retry, by recovery path.",
+    unit="{write}",
+)
+
 
 def normalize_content_type(content_type: str | None) -> str:
     """Map a free-form MIME / extension to a bounded label set for memo_uploaded.

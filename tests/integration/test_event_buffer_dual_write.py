@@ -64,7 +64,11 @@ async def test_subagent_xadd_carries_event_and_record_fields(real_cache):
             stream_record=record_payload,
             ttl=60,
         )
-        assert await real_cache.stream_tail(stream_key) == (i, sse.encode("utf-8"))
+        assert await real_cache.stream_tail(stream_key) == (
+            i,
+            sse.encode("utf-8"),
+            record_payload.encode("utf-8"),
+        )
 
     stream_len = await real_cache.client.xlen(stream_key)
     assert stream_len == n

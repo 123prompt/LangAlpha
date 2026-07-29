@@ -130,7 +130,7 @@ class TestBufferEventRedisFailureModes:
             side_effect=redis_exceptions.TimeoutError("Timeout reading from redis")
         )
         # Tail stays behind the frame we tried to write: it never landed.
-        mock_cache.stream_tail = AsyncMock(return_value=(4, b"earlier"))
+        mock_cache.stream_tail = AsyncMock(return_value=(4, b"earlier", None))
 
         with patch(
             "src.server.services.runs.stream_writer.get_cache_client",
