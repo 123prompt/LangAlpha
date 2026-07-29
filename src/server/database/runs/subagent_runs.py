@@ -598,6 +598,29 @@ async def get_latest_run_statuses(
             return {str(r["task_id"]): str(r["status"]) for r in rows}
 
 
+async def get_task_run_statuses(task_run_ids: List[str]) -> Dict[str, str]:
+    """task_run_id -> status, for the ids that HAVE a row.
+
+    Absence means the row does not exist — load-bearing for the retention
+    sweeper, which treats a missing v2 run as garbage. That inference is only
+    sound because the row is inserted before the run's first XADD.
+    """
+    if not task_run_ids:
+        return {}
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT task_run_id, status
+                FROM subagent_runs
+                WHERE task_run_id = ANY(%s)
+                """,
+                (list(task_run_ids),),
+            )
+            rows = await cur.fetchall()
+            return {str(r["task_run_id"]): str(r["status"]) for r in rows}
+
+
 async def get_latest_run_details(
     thread_id: str, task_ids: List[str]
 ) -> Dict[str, Dict[str, Any]]:
