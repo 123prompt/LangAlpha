@@ -97,6 +97,9 @@ async def test_reset_for_resume_resets_seq_counters_after_redis_clear():
     assert task.captured_event_seq == 0
     assert task.captured_event_count == 0
     assert task.captured_event_bytes == 0
+    # A cleared spool has no prior round left to skip, so the round floor
+    # goes back to the start of the stream.
+    assert task.captured_event_seq_base == 0
     assert task.redis_write_failed is False
 
 
@@ -183,7 +186,8 @@ async def test_unconfirmed_stream_delete_keeps_the_current_epoch():
     under the ids the next writer claims: the fenced append then finds a tail
     past its own id, cannot prove it owns the stream, and kills the run.
     Keeping the counter makes the next write an ordinary append with no epoch
-    DEL to replay.
+    DEL to replay — and the retained round is fenced off by the seq base, not
+    by a carried-over count.
     """
     registry = BackgroundTaskRegistry(thread_id="thread-x")
     middleware = BackgroundSubagentMiddleware(registry=registry, enabled=True)
@@ -204,8 +208,13 @@ async def test_unconfirmed_stream_delete_keeps_the_current_epoch():
     assert task.completed is False
     assert task.redis_write_failed is False
     assert task.captured_event_seq == 7
-    assert task.captured_event_count == 7
-    assert task.captured_event_bytes == 1234
+    # The prior round stays on the stream, so the new round starts above it.
+    assert task.captured_event_seq_base == 7
+    # ...but the per-round totals still zero: they are what the archive
+    # completeness gates weigh against THIS round's recovered records, and a
+    # carried-over count is what withholds a resumed round's whole archive.
+    assert task.captured_event_count == 0
+    assert task.captured_event_bytes == 0
     # The best-effort keys are still cleared: they precede the stream delete
     # precisely so its failure cannot skip them.
     deleted_keys = [call.args[0] for call in cache.delete.await_args_list]

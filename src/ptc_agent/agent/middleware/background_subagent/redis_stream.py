@@ -13,8 +13,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+import redis.exceptions as redis_exceptions
 import structlog
 
 if TYPE_CHECKING:
@@ -105,30 +106,110 @@ _SPILL_TIMEOUT_SECONDS = 5.0
 SUBAGENT_STREAM_END_EVENT = "subagent_stream_end"
 
 
+# How many tail entries the probe walks back before giving up. The run stream
+# is NOT exclusively ours: ``SubagentRunCoordinator._append_v2_frame`` writes
+# control frames (``lane_open``, ``run_end``) to a byte-identical key without
+# holding ``redis_spill_lock``, and those payloads carry no ``seq``. Reading
+# only the newest entry therefore reports "not landed" whenever a control frame
+# raced in behind our write — and "not landed" means replay, which on an
+# auto-id stream renders a duplicate token to the user. Two control frame types
+# exist, so a handful of slots is generous; the cap keeps a degraded probe from
+# dragging a whole stream back.
+_TAIL_PROBE_SCAN = 8
+
+
 async def _stream_tail_seq(cache: Any, stream_key: str, field: bytes) -> int | None:
-    """Seq of the newest entry in a spill stream, or None.
+    """Seq of the newest *seq-bearing* entry in a spill stream, or None.
 
     ``wait_for`` cancels the awaiting coroutine on timeout, but the
     command may already be on the wire — the tail decides landed
     (continue) vs lost (retry, then circuit). Reads the seq out of the
     payload because the v2 stream uses Redis auto-ids, which carry no
-    relation to the record's sequence number.
+    relation to the record's sequence number, and skips past seq-less
+    control frames rather than reading one as "our write is missing".
     """
     try:
         entries = await asyncio.wait_for(
-            cache.client.xrevrange(stream_key, count=1),
+            cache.client.xrevrange(stream_key, count=_TAIL_PROBE_SCAN),
             timeout=_SPILL_TIMEOUT_SECONDS,
         )
-        if not entries:
-            return None
-        raw = (entries[0][1] or {}).get(field)
-        if raw is None:
-            return None
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8")
-        return int(json.loads(raw)["seq"])
     except Exception:
         return None
+    for entry in entries or ():
+        try:
+            raw = (entry[1] or {}).get(field)
+            if raw is None:
+                continue
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or "seq" not in payload:
+                continue
+            return int(payload["seq"])
+        except Exception:
+            continue
+    return None
+
+
+# redis-py spells each stage of a command's journey with a distinct message, so
+# how far a failed write got is recoverable from the error text. Line refs are
+# redis-py 7.4.0 ``redis/asyncio/connection.py``.
+_V2_PRE_SEND_MARKERS = (
+    # :629 ``_send_ping`` — ``check_health()`` runs at :657-658, BEFORE the
+    # command is written. With ``health_check_interval=30`` any pooled
+    # connection idle for half a minute is PINGed first, so a Redis restart,
+    # failover or LB idle-reap fails here with nothing sent. This is the
+    # dominant real-world trigger.
+    "Bad response from PING health check",
+    # :387 -> ``redis/utils.py`` :277-286 ``format_error_message`` — the socket
+    # was never established.
+    " connecting to ",
+    # :1496 / :1501 ``ensure_connection`` — the pool refused to hand out the
+    # connection; the command was not even packed.
+    "Connection has data",
+    "Connection not ready",
+)
+
+_V2_AMBIGUOUS_MARKERS = (
+    # :705 ``can_read_destructive`` / :748 ``read_response`` — the command is on
+    # the wire and only the reply was lost.
+    "Error while reading from ",
+    # :681 ``send_packed_command``. Textually this is the write side, but it is
+    # NOT provably pre-send: ``StreamWriter.drain()`` also raises when the peer
+    # resets a connection whose bytes it had already flushed AND executed, so a
+    # fully-written XADD can surface here. Ambiguous is the conservative read —
+    # a probe costs one XREVRANGE, a wrong replay costs a duplicate token.
+    " while writing to socket",
+)
+
+
+def _classify_v2_write_failure(
+    exc: BaseException,
+) -> Literal["pre_send", "ambiguous", "fatal"]:
+    """How far the auto-id v2 XADD got — the only question worth asking here.
+
+    The v2 leg carries no id fence and nothing downstream dedupes by payload
+    seq (the mux stamps the Redis entry id), so replaying a write that actually
+    landed renders a duplicate token to the user. Only ``pre_send`` may be
+    replayed blind; ``ambiguous`` must first prove the frame is absent;
+    anything unrecognized stays fatal rather than guessing.
+    """
+    from src.utils.cache.redis_cache import is_pool_exhaustion
+
+    if is_pool_exhaustion(exc):
+        # The acquire never produced a connection.
+        return "pre_send"
+    if isinstance(exc, redis_exceptions.TimeoutError):
+        # Not ``builtins.TimeoutError`` — a socket timeout can fire either side
+        # of the server seeing the command, same as our own ``wait_for`` cap.
+        return "ambiguous"
+    if isinstance(exc, redis_exceptions.ConnectionError):
+        text = str(exc)
+        if any(marker in text for marker in _V2_PRE_SEND_MARKERS):
+            return "pre_send"
+        if any(marker in text for marker in _V2_AMBIGUOUS_MARKERS):
+            return "ambiguous"
+    return "fatal"
 
 
 async def spill_task_record(
@@ -167,10 +248,7 @@ async def spill_task_record(
         return
 
     try:
-        from src.utils.cache.redis_cache import (
-            get_cache_client,
-            is_pool_exhaustion,
-        )
+        from src.utils.cache.redis_cache import get_cache_client
         from src.utils.cache.stream_append import (
             StreamAppendError,
             stream_append_with_retry,
@@ -342,13 +420,39 @@ async def spill_task_record(
                         )
                         break
                     except Exception as exc:
-                        if is_pool_exhaustion(exc) and attempt == 1:
-                            # Pre-send: the acquire never produced a
-                            # connection, so nothing reached the server and
-                            # replaying is safe even without an id fence.
-                            # Every other failure here is ambiguous and an
-                            # auto-id write cannot be replayed.
-                            continue
+                        # An auto-id write cannot be REPLAYED blind, but that
+                        # is no reason not to CLASSIFY it: most failures
+                        # reachable here are pre-send and unambiguous, and
+                        # tearing the run on one of those throws away a
+                        # subagent's finished work. Same policy as the timeout
+                        # branch above, split by what the server can have seen.
+                        verdict = _classify_v2_write_failure(exc)
+                        if verdict != "fatal":
+                            if verdict == "ambiguous" and (
+                                await _stream_tail_seq(cache, v2_key, b"payload")
+                                == seq
+                            ):
+                                logger.info(
+                                    "subagent_event_spill_recovered",
+                                    phase="v2_error_landed",
+                                    tool_call_id=task.tool_call_id,
+                                    task_id=task.task_id,
+                                    task_run_id=task.task_run_id,
+                                    seq=seq,
+                                    error=str(exc),
+                                )
+                                break
+                            if attempt == 1:
+                                logger.warning(
+                                    "subagent_event_spill_retry",
+                                    phase=f"v2_{verdict}",
+                                    tool_call_id=task.tool_call_id,
+                                    task_id=task.task_id,
+                                    task_run_id=task.task_run_id,
+                                    seq=seq,
+                                    error=str(exc),
+                                )
+                                continue
                         task.redis_write_failed = True
                         logger.warning(
                             "subagent_event_spill_failed",

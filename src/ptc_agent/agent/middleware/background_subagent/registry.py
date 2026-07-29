@@ -163,17 +163,26 @@ class BackgroundTask:
     """Monotonic seq counter. Each captured event gets ``captured_event_seq + 1``;
     the value is also the XADD entry ID (``<seq>-0``) on the per-task stream."""
 
+    captured_event_seq_base: int = 0
+    """XADD sequence floor of the current round: everything at or below it
+    belongs to a previous round on a stream the resume could not prove it
+    cleared. Readers start past it so a retained epoch is skipped rather than
+    counted, which is what makes the archive look identical whether or not the
+    resume's spool delete landed."""
+
     captured_event_count: int = 0
-    """Total events ever captured (== ``captured_event_seq`` once monotonic).
-    Tracked separately so it can survive resets that re-zero ``captured_event_seq``
-    if that ever happens (currently they move in lock-step)."""
+    """Events captured in the CURRENT round — reset on every resume, whether or
+    not the sequence restarts with it. The completeness gates compare it against
+    what they recover above ``captured_event_seq_base``, so a cumulative value
+    here would make a resumed round's archive look permanently short."""
 
     captured_event_bytes: int = 0
-    """Cumulative bytes captured (telemetry only; estimated)."""
+    """Bytes captured in the current round (telemetry only; estimated)."""
 
     redis_write_failed: bool = False
-    """Set if any Redis spill failed for this task. Telemetry only — degraded
-    mode still keeps streaming working via the in-memory tail."""
+    """Sticky circuit-break: a failed spill permanently stops this task's Redis
+    writes, and the run ends as ``error(transport_lost)`` rather than degrading
+    to the in-memory tail — a gap in the replay archive is not recoverable."""
 
     cancelled: bool = False
     """Whether the task was explicitly cancelled (distinct from completed with error)."""
@@ -532,7 +541,10 @@ class BackgroundTaskRegistry:
             if task.task_run_id:
                 record["task_run"] = task.task_run_id
 
-            task.captured_event_count = seq
+            # Counts this round's appends, NOT the seq: on a resume that could
+            # not clear the spool the seq carries over from the prior round,
+            # and the archive gates measure this round only.
+            task.captured_event_count += 1
             task.captured_event_bytes += _estimate_record_bytes(record)
             # Bump last_updated_at only on user-visible text output.
             # reasoning_signal / reasoning / tool_calls / tool_call_result

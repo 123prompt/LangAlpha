@@ -13,6 +13,9 @@ import json
 import logging
 from typing import AsyncIterator
 
+from ptc_agent.agent.middleware.background_subagent.redis_stream import (
+    task_stream_key,
+)
 from src.utils.cache.redis_cache import get_cache_client
 
 logger = logging.getLogger(__name__)
@@ -37,7 +40,7 @@ _ARCHIVE_PAGE = 1000
 async def iter_subagent_events_full(
     thread_id: str, task
 ) -> AsyncIterator[dict]:
-    """Yield every captured record for a subagent in seq order.
+    """Yield the current round's captured records for a subagent, in seq order.
 
     Raises ``SubagentArchiveReadError`` if the stream cannot be read in full.
     """
@@ -45,7 +48,11 @@ async def iter_subagent_events_full(
         return
 
     high_water = int(getattr(task, "captured_event_seq", 0) or 0)
-    if high_water <= 0:
+    # A resume that could not confirm its spool delete keeps the sequence
+    # running rather than restarting it, so the retained prior round sits under
+    # ids <= base. Reading from base makes the archive identical either way.
+    base = int(getattr(task, "captured_event_seq_base", 0) or 0)
+    if high_water <= base:
         return
 
     try:
@@ -59,12 +66,13 @@ async def iter_subagent_events_full(
     if cache is None or not getattr(cache, "enabled", False) or cache.client is None:
         return
 
-    sa_stream_key = f"subagent:stream:{thread_id}:{task.task_id}"
-    # The v1 spill writes explicit ``{seq}-0`` ids, so the high-water mark is
-    # directly expressible as a range bound — everything past it is a later
-    # epoch's refill and was never ours to read.
+    sa_stream_key = task_stream_key(thread_id, task.task_id)
+    # The v1 spill writes explicit ``{seq}-0`` ids, so both round bounds are
+    # directly expressible as a range — everything past the high-water is a
+    # later epoch's refill and was never ours to read, everything at or below
+    # the base is a previous round's.
     upper = f"{high_water}-0"
-    cursor = "-"
+    cursor = "-" if base <= 0 else f"({base}-0"
     yielded = 0
     while True:
         try:
@@ -86,7 +94,7 @@ async def iter_subagent_events_full(
                 seq = int(seq_part.split("-", 1)[0])
             except (ValueError, AttributeError):
                 continue
-            if seq <= 0 or seq > high_water:
+            if seq <= base or seq > high_water:
                 continue
             raw = fields.get(b"record")
             if raw is None:
@@ -111,7 +119,7 @@ async def iter_subagent_events_full(
             last_id = last_id.decode("utf-8")
         cursor = f"({last_id}"  # exclusive, so the last entry isn't re-read
 
-    expected = high_water
+    expected = high_water - base
     if yielded < expected:
         logger.warning(
             "subagent_history_truncated",

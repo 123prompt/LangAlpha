@@ -417,10 +417,21 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                     task_id=task.task_id,
                     exc_info=True,
                 )
+        # Two independent axes here. The COUNTERS are per-round totals — the
+        # archive completeness gates weigh them against what they recover for
+        # THIS round, so carrying a cumulative count into a round that only
+        # appends its own events would withhold the whole archive. The
+        # SEQUENCE is the stream's identity and only restarts once the old
+        # epoch is proven gone; when it has to carry over, the base records
+        # where this round starts so readers skip the retained epoch instead
+        # of counting it as missing.
+        task.captured_event_count = 0
+        task.captured_event_bytes = 0
         if spool_cleared:
             task.captured_event_seq = 0
-            task.captured_event_count = 0
-            task.captured_event_bytes = 0
+            task.captured_event_seq_base = 0
+        else:
+            task.captured_event_seq_base = task.captured_event_seq
         # Reset timestamps so the LLM sees honest staleness for the
         # resumed run, not leftover values from the prior asyncio.Task.
         task.last_checked_at = time.time()

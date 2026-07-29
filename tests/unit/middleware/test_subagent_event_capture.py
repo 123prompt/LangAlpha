@@ -280,19 +280,22 @@ async def test_redis_spill_timeout_landed_write_recovers(monkeypatch) -> None:
 
     seen: dict = {}
 
+    def _as_bytes(value):
+        return value.encode("utf-8") if isinstance(value, str) else value
+
     async def hang_first(*_args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             seen["payload"] = kwargs["stream_event"]
+            seen["record"] = kwargs["stream_record"]
             await asyncio.sleep(10)
 
     async def landed_tail(*_args, **_kwargs):
-        # The witness is the id AND the bytes: an id match alone could be a
-        # crashed predecessor's frame sitting under the same seq.
-        payload = seen.get("payload")
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        return 1, payload
+        # The witness is the id AND the whole entry: an id match alone could be
+        # a crashed predecessor's frame sitting under the same seq, and the
+        # rendered frame alone omits the ownership ids that only ``record``
+        # carries — this lane writes both, so both must match.
+        return 1, _as_bytes(seen.get("payload")), _as_bytes(seen.get("record"))
 
     fake_cache = MagicMock()
     fake_cache.enabled = True
