@@ -8,7 +8,11 @@ version = "0.1.0"
 description = "LangAlpha core"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.12"
+# 3.13, not 3.12: the Redis pools block on an asyncio.Condition, and before
+# 3.13 a waiter cancelled at its own deadline swallowed a notify instead of
+# re-delivering it — so a caller could be told the pool was exhausted while a
+# connection sat free. Nothing in this repo can compensate for that.
+requires-python = ">=3.13"
 dependencies = [
     "httpx[http2]>=0.28.1",
     # LangChain core packages (v1)
