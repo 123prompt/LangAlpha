@@ -131,6 +131,7 @@ redis:
   # Three pools split by how long a connection is HELD, not by feature. Short
   # cache ops must never queue behind a reader parked in XREAD BLOCK, and a
   # subscriber holding a connection for 30 minutes must not sit in either.
+  # The three caps sum per worker (400 here) — keep workers x 400 under the Redis server's maxclients
   max_connections: 150 # Cache pool: short ops only (override via REDIS_MAX_CONNECTIONS env)
   stream_max_connections: 100 # Blocking stream readers, ~1 held per live SSE consumer (REDIS_STREAM_MAX_CONNECTIONS)
   pubsub_max_connections: 150 # Long-lived subscriptions (REDIS_PUBSUB_MAX_CONNECTIONS)
