@@ -191,8 +191,15 @@ def _classify_v2_write_failure(
     The v2 leg carries no id fence and nothing downstream dedupes by payload
     seq (the mux stamps the Redis entry id), so replaying a write that actually
     landed renders a duplicate token to the user. Only ``pre_send`` may be
-    replayed blind; ``ambiguous`` must first prove the frame is absent;
-    anything unrecognized stays fatal rather than guessing.
+    replayed blind; ``ambiguous`` is replayed only when the tail does not
+    confirm it landed, which is weaker than proving it absent — a probe that
+    itself fails counts as not-landed, so that one replay is bounded rather
+    than safe. The root lane gets the proof for free: its ``{id}-0`` fence
+    makes Redis adjudicate, and the duplicate-id rejection *is* the
+    confirmation. This lane cannot have that while the contract makes the
+    server-assigned entry id the reader's cursor (``STREAM_CONTRACT_V2.md``);
+    fencing it would delete the probe and this caveat with it. Anything
+    unrecognized stays fatal.
     """
     from src.utils.cache.redis_cache import is_pool_exhaustion
 
