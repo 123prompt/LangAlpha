@@ -14,6 +14,7 @@ from __future__ import annotations
 from opentelemetry import metrics
 
 from .db_callbacks import credits_observe, llm_tokens_observe
+from .redis_pool_callbacks import pool_in_use_observe, pool_max_observe
 
 meter = metrics.get_meter("langalpha")
 
@@ -248,6 +249,35 @@ ws_disconnects = meter.create_counter(
     "langalpha.ws.disconnects",
     description="MarketView WebSocket disconnects by reason (client_close | server_error | shutdown).",
     unit="{disconnect}",
+)
+
+
+# Event-loop scheduling delay, sampled by a fixed-interval heartbeat. Redis
+# read timeouts and SSE stalls are indistinguishable from server-side faults
+# without this: a blocked loop starves the socket reader, and redis-py reports
+# it as "Timeout reading from redis" — pointing the investigation at the wrong
+# component.
+event_loop_lag_ms = meter.create_histogram(
+    "langalpha.event_loop.lag_ms",
+    description="Event-loop scheduling delay measured by the heartbeat sampler.",
+    unit="ms",
+)
+
+
+# Pool exhaustion errors name the connections that lost the race, never the
+# ones holding the slots — occupancy has to be sampled while the pool fills.
+redis_pool_in_use = meter.create_observable_gauge(
+    "langalpha.redis.pool.in_use",
+    callbacks=[pool_in_use_observe],
+    description="Redis connections checked out, by pool (cache | reader | pubsub).",
+    unit="{connection}",
+)
+
+redis_pool_max = meter.create_observable_gauge(
+    "langalpha.redis.pool.max",
+    callbacks=[pool_max_observe],
+    description="Redis pool capacity, by pool (cache | reader | pubsub).",
+    unit="{connection}",
 )
 
 
