@@ -19,7 +19,8 @@ import logging
 from typing import Optional
 
 import redis.asyncio as redis
-from redis.asyncio.connection import BlockingConnectionPool
+from redis.asyncio.connection import AbstractConnection, BlockingConnectionPool
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from src.config.settings import (
     get_redis_socket_timeout,
@@ -30,20 +31,50 @@ logger = logging.getLogger(__name__)
 
 # Acquire and connect budgets, derived rather than configured. A reader BLOCKs
 # for ``socket_timeout - 1s`` (4s by default) inside an outer ``wait_for`` of
-# ``block + 2s``, so everything that is not the block shares 2 seconds:
+# ``block + 2s``, so the queue wait, the connect, and one response round trip
+# have to share the ~2s that is left.
 #
-#     acquire (queue) + connect (TCP+AUTH) + response round trip  <=  2.0s
-#
-# The connect term has to be budgeted here explicitly. redis-py runs
-# ``ensure_connection()`` OUTSIDE ``async_timeout(pool.timeout)`` (see
-# ``BlockingConnectionPool.get_connection``), so the pool's acquire timeout
-# bounds the queue wait and nothing else. Left at the shared 5s connect
-# default, a reader that queues and then dials overruns the caller's deadline —
-# and the cancellation tears the socket down, so the next round pays a fresh
-# dial. That self-feeding connect storm is exactly what this pool split exists
-# to prevent, and it fires under precisely the load that motivated the split.
+# redis-py bounds the pieces, never the whole, so each budget below has to be
+# imposed at the right seam: ``timeout=`` covers the acquire queue only
+# (``ensure_connection`` runs outside it), ``socket_connect_timeout`` covers the
+# TCP dial only, and the AUTH/CLIENT-SETINFO/SELECT handshake after the dial has
+# no enclosing deadline at all — each of its round trips gets a fresh
+# ``socket_timeout``, so they sum. ``_bounded_handshake`` supplies that missing
+# cap; the caller's ``wait_for`` is a backstop, and reaching it cancels
+# mid-handshake into the self-feeding redial storm this pool split prevents.
 _ACQUIRE_TIMEOUT_S = 0.5
 _CONNECT_TIMEOUT_S = 1.0
+
+
+def connect_path_budget_s() -> float:
+    """Worst case to hand a caller a usable connection, before any command.
+
+    Exported so the readers can size their outer deadline off the real
+    budgets instead of a hand-tuned constant: a deadline below this sum
+    cancels mid-connect, and that cancel is what starts the redial storm.
+    The dial and the handshake are capped separately, both at
+    ``_CONNECT_TIMEOUT_S``, so each is counted.
+    """
+    return _ACQUIRE_TIMEOUT_S + (2 * _CONNECT_TIMEOUT_S)
+
+
+async def _bounded_handshake(conn: AbstractConnection) -> None:
+    """Cap the post-dial handshake that redis-py leaves unbounded.
+
+    Installed as ``redis_connect_func``, which redis-py substitutes for the
+    default ``on_connect`` wholesale. It has to fail as a ``RedisError``: that
+    is what makes ``connect_check_health`` drop the half-open socket, and it
+    keeps the SSE readers on their backoff branch instead of the immediate-retry
+    branch they take for a bare ``asyncio.TimeoutError``.
+    """
+    try:
+        async with asyncio.timeout(_CONNECT_TIMEOUT_S):
+            await conn.on_connect_check_health(check_health=True)
+    except asyncio.TimeoutError as exc:
+        raise RedisConnectionError(
+            f"Timed out after {_CONNECT_TIMEOUT_S}s during Redis handshake"
+        ) from exc
+
 
 _reader_client: Optional[redis.Redis] = None
 _reader_pool: Optional[BlockingConnectionPool] = None
@@ -86,6 +117,7 @@ async def get_stream_reader_client(cache) -> Optional[redis.Redis]:
                 timeout=_ACQUIRE_TIMEOUT_S,
                 socket_timeout=get_redis_socket_timeout(),
                 socket_connect_timeout=_CONNECT_TIMEOUT_S,
+                redis_connect_func=_bounded_handshake,
                 decode_responses=False,
                 health_check_interval=30,
             )

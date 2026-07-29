@@ -36,10 +36,11 @@ from src.utils.cache.redis_cache import get_cache_client, is_pool_exhaustion
 from src.utils.cache import stream_pool
 
 from src.server.services.report_back.flash.core import watch_wakes
-from .run_stream_reader import (
-    _XREAD_ERROR_BACKOFF_S,
-    _XREAD_EXHAUSTION_BACKOFF_S,
-    _xread_block_ms,
+from .xread_tuning import (
+    XREAD_ERROR_BACKOFF_S,
+    XREAD_EXHAUSTION_BACKOFF_S,
+    xread_block_ms,
+    xread_wait_timeout_s,
 )
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
@@ -47,9 +48,10 @@ logger = logging.getLogger("src.server.handlers.chat_handler")
 
 _MAX_CHANNELS = 32
 _MAX_CURSORS_LEN = 4096
-# Per-channel entries per XREAD round. XREAD's COUNT applies per stream, so
-# this IS the fairness bound: a flooding task hands the loop at most this
-# many frames before other channels get their turn.
+# Per-channel entries per XREAD round — deliberately not the shared
+# ``xread_tuning.XREAD_COUNT``. XREAD's COUNT applies per stream, so here it IS
+# the fairness bound: a flooding task hands the loop at most this many frames
+# before other channels get their turn.
 _XREAD_COUNT = 32
 _XREAD_MAX_CONSECUTIVE_FAILURES = 5
 # Empty XREAD rounds on a channel before its (rate-limited) settled probe may
@@ -572,7 +574,7 @@ async def stream_thread_mux_v2(
         yield frame
 
     # ---- pumps -----------------------------------------------------------
-    block_ms = _xread_block_ms()
+    block_ms = xread_block_ms()
 
     # A deferred admission must outlive every bounded recovery window AND
     # this socket: its announce is already behind control_cursor, a run that
@@ -674,7 +676,7 @@ async def stream_thread_mux_v2(
                     reader.xread(
                         streams, block=block_ms, count=_XREAD_COUNT
                     ),
-                    timeout=(block_ms / 1000.0) + 2.0,
+                    timeout=xread_wait_timeout_s(),
                 )
             except asyncio.TimeoutError:
                 result = None
@@ -700,9 +702,9 @@ async def stream_thread_mux_v2(
                     await out_q.put(("transport", None))
                     return
                 await asyncio.sleep(
-                    _XREAD_EXHAUSTION_BACKOFF_S
+                    XREAD_EXHAUSTION_BACKOFF_S
                     if is_pool_exhaustion(exc)
-                    else _XREAD_ERROR_BACKOFF_S
+                    else XREAD_ERROR_BACKOFF_S
                 )
                 continue
             else:
