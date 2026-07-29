@@ -1,16 +1,5 @@
 """Background sweep putting a TTL on event streams that never got one.
 
-Active streams carry no TTL by design — retention is stamped at the run's
-terminal, so a live consumer can never have its backlog expire underneath it.
-A run that dies without reaching that terminal (crash, OOM, kill -9) therefore
-leaves its stream resident forever, and on a long-lived deployment those
-orphans grew to dominate the keyspace.
-
-Keyspace-driven with the ledger as oracle, rather than ledger-driven: the run
-tables carry no "finalized_at", so there is no way to enumerate the runs whose
-streams should have been stamped. Scanning the keyspace and asking the ledger
-about what it finds inverts that cleanly.
-
 Scope is deliberately narrow — root ``workflow:stream:{tid}:{run_id}`` and v2
 ``subagent:stream:{tid}:{task_run_id}`` only. Both insert their ledger row
 BEFORE the run's first XADD, which is what makes "no row ⇒ garbage" sound. v1
@@ -27,6 +16,8 @@ import logging
 import random
 import uuid
 from typing import Optional
+
+from src.utils.concurrency import cancel_and_join
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +46,11 @@ _LEASE_TTL_S = 600
 _CURSOR_KEY = "sweep:stream_retention:cursor"
 _CURSOR_TTL_S = 86400
 
+# Keyspace-driven with the ledger as oracle, rather than ledger-driven: the run
+# tables carry no "finalized_at", so there is no way to enumerate the runs whose
+# streams should have been stamped. Scanning the keyspace and asking the ledger
+# about what it finds inverts that cleanly.
+#
 # One pattern, so one cursor is enough: a SCAN cursor is a position in the
 # keyspace, not in a filtered view, and juggling several against one cursor
 # means no pattern ever completes a pass. ``_stamp_batch`` does the precise
@@ -138,11 +134,7 @@ class StreamRetentionSweeper:
             logger.warning(
                 "[StreamRetentionSweeper] sweep exceeded stop grace; cancelling"
             )
-            self._loop_task.cancel()
-            try:
-                await self._loop_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await cancel_and_join(self._loop_task)
         except Exception:
             logger.warning("[StreamRetentionSweeper] stop failed", exc_info=True)
         self._loop_task = None
@@ -297,6 +289,12 @@ class StreamRetentionSweeper:
                 exc_info=True,
             )
             return []
+        # Terminal-or-gone is the whole test. Active streams carry no TTL by
+        # design — retention is stamped at the run's terminal, so a live
+        # consumer can never have its backlog expire underneath it. A run that
+        # dies before that terminal (crash, OOM, kill -9) leaves its stream
+        # resident forever, and on a long-lived deployment those orphans grew to
+        # dominate the keyspace.
         return [
             key
             for run_id, key in by_run.items()

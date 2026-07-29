@@ -1739,10 +1739,13 @@ async def test_watch_wakes_snapshots_only_after_registration_is_proven(
     with patch.object(
         status, "read_report_back_slice", new=AsyncMock(side_effect=_slice)
     ):
-        asyncio.create_task(_go_live())
+        # Hold the handle: the loop only weak-references tasks, so a discarded
+        # one can be collected before it runs and wait_live would time out.
+        go_live = asyncio.create_task(_go_live())
         gen = core.watch_wakes(_WAKE_CACHE, "th-ack")
         first = await gen.__anext__()
         await gen.aclose()
+        await go_live
 
     assert first.startswith(f"event: {wake.SNAPSHOT_EVENT}")
     assert calls == ["live", "slice"]

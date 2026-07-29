@@ -243,7 +243,9 @@ class TestSubscriptionLoop:
             await listener.stop()
 
     @pytest.mark.asyncio
-    async def test_stops_when_there_is_no_pubsub_pool(self, listener, monkeypatch):
+    async def test_never_goes_live_when_there_is_no_pubsub_pool(
+        self, listener, monkeypatch
+    ):
         monkeypatch.setattr(
             "src.server.services.workspace_status_pubsub.get_shared_pubsub_client",
             AsyncMock(return_value=None),

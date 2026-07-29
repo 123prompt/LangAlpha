@@ -14,6 +14,8 @@ import logging
 import time
 from typing import Optional
 
+from src.utils.concurrency import cancel_and_join
+
 logger = logging.getLogger(__name__)
 
 # Sampling cadence. Short enough to catch the sub-second stalls that precede a
@@ -53,13 +55,9 @@ class EventLoopLagMonitor:
 
     async def stop(self) -> None:
         self._stopping.set()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._task = None
+        task, self._task = self._task, None
+        if task is not None:
+            await cancel_and_join(task)
 
     async def _run(self) -> None:
         from src.observability.metrics import event_loop_lag_ms

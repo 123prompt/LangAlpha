@@ -23,6 +23,7 @@ import time
 import uuid
 from typing import Optional
 
+from src.utils.concurrency import cancel_and_join
 from src.server.services.report_back.flash.keys import (
     parse_thread_wake_key,
     thread_wake_pattern,
@@ -118,13 +119,9 @@ class ThreadWakeListener:
 
     async def stop(self) -> None:
         self._stopping.set()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._task = None
+        task, self._task = self._task, None
+        if task is not None:
+            await cancel_and_join(task)
         self._go_dark()
 
     # -- viewer API --------------------------------------------------------
@@ -164,7 +161,8 @@ class ThreadWakeListener:
         """Never starts the listener: app setup owns its lifecycle, and a
         viewer silently reviving it would mask a failed startup. A listener
         that isn't running simply never goes live, and viewers degrade to the
-        client's /status poll."""
+        client's close-driven reconcile (the watch is push-only — there is no
+        polling loop), which paces out to ~30s."""
         try:
             await asyncio.wait_for(self._live.wait(), timeout=timeout)
             return True
