@@ -54,14 +54,26 @@ class _FakeRedisClient:
 
 
 class _FakeCache:
-    def __init__(self, *, enabled, client):
+    def __init__(self, *, enabled, client, url="redis://localhost:6379/0"):
         self.enabled = enabled
         self.client = client
+        self.url = url
 
 
 def _install_cache(monkeypatch, cache):
     monkeypatch.setattr(
         workspace_status_pubsub, "get_cache_client", lambda: cache
+    )
+
+    # Stand in for the dedicated pubsub pool. Patched explicitly because the
+    # subscriber must never reach the shared cache client on its own — these
+    # tests used to pass through the (now deleted) fallback that did exactly
+    # that, so the isolation they appear to exercise was fictional.
+    async def _fake_pubsub_client(_cache):
+        return cache.client
+
+    monkeypatch.setattr(
+        workspace_status_pubsub, "_get_pubsub_client", _fake_pubsub_client
     )
 
 
@@ -116,6 +128,50 @@ async def test_subscribe_yields_none_when_redis_disabled(monkeypatch):
 
     async with subscribe_to_status("ws-1") as wait:
         assert wait is None
+
+
+@pytest.mark.asyncio
+async def test_subscribe_yields_none_when_the_dedicated_pool_is_unavailable(
+    monkeypatch,
+):
+    """It must NOT quietly borrow the shared cache pool. A 600s subscription
+    held there is the exact shape that exhausted it in production; callers keep
+    a DB-poll path precisely so this can degrade instead."""
+    client = _FakeRedisClient(pubsub_obj=_FakePubsub())
+    monkeypatch.setattr(
+        workspace_status_pubsub,
+        "get_cache_client",
+        lambda: _FakeCache(enabled=True, client=client),
+    )
+
+    async def _no_pool(_cache):
+        return None
+
+    monkeypatch.setattr(workspace_status_pubsub, "_get_pubsub_client", _no_pool)
+
+    async with subscribe_to_status("ws-1") as wait:
+        assert wait is None
+
+
+@pytest.mark.asyncio
+async def test_pool_build_failure_returns_none_and_backs_off(monkeypatch):
+    monkeypatch.setattr(workspace_status_pubsub, "_pubsub_client", None)
+    monkeypatch.setattr(workspace_status_pubsub, "_pubsub_retry_after", 0.0)
+    calls = {"n": 0}
+
+    def _boom(*_args, **_kwargs):
+        calls["n"] += 1
+        raise ValueError("unparseable url")
+
+    monkeypatch.setattr(
+        workspace_status_pubsub.ConnectionPool, "from_url", staticmethod(_boom)
+    )
+
+    cache = _FakeCache(enabled=True, client=_FakeRedisClient())
+    assert await workspace_status_pubsub._get_pubsub_client(cache) is None
+    # Second call inside the cooldown must not retry a build that can't work.
+    assert await workspace_status_pubsub._get_pubsub_client(cache) is None
+    assert calls["n"] == 1
 
 
 @pytest.mark.asyncio
