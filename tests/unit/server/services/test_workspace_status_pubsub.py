@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+from src.config.settings import get_redis_socket_connect_timeout
 from src.server.services import workspace_status_pubsub
 from src.server.services.workspace_status_pubsub import (
     publish_status_change,
@@ -172,6 +173,37 @@ async def test_pool_build_failure_returns_none_and_backs_off(monkeypatch):
     # Second call inside the cooldown must not retry a build that can't work.
     assert await workspace_status_pubsub._get_pubsub_client(cache) is None
     assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_pubsub_pool_bounds_connect_but_leaves_reads_blocking(monkeypatch):
+    """Pins the deliberate timeout asymmetry on the dedicated pubsub pool.
+
+    redis-py aliases socket_connect_timeout to socket_timeout when it is unset,
+    so omitting both left every fresh connection — including the AUTH handshake
+    read that a password-bearing URL forces — on the OS SYN timeout (~75-130s).
+    socket_timeout stays None on purpose: subscribers park on blocking reads and
+    every reader passes its own explicit get_message timeout.
+    """
+    monkeypatch.setattr(workspace_status_pubsub, "_pubsub_client", None)
+    monkeypatch.setattr(workspace_status_pubsub, "_pubsub_pool", None)
+    monkeypatch.setattr(workspace_status_pubsub, "_pubsub_retry_after", 0.0)
+
+    cache = _FakeCache(
+        enabled=True,
+        client=_FakeRedisClient(),
+        url="redis://:pw@localhost:6379/0",
+    )
+    assert await workspace_status_pubsub._get_pubsub_client(cache) is not None
+
+    pool = workspace_status_pubsub.peek_status_pubsub_pool()
+    assert pool is not None
+    # from_url only parses the URL and make_connection performs no I/O, so this
+    # reads the real post-aliasing values off a genuine redis-py connection.
+    conn = pool.make_connection()
+    assert conn.socket_connect_timeout == get_redis_socket_connect_timeout()
+    assert conn.socket_connect_timeout > 0
+    assert conn.socket_timeout is None
 
 
 @pytest.mark.asyncio

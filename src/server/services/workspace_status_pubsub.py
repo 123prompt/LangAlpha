@@ -21,7 +21,10 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 import redis.asyncio as redis
 from redis.asyncio.connection import ConnectionPool
 
-from src.config.settings import get_redis_pubsub_max_connections
+from src.config.settings import (
+    get_redis_pubsub_max_connections,
+    get_redis_socket_connect_timeout,
+)
 from src.utils.cache.redis_cache import RedisCacheClient, get_cache_client
 
 logger = logging.getLogger(__name__)
@@ -66,9 +69,16 @@ async def _get_pubsub_client(cache: RedisCacheClient) -> Optional[redis.Redis]:
         if loop.time() < _pubsub_retry_after:
             return None
         try:
+            # socket_connect_timeout only: connect is bounded by nature, and
+            # redis-py wraps both the AUTH handshake read and pool disconnect in
+            # it — unset, a Redis that accepts TCP but never answers parks a
+            # subscriber on the OS SYN timeout (~75-130s). socket_timeout stays
+            # unset because subscribers park on blocking reads; every reader
+            # here passes its own explicit get_message(timeout=...).
             _pubsub_pool = ConnectionPool.from_url(
                 cache.url,
                 max_connections=get_redis_pubsub_max_connections(),
+                socket_connect_timeout=get_redis_socket_connect_timeout(),
                 decode_responses=False,
                 health_check_interval=30,
             )

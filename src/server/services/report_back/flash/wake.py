@@ -47,7 +47,8 @@ _LIVE_TIMEOUT_S = 5.0
 _RESYNC_JITTER_S = 2.0
 
 # A listener that stays down this long is not a blip. Viewers close so the
-# client resubscribes; its /status poll is the backstop in the meantime.
+# client resubscribes; each close drives a /status reconcile, and the paced
+# resubscribe caps at ~30s — that is the backstop, not a polling loop.
 _DEAD_LISTENER_S = 30.0
 
 
@@ -68,8 +69,8 @@ async def publish_wake(
     so the client treats it as a /status-refresh nudge); a consumption clear
     carries ``{thread_id, cleared: true}`` (the watcher reconciles and drops
     its pending chip without waiting for the status backstop). Swallows
-    publish failures — a dropped nudge degrades to the client's ``/status``
-    poll.
+    publish failures — a dropped nudge degrades to the client's close-driven
+    ``/status`` reconcile.
     """
     if not (cache and getattr(cache, "client", None)):
         logger.warning(
