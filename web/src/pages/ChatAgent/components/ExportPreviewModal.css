@@ -477,7 +477,9 @@
     margin: 15mm; /* Paged.js @page{margin:0} is scoped to media=screen during print */
   }
 
-  /* Unclip ancestor chain — react-to-print iframe inherits parent stylesheets */
+  /* Unclip ancestor chain — react-to-print iframe inherits parent stylesheets.
+     The matching `color-scheme: light` lives in the pageStyle prop, not here —
+     see the comment on useReactToPrint in ExportPreviewModal.tsx. */
   html, body {
     height: auto !important;
     overflow: visible !important;
