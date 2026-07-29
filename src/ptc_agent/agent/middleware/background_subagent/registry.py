@@ -611,7 +611,11 @@ class BackgroundTaskRegistry:
                 timeout=redis_stream._SPILL_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            logger.debug(
+            # WARNING, not debug: this is the ONLY place an active stream's
+            # expiry clock starts, so a swallowed failure here is exactly how
+            # a stream becomes immortal. The retention sweeper is the backstop,
+            # and a trickle of these is the signal it is doing real work.
+            logger.warning(
                 "subagent_terminal_ttl_stamp_failed",
                 tool_call_id=task.tool_call_id,
                 error=str(exc),

@@ -556,8 +556,21 @@ async def test_resume_steals_claim_before_redis_deletes():
     evictions: list[bool] = []
     locked_during_delete: list[bool] = []
 
+    class _FakeClient:
+        """The stream delete goes through the raw client, not ``cache.delete``."""
+
+        def __init__(self, record):
+            self._record = record
+
+        async def delete(self, key: str) -> int:
+            await self._record(key)
+            return 1
+
     class FakeCache:
         enabled = True
+
+        def __init__(self):
+            self.client = _FakeClient(self.delete)
 
         async def delete(self, key: str) -> None:
             locked_during_delete.append(task.redis_spill_lock.locked())
