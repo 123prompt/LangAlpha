@@ -18,6 +18,9 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import redis.exceptions as redis_exceptions
+
+from src.utils.cache import stream_append
 
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
@@ -80,7 +83,7 @@ async def test_redis_spill_called_for_every_event(monkeypatch) -> None:
     post-turn collector can XRANGE the record back out."""
     fake_cache = MagicMock()
     fake_cache.enabled = True
-    fake_cache.pipelined_event_buffer = AsyncMock(return_value=(True, 1))
+    fake_cache.pipelined_event_buffer = AsyncMock(return_value=None)
     monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
     monkeypatch.setattr(
         "src.config.settings.is_subagent_event_redis_spill_enabled", lambda: True
@@ -96,26 +99,20 @@ async def test_redis_spill_called_for_every_event(monkeypatch) -> None:
 
     assert fake_cache.pipelined_event_buffer.await_count == 5
     seqs = [
-        call.kwargs["last_event_id"]
+        call.kwargs["event_id"]
         for call in fake_cache.pipelined_event_buffer.await_args_list
     ]
     assert seqs == [1, 2, 3, 4, 5]
-    meta_keys = {
-        call.kwargs["meta_key"]
-        for call in fake_cache.pipelined_event_buffer.await_args_list
-    }
-    assert meta_keys == {f"subagent:events:meta:thread-x:{task.task_id}"}
     stream_keys = {
-        call.kwargs["stream_key"]
-        for call in fake_cache.pipelined_event_buffer.await_args_list
+        call.args[0] for call in fake_cache.pipelined_event_buffer.await_args_list
     }
     assert stream_keys == {f"subagent:stream:thread-x:{task.task_id}"}
     # Every spill carries the JSON record for the post-turn collector.
     for call in fake_cache.pipelined_event_buffer.await_args_list:
         assert "stream_record" in call.kwargs
         assert call.kwargs["stream_record"], "stream_record must be a non-empty payload"
-        # No List key in the new signature — events_key was removed.
-        assert "events_key" not in call.kwargs
+        # The write-only counter hash is gone; nothing ever read it.
+        assert "meta_key" not in call.kwargs
     assert not task.redis_write_failed
 
 
@@ -145,10 +142,16 @@ async def test_record_carries_run_stamp(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_redis_spill_failure_sets_flag_no_raise(monkeypatch) -> None:
-    """Pipeline returning (False, 0) flips redis_write_failed without raising."""
+    """A transport error flips redis_write_failed without raising.
+
+    The transport now raises instead of returning a bare False — the caller
+    needs the cause to tell "nothing was sent" from "the reply was lost".
+    """
     fake_cache = MagicMock()
     fake_cache.enabled = True
-    fake_cache.pipelined_event_buffer = AsyncMock(return_value=(False, 0))
+    fake_cache.pipelined_event_buffer = AsyncMock(
+        side_effect=redis_exceptions.ConnectionError("No connection available.")
+    )
     monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
     monkeypatch.setattr(
         "src.config.settings.is_subagent_event_redis_spill_enabled", lambda: True
@@ -165,6 +168,41 @@ async def test_redis_spill_failure_sets_flag_no_raise(monkeypatch) -> None:
     assert task.redis_write_failed is True
     # The seq counter still advanced even though spills failed.
     assert task.captured_event_seq == 2
+
+
+@pytest.mark.asyncio
+async def test_pool_exhaustion_is_retried_and_never_tears_the_subagent(
+    monkeypatch,
+) -> None:
+    """The spill path used to treat an exhausted pool as fatal — no retry, the
+    circuit opens and the subagent run dies. That is the incident this whole
+    subsystem exists to survive, so it now runs the same fenced-retry policy as
+    the root lane: nothing was sent, so the identical write is replayed."""
+    fake_cache = MagicMock()
+    fake_cache.enabled = True
+    fake_cache.pipelined_event_buffer = AsyncMock(
+        side_effect=[
+            redis_exceptions.ConnectionError("No connection available."),
+            None,
+        ]
+    )
+    fake_cache.stream_tail = AsyncMock(return_value=None)
+    monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
+    monkeypatch.setattr(
+        "src.config.settings.is_subagent_event_redis_spill_enabled", lambda: True
+    )
+
+    registry = BackgroundTaskRegistry(thread_id="thread-x")
+    task = await registry.register(
+        tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
+    )
+
+    await registry.append_captured_event(task.tool_call_id, _event(0))
+
+    assert task.redis_write_failed is False
+    assert fake_cache.pipelined_event_buffer.await_count == 2
+    # Nothing reached the server, so there was nothing to probe.
+    fake_cache.stream_tail.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -191,27 +229,27 @@ async def test_redis_spill_exception_sets_flag_no_raise(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_redis_spill_timeout_flips_flag_no_hang(monkeypatch) -> None:
-    """A hung pipeline must not pace the subagent: ``asyncio.wait_for`` aborts
-    after ``_SPILL_TIMEOUT_SECONDS``; the write is verified against the stream
-    tail (absent here) and retried once, then the circuit trips so the next
-    append short-circuits without re-entering Redis."""
+    """A hung pipeline must not pace the subagent: each attempt aborts on its
+    own cap, the write is verified against the stream tail (absent here) and
+    retried within the append budget, then the circuit trips so the next append
+    short-circuits without re-entering Redis."""
 
-    async def hang(**_kwargs):
+    async def hang(*_args, **_kwargs):
         await asyncio.sleep(10)
-        return True, 1
 
     fake_cache = MagicMock()
     fake_cache.enabled = True
     fake_cache.pipelined_event_buffer = AsyncMock(side_effect=hang)
-    fake_cache.client.xrevrange = AsyncMock(return_value=[])
+    fake_cache.stream_tail = AsyncMock(return_value=None)
     monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
     monkeypatch.setattr(
         "src.config.settings.is_subagent_event_redis_spill_enabled", lambda: True
     )
-    monkeypatch.setattr(
-        "ptc_agent.agent.middleware.background_subagent.redis_stream._SPILL_TIMEOUT_SECONDS",
-        0.05,
-    )
+    # Shrink the shared policy's own geometry rather than a caller-side budget:
+    # the budget is derived from the pool acquire timeout, so the test drives
+    # the same two knobs production does.
+    monkeypatch.setattr("src.config.settings.get_redis_pool_timeout", lambda: 0.01)
+    monkeypatch.setattr("src.utils.cache.stream_append._ATTEMPT_HEADROOM_S", 0.04)
 
     registry = BackgroundTaskRegistry(thread_id="thread-x")
     task = await registry.register(
@@ -222,10 +260,14 @@ async def test_redis_spill_timeout_flips_flag_no_hang(monkeypatch) -> None:
     assert task.redis_write_failed is True
 
     await registry.append_captured_event(task.tool_call_id, _event(1))
-    # Timeout → tail verify (empty) → one retry → circuit. Only the first
-    # append reached Redis (twice); the circuit-breaker short-circuits
-    # subsequent appends so a degraded Redis can't pace subagent execution.
-    assert fake_cache.pipelined_event_buffer.await_count == 2
+    # Timeout → tail verify (empty) → retry until the budget is out → circuit.
+    # Only the FIRST append reached Redis at all; the circuit-breaker
+    # short-circuits later ones so a degraded Redis can't pace the subagent.
+    # Pinned to the shared policy's attempt count, not a literal, so the
+    # assertion tracks the policy instead of drifting from it.
+    assert (
+        fake_cache.pipelined_event_buffer.await_count == stream_append._ATTEMPTS
+    )
     assert task.captured_event_seq == 2
 
 
@@ -236,18 +278,26 @@ async def test_redis_spill_timeout_landed_write_recovers(monkeypatch) -> None:
     kill where ``wait_for`` fired on event-loop stall, not Redis."""
     calls = {"n": 0}
 
-    async def hang_first(**_kwargs):
+    seen: dict = {}
+
+    async def hang_first(*_args, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
+            seen["payload"] = kwargs["stream_event"]
             await asyncio.sleep(10)
-        return True, 2
+
+    async def landed_tail(*_args, **_kwargs):
+        # The witness is the id AND the bytes: an id match alone could be a
+        # crashed predecessor's frame sitting under the same seq.
+        payload = seen.get("payload")
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        return 1, payload
 
     fake_cache = MagicMock()
     fake_cache.enabled = True
     fake_cache.pipelined_event_buffer = AsyncMock(side_effect=hang_first)
-    fake_cache.client.xrevrange = AsyncMock(
-        return_value=[(b"1-1", {b"record": b'{"seq": 1}'})]
-    )
+    fake_cache.stream_tail = AsyncMock(side_effect=landed_tail)
     monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
     monkeypatch.setattr(
         "src.config.settings.is_subagent_event_redis_spill_enabled", lambda: True
@@ -278,16 +328,15 @@ async def test_redis_spill_timeout_retry_succeeds(monkeypatch) -> None:
     successful retry keeps the transport healthy."""
     calls = {"n": 0}
 
-    async def hang_first(**_kwargs):
+    async def hang_first(*_args, **_kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             await asyncio.sleep(10)
-        return True, 1
 
     fake_cache = MagicMock()
     fake_cache.enabled = True
     fake_cache.pipelined_event_buffer = AsyncMock(side_effect=hang_first)
-    fake_cache.client.xrevrange = AsyncMock(return_value=[])
+    fake_cache.stream_tail = AsyncMock(return_value=None)
     monkeypatch.setattr("src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache)
     monkeypatch.setattr(
         "src.config.settings.is_subagent_event_redis_spill_enabled", lambda: True
@@ -476,15 +525,14 @@ async def test_per_task_lock_serializes_concurrent_spills(monkeypatch) -> None:
     started: list[int] = []
     finished: list[int] = []
 
-    async def slow_then_fast(**kwargs):
-        seq = kwargs["last_event_id"]
+    async def slow_then_fast(*_args, **kwargs):
+        seq = kwargs["event_id"]
         started.append(seq)
         if seq == 1:
             await asyncio.sleep(0.05)
         else:
             await asyncio.sleep(0.01)
         finished.append(seq)
-        return True, seq
 
     fake_cache = MagicMock()
     fake_cache.enabled = True
@@ -506,7 +554,7 @@ async def test_per_task_lock_serializes_concurrent_spills(monkeypatch) -> None:
 
     assert finished == [1, 2], f"spills landed out of order: finished={finished}"
     seqs_in_call_order = [
-        call.kwargs["last_event_id"]
+        call.kwargs["event_id"]
         for call in fake_cache.pipelined_event_buffer.await_args_list
     ]
     assert seqs_in_call_order == [1, 2]
@@ -604,11 +652,16 @@ async def test_sentinel_writes_xadd_no_seq_bump(monkeypatch) -> None:
 async def test_quota_breach_opens_the_spill_circuit(monkeypatch) -> None:
     """A write that lands PAST the per-agent quota flips redis_write_failed —
     the abort loop + terminal escalation then finalize error(transport_lost)
-    instead of the 2x MAXLEN backstop silently trimming the served head."""
+    instead of the 2x MAXLEN backstop silently trimming the served head.
+
+    The gate reads the record's own seq now that the counter hash is gone; the
+    seq is assigned by the same append that writes the frame, so it counts at
+    least as many events as ever reached Redis.
+    """
     fake_cache = MagicMock()
     fake_cache.enabled = True
     fake_cache.client = MagicMock()
-    fake_cache.pipelined_event_buffer = AsyncMock(return_value=(True, 151))
+    fake_cache.pipelined_event_buffer = AsyncMock(return_value=None)
     monkeypatch.setattr(
         "src.utils.cache.redis_cache.get_cache_client", lambda: fake_cache
     )
@@ -623,6 +676,7 @@ async def test_quota_breach_opens_the_spill_circuit(monkeypatch) -> None:
     task = await registry.register(
         tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
     )
+    task.captured_event_seq = 150  # next append is the first past quota
 
     await registry.append_captured_event(task.tool_call_id, _event(1))
     assert task.redis_write_failed is True

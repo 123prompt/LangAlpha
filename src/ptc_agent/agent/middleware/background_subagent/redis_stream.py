@@ -28,6 +28,13 @@ def task_stream_key(thread_id: str, task_id: str) -> str:
 
 
 def task_meta_key(thread_id: str, task_id: str) -> str:
+    """Write-only counter hash, no longer written by this release.
+
+    LEGACY_META_COMPAT — retained so the terminal stamp and the resume cleanup
+    still reach hashes a previous-release worker created during a rolling
+    deploy. Grep that tag for every site that goes with it; the removal
+    checklist lives in ``stream_retention_sweep``.
+    """
     return f"subagent:events:meta:{thread_id}:{task_id}"
 
 
@@ -72,15 +79,23 @@ async def stamp_task_retention(
             await pipe.execute()
 
 
-# Per-call cap for the durable Redis spill on the subagent hot path. A healthy
-# pipeline acks in <10ms; this cap bounds the worst case so a degraded Redis
-# can't pace subagent execution. ``asyncio.wait_for`` measures wall-clock
-# INCLUDING event-loop scheduling delay, so the cap must absorb loop stalls
-# (checkpoint serialization, large json.dumps) — 0.5s fired on a healthy Redis
-# and killed a run whose write had actually landed. On timeout the stream tail
-# is verified (landed ⇒ continue) and the write retried once before the
-# per-task circuit opens for the rest of the run (see ``spill_task_record``).
-_SPILL_TIMEOUT_SECONDS = 3.0
+# Per-call cap for the un-fenced writes on the subagent hot path (the v2
+# auto-id append, the tail probes, the retention stamp). A healthy pipeline
+# acks in <10ms; this cap bounds the worst case so a degraded Redis can't pace
+# subagent execution. ``asyncio.wait_for`` measures wall-clock INCLUDING
+# event-loop scheduling delay, so the cap must absorb loop stalls (checkpoint
+# serialization, large json.dumps) — 0.5s fired on a healthy Redis and killed a
+# run whose write had actually landed. It must also clear the cache pool's
+# acquire timeout (2s) plus a real command, or contention alone cancels a
+# queued write.
+_SPILL_TIMEOUT_SECONDS = 5.0
+
+# The fenced v1 append gets a budget rather than one cap — the id fence makes
+# it retryable, unlike everything above, which stays single-shot because an
+# auto-id write is not replayable. That budget is NOT set here: it is derived
+# from the pool's acquire timeout by ``stream_append``, which is the only layer
+# that knows how much of an attempt the queue can eat. A hand-picked number
+# here silently made the last attempt too short to be classified honestly.
 
 # Event-type marker for the per-task stream-end sentinel. The producer writes
 # one of these via ``append_sentinel_to_stream`` when the subagent finishes
@@ -95,7 +110,9 @@ async def _stream_tail_seq(cache: Any, stream_key: str, field: bytes) -> int | N
 
     ``wait_for`` cancels the awaiting coroutine on timeout, but the
     command may already be on the wire — the tail decides landed
-    (continue) vs lost (retry, then circuit).
+    (continue) vs lost (retry, then circuit). Reads the seq out of the
+    payload because the v2 stream uses Redis auto-ids, which carry no
+    relation to the record's sequence number.
     """
     try:
         entries = await asyncio.wait_for(
@@ -119,16 +136,14 @@ async def spill_task_record(
 ) -> None:
     """Best-effort spill of one captured record to the per-task Stream.
 
-    Writes a single XADD entry with two fields: ``b"event"`` (pre-rendered
-    SSE wire string, consumed live by SSE clients) and ``b"record"``
-    (JSON record, consumed post-turn by ``iter_subagent_events_full``
-    via XRANGE). A timed-out write is verified against the stream tail
-    (landed ⇒ continue) and retried once; only then does failure flip
-    ``task.redis_write_failed`` (sticky circuit-break), silently logged —
-    never raised. Returns
-    silently when the circuit-break is set, no
-    thread_id was configured (test fixtures), the spill flag is off, or the cache
-    client is unavailable.
+    Writes a single XADD entry with two fields: ``b"event"`` (pre-rendered SSE
+    wire string, consumed live by SSE clients) and ``b"record"`` (JSON record,
+    consumed post-turn by ``iter_subagent_events_full`` via XRANGE). The v1
+    append runs the shared fenced-retry policy; only an exhausted budget flips
+    ``task.redis_write_failed`` (sticky circuit-break), silently logged — never
+    raised. Returns silently when the circuit-break is set, no thread_id was
+    configured (test fixtures), the spill flag is off, or the cache client is
+    unavailable.
     """
     if task.redis_write_failed:
         return
@@ -152,7 +167,14 @@ async def spill_task_record(
         return
 
     try:
-        from src.utils.cache.redis_cache import get_cache_client
+        from src.utils.cache.redis_cache import (
+            get_cache_client,
+            is_pool_exhaustion,
+        )
+        from src.utils.cache.stream_append import (
+            StreamAppendError,
+            stream_append_with_retry,
+        )
 
         cache = get_cache_client()
     except Exception as exc:
@@ -170,7 +192,6 @@ async def spill_task_record(
         return
 
     # Records are JSON-serialized ``{"seq", "event", "data", "agent_id", "ts"}`` dicts.
-    meta_key = task_meta_key(thread_id, task.task_id)
     stream_key = task_stream_key(thread_id, task.task_id)
 
     try:
@@ -233,52 +254,25 @@ async def spill_task_record(
             # stamped at terminal by ``stamp_terminal_retention``), and
             # MAXLEN is a 2x backstop: the quota check below opens the
             # circuit before FIFO trim could touch the head.
+            # Same fenced-append policy as the root lane, including the
+            # retry on pool exhaustion this path used to lack: an exhausted
+            # pool tore the subagent run outright, which is the failure this
+            # whole subsystem exists to survive.
             success = False
-            seq_count: int | None = None
-            for attempt in (1, 2):
-                try:
-                    success, seq_count = await asyncio.wait_for(
-                        cache.pipelined_event_buffer(
-                            meta_key=meta_key,
-                            max_size=quota * 2,
-                            ttl=None,
-                            last_event_id=record.get("seq"),
-                            stream_key=stream_key,
-                            stream_event=stream_payload,
-                            stream_record=payload,
-                        ),
-                        timeout=_SPILL_TIMEOUT_SECONDS,
-                    )
-                    break
-                except asyncio.TimeoutError:
-                    # The cancelled pipeline may already have executed
-                    # server-side; a landed write must not tear the run.
-                    # seq_count=None skips this record's quota check —
-                    # the next spill re-evaluates it.
-                    if (
-                        await _stream_tail_seq(cache, stream_key, b"record")
-                        == seq
-                    ):
-                        success, seq_count = True, None
-                        logger.info(
-                            "subagent_event_spill_recovered",
-                            phase="v1_timeout_landed",
-                            tool_call_id=task.tool_call_id,
-                            task_id=task.task_id,
-                            seq=seq,
-                        )
-                        break
-                    if attempt == 1:
-                        logger.warning(
-                            "subagent_event_spill_retry",
-                            phase="v1_timeout",
-                            tool_call_id=task.tool_call_id,
-                            task_id=task.task_id,
-                            seq=seq,
-                            timeout_seconds=_SPILL_TIMEOUT_SECONDS,
-                        )
-                        continue
-                    raise
+            append_error: str | None = None
+            try:
+                await stream_append_with_retry(
+                    cache,
+                    stream_key,
+                    event_id=seq,
+                    max_size=quota * 2,
+                    stream_event=stream_payload,
+                    stream_record=payload,
+                    label=f"task:{task.task_id}",
+                )
+                success = True
+            except StreamAppendError as exc:
+                append_error = str(exc)
             # v2 dual-write (STREAM_CONTRACT_V2.md): the immutable
             # per-run stream, keyed by ledger identity. Same lock hold so
             # per-run frame order matches append order; seq is the XADD
@@ -347,7 +341,14 @@ async def spill_task_record(
                             seq=record.get("seq"),
                         )
                         break
-                    except Exception:
+                    except Exception as exc:
+                        if is_pool_exhaustion(exc) and attempt == 1:
+                            # Pre-send: the acquire never produced a
+                            # connection, so nothing reached the server and
+                            # replaying is safe even without an id fence.
+                            # Every other failure here is ambiguous and an
+                            # auto-id write cannot be replayed.
+                            continue
                         task.redis_write_failed = True
                         logger.warning(
                             "subagent_event_spill_failed",
@@ -356,6 +357,7 @@ async def spill_task_record(
                             task_id=task.task_id,
                             task_run_id=task.task_run_id,
                             seq=record.get("seq"),
+                            error=str(exc),
                         )
                         break
         if not success:
@@ -366,8 +368,9 @@ async def spill_task_record(
                 tool_call_id=task.tool_call_id,
                 task_id=task.task_id,
                 seq=record.get("seq"),
+                error=append_error,
             )
-        elif int(seq_count or 0) > quota:
+        elif seq > quota:
             # Quota breach tears the transport by contract: opening the
             # circuit here (instead of trimming FIFO) makes the abort
             # loop + terminal escalation finalize error(transport_lost),
