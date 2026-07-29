@@ -32,10 +32,15 @@ from typing import AsyncGenerator, Optional
 from fastapi import HTTPException
 
 from src.server.services.thread_control_stream import control_stream_key
-from src.utils.cache.redis_cache import get_cache_client
+from src.utils.cache.redis_cache import get_cache_client, is_pool_exhaustion
+from src.utils.cache import stream_pool
 
 from src.server.services.report_back.flash.core import watch_wakes
-from .run_stream_reader import _xread_block_ms
+from .run_stream_reader import (
+    _XREAD_ERROR_BACKOFF_S,
+    _XREAD_EXHAUSTION_BACKOFF_S,
+    _xread_block_ms,
+)
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
@@ -46,6 +51,7 @@ _MAX_CURSORS_LEN = 4096
 # this IS the fairness bound: a flooding task hands the loop at most this
 # many frames before other channels get their turn.
 _XREAD_COUNT = 32
+_XREAD_MAX_CONSECUTIVE_FAILURES = 5
 # Empty XREAD rounds on a channel before its (rate-limited) settled probe may
 # fire — a throttle on the crash-window backstop, not a completion handshake.
 _QUIESCE_EMPTY_ROUNDS = 2
@@ -93,8 +99,13 @@ def _pending_key(thread_id: str) -> str:
 async def _store_pending(cache, thread_id: str, run_id: str, lane: str) -> None:
     try:
         key = _pending_key(thread_id)
-        await cache.client.hset(key, run_id, lane)
-        await cache.client.expire(key, _PENDING_TTL_S)
+        # One connection, one round trip — and the TTL can no longer be
+        # skipped by a failure between two separate awaits, which is a real
+        # leak here: TTL is the ONLY eraser for this hash.
+        async with cache.client.pipeline(transaction=False) as pipe:
+            pipe.hset(key, run_id, lane)
+            pipe.expire(key, _PENDING_TTL_S)
+            await pipe.execute()
     except Exception:
         logger.warning(
             "[mux2] pending store failed for %s/%s", thread_id, run_id,
@@ -363,6 +374,13 @@ async def stream_thread_mux_v2(
     history load still gets positive closure."""
     cache = get_cache_client()
     if not cache.enabled or not cache.client:
+        yield _control("transport_error", {"retryable": True})
+        return
+
+    # The mux's XREAD holds a connection for the socket's whole life, so it
+    # reads from the dedicated reader pool — never the cache pool.
+    reader = await stream_pool.get_stream_reader_client(cache)
+    if reader is None:
         yield _control("transport_error", {"retryable": True})
         return
 
@@ -645,6 +663,7 @@ async def stream_thread_mux_v2(
     async def _read_pump() -> None:
         nonlocal control_cursor, pending_synced
         last_scan = time.monotonic()
+        xread_failures = 0
         while True:
             open_chans = [c for c in channels.values() if not c.closed]
             streams: dict[bytes, bytes] = {control_key: control_cursor}
@@ -652,21 +671,42 @@ async def stream_thread_mux_v2(
                 streams[c.stream_key] = c.cursor
             try:
                 result = await asyncio.wait_for(
-                    cache.client.xread(
+                    reader.xread(
                         streams, block=block_ms, count=_XREAD_COUNT
                     ),
                     timeout=(block_ms / 1000.0) + 2.0,
                 )
             except asyncio.TimeoutError:
                 result = None
+                xread_failures = 0
             except (asyncio.CancelledError, GeneratorExit):
                 raise
-            except Exception:
+            except Exception as exc:
+                # A read that lost the race for a reader slot is not a dead
+                # socket. Tearing the SSE down here sends the viewer straight
+                # back through reconnect and into the same short pool — the
+                # herd that makes exhaustion self-sustaining. The two
+                # single-run readers already back off; this is the live v2
+                # chat path and needs the same treatment. A genuinely stuck
+                # reader still surfaces, just after it has proven persistent.
+                xread_failures += 1
                 logger.warning(
-                    "[mux2] XREAD failed for %s", thread_id, exc_info=True
+                    "[mux2] XREAD failed for %s (%d consecutive)",
+                    thread_id,
+                    xread_failures,
+                    exc_info=True,
                 )
-                await out_q.put(("transport", None))
-                return
+                if xread_failures >= _XREAD_MAX_CONSECUTIVE_FAILURES:
+                    await out_q.put(("transport", None))
+                    return
+                await asyncio.sleep(
+                    _XREAD_EXHAUSTION_BACKOFF_S
+                    if is_pool_exhaustion(exc)
+                    else _XREAD_ERROR_BACKOFF_S
+                )
+                continue
+            else:
+                xread_failures = 0
 
             got: set[str] = set()
             for stream_name, entries in result or ():

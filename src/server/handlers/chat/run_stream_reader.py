@@ -20,10 +20,17 @@ from typing import AsyncGenerator, Awaitable, Callable, Optional
 from src.config.settings import get_redis_socket_timeout
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.runs.stream_writer import RUN_END_EVENT_TYPE
-from src.utils.cache.redis_cache import get_cache_client
+from src.utils.cache.redis_cache import get_cache_client, is_pool_exhaustion
+from src.utils.cache import stream_pool
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
+
+# Error backoff between XREAD retries. Pool exhaustion gets the longer one on
+# purpose: a 0.5s retry from every reader is what turns a brief shortage into a
+# self-sustaining storm — each failed acquire is itself contention.
+_XREAD_ERROR_BACKOFF_S = 0.5
+_XREAD_EXHAUSTION_BACKOFF_S = 2.0
 
 
 # Pre-finalize stream-end sentinel written by pre-1.5 producers. Nothing on
@@ -162,6 +169,17 @@ async def _stream_from_redis_log(
         )
         return
 
+    # The blocking read lives on its own pool: this loop holds a connection for
+    # the life of the stream, and parking that in the cache pool is what
+    # starved every short op in the process.
+    reader = await stream_pool.get_stream_reader_client(cache)
+    if reader is None:
+        logger.warning(
+            "[stream_from_log] no stream-reader pool — cannot stream %s",
+            stream_key,
+        )
+        return
+
     if last_event_id is None or last_event_id <= 0:
         cursor: bytes = b"0"
     else:
@@ -215,7 +233,7 @@ async def _stream_from_redis_log(
                 # Using ``+ 1.0`` would equal socket_timeout and produce a
                 # racy double-fire.
                 result = await asyncio.wait_for(
-                    cache.client.xread(
+                    reader.xread(
                         {stream_key_bytes: cursor},
                         block=block_ms,
                         count=_XREAD_COUNT,
@@ -248,7 +266,11 @@ async def _stream_from_redis_log(
                 if await terminal_check():
                     return
                 # Brief backoff to avoid tight error loops, then retry.
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(
+                    _XREAD_EXHAUSTION_BACKOFF_S
+                    if is_pool_exhaustion(exc)
+                    else _XREAD_ERROR_BACKOFF_S
+                )
                 continue
 
             if not result:

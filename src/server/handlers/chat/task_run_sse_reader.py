@@ -20,8 +20,14 @@ from ptc_agent.agent.middleware.background_subagent.redis_stream import (
     run_stream_key,
 )
 from src.server.services.background_registry_store import BackgroundRegistryStore
-from src.server.handlers.chat.run_stream_reader import _XREAD_COUNT, _xread_block_ms
-from src.utils.cache.redis_cache import get_cache_client
+from src.server.handlers.chat.run_stream_reader import (
+    _XREAD_COUNT,
+    _XREAD_ERROR_BACKOFF_S,
+    _XREAD_EXHAUSTION_BACKOFF_S,
+    _xread_block_ms,
+)
+from src.utils.cache.redis_cache import get_cache_client, is_pool_exhaustion
+from src.utils.cache import stream_pool
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
@@ -43,7 +49,10 @@ async def _resolve_task_run_id(thread_id: str, task_id: str) -> Optional[str]:
     from src.server.database.runs import subagent_runs as sr_db
 
     registry_store = BackgroundRegistryStore.get_instance()
-    waited = 0.0
+    # Wall-clock deadline: every round awaits a DB read and a Redis read, and
+    # summing only the sleeps let the bound overrun by the time those took.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _STARTUP_TIMEOUT
     while True:
         try:
             task_row = await sr_db.get_task(thread_id, task_id)
@@ -72,10 +81,9 @@ async def _resolve_task_run_id(thread_id: str, task_id: str) -> Optional[str]:
         if local is not None:
             return None
 
-        if waited >= _STARTUP_TIMEOUT:
+        if loop.time() >= deadline:
             return None
         await asyncio.sleep(_STARTUP_POLL)
-        waited += _STARTUP_POLL
 
 
 def _record_to_v1_sse(record: dict, thread_id: str, task_id: str) -> str:
@@ -134,6 +142,14 @@ async def stream_task_run_sse(
         )
         return
 
+    # Blocking reads live on the dedicated reader pool, not the cache pool.
+    reader = await stream_pool.get_stream_reader_client(cache)
+    if reader is None:
+        logger.warning(
+            "[task_run_sse] no stream-reader pool for %s/%s", thread_id, task_id
+        )
+        return
+
     stream_key = run_stream_key(thread_id, run_id).encode("utf-8")
     block_ms = _xread_block_ms()
     # v2 entries carry auto XADD ids; the v1 seq cursor filters on the
@@ -156,7 +172,7 @@ async def stream_task_run_sse(
     while True:
         try:
             result = await asyncio.wait_for(
-                cache.client.xread(
+                reader.xread(
                     {stream_key: cursor},
                     block=block_ms,
                     count=_XREAD_COUNT,
@@ -178,7 +194,11 @@ async def stream_task_run_sse(
             )
             if await _settled():
                 return
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(
+                _XREAD_EXHAUSTION_BACKOFF_S
+                if is_pool_exhaustion(exc)
+                else _XREAD_ERROR_BACKOFF_S
+            )
             continue
 
         if not result:
