@@ -35,7 +35,10 @@ logger = structlog.get_logger(__name__)
 # content-identical, but a warm sandbox would otherwise keep serving the 3.12
 # spacing indefinitely, since the manifest hashes generation inputs and the
 # interpreter is not one of them.
-MCP_CLIENT_CODEGEN_VERSION = "3"
+# "4": MCP 2026-07-28 client — server/discover negotiation with legacy
+# initialize fallback, per-request _meta, id-matched replies, structuredContent
+# preference, resultType handling, spec HTTP headers, legacy "sse" rejected.
+MCP_CLIENT_CODEGEN_VERSION = "4"
 
 # Aggregate per-execution ceiling on result_body bytes emitted BY THE GENERATED
 # CLIENT, interpolated into it. This keeps a cooperative run's trace small (per
@@ -100,37 +103,33 @@ def discover(server_name: str) -> dict:
 
 
 def _discover_stdio(server_name: str) -> list:
-    """Start the stdio server in discovery mode and return its tools/list."""
-    proc = _start_mcp_server(server_name, discovery=True)
-    req = {"jsonrpc": "2.0", "id": _get_next_message_id(),
-           "method": "tools/list", "params": {}}
-    proc.stdin.write(json.dumps(req) + "\\n")
-    proc.stdin.flush()
-    ready, _, _ = select.select([proc.stdout], [], [], 30)
-    if not ready:
-        proc.kill()
-        _server_processes.pop(server_name, None)
-        raise RuntimeError(f"discovery timed out for {server_name} (30s)")
-    line = proc.stdout.readline()
-    if not line:
-        raise RuntimeError(f"{server_name} closed connection during discovery")
-    resp = json.loads(line)
+    """Negotiate with the stdio server in discovery mode and list its tools."""
+    proc, proto = _ensure_stdio_server(server_name, discovery=True)
+    if proto["mode"] == "modern":
+        req = _modern_request("tools/list", {}, proto["version"])
+    else:
+        req = _legacy_request("tools/list", {})
+    _send_message(server_name, proc, req)
+    resp = _read_reply(server_name, proc, req["id"], 30)
     if "error" in resp:
         raise RuntimeError(f"tools/list error: {resp['error']}")
     return (resp.get("result") or {}).get("tools", [])
 
 
 def _discover_sse(server_name: str) -> list:
-    """Initialize the sse/http server in discovery mode and return its tools/list."""
-    _initialize_sse_server(server_name, discovery=True)
+    """Negotiate with the http server in discovery mode and list its tools."""
+    proto = _ensure_http_server(server_name, discovery=True)
     config = _SERVER_CONFIGS.get(server_name)
     url, headers = _resolve_sse(config, server_name, discovery=True)
-    req = {"jsonrpc": "2.0", "id": _get_next_message_id(),
-           "method": "tools/list", "params": {}}
+    if proto["mode"] == "modern":
+        req = _modern_request("tools/list", {}, proto["version"])
+    else:
+        req = _legacy_request("tools/list", {})
+    hdrs = _mcp_headers("tools/list", "", proto, headers)
     with httpx.Client(timeout=30.0) as client:
-        response = client.post(url, json=req, headers=headers)
+        response = client.post(url, json=req, headers=hdrs)
         response.raise_for_status()
-        result = response.json()
+        result = _parse_http_reply(response, req["id"], server_name)
     if "error" in result:
         raise RuntimeError(f"tools/list error: {result['error']}")
     return (result.get("result") or {}).get("tools", [])
@@ -911,7 +910,6 @@ def _resolve_sse(config, server_name, *, discovery=False):
             sse_call_resolve = (
                 "\n        url, _headers = _resolve_sse(config, server_name)\n"
             )
-            sse_post_kwargs = ", headers=_headers"
         else:
             sse_init_resolve = (
                 "\n    # Resolve environment variables in URL\n"
@@ -921,6 +919,7 @@ def _resolve_sse(config, server_name, *, discovery=False):
                 "        return os.environ.get(var_name, match.group(0))\n"
                 "\n"
                 "    url = re.sub(r'\\$\\{([^}]+)\\}', resolve_env, url)\n"
+                "    _headers = {}\n"
             )
             sse_call_resolve = (
                 "\n        # Resolve environment variables in URL\n"
@@ -929,8 +928,8 @@ def _resolve_sse(config, server_name, *, discovery=False):
                 "            return os.environ.get(var_name, match.group(0))\n"
                 "\n"
                 "        url = re.sub(r'\\$\\{([^}]+)\\}', resolve_env, url)\n"
+                "        _headers = {}\n"
             )
-            sse_post_kwargs = ""
 
         # Discovery entrypoint + CLI. Emitted only when a workspace server is
         # present so builtin-only clients stay byte-identical. Discovery lists a
@@ -940,22 +939,15 @@ def _resolve_sse(config, server_name, *, discovery=False):
         if has_workspace:
             discover_block = _DISCOVER_SOURCE
             main_block = _MAIN_SOURCE
+            # In discovery mode, unresolved secret refs in a workspace server's
+            # env resolve to an inert placeholder (secrets may be absent).
             discovery_param = ", discovery: bool = False"
-            discovery_doc = (
-                "\n        discovery: When True, unresolved secret refs in a "
-                "workspace server's env\n            resolve to an inert "
-                "placeholder (secrets may be absent in discovery)."
-            )
-            discovery_doc_sse = (
-                "\n        discovery: tolerate missing secret refs "
-                "(resolve to placeholder)"
-            )
+            discovery_arg = ", discovery=discovery"
         else:
             discover_block = ""
             main_block = ""
             discovery_param = ""
-            discovery_doc = ""
-            discovery_doc_sse = ""
+            discovery_arg = ""
 
         return f'''"""
 MCP Client for sandbox environment.
@@ -978,12 +970,25 @@ import httpx
 
 # Global registry of MCP server processes (for stdio)
 _server_processes: dict[str, subprocess.Popen] = {{}}
-_server_locks: dict[str, threading.Lock] = {{}}
+_server_locks: dict[str, threading.RLock] = {{}}
+_locks_guard = threading.Lock()
 _message_id_counter = 0
 _message_id_lock = threading.Lock()
 
-# Global registry for SSE sessions
-_sse_sessions: dict[str, bool] = {{}}  # server_name -> initialized
+# Negotiated protocol state per server, published only after a spawn+negotiate
+# transaction completes: {{"mode": "modern"|"legacy", "version": str,
+# "session_id": str|None}}. Per-interpreter (each execute_code is a fresh
+# process), so a silent server pays one bounded probe per interpreter.
+_PROTO: dict[str, dict] = {{}}
+
+_CLIENT_INFO = {{"name": "open-ptc-client", "version": "2.0.0"}}
+# Modern spec revisions this client speaks, newest first.
+_MODERN_VERSIONS = ("2026-07-28",)
+# Version offered on the legacy initialize fallback — the latest handshake
+# revision, so pre-2026 servers negotiate the newest era they support.
+_LEGACY_OFFER = "2025-11-25"
+_PROBE_TIMEOUT = 10.0
+_CALL_TIMEOUT = 120.0
 
 # MCP server configurations
 _SERVER_CONFIGS = {servers_dict}
@@ -1077,7 +1082,16 @@ def _is_error_result(envelope: Any, value: Any) -> bool:
 
 
 def _unwrap_mcp_content(envelope: Any) -> Any:
-    """Unwrap a single text content block to parsed JSON / text; else passthrough."""
+    """Prefer structuredContent (unwrapping the SDK's single-``result``-key
+    convention for non-object returns); fall back to a single text content
+    block parsed as JSON / text; else passthrough."""
+    if isinstance(envelope, dict):
+        structured = envelope.get("structuredContent")
+        if isinstance(structured, dict):
+            if set(structured) == {{"result"}}:
+                return structured["result"]
+            return structured
+
     if (isinstance(envelope, dict) and
         isinstance(envelope.get("content"), list)):
 
@@ -1108,6 +1122,17 @@ def _finalize_mcp_result(
     Shared by both transports — the single place that sees the raw envelope (so
     the ``isError`` flag survives) and decides whether the call is recordable.
     """
+    if isinstance(envelope, dict):
+        result_type = envelope.get("resultType")
+        if result_type not in (None, "complete"):
+            # input_required (or any future resultType) needs an interactive
+            # continuation this one-shot client can't provide — fail clearly,
+            # never retry-loop or hang.
+            msg = (
+                f"MCP tool {{server_name}}.{{tool_name}} returned "
+                f"resultType={{result_type!r}}, which this client cannot continue"
+            )
+            raise RuntimeError(msg)
     value = _unwrap_mcp_content(envelope)
     if not _is_error_result(envelope, value):
         _trace_mcp_call(server_name, tool_name, arguments, value)
@@ -1122,21 +1147,115 @@ def _get_next_message_id() -> int:
         return _message_id_counter
 
 
-def _start_mcp_server(server_name: str{discovery_param}) -> subprocess.Popen:
-    """Start an MCP server process if not already running.
+def _get_server_lock(server_name: str) -> threading.RLock:
+    """Per-server RLock, created race-free before any process inspection."""
+    with _locks_guard:
+        lock = _server_locks.get(server_name)
+        if lock is None:
+            lock = threading.RLock()
+            _server_locks[server_name] = lock
+    return lock
 
-    Args:
-        server_name: Name of the MCP server{discovery_doc}
 
-    Returns:
-        Popen process object
+def _modern_request(method: str, params: dict, version: str) -> dict:
+    """Build a 2026-07-28 request: _meta must carry protocolVersion AND
+    clientCapabilities on EVERY request or the server rejects it."""
+    params = dict(params or {{}})
+    meta = dict(params.get("_meta") or {{}})
+    meta["io.modelcontextprotocol/protocolVersion"] = version
+    meta["io.modelcontextprotocol/clientCapabilities"] = {{}}
+    meta["io.modelcontextprotocol/clientInfo"] = _CLIENT_INFO
+    params["_meta"] = meta
+    return {{
+        "jsonrpc": "2.0",
+        "id": _get_next_message_id(),
+        "method": method,
+        "params": params,
+    }}
+
+
+def _legacy_request(method: str, params: dict) -> dict:
+    return {{
+        "jsonrpc": "2.0",
+        "id": _get_next_message_id(),
+        "method": method,
+        "params": params or {{}},
+    }}
+
+
+def _kill_server(server_name: str, proc: subprocess.Popen) -> None:
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    _server_processes.pop(server_name, None)
+    _PROTO.pop(server_name, None)
+
+
+def _send_message(server_name: str, proc: subprocess.Popen, message: dict) -> None:
+    try:
+        proc.stdin.write(json.dumps(message) + "\\n")
+        proc.stdin.flush()
+    except OSError as e:
+        _kill_server(server_name, proc)
+        error_msg = f"Failed to send request to MCP server {{server_name}}: {{e}}"
+        print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
+        raise RuntimeError(error_msg)
+
+
+def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout: float) -> dict:
+    """Read the reply matching ``want_id``.
+
+    Skips notifications and stale replies (abandoned ids from a prior timeout),
+    answers server-initiated requests with -32601 (server->client requests are
+    deprecated in 2026-07-28), and kills the process on timeout / EOF / invalid
+    framing so the next call restarts cleanly.
     """
-    if server_name in _server_processes:
-        proc = _server_processes[server_name]
-        if proc.poll() is None:  # Process still running
-            return proc
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_server(server_name, proc)
+            error_msg = f"MCP server {{server_name}} timed out after {{timeout:.0f}}s"
+            print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
+            raise RuntimeError(error_msg)
+        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not ready:
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            _kill_server(server_name, proc)
+            error_msg = f"MCP server {{server_name}} closed connection"
+            print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
+            raise RuntimeError(error_msg)
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            _kill_server(server_name, proc)
+            error_msg = f"Invalid JSON from MCP server {{server_name}}: {{line[:200]!r}}"
+            print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
+            raise RuntimeError(error_msg)
+        if not isinstance(message, dict) or "id" not in message:
+            continue  # notification (or junk) — never the reply
+        if "method" in message:
+            refusal = {{
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {{"code": -32601, "message": "Method not found"}},
+            }}
+            try:
+                proc.stdin.write(json.dumps(refusal) + "\\n")
+                proc.stdin.flush()
+            except OSError:
+                pass
+            continue
+        if message.get("id") != want_id:
+            continue  # stale reply from an abandoned request
+        return message
 
-    # Get server config
+
+def _spawn_mcp_process(server_name: str{discovery_param}) -> subprocess.Popen:
+    """Spawn the server subprocess (no handshake, no registry publication)."""
     config = _SERVER_CONFIGS.get(server_name)
     if not config:
         msg = f"Unknown MCP server: {{server_name}}"
@@ -1156,65 +1275,169 @@ def _start_mcp_server(server_name: str{discovery_param}) -> subprocess.Popen:
     )
 
     # Drain stderr in background to prevent pipe buffer deadlock.
-    # FastMCP logs INFO to stderr via RichHandler; if the 64KB pipe buffer
-    # fills, the server blocks on write(stderr) and can't respond on stdout.
+    # MCP servers log INFO to stderr; if the 64KB pipe buffer fills, the
+    # server blocks on write(stderr) and can't respond on stdout.
     threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-
-    # Store process
-    if server_name not in _server_locks:
-        _server_locks[server_name] = threading.Lock()
-    _server_processes[server_name] = proc
-
-    # Send initialize request
-    init_request = {{
-        "jsonrpc": "2.0",
-        "id": _get_next_message_id(),
-        "method": "initialize",
-        "params": {{
-            "protocolVersion": "2024-11-05",
-            "capabilities": {{}},
-            "clientInfo": {{
-                "name": "open-ptc-client",
-                "version": "1.0.0"
-            }}
-        }}
-    }}
-
-    proc.stdin.write(json.dumps(init_request) + "\\n")
-    proc.stdin.flush()
-
-    # Read initialize response (with timeout to avoid hanging on broken servers)
-    ready, _, _ = select.select([proc.stdout], [], [], 30)
-    if not ready:
-        proc.kill()
-        _server_processes.pop(server_name, None)
-        raise RuntimeError(f"MCP server {{server_name}} timed out during initialization (30s)")
-    response_line = proc.stdout.readline()
-    if response_line:
-        response = json.loads(response_line)
-        if "error" in response:
-            msg = f"MCP initialization failed: {{response['error']}}"
-            raise RuntimeError(msg)
-
-    # Send initialized notification
-    initialized_notif = {{
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    }}
-    proc.stdin.write(json.dumps(initialized_notif) + "\\n")
-    proc.stdin.flush()
 
     return proc
 
 
-def _initialize_sse_server(server_name: str{discovery_param}) -> None:
-    """Initialize an SSE MCP server connection.
+def _legacy_initialize(server_name: str, proc: subprocess.Popen) -> dict:
+    """Pre-2026 handshake; offer the newest legacy revision, adopt the reply's."""
+    request = _legacy_request("initialize", {{
+        "protocolVersion": _LEGACY_OFFER,
+        "capabilities": {{}},
+        "clientInfo": _CLIENT_INFO,
+    }})
+    _send_message(server_name, proc, request)
+    response = _read_reply(server_name, proc, request["id"], _PROBE_TIMEOUT)
+    if "error" in response:
+        _kill_server(server_name, proc)
+        msg = f"MCP initialization failed: {{response['error']}}"
+        raise RuntimeError(msg)
+    version = (response.get("result") or {{}}).get("protocolVersion") or _LEGACY_OFFER
+    _send_message(server_name, proc, {{
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    }})
+    return {{"mode": "legacy", "version": version, "session_id": None}}
 
-    Args:
-        server_name: Name of the MCP server{discovery_doc_sse}
+
+def _negotiate_stdio(server_name: str, proc: subprocess.Popen{discovery_param}) -> tuple:
+    """server/discover probe with a bounded fallback ladder.
+
+    Mutual modern version => modern. JSON-RPC method error => legacy initialize
+    on the SAME stream (a pre-2026 server answered politely; no era latch).
+    Discover ok but only legacy versions advertised => legacy initialize on a
+    FRESH stream (the v2 server era-latched this connection on first request).
+    Timeout / EOF / invalid framing => the probe may have crashed the server:
+    restart once, then legacy initialize. -32022 with a mutual version in its
+    data => retry discover once with that version.
     """
-    if server_name in _sse_sessions and _sse_sessions[server_name]:
-        return  # Already initialized
+    version = _MODERN_VERSIONS[0]
+    error = None
+    for attempt in (1, 2):
+        request = _modern_request("server/discover", {{}}, version)
+        _send_message(server_name, proc, request)
+        try:
+            response = _read_reply(server_name, proc, request["id"], _PROBE_TIMEOUT)
+        except RuntimeError:
+            proc = _spawn_mcp_process(server_name{discovery_arg})
+            return proc, _legacy_initialize(server_name, proc)
+        error = response.get("error")
+        if error is None:
+            result = response.get("result") or {{}}
+            supported = result.get("supportedVersions") or []
+            mutual = [v for v in _MODERN_VERSIONS if v in supported]
+            if mutual:
+                return proc, {{"mode": "modern", "version": mutual[0], "session_id": None}}
+            _kill_server(server_name, proc)
+            proc = _spawn_mcp_process(server_name{discovery_arg})
+            return proc, _legacy_initialize(server_name, proc)
+        code = error.get("code") if isinstance(error, dict) else None
+        if code == -32022 and attempt == 1:
+            data = error.get("data") or {{}}
+            supported = data.get("supportedVersions") or []
+            mutual = [v for v in _MODERN_VERSIONS if v in supported]
+            if mutual:
+                version = mutual[0]
+                continue
+        return proc, _legacy_initialize(server_name, proc)
+    _kill_server(server_name, proc)
+    msg = f"MCP server {{server_name}} rejected protocol negotiation: {{error}}"
+    raise RuntimeError(msg)
+
+
+def _ensure_stdio_server(server_name: str{discovery_param}) -> tuple:
+    """Return (proc, proto); spawn + negotiate + publish is ONE lock-guarded
+    transaction, so two racing cold starts produce exactly one process."""
+    with _get_server_lock(server_name):
+        proc = _server_processes.get(server_name)
+        proto = _PROTO.get(server_name)
+        if proc is not None and proc.poll() is None and proto is not None:
+            return proc, proto
+        proc = _spawn_mcp_process(server_name{discovery_arg})
+        proc, proto = _negotiate_stdio(server_name, proc{discovery_arg})
+        _server_processes[server_name] = proc
+        _PROTO[server_name] = proto
+        return proc, proto
+
+
+def _mcp_headers(method: str, mcp_name: str, proto: dict, extra: dict) -> dict:
+    """Spec headers for one HTTP request. Modern adds Mcp-Method/Mcp-Name
+    (MCP-Protocol-Version must equal the body _meta); legacy echoes the
+    captured Mcp-Session-Id. Configured headers are applied last."""
+    headers = {{"Accept": "application/json, text/event-stream"}}
+    headers["MCP-Protocol-Version"] = proto["version"]
+    if proto["mode"] == "modern":
+        headers["Mcp-Method"] = method
+        if mcp_name:
+            try:
+                mcp_name.encode("ascii")
+            except UnicodeEncodeError:
+                raise RuntimeError(
+                    f"Non-ASCII MCP name {{mcp_name!r}}: the base64 Mcp-Name "
+                    "sentinel form is not supported by this client"
+                )
+            headers["Mcp-Name"] = mcp_name
+    elif proto.get("session_id"):
+        headers["Mcp-Session-Id"] = proto["session_id"]
+    headers.update(extra or {{}})
+    return headers
+
+
+def _parse_http_reply(response, want_id: int, server_name: str) -> dict:
+    """Extract the JSON-RPC reply from a JSON or SSE-framed HTTP response.
+
+    SSE parsing joins multiline data: fields per the eventsource spec, skips
+    comment/priming frames and interleaved notifications, and returns the
+    message whose id matches.
+    """
+    ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype != "text/event-stream":
+        return response.json()
+
+    def _frame_reply(payload):
+        try:
+            message = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(message, dict) and message.get("id") == want_id and "method" not in message:
+            return message
+        return None
+
+    data_lines = []
+    for raw in response.iter_lines():
+        line = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+        if line == "":
+            if data_lines:
+                reply = _frame_reply("\\n".join(data_lines))
+                data_lines = []
+                if reply is not None:
+                    return reply
+            continue
+        if line.startswith(":"):
+            continue  # comment / keep-alive priming
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+        # other SSE fields (event:, id:, retry:) never carry the payload
+    if data_lines:
+        reply = _frame_reply("\\n".join(data_lines))
+        if reply is not None:
+            return reply
+    msg = f"MCP server {{server_name}}: SSE stream ended without a matching reply"
+    raise RuntimeError(msg)
+
+
+def _ensure_http_server(server_name: str{discovery_param}) -> dict:
+    """Negotiate (once per interpreter) and return the server's proto state.
+
+    HTTP is stateless per POST, so a failed discover probe needs no restart —
+    the legacy initialize simply goes out as a fresh request.
+    """
+    proto = _PROTO.get(server_name)
+    if proto is not None:
+        return proto
 
     config = _SERVER_CONFIGS.get(server_name)
     if not config:
@@ -1226,47 +1449,63 @@ def _initialize_sse_server(server_name: str{discovery_param}) -> None:
         msg = f"Remote MCP server {{server_name}} has no URL configured"
         raise ValueError(msg)
 {sse_init_resolve}
-    # Send initialize request
-    init_request = {{
-        "jsonrpc": "2.0",
-        "id": _get_next_message_id(),
-        "method": "initialize",
-        "params": {{
-            "protocolVersion": "2024-11-05",
-            "capabilities": {{}},
-            "clientInfo": {{
-                "name": "open-ptc-client",
-                "version": "1.0.0"
-            }}
-        }}
-    }}
-
+    version = _MODERN_VERSIONS[0]
     try:
         with httpx.Client(timeout=30.0) as client:
-            response = client.post(url, json=init_request{sse_post_kwargs})
-            response.raise_for_status()
-            result = response.json()
-
-            if "error" in result:
-                msg = f"MCP SSE initialization failed: {{result['error']}}"
-                raise RuntimeError(msg)
-
-            # Send initialized notification
-            initialized_notif = {{
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
+            probe = _modern_request("server/discover", {{}}, version)
+            probe_headers = {{
+                "Accept": "application/json, text/event-stream",
+                "MCP-Protocol-Version": version,
+                "Mcp-Method": "server/discover",
             }}
-            client.post(url, json=initialized_notif{sse_post_kwargs})
+            probe_headers.update(_headers)
+            reply = None
+            try:
+                response = client.post(url, json=probe, headers=probe_headers)
+                if response.status_code < 400:
+                    reply = _parse_http_reply(response, probe["id"], server_name)
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                reply = None
+            if isinstance(reply, dict) and "result" in reply:
+                supported = (reply["result"] or {{}}).get("supportedVersions") or []
+                mutual = [v for v in _MODERN_VERSIONS if v in supported]
+                if mutual:
+                    proto = {{"mode": "modern", "version": mutual[0], "session_id": None}}
+                    _PROTO[server_name] = proto
+                    return proto
 
-        _sse_sessions[server_name] = True
+            init = _legacy_request("initialize", {{
+                "protocolVersion": _LEGACY_OFFER,
+                "capabilities": {{}},
+                "clientInfo": _CLIENT_INFO,
+            }})
+            init_headers = {{"Accept": "application/json, text/event-stream"}}
+            init_headers.update(_headers)
+            response = client.post(url, json=init, headers=init_headers)
+            response.raise_for_status()
+            reply = _parse_http_reply(response, init["id"], server_name)
+            if "error" in reply:
+                msg = f"MCP SSE initialization failed: {{reply['error']}}"
+                raise RuntimeError(msg)
+            adopted = (reply.get("result") or {{}}).get("protocolVersion") or _LEGACY_OFFER
+            session_id = response.headers.get("mcp-session-id")
+            proto = {{"mode": "legacy", "version": adopted, "session_id": session_id}}
+            notif_headers = _mcp_headers("notifications/initialized", "", proto, _headers)
+            client.post(
+                url,
+                json={{"jsonrpc": "2.0", "method": "notifications/initialized"}},
+                headers=notif_headers,
+            )
+        _PROTO[server_name] = proto
+        return proto
 
     except Exception as e:  # noqa: BLE001 - Re-raising as RuntimeError with context
         msg = f"Failed to initialize remote MCP server {{server_name}}: {{e}}"
         raise RuntimeError(msg) from e
 
 
-def _call_mcp_tool_sse(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
-    """Call an MCP tool via SSE/HTTP transport.
+def _call_mcp_tool_http(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
+    """Call an MCP tool via streamable HTTP transport.
 
     Args:
         server_name: Name of the MCP server
@@ -1280,28 +1519,24 @@ def _call_mcp_tool_sse(server_name: str, tool_name: str, arguments: dict[str, An
     import re
 
     try:
-        # Ensure server is initialized
-        _initialize_sse_server(server_name)
+        # Negotiate once per interpreter, then speak the agreed era
+        proto = _ensure_http_server(server_name)
 
         config = _SERVER_CONFIGS.get(server_name)
         url = config.get("url", "")
 {sse_call_resolve}
-        # Build JSON-RPC request
-        request = {{
-            "jsonrpc": "2.0",
-            "id": _get_next_message_id(),
-            "method": "tools/call",
-            "params": {{
-                "name": tool_name,
-                "arguments": arguments
-            }}
-        }}
+        params = {{"name": tool_name, "arguments": arguments}}
+        if proto["mode"] == "modern":
+            request = _modern_request("tools/call", params, proto["version"])
+        else:
+            request = _legacy_request("tools/call", params)
+        headers = _mcp_headers("tools/call", tool_name, proto, _headers)
 
         # Send request via HTTP POST
         with httpx.Client(timeout=60.0) as client:
-            response = client.post(url, json=request{sse_post_kwargs})
+            response = client.post(url, json=request, headers=headers)
             response.raise_for_status()
-            result = response.json()
+            result = _parse_http_reply(response, request["id"], server_name)
 
         # Check for errors
         if "error" in result:
@@ -1322,7 +1557,7 @@ def _call_mcp_tool_sse(server_name: str, tool_name: str, arguments: dict[str, An
         error_type = type(e).__name__
         error_msg = str(e)
         print(f"\\n{{'='*60}}", file=sys.stderr)  # noqa: T201
-        print(f"ERROR in _call_mcp_tool_sse", file=sys.stderr)  # noqa: T201
+        print(f"ERROR in _call_mcp_tool_http", file=sys.stderr)  # noqa: T201
         print(f"{{'='*60}}", file=sys.stderr)  # noqa: T201
         print(f"Error Type: {{error_type}}", file=sys.stderr)  # noqa: T201
         print(f"Error Message: {{error_msg}}", file=sys.stderr)  # noqa: T201
@@ -1349,60 +1584,19 @@ def _call_mcp_tool_stdio(server_name: str, tool_name: str, arguments: dict[str, 
     import traceback
 
     try:
-        # Ensure server is running (initial start outside lock to avoid holding
-        # the lock during slow server startup)
-        _start_mcp_server(server_name)
+        # The whole exchange holds the server lock: ensure (spawn+negotiate on
+        # cold start — RLock, so re-entry is fine), then write+read serialized.
+        with _get_server_lock(server_name):
+            proc, proto = _ensure_stdio_server(server_name)
 
-        # Use lock to ensure thread-safe communication
-        lock = _server_locks[server_name]
-        with lock:
-            # Re-fetch proc inside lock to avoid TOCTOU race: another thread
-            # may have killed the process while we were waiting for the lock.
-            proc = _server_processes.get(server_name)
-            if proc is None or proc.poll() is not None:
-                proc = _start_mcp_server(server_name)
-            # Build JSON-RPC request
-            request = {{
-                "jsonrpc": "2.0",
-                "id": _get_next_message_id(),
-                "method": "tools/call",
-                "params": {{
-                    "name": tool_name,
-                    "arguments": arguments
-                }}
-            }}
+            params = {{"name": tool_name, "arguments": arguments}}
+            if proto["mode"] == "modern":
+                request = _modern_request("tools/call", params, proto["version"])
+            else:
+                request = _legacy_request("tools/call", params)
 
-            # Send request
-            request_json = json.dumps(request) + "\\n"
-            try:
-                proc.stdin.write(request_json)
-                proc.stdin.flush()
-            except (OSError, IOError) as e:
-                error_msg = f"Failed to send request to MCP server {{server_name}}: {{e}}"
-                print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-                raise RuntimeError(error_msg)
-
-            # Read response (with timeout to detect stalled servers)
-            try:
-                ready, _, _ = select.select([proc.stdout], [], [], 120)
-                if not ready:
-                    error_msg = f"MCP server {{server_name}} timed out after 120s on tool {{tool_name}}"
-                    print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-                    proc.kill()
-                    _server_processes.pop(server_name, None)
-                    raise RuntimeError(error_msg)
-                response_line = proc.stdout.readline()
-                if not response_line:
-                    error_msg = f"MCP server {{server_name}} closed connection"
-                    print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-                    raise RuntimeError(error_msg)
-
-                response = json.loads(response_line)
-            except json.JSONDecodeError as e:
-                error_msg = f"Invalid JSON response from MCP server {{server_name}}: {{e}}"
-                print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-                print(f"Response line: {{response_line}}", file=sys.stderr)  # noqa: T201
-                raise RuntimeError(error_msg)
+            _send_message(server_name, proc, request)
+            response = _read_reply(server_name, proc, request["id"], _CALL_TIMEOUT)
 
             # Check for errors
             if "error" in response:
@@ -1464,8 +1658,18 @@ def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) 
     # Tracing happens in the transport via _finalize_mcp_result, where the raw
     # envelope (incl. the MCP isError flag) is still visible — so failed calls
     # and error payloads are returned to the agent but never recorded as sources.
-    if transport in ("sse", "http"):
-        return _call_mcp_tool_sse(server_name, tool_name, arguments)
+    if transport == "http":
+        return _call_mcp_tool_http(server_name, tool_name, arguments)
+    if transport == "sse":
+        # The old client POSTed plain JSON-RPC, which never satisfied a real
+        # legacy-SSE server's GET->endpoint-event->POST flow — nothing working
+        # breaks by refusing outright.
+        msg = (
+            f"MCP server {{server_name}} uses legacy transport 'sse', which this "
+            "client does not support; change the server's transport to 'http' "
+            "(streamable HTTP)."
+        )
+        raise RuntimeError(msg)
     return _call_mcp_tool_stdio(server_name, tool_name, arguments)
 
 
@@ -1478,4 +1682,5 @@ def cleanup_mcp_servers():
         except (OSError, TimeoutError) as e:
             print(f"Error cleaning up MCP server {{server_name}}: {{e}}", file=sys.stderr)  # noqa: T201
     _server_processes.clear()
+    _PROTO.clear()
 {discover_block}{main_block}'''
