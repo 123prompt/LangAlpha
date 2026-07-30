@@ -13,14 +13,13 @@ mcp_servers/AGENT_CONTRACT.md).
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 import math
 
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
 
 from mcp_servers._envelope import make_error, make_response
 from mcp_servers._yf_common import boundary, clean_value, safe_detail, serialize_records
@@ -32,7 +31,7 @@ SOURCE = "yfinance"
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("YFinanceAnalysisMCP")
+mcp = MCPServer("YFinanceAnalysisMCP")
 
 
 @mcp.tool()

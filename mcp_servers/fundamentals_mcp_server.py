@@ -25,20 +25,19 @@ Tools:
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 from typing import Literal
 
-from mcp.server.fastmcp import FastMCP
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from src.market_protocol.symbology import to_canonical, to_display
 
 
-mcp = FastMCP("FundamentalsMCP", lifespan=fmp_lifespan)
+mcp = MCPServer("FundamentalsMCP", lifespan=fmp_lifespan)
 
 _SOURCE = "fmp"
 _CLIENT_UNAVAILABLE = "FMP client is unavailable"
@@ -465,4 +464,4 @@ async def get_technical_indicator(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")

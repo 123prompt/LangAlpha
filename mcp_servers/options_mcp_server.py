@@ -25,14 +25,13 @@ src.market_protocol (US options: USD / America/New_York).
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP
 
 from data_client.ginlix_data import (
     close_ginlix_mcp_client,
@@ -112,7 +111,7 @@ def _ginlix_error(result: dict, **context: Any) -> dict:
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("OptionsMCP", lifespan=_lifespan)
+mcp = MCPServer("OptionsMCP", lifespan=_lifespan)
 
 
 @mcp.tool()
@@ -293,4 +292,4 @@ async def get_options_snapshot(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")

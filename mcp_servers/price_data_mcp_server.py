@@ -27,14 +27,13 @@ identity, currency, timezone); prices are returned in major currency units
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
 
-from mcp.server.fastmcp import FastMCP
 
 from data_client.fmp import close_fmp_client, get_fmp_client
 from data_client.ginlix_data import (
@@ -232,7 +231,7 @@ async def _fetch_stock_series(
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("PriceDataMCP", lifespan=_lifespan)
+mcp = MCPServer("PriceDataMCP", lifespan=_lifespan)
 
 
 @mcp.tool()
@@ -440,4 +439,4 @@ async def get_short_data(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")

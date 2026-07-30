@@ -13,12 +13,11 @@ sector/industry data — wrapped in the standard market-data envelope
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
 
 from mcp_servers._envelope import make_error, make_response
 from mcp_servers._yf_common import clean_value, safe_detail, serialize_records
@@ -30,7 +29,7 @@ SOURCE = "yfinance"
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("YFinanceMarketMCP")
+mcp = MCPServer("YFinanceMarketMCP")
 
 
 def _build_equity_query(filter_dict: dict) -> yf.EquityQuery:

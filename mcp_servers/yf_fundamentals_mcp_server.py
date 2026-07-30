@@ -21,16 +21,15 @@ Tools:
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 import json
 from typing import List
 
 import pandas as pd
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
 
 from mcp_servers._envelope import make_error, make_response
 from mcp_servers._yf_common import boundary, format_datetime, safe_detail, serialize_records
@@ -59,7 +58,7 @@ def _serialize_dataframe(df: pd.DataFrame) -> dict:
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("YFinanceFundamentalsMCP")
+mcp = MCPServer("YFinanceFundamentalsMCP")
 
 
 # ---------------------------------------------------------------------------

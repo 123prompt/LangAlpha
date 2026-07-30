@@ -18,15 +18,14 @@ Tools:
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 from typing import Any, List, Optional
 
 import pandas as pd
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
 
 from mcp_servers._envelope import make_error, make_response, normalize_interval
 from mcp_servers._yf_common import boundary, format_datetime, safe_detail
@@ -186,7 +185,7 @@ def _serialize_history(df: pd.DataFrame, price_divisor: float = 1.0) -> list[dic
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("YFinancePriceMCP")
+mcp = MCPServer("YFinancePriceMCP")
 
 
 @mcp.tool()

@@ -17,7 +17,11 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+
+try:
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
+except ModuleNotFoundError:  # imported as a package module (tests)
+    from mcp_servers._bootstrap import MCPServer
 
 X_API_BASE = "https://api.x.com/2"
 _HTTP_TIMEOUT = 30.0
@@ -62,7 +66,7 @@ async def _lifespan(app):
         _client = None
 
 
-mcp = FastMCP("XApiMCP", lifespan=_lifespan)
+mcp = MCPServer("XApiMCP", lifespan=_lifespan)
 
 
 def _resolve_token(bearer_token: Optional[str]) -> Optional[str]:
@@ -447,4 +451,4 @@ async def get_conversation(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")
