@@ -57,7 +57,7 @@ def _all_tools() -> tuple[list[tuple[str, str, str, dict]], dict[str, str]]:
             continue
         for tool in tools:
             entries.append(
-                (server_name, tool.name, tool.description or "", tool.inputSchema)
+                (server_name, tool.name, tool.description or "", tool.input_schema)
             )
     return entries, errors
 

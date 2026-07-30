@@ -4,19 +4,42 @@ import asyncio
 import os
 import threading
 from collections import deque
+from contextlib import AbstractAsyncContextManager
 from types import TracebackType
 from typing import Any
 
-import httpx
 import structlog
-from mcp import ClientSession, StdioServerParameters
+from mcp import StdioServerParameters
+from mcp.client import Client
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
+
+# The SDK's own httpx factory (sse_client's default); no public re-export yet.
+from mcp.shared._httpx_utils import create_mcp_http_client
 
 from ptc_agent.config.core import CoreConfig, MCPServerConfig
 from src.observability.tracing import tracer as _otel_tracer
 
 logger = structlog.get_logger(__name__)
+
+
+class _StreamsTransport:
+    """Adapt an async CM yielding ``(read, write)`` streams to the Client Transport protocol.
+
+    Lets ``Client`` drive transports the SDK exposes only as stream factories —
+    notably ``stdio_client`` with our ``errlog`` capture, which no built-in
+    Transport class carries.
+    """
+
+    def __init__(self, streams_cm: AbstractAsyncContextManager) -> None:
+        self._cm = streams_cm
+
+    async def __aenter__(self):
+        return await self._cm.__aenter__()
+
+    async def __aexit__(self, *exc_info) -> bool | None:
+        return await self._cm.__aexit__(*exc_info)
 
 
 class _StderrTail:
@@ -154,14 +177,15 @@ class MCPToolInfo:
 class MCPServerConnector:
     """Connector for an individual MCP server.
 
-    Uses nested async with pattern following MCP SDK best practices.
-    The connector acts as an async context manager that keeps the
-    stdio_client and ClientSession contexts alive.
+    A background task holds the transport + ``Client`` contexts alive for the
+    connection's lifetime; ``Client`` (mode="auto") negotiates the protocol era
+    per connection — ``server/discover`` probe with legacy ``initialize``
+    fallback.
     """
 
     def __init__(self, config: MCPServerConfig) -> None:
         self.config = config
-        self.session: ClientSession | None = None
+        self.session: Client | None = None
         self.tools: list[MCPToolInfo] = []
 
         # Background task management
@@ -269,79 +293,70 @@ class MCPServerConnector:
 
         return self
 
+    def _resolve_headers(self) -> dict[str, str] | None:
+        """Config headers with ``${VAR}`` values expanded; None when empty."""
+        if not self.config.headers:
+            return None
+        return {k: os.path.expandvars(v) for k, v in self.config.headers.items()}
+
+    async def _serve(self, client: Client, *, retry_discovery: bool = False) -> None:
+        """Discover tools, signal readiness, and hold the connection open."""
+        self.session = client
+        if retry_discovery:
+            await self._discover_tools_with_retry()
+        else:
+            await self._discover_tools()
+
+        logger.debug(
+            "MCP connection established",
+            server=self.config.name,
+            transport=self.config.transport,
+        )
+
+        # Signal that connection is ready, then keep contexts alive until
+        # disconnect is signaled.
+        self._ready.set()
+        await self._disconnect_event.wait()
+
+        logger.debug(
+            "MCP connection disconnect signaled",
+            server=self.config.name,
+        )
+
     async def _run_connection(self) -> None:
         """Background task that maintains the nested async with contexts.
 
-        This follows MCP SDK best practices by using proper nested async with
-        statements within a single task, ensuring contexts are entered and
-        exited in LIFO order within the same task.
+        Contexts are entered and exited in LIFO order within this single task
+        (MCP SDK best practice); the transport variants differ only in how the
+        stream contexts are built.
         """
         stderr_capture: _StderrTail | None = None
         try:
             if self.config.transport == "http":
-                # HTTP transport - use direct JSON-RPC over HTTP POST
                 url = self._expand_url()
                 if not url:
                     msg = f"URL required for HTTP transport: {self.config.name}"
                     raise ValueError(msg)
 
-                # HTTP transport doesn't use ClientSession - we make direct requests
-                self._http_url = url
-                self._http_client = httpx.AsyncClient(timeout=60.0)
-                self._message_id = 0
-
-                # Discover tools via HTTP
-                await self._discover_tools_http()
-
-                logger.debug(
-                    "MCP HTTP connection established",
-                    server=self.config.name,
-                )
-
-                # Signal that connection is ready
-                self._ready.set()
-
-                # Keep alive until disconnect
-                await self._disconnect_event.wait()
-
-                # Cleanup
-                await self._http_client.aclose()
-
-                logger.debug(
-                    "MCP HTTP connection disconnect signaled",
-                    server=self.config.name,
-                )
+                # Custom headers ride on a preconfigured httpx client;
+                # streamable_http_client takes no headers of its own.
+                async with create_mcp_http_client(headers=self._resolve_headers()) as http_client:
+                    transport = _StreamsTransport(
+                        streamable_http_client(url, http_client=http_client)
+                    )
+                    async with Client(transport) as client:
+                        await self._serve(client)
 
             elif self.config.transport == "sse":
-                # SSE transport - use URL-based connection
                 url = self._expand_url()
                 if not url:
                     msg = f"URL required for SSE transport: {self.config.name}"
                     raise ValueError(msg)
 
-                async with sse_client(url) as (read_stream, write_stream), ClientSession(read_stream, write_stream) as session:
-                    self.session = session
+                # SSE connections need discovery retry due to endpoint event timing.
+                async with Client(_StreamsTransport(sse_client(url))) as client:
+                    await self._serve(client, retry_discovery=True)
 
-                    # Initialize and discover tools
-                    # SSE connections need retry due to endpoint event timing
-                    await self.session.initialize()
-                    await self._discover_tools_with_retry()
-
-                    logger.debug(
-                        "MCP SSE connection established",
-                        server=self.config.name,
-                    )
-
-                    # Signal that connection is ready
-                    self._ready.set()
-
-                    # Keep contexts alive until disconnect is signaled
-                    await self._disconnect_event.wait()
-
-                    logger.debug(
-                        "MCP SSE connection disconnect signaled",
-                        server=self.config.name,
-                    )
             else:
                 # Stdio transport (default) - use command-based connection
                 if not self.config.command:
@@ -352,31 +367,12 @@ class MCPServerConnector:
                     env=self._prepare_env(),
                 )
 
-                # Proper nested async with pattern (MCP SDK best practice)
                 stderr_capture = _StderrTail()
-                async with stdio_client(server_params, errlog=stderr_capture.writer) as (read_stream, write_stream):
-                    async with ClientSession(read_stream, write_stream) as session:
-                        self.session = session
-
-                        # Initialize and discover tools
-                        await self.session.initialize()
-                        await self._discover_tools()
-
-                        logger.debug(
-                            "MCP connection contexts established",
-                            server=self.config.name,
-                        )
-
-                        # Signal that connection is ready
-                        self._ready.set()
-
-                        # Keep contexts alive until disconnect is signaled
-                        await self._disconnect_event.wait()
-
-                        logger.debug(
-                            "MCP connection disconnect signaled",
-                            server=self.config.name,
-                        )
+                transport = _StreamsTransport(
+                    stdio_client(server_params, errlog=stderr_capture.writer)
+                )
+                async with Client(transport) as client:
+                    await self._serve(client)
 
         except Exception as e:
             # Store error and signal ready so __aenter__ can raise it
@@ -422,7 +418,7 @@ class MCPServerConnector:
                 tool_info = MCPToolInfo(
                     name=tool.name,
                     description=tool.description or "",
-                    input_schema=tool.inputSchema or {},
+                    input_schema=tool.input_schema or {},
                     server_name=self.config.name,
                 )
                 self.tools.append(tool_info)
@@ -445,90 +441,6 @@ class MCPServerConnector:
             raise
         finally:
             span.end()
-
-    async def _discover_tools_http(self) -> None:
-        """Discover available tools via HTTP transport."""
-        try:
-            self._message_id += 1
-            request = {
-                "jsonrpc": "2.0",
-                "id": self._message_id,
-                "method": "tools/list",
-                "params": {}
-            }
-
-            response = await self._http_client.post(
-                self._http_url,
-                json=request,
-                headers={"Content-Type": "application/json"}
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            if "error" in result:
-                msg = f"MCP error: {result['error']}"
-                raise RuntimeError(msg)
-
-            tools_data = result.get("result", {}).get("tools", [])
-            self.tools = []
-
-            for tool in tools_data:
-                tool_info = MCPToolInfo(
-                    name=tool.get("name", ""),
-                    description=tool.get("description", ""),
-                    input_schema=tool.get("inputSchema", {}),
-                    server_name=self.config.name,
-                )
-                self.tools.append(tool_info)
-
-            logger.debug(
-                "Discovered tools via HTTP",
-                server=self.config.name,
-                tool_count=len(self.tools),
-            )
-
-        except Exception as e:
-            logger.error(
-                "Failed to discover tools via HTTP",
-                server=self.config.name,
-                error=str(e),
-            )
-            raise
-
-    async def _call_tool_http(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call a tool via HTTP transport.
-
-        Args:
-            tool_name: Name of the tool
-            arguments: Tool arguments
-
-        Returns:
-            Tool result
-        """
-        self._message_id += 1
-        request = {
-            "jsonrpc": "2.0",
-            "id": self._message_id,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": arguments
-            }
-        }
-
-        response = await self._http_client.post(
-            self._http_url,
-            json=request,
-            headers={"Content-Type": "application/json"}
-        )
-        response.raise_for_status()
-        result = response.json()
-
-        if "error" in result:
-            msg = f"MCP tool call failed: {result['error']}"
-            raise RuntimeError(msg)
-
-        return result.get("result", {})
 
     async def _discover_tools_with_retry(self, *, max_retries: int = 3) -> None:
         """Discover tools with retry logic for SSE connections.
@@ -589,20 +501,6 @@ class MCPServerConnector:
         )
 
         try:
-            if self.config.transport == "http":
-                result = await self._call_tool_http(tool_name, arguments)
-                logger.debug("MCP tool call completed", server=self.config.name, tool=tool_name)
-
-                # HTTP returns dict directly; unwrap text content when present.
-                if isinstance(result, dict) and "content" in result:
-                    content = result["content"]
-                    if isinstance(content, list) and len(content) > 0:
-                        content_item = content[0]
-                        if isinstance(content_item, dict) and "text" in content_item:
-                            return content_item["text"]
-                return result
-
-            # SSE/stdio transport uses session
             if not self.session:
                 raise RuntimeError("Not connected to server")
 
@@ -610,7 +508,7 @@ class MCPServerConnector:
 
             logger.debug("MCP tool call completed", server=self.config.name, tool=tool_name)
 
-            if hasattr(result, "content") and result.content and len(result.content) > 0:
+            if result.content:
                 content_item = result.content[0]
                 if hasattr(content_item, "text"):
                     return content_item.text
