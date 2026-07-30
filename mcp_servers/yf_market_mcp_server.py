@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 import yfinance as yf
 
 from mcp_servers._envelope import make_error, make_response
+from mcp_servers._schemas import OBJECT, RECORDS, envelope_schema, output_model
 from mcp_servers._yf_common import clean_value, safe_detail, serialize_records
 
 SOURCE = "yfinance"
@@ -45,8 +46,11 @@ def _build_equity_query(filter_dict: dict) -> yf.EquityQuery:
     return yf.EquityQuery(operator, operands)
 
 
+_OUT_SEARCH_TICKERS = output_model("SearchTickersOut", envelope_schema(OBJECT))
+
+
 @mcp.tool()
-def search_tickers(query: str, max_results: int = 8, news_count: int = 5) -> dict:
+def search_tickers(query: str, max_results: int = 8, news_count: int = 5) -> _OUT_SEARCH_TICKERS:
     """Look up tickers and related news by free-text keyword. Use to resolve a
     company name to symbols or scan headlines.
 
@@ -75,8 +79,14 @@ def search_tickers(query: str, max_results: int = 8, news_count: int = 5) -> dic
         return make_error("upstream_error", safe_detail("Ticker search", e))
 
 
+_OUT_GET_MARKET_STATUS = output_model(
+    "GetMarketStatusOut",
+    envelope_schema(OBJECT, echo={"market": {"type": "string"}}),
+)
+
+
 @mcp.tool()
-def get_market_status(market: str = "US") -> dict:
+def get_market_status(market: str = "US") -> _OUT_GET_MARKET_STATUS:
     """Current status and index summary for a market. Use to check whether a
     market is open and read headline index moves.
     Markets: US, GB, ASIA, EUROPE, RATES, COMMODITIES, CURRENCIES,
@@ -106,13 +116,16 @@ def get_market_status(market: str = "US") -> dict:
         )
 
 
+_OUT_SCREEN_STOCKS = output_model("ScreenStocksOut", envelope_schema(OBJECT))
+
+
 @mcp.tool()
 def screen_stocks(
     filters: list[dict],
     sort_field: str = "percentchange",
     sort_asc: bool = False,
     count: int = 25,
-) -> dict:
+) -> _OUT_SCREEN_STOCKS:
     """Screen equities with custom Yahoo filters — find stocks matching
     numeric/categorical criteria.
     Each filter is {operator, operands}; operators: gt, lt, gte, lte, eq, btwn,
@@ -150,8 +163,14 @@ def screen_stocks(
         return make_error("upstream_error", safe_detail("Stock screen", e))
 
 
+_OUT_GET_PREDEFINED_SCREEN = output_model(
+    "GetPredefinedScreenOut",
+    envelope_schema(OBJECT, echo={"screen_name": {"type": "string"}}),
+)
+
+
 @mcp.tool()
-def get_predefined_screen(screen_name: str) -> dict:
+def get_predefined_screen(screen_name: str) -> _OUT_GET_PREDEFINED_SCREEN:
     """Run a named Yahoo predefined screener. Use for common ready-made scans
     (day_gainers, day_losers, most_actives, most_shorted_stocks,
     undervalued_growth_stocks, growth_technology_stocks, ...); an unknown name
@@ -183,8 +202,17 @@ def get_predefined_screen(screen_name: str) -> dict:
         return make_error("upstream_error", safe_detail("Predefined screen", e))
 
 
+_OUT_GET_EARNINGS_CALENDAR = output_model(
+    "GetEarningsCalendarOut",
+    envelope_schema(
+        RECORDS,
+        echo={"start": {"type": "string"}, "end": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
-def get_earnings_calendar(start: str, end: str) -> dict:
+def get_earnings_calendar(start: str, end: str) -> _OUT_GET_EARNINGS_CALENDAR:
     """Earnings announcements scheduled within a date range. Use to find which
     companies report in a window.
 
@@ -212,8 +240,14 @@ def get_earnings_calendar(start: str, end: str) -> dict:
         )
 
 
+_OUT_GET_SECTOR_INFO = output_model(
+    "GetSectorInfoOut",
+    envelope_schema(OBJECT, echo={"sector": {"type": "string"}}),
+)
+
+
 @mcp.tool()
-def get_sector_info(sector_key: str) -> dict:
+def get_sector_info(sector_key: str) -> _OUT_GET_SECTOR_INFO:
     """Overview of a market sector — top companies, ETFs, and its industries.
     Use for sector-level context and constituents.
     Sector keys: technology, healthcare, financial-services, consumer-cyclical,
@@ -251,8 +285,14 @@ def get_sector_info(sector_key: str) -> dict:
         )
 
 
+_OUT_GET_INDUSTRY_INFO = output_model(
+    "GetIndustryInfoOut",
+    envelope_schema(OBJECT, echo={"industry": {"type": "string"}}),
+)
+
+
 @mcp.tool()
-def get_industry_info(industry_key: str) -> dict:
+def get_industry_info(industry_key: str) -> _OUT_GET_INDUSTRY_INFO:
     """Overview of an industry — top performing and top growth companies plus
     its parent sector. Use for industry-level context and constituents.
 
