@@ -23,6 +23,7 @@ from ptc_agent.agent.middleware import (
     AskUserMiddleware,
     LeakDetectionMiddleware,
     ProvenanceMiddleware,
+    ReasoningCompatibilityMiddleware,
 )
 from ptc_agent.agent.middleware.openai_prompt_caching import OpenAIPromptCachingMiddleware
 from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
@@ -308,8 +309,15 @@ class FlashAgent:
 
         # Build final middleware stack
         # RuntimeContextMiddleware is last (innermost) so it appends after
-        # the cache breakpoint, keeping the static prompt cacheable.
-        middleware = [*shared_middleware, *main_middleware, runtime_context_middleware]
+        # the cache breakpoint, keeping the static prompt cacheable;
+        # ReasoningCompatibilityMiddleware sits inside model resilience so it
+        # sanitizes against the post-fallback model, not the requested one.
+        middleware = [
+            *shared_middleware,
+            *main_middleware,
+            runtime_context_middleware,
+            ReasoningCompatibilityMiddleware(),
+        ]
 
         logger.info(
             "Creating Flash agent",

@@ -55,7 +55,7 @@ from ptc_agent.agent.middleware import (
     MemoryContextMiddleware,
     # injects <memo-index count=N path=.../>
     MemoAwarenessMiddleware,
-    AnthropicThinkingSanitizerMiddleware,
+    ReasoningCompatibilityMiddleware,
 )
 from ptc_agent.core.paths import (
     MEMO_INDEX_FILENAME,
@@ -717,7 +717,7 @@ class PTCAgent:
                 OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
                 PatchToolCallsMiddleware(),
-                AnthropicThinkingSanitizerMiddleware(),
+                ReasoningCompatibilityMiddleware(),
             ]
             if m is not None
         ]
@@ -789,7 +789,7 @@ class PTCAgent:
                 *workspace_context_middleware,
                 *dynamic_context_middleware,
                 *runtime_context_middleware,
-                AnthropicThinkingSanitizerMiddleware(),
+                ReasoningCompatibilityMiddleware(),
             ]
             if m is not None
         ]

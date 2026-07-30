@@ -12,6 +12,7 @@ from langchain_qwq import ChatQwen
 
 from .endpoints import is_official_openai_endpoint
 from .pricing_utils import get_price_tier
+from .reasoning_lineage import ROUTE_ENDPOINT_SEP
 
 load_dotenv()
 
@@ -481,12 +482,37 @@ class LLM:
             raise ValueError(f"Unsupported SDK: {self.sdk} for provider {self.provider}")
 
         # Tag the client with billing metadata so PerCallTokenTracker can
-        # attribute each LLM call to the correct billing source.
+        # attribute each LLM call to the correct billing source, and with the
+        # resolved provider so ReasoningCompatibilityMiddleware can tell whose
+        # reasoning blocks these are. ``self.provider`` is read after the
+        # system_provider reassignment above, so the stamp names the route the
+        # request actually takes — langchain's own ``model_provider`` field
+        # cannot be trusted here (ChatAnthropic reports "anthropic" for every
+        # Anthropic-compatible shim).
         billing_type = self._resolve_billing_type()
         existing = client.metadata or {}
-        client.metadata = {**existing, "billing_type": billing_type}
+        client.metadata = {
+            **existing,
+            "billing_type": billing_type,
+            "provider_route": self._provider_route(),
+        }
 
         return client
+
+    def _provider_route(self) -> str:
+        """Identity of the upstream this client actually reaches.
+
+        The provider key alone is not that identity. BYOK can repoint a built-in
+        provider at another endpoint, and a custom Anthropic-shaped provider is
+        rewritten onto its manifest parent to inherit the right SDK (#221) —
+        both keep ``provider`` while changing the upstream. Since a reasoning
+        signature is only verifiable by the endpoint that minted it, an
+        off-manifest ``base_url`` is qualified into the route so it gets its own
+        lineage instead of inheriting the manifest route's trust.
+        """
+        if self.base_url != self.provider_info.get("base_url"):
+            return f"{self.provider}{ROUTE_ENDPOINT_SEP}{self.base_url}"
+        return self.provider
 
     def _resolve_api_key(self) -> str:
         """Resolve API key: BYOK override > env var > local fallback.

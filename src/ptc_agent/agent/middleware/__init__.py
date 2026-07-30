@@ -114,9 +114,9 @@ from .openai_prompt_caching import (
     OpenAIPromptCachingMiddleware,
 )
 
-# Anthropic thinking-block sanitizer (repairs orphan signature-only blocks)
-from .anthropic_thinking_sanitizer import (
-    AnthropicThinkingSanitizerMiddleware,
+# Cross-provider reasoning sanitizer (origin + shape gates, origin stamping)
+from .reasoning_compat import (
+    ReasoningCompatibilityMiddleware,
 )
 
 # Subagent steering middleware
@@ -187,8 +187,8 @@ __all__ = [
     "RuntimeContextMiddleware",
     # OpenAI prompt caching
     "OpenAIPromptCachingMiddleware",
-    # Anthropic thinking sanitizer
-    "AnthropicThinkingSanitizerMiddleware",
+    # Cross-provider reasoning sanitizer
+    "ReasoningCompatibilityMiddleware",
     # Subagent middleware
     "CompiledSubAgent",
     "SubAgent",

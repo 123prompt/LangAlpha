@@ -1447,6 +1447,7 @@
       "use_response_api": true,
       "prompt_cache_key": true,
       "display_name": "OpenAI",
+      "reasoning_compat_group": "openai",
       "variants": {
         "codex-oauth": {
           "sdk": "codex",
@@ -1454,7 +1455,8 @@
           "env_key": null,
           "access_type": "oauth",
           "use_response_api": true,
-          "display_name": "ChatGPT Codex"
+          "display_name": "ChatGPT Codex",
+          "reasoning_compat_group": "codex-oauth"
         }
       }
     },
@@ -1464,6 +1466,7 @@
       "access_type": "api_key",
       "byok_eligible": true,
       "display_name": "Anthropic",
+      "reasoning_compat_group": "anthropic",
       "variants": {
         "claude-oauth": {
           "base_url": "https://api.anthropic.com",
