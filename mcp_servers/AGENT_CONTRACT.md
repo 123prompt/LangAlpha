@@ -66,6 +66,38 @@ text never lands in `error`; a sanitized summary may go in `detail`. Context key
 Use the shared helpers in `_envelope.py` (`make_response`, `make_error`,
 `normalize_interval`) rather than hand-rolling either shape.
 
+## Published output schemas
+
+Every tool's return annotation is an `output_model()` subclass built in
+`_schemas.py`: `tools/list` publishes the tool's precise success∪error envelope
+as `outputSchema`, and successful calls carry the returned dict verbatim in
+`structuredContent` alongside the JSON text block. Validation stays permissive
+by construction (`RootModel[dict]` — any mapping validates), so an error
+envelope can never become an `isError` exception via schema validation, and
+open-ended echo keys or vendor drift never hard-fail a tool.
+
+Construction rules (both SDK eras derive these identically):
+
+- Root is `type: "object"` + `additionalProperties: true`, with a **sibling**
+  `anyOf` of the arms' required-key sets (`["count","data","source"]` vs
+  `["error","detail"]`). Never a root `anyOf` (breaks pre-2026 `tools/list`
+  parsers) and never a Python union annotation (the SDK nests unions under a
+  `result` wrapper).
+- Envelope tools build schemas with `envelope_schema(data_shape, frame=, echo=)`;
+  `data` is described at container level only (`RECORDS`, `RECORDS_BY_KEY`,
+  `OBJECT`, `OBJECTS_BY_KEY`, `ANY`) — never per-record field typing.
+- An arm's required set must hold for **every** reply on that arm: the v2 SDK
+  client auto-validates results, so a reply matching neither arm fails the call
+  (`x_mcp`'s error arm requires only `error` because rate-limit replies carry
+  no `detail`).
+- `x_mcp_server` publishes literal tool-specific schemas under the same
+  construction rules; its docstring conventions remain exempt.
+
+Return annotations are **not** prompt surface: the docstring lock does not
+cover them, wrapper return types stay docstring-derived, and schema edits need
+no `MCP_CLIENT_CODEGEN_VERSION` bump (server files resync to warm sandboxes by
+content hash, `_schemas.py` ships via `_MCP_SHARED_RUNTIME_FILES`).
+
 ## Docstring standard
 
 Three sections, in order, moderate length (target ≤800 characters total):
