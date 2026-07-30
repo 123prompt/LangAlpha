@@ -10,87 +10,22 @@ narrow callables.
 """
 
 import asyncio
-import json
 import logging
 import time
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, Callable, Optional
 
 from src.config.settings import (
     get_sse_drain_timeout,
     get_subagent_collector_timeout,
     get_subagent_orphan_collector_timeout,
 )
+from src.server.services.runs.subagent_archive import (
+    SubagentArchiveReadError,
+    iter_subagent_events_full,
+)
 from src.utils.cache.redis_cache import get_cache_client
 
 logger = logging.getLogger(__name__)
-
-
-async def iter_subagent_events_full(
-    thread_id: str, task
-) -> AsyncIterator[dict]:
-    """Yield every captured record for a subagent in seq order."""
-    if task is None or not thread_id:
-        return
-
-    high_water = int(getattr(task, "captured_event_seq", 0) or 0)
-    if high_water <= 0:
-        return
-
-    try:
-        cache = get_cache_client()
-    except Exception as exc:
-        logger.warning(
-            "[SubagentCollector] Failed to obtain cache client for "
-            f"task {getattr(task, 'task_id', '?')}: {exc}"
-        )
-        return
-    if cache is None or not getattr(cache, "enabled", False) or cache.client is None:
-        return
-
-    sa_stream_key = f"subagent:stream:{thread_id}:{task.task_id}"
-    try:
-        entries = await cache.client.xrange(sa_stream_key, min="-", max="+")
-    except Exception as exc:
-        logger.warning(
-            f"[SubagentCollector] XRANGE failed for {sa_stream_key}: {exc}"
-        )
-        return
-
-    yielded = 0
-    for entry_id, fields in entries or []:
-        try:
-            seq_part = entry_id.decode("utf-8") if isinstance(entry_id, bytes) else entry_id
-            seq = int(seq_part.split("-", 1)[0])
-        except (ValueError, AttributeError):
-            continue
-        if seq <= 0 or seq > high_water:
-            continue
-        raw = fields.get(b"record")
-        if raw is None:
-            continue
-        try:
-            payload = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-            record = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(record, dict):
-            continue
-        yielded += 1
-        yield record
-
-    expected = high_water
-    if yielded < expected:
-        logger.warning(
-            "subagent_history_truncated",
-            extra={
-                "thread_id": thread_id,
-                "task_id": getattr(task, "task_id", None),
-                "expected": expected,
-                "recovered": yielded,
-                "missing": expected - yielded,
-                "redis_write_failed": bool(getattr(task, "redis_write_failed", False)),
-            },
-        )
 
 
 def record_to_persist_event(record: dict, thread_id: str) -> dict:
@@ -207,13 +142,20 @@ async def replay_owned_task_events(
     )
     buffered: list[dict] = []
     eligible = 0
-    async for record in iter_subagent_events_full(thread_id, task):
-        if task.collector_response_id != response_id:
-            return False  # stolen mid-replay: the resume owns the archive
-        if record.get("run") not in allowed:
-            continue  # another round's record (cross-worker resume)
-        eligible += 1
-        buffered.append(record_to_persist_event(record, thread_id))
+    try:
+        async for record in iter_subagent_events_full(thread_id, task):
+            if task.collector_response_id != response_id:
+                return False  # stolen mid-replay: the resume owns the archive
+            if record.get("run") not in allowed:
+                continue  # another round's record (cross-worker resume)
+            eligible += 1
+            buffered.append(record_to_persist_event(record, thread_id))
+    except SubagentArchiveReadError as exc:
+        logger.error(
+            f"[SubagentCollector] Archive read failed for task "
+            f"{getattr(task, 'task_id', '?')}; withholding partial archive: {exc}"
+        )
+        return False
     if eligible != expected:
         logger.error(
             f"[SubagentCollector] Incomplete stream recovery for task "

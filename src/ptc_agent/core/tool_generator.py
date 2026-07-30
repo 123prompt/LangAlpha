@@ -29,7 +29,13 @@ logger = structlog.get_logger(__name__)
 # re-uploaded to a reused sandbox. Folding this constant into the tool_modules
 # version makes a bump force the regenerated client onto every workspace on its
 # next sync. See sandbox/assets.py:_compute_sandbox_manifest.
-MCP_CLIENT_CODEGEN_VERSION = "2"
+# "3": the backend runtime moved to Python 3.13, which dedents docstrings at
+# compile time. Tool docstrings are interpolated into the generated wrappers, so
+# 54 of the 61 agent-facing pins re-render with different leading whitespace —
+# content-identical, but a warm sandbox would otherwise keep serving the 3.12
+# spacing indefinitely, since the manifest hashes generation inputs and the
+# interpreter is not one of them.
+MCP_CLIENT_CODEGEN_VERSION = "3"
 
 # Aggregate per-execution ceiling on result_body bytes emitted BY THE GENERATED
 # CLIENT, interpolated into it. This keeps a cooperative run's trace small (per

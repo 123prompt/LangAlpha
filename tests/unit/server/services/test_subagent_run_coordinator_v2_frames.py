@@ -12,6 +12,7 @@ import pytest
 
 from ptc_agent.agent.middleware.background_subagent.registry import TaskRunRejected
 from src.server.services.subagent_run_coordinator import SubagentRunCoordinator
+from tests.unit.redis_mock_pipeline import attach_pipeline
 
 COORD_SRDB = "src.server.services.subagent_run_coordinator.sr_db"
 CACHE = "src.utils.cache.redis_cache.get_cache_client"
@@ -28,6 +29,9 @@ def _cache(*, enabled: bool = True, xadd_fails: bool = False, tail=None):
     )
     cache.client.expire = AsyncMock(return_value=True)
     cache.client.xrevrange = AsyncMock(return_value=tail or [])
+    # The control-lane announce batches xadd+expire into one pipeline; the
+    # shim replays them onto these mocks so assertions stay on the commands.
+    attach_pipeline(cache.client)
     return cache
 
 

@@ -706,6 +706,34 @@ async def get_latest_attempts_for_threads(
             return {str(r["conversation_thread_id"]): dict(r) for r in rows}
 
 
+async def get_run_statuses(run_ids: List[str]) -> Dict[str, str]:
+    """run_id -> status, for the ids that HAVE a row.
+
+    Absence means the row does not exist — load-bearing for the retention
+    sweeper, which treats a missing root run as garbage. That inference is
+    only sound because the row is inserted before the run's first XADD.
+    Non-UUID ids are dropped pre-bind so one malformed key can't 22P02 the
+    whole batch.
+    """
+    normalized = [nid for nid in (normalize_uuid(r) for r in run_ids) if nid]
+    if not normalized:
+        return {}
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT conversation_response_id, status
+                FROM conversation_responses
+                WHERE conversation_response_id = ANY(%s)
+                """,
+                (normalized,),
+            )
+            rows = await cur.fetchall()
+            return {
+                str(r["conversation_response_id"]): str(r["status"]) for r in rows
+            }
+
+
 async def find_run_by_request_key(request_key: str) -> Optional[Dict[str, Any]]:
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:

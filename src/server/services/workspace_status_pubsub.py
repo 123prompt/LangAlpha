@@ -21,7 +21,10 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 import redis.asyncio as redis
 from redis.asyncio.connection import ConnectionPool
 
-from src.config.settings import get_redis_max_connections
+from src.config.settings import (
+    get_redis_pubsub_max_connections,
+    get_redis_socket_connect_timeout,
+)
 from src.utils.cache.redis_cache import RedisCacheClient, get_cache_client
 
 logger = logging.getLogger(__name__)
@@ -35,48 +38,60 @@ logger = logging.getLogger(__name__)
 _pubsub_client: Optional[redis.Redis] = None
 _pubsub_pool: Optional[ConnectionPool] = None
 _pubsub_init_lock = asyncio.Lock()
-# Sticky flag set when dedicated-pool construction fails (deterministic — a bad
-# URL fails every time). Lets later calls return the shared client via the
-# lock-free fast path instead of re-acquiring the lock and retrying a build that
-# can't succeed. NOT stored in _pubsub_client: that would make
-# close_status_pubsub_pool aclose() the shared cache client. Reset on shutdown.
-_pubsub_fallback = False
+# Monotonic deadline before which a failed pool build is not re-attempted, so a
+# broken URL doesn't cost a rebuild on every subscribe.
+_pubsub_retry_after = 0.0
+_POOL_RETRY_COOLDOWN_S = 30.0
 
 # Backoff after a broken-connection get_message so error paths don't busy-spin.
 _BROKEN_CONN_BACKOFF_S = 1.0
 
 
-async def _get_pubsub_client(cache: RedisCacheClient) -> redis.Redis:
-    """Return the dedicated pubsub client, lazily built from the cache's URL.
+async def _get_pubsub_client(cache: RedisCacheClient) -> Optional[redis.Redis]:
+    """Return the dedicated pubsub client, or None when its pool can't be built.
 
-    Falls back to the shared cache client if the dedicated pool can't be
-    created — correctness is unaffected, only the pool isolation is lost.
+    Deliberately does NOT fall back to the shared cache client. ``from_url``
+    only parses the URL — it never connects — so the only way construction
+    fails is a URL the shared client could not have used either. Falling back
+    would silently move every long-lived subscription (600s ``/events`` streams
+    and every cross-worker start wait) onto the pool this isolation exists to
+    protect, for the life of the process and with no signal that it happened.
     """
-    global _pubsub_client, _pubsub_pool, _pubsub_fallback
+    global _pubsub_client, _pubsub_pool, _pubsub_retry_after
     if _pubsub_client is not None:
         return _pubsub_client
-    if _pubsub_fallback:
-        return cache.client
+    loop = asyncio.get_running_loop()
+    if loop.time() < _pubsub_retry_after:
+        return None
     async with _pubsub_init_lock:
         if _pubsub_client is not None:
             return _pubsub_client
-        if _pubsub_fallback:
-            return cache.client
+        if loop.time() < _pubsub_retry_after:
+            return None
         try:
+            # socket_connect_timeout only: connect is bounded by nature, and
+            # redis-py wraps both the AUTH handshake read and pool disconnect in
+            # it — unset, a Redis that accepts TCP but never answers parks a
+            # subscriber on the OS SYN timeout (~75-130s). socket_timeout stays
+            # unset because subscribers park on blocking reads; every reader
+            # here passes its own explicit get_message(timeout=...).
             _pubsub_pool = ConnectionPool.from_url(
                 cache.url,
-                max_connections=get_redis_max_connections(),
+                max_connections=get_redis_pubsub_max_connections(),
+                socket_connect_timeout=get_redis_socket_connect_timeout(),
                 decode_responses=False,
                 health_check_interval=30,
             )
             _pubsub_client = redis.Redis(connection_pool=_pubsub_pool)
         except Exception as exc:
             logger.warning(
-                "Failed to init dedicated pubsub pool, using shared cache pool: %s",
+                "Failed to init dedicated pubsub pool; status pub/sub is "
+                "unavailable for the next %.0fs (callers fall back to polling): %s",
+                _POOL_RETRY_COOLDOWN_S,
                 exc,
             )
-            _pubsub_fallback = True
-            return cache.client
+            _pubsub_retry_after = loop.time() + _POOL_RETRY_COOLDOWN_S
+            return None
     return _pubsub_client
 
 
@@ -92,13 +107,18 @@ async def get_shared_pubsub_client() -> Optional[redis.Redis]:
     return await _get_pubsub_client(cache)
 
 
+def peek_status_pubsub_pool() -> Optional[ConnectionPool]:
+    """The pubsub pool if one exists, without building it (metrics callbacks)."""
+    return _pubsub_pool
+
+
 async def close_status_pubsub_pool() -> None:
     """Tear down the dedicated pubsub pool on shutdown. Best-effort."""
-    global _pubsub_client, _pubsub_pool, _pubsub_fallback
+    global _pubsub_client, _pubsub_pool, _pubsub_retry_after
     client, _pubsub_client = _pubsub_client, None
     pool, _pubsub_pool = _pubsub_pool, None
-    # Clear the sticky fallback so a restart can re-attempt the dedicated pool.
-    _pubsub_fallback = False
+    # Clear the cooldown so a restart can re-attempt the dedicated pool.
+    _pubsub_retry_after = 0.0
     if client is not None:
         try:
             await client.aclose()
@@ -165,6 +185,12 @@ async def subscribe_to_status(
         return
 
     client = await _get_pubsub_client(cache)
+    if client is None:
+        # No isolated pool to subscribe on, and the shared one is off limits
+        # for a 600s hold. Callers keep their DB-poll path for exactly this.
+        yield None
+        return
+
     pubsub = client.pubsub()
     try:
         await pubsub.subscribe(status_channel(workspace_id))

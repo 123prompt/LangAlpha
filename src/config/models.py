@@ -176,6 +176,27 @@ class RedisConfig(BaseModel):
 
     cache_enabled: bool = Field(default=True, description="Enable/disable caching globally")
     max_connections: int = Field(default=10, description="Connection pool size")
+    # Pools are split by connection LIFETIME, not by feature: short cache ops
+    # must never queue behind a stream reader parked in XREAD BLOCK, and a
+    # subscriber holding a connection for 30 minutes must not sit in either.
+    stream_max_connections: int = Field(
+        default=100,
+        ge=1,
+        le=10000,
+        description="Pool size for blocking stream readers (XREAD)",
+    )
+    pubsub_max_connections: int = Field(
+        default=150,
+        ge=1,
+        le=10000,
+        description="Pool size for long-lived pub/sub subscriptions",
+    )
+    pool_timeout: float = Field(
+        default=2.0,
+        gt=0,
+        le=60,
+        description="Seconds a caller queues for a free cache connection before failing",
+    )
     socket_timeout: int = Field(
         default=5, description="Redis socket read/write timeout in seconds"
     )

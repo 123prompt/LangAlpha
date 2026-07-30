@@ -23,6 +23,7 @@ if sys.platform == "win32":
 # ============================================================================
 # Imports and Global Variables
 # ============================================================================
+import importlib
 import logging
 import os
 import certifi
@@ -87,6 +88,32 @@ _ACCEPTABLE_INIT_COMMS = (
     "dumb-init",
     "podman-init",
 )
+
+
+# Per-worker background singletons sharing one lifecycle shape: importable
+# lazily, ``get_instance()``, sync ``start()``, async ``stop()``. A table
+# rather than a stanza each, so adding one is a row and neither direction can
+# drift out of sync with the other.
+_REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
+    # A run that dies before its terminal never stamps a TTL, so its event
+    # stream would stay resident forever.
+    ("StreamRetentionSweeper", "src.server.services.stream_retention_sweep"),
+    # One PSUBSCRIBE per worker feeds every open /watch, instead of one pinned
+    # Redis connection per viewer.
+    ("ThreadWakeListener", "src.server.services.report_back.flash.wake_listener"),
+    # Tells apart "Redis is slow" from "this worker's loop was blocked", which
+    # read identically at the redis-py boundary.
+    ("EventLoopLagMonitor", "src.observability.loop_lag"),
+)
+
+
+def _background_singleton(name: str, module: str):
+    """Resolve one singleton, importing its module on first use.
+
+    Imports stay lazy for the same reason the hand-written blocks did it: these
+    modules pull in Redis and service layers that must not load at import time.
+    """
+    return getattr(importlib.import_module(module), name).get_instance()
 
 
 def _log_container_hardening() -> None:
@@ -473,6 +500,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start TurnCancelListener: {e}")
 
+    for name, module in _REDIS_BACKGROUND_SINGLETONS:
+        try:
+            _background_singleton(name, module).start()
+            logger.info(f"{name} started")
+        except Exception as e:
+            logger.warning(f"Failed to start {name}: {e}")
+
     # Start MarketDataFeed (shared upstream WS to ginlix-data)
     try:
         from src.server.services.market_data_feed import (
@@ -569,6 +603,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error stopping TurnCancelListener: {e}")
 
+    # 0.0b. Stop the Redis-backed background singletons, in reverse start
+    # order so nothing is still publishing into a listener that has gone.
+    for name, module in reversed(_REDIS_BACKGROUND_SINGLETONS):
+        try:
+            await _background_singleton(name, module).stop()
+        except Exception as e:
+            logger.warning(f"Error stopping {name}: {e}")
+
     # 0.1. Shutdown ProvenanceGCService
     try:
         from src.server.services.provenance_gc import ProvenanceGCService
@@ -640,14 +682,6 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Error draining warm tasks: {e}")
         try:
-            from src.server.services.workspace_status_pubsub import (
-                close_status_pubsub_pool,
-            )
-
-            await close_status_pubsub_pool()
-        except Exception as e:
-            logger.warning(f"Error closing status pubsub pool: {e}")
-        try:
             logger.info("Shutting down Workspace Manager...")
             await workspace_manager.shutdown()
             logger.info("Workspace Manager shutdown complete")
@@ -671,17 +705,6 @@ async def lifespan(app: FastAPI):
         clear_global_registry()
     except Exception as e:
         logger.debug(f"Error clearing global MCP registry: {e}")
-
-    # 5. Close PTC Agent checkpointer pool
-    if checkpointer is not None:
-        try:
-            from src.server.utils.checkpointer import close_checkpointer_pool
-
-            logger.info("Closing PTC Agent checkpointer pool...")
-            await close_checkpointer_pool(checkpointer)
-            logger.info("PTC Agent checkpointer pool closed")
-        except Exception as e:
-            logger.warning(f"Error closing PTC Agent checkpointer pool: {e}")
 
     # 6. Gracefully shutdown background workflows
     try:
@@ -710,6 +733,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing writer-guard pool: {e}")
 
+    # 6d. Close the checkpointer pool AFTER BTM shutdown, for the same reason
+    # as 6b/6c: cancelling a live run flushes its checkpoint on the way out.
+    # Closing first left that flush — and the history projection behind it —
+    # retrying against a dead pool and falling back to a slow listing, which
+    # dragged graceful shutdown past the deploy's grace period.
+    if checkpointer is not None:
+        try:
+            from src.server.utils.checkpointer import close_checkpointer_pool
+
+            logger.info("Closing PTC Agent checkpointer pool...")
+            await close_checkpointer_pool(checkpointer)
+            logger.info("PTC Agent checkpointer pool closed")
+        except Exception as e:
+            logger.warning(f"Error closing PTC Agent checkpointer pool: {e}")
+
     # 7. Close database pools
     try:
         from src.server.database.pool import get_or_create_pool
@@ -722,7 +760,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error closing conversation database pool: {e}")
 
-    # 8. Close Redis cache connection
+    # 8. Close the Redis pools. All three, unconditionally — the status pubsub
+    # pool used to be closed only when a workspace manager existed, so some
+    # shutdown paths leaked it.
+    try:
+        from src.server.services.workspace_status_pubsub import (
+            close_status_pubsub_pool,
+        )
+
+        await close_status_pubsub_pool()
+    except Exception as e:
+        logger.warning(f"Error closing status pubsub pool: {e}")
+
+    try:
+        from src.utils.cache.stream_pool import close_stream_reader_pool
+
+        await close_stream_reader_pool()
+    except Exception as e:
+        logger.warning(f"Error closing Redis stream-reader pool: {e}")
+
     try:
         from src.utils.cache.redis_cache import close_cache
 

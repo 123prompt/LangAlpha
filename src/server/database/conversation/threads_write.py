@@ -375,7 +375,15 @@ async def ensure_thread_exists(
         )
         return
 
-    # Slow path: at least one cache miss — need a connection
+    # Slow path: at least one cache miss — need a connection.
+    #
+    # Existence stamps are collected here and written after the connection is
+    # released. A blocking cache pool queues instead of failing, so a Redis
+    # stall inside this block would hold a Postgres connection for the whole
+    # acquire timeout — turning Redis contention into Postgres exhaustion for
+    # endpoints that never touch Redis. The stamps are pure cache warming and
+    # have no ordering relationship to the transaction.
+    stamp_exists: list[str] = []
     async with pool.get_db_connection() as conn:
         # Step 1: Verify workspace exists
         if not ws_cached:
@@ -392,11 +400,7 @@ async def ensure_thread_exists(
                 raise ValueError(
                     f"Workspace {workspace_id} does not exist. Create it first via POST /workspaces"
                 )
-            if cache.enabled and cache.client:
-                try:
-                    await cache.client.set(ws_key, b"1", ex=_EXISTS_TTL)
-                except Exception:
-                    pass
+            stamp_exists.append(ws_key)
 
         # Step 2: Check if thread already exists
         thread_exists = thread_cached
@@ -426,25 +430,25 @@ async def ensure_thread_exists(
                 conn=conn,
             )
             # Cache the new thread's existence
-            if cache.enabled and cache.client:
-                try:
-                    await cache.client.set(thread_key, b"1", ex=_EXISTS_TTL)
-                except Exception:
-                    pass
+            stamp_exists.append(thread_key)
         else:
             # Thread exists (resume scenario), update status
             await update_thread_status(
                 conversation_thread_id, initial_status, conn=conn
             )
             # Cache thread existence on resume too (in case cache was cold)
-            if not thread_cached and cache.enabled and cache.client:
-                try:
-                    await cache.client.set(thread_key, b"1", ex=_EXISTS_TTL)
-                except Exception:
-                    pass
+            if not thread_cached:
+                stamp_exists.append(thread_key)
             logger.debug(
                 f"Resumed thread {conversation_thread_id}, updated status to {initial_status}"
             )
+
+    if stamp_exists and cache.enabled and cache.client:
+        for key in stamp_exists:
+            try:
+                await cache.client.set(key, b"1", ex=_EXISTS_TTL)
+            except Exception:
+                pass
 
 
 async def truncate_thread_from_turn(

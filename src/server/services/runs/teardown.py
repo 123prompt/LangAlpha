@@ -198,23 +198,30 @@ async def drain_killed_subagent_events(
         # writer's — never this round's.
         allowed = (run_id,) if run_id else (None,)
         eligible = 0
-        async for record in subagent_collection.iter_subagent_events_full(
-            thread_id, task
-        ):
-            if record.get("run") not in allowed:
-                continue  # another round's record (cross-worker resume)
-            eligible += 1
-            enriched = subagent_collection.record_to_persist_event(
-                record, thread_id
+        try:
+            async for record in subagent_collection.iter_subagent_events_full(
+                thread_id, task
+            ):
+                if record.get("run") not in allowed:
+                    continue  # another round's record (cross-worker resume)
+                eligible += 1
+                enriched = subagent_collection.record_to_persist_event(
+                    record, thread_id
+                )
+                task_events.append(enriched)
+                data = enriched.get("data") or {}
+                if data.get("content_type") == "reasoning_signal":
+                    rk = (data.get("agent", ""), data.get("id", ""))
+                    if data.get("content") == "start":
+                        open_reasoning[rk] = None
+                    elif data.get("content") == "complete":
+                        open_reasoning.pop(rk, None)
+        except subagent_collection.SubagentArchiveReadError as exc:
+            logger.warning(
+                f"[StopTeardown] Archive read failed for task "
+                f"{getattr(task, 'task_id', '?')}; withholding snapshot: {exc}"
             )
-            task_events.append(enriched)
-            data = enriched.get("data") or {}
-            if data.get("content_type") == "reasoning_signal":
-                rk = (data.get("agent", ""), data.get("id", ""))
-                if data.get("content") == "start":
-                    open_reasoning[rk] = None
-                elif data.get("content") == "complete":
-                    open_reasoning.pop(rk, None)
+            continue
         if eligible != expected:
             # Mismatch against this round's attempted appends (XRANGE
             # failure reads as zero rows; a torn spill leaves a prefix;

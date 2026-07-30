@@ -362,12 +362,21 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         # collector hasn't billed the prior run yet, the next completion merges
         # into them so run-1 usage survives the resume. Cleanup drops them only
         # after a successful persist.
-        task.captured_event_seq = 0
-        task.captured_event_count = 0
-        task.captured_event_bytes = 0
         task.redis_write_failed = False
         task.sse_drain_complete = asyncio.Event()
         task.sse_consumer_count = 0
+        # The spool has to be gone BEFORE the sequence restarts at 1, and the
+        # delete has to be known to have happened. A silent failure here leaves
+        # the previous epoch resident under the very ids the next writer is
+        # about to claim; the fenced append then finds a stream it cannot prove
+        # it owns and — correctly — kills the run rather than writing into it.
+        #
+        # So when the delete cannot be confirmed, don't start a new epoch at
+        # all: keep counting where the last one left off. The next write is
+        # then an ordinary append with no destructive step to get wrong, and
+        # the archive ends up a superset of this task's events rather than a
+        # stream two writers disagree about.
+        spool_cleared = True
         if self.registry.thread_id:
             try:
                 from src.utils.cache.redis_cache import get_cache_client
@@ -381,26 +390,48 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                     )
 
                     async with task.redis_spill_lock:
+                        # Best-effort by contract — nothing reads either key as
+                        # an archive, so failing to clear them cannot corrupt a
+                        # replay. They go first so a stream-delete failure does
+                        # not skip them. The legacy List key is a one-release
+                        # backward-compat sweep for pre-cutover workers.
                         await cache.delete(
                             task_meta_key(self.registry.thread_id, task.task_id)
                         )
-                        await cache.delete(
-                            task_stream_key(self.registry.thread_id, task.task_id)
-                        )
-                        # One-release backward-compat sweep for the legacy List
-                        # key written by pre-cutover workers. Safe to drop once
-                        # no worker on the old code path is in rotation.
                         await cache.delete(
                             legacy_task_events_key(
                                 self.registry.thread_id, task.task_id
                             )
                         )
+                        # Raw client, not ``cache.delete``: that helper reports
+                        # a transport failure and an absent key identically, and
+                        # only the former may block the epoch reset.
+                        await cache.client.delete(
+                            task_stream_key(self.registry.thread_id, task.task_id)
+                        )
             except Exception:
+                spool_cleared = False
                 logger.warning(
-                    "Failed to clear Redis spool on resume; replay may include stale events",
+                    "Failed to clear Redis spool on resume; continuing the "
+                    "current event epoch instead of restarting it",
                     task_id=task.task_id,
                     exc_info=True,
                 )
+        # Two independent axes here. The COUNTERS are per-round totals — the
+        # archive completeness gates weigh them against what they recover for
+        # THIS round, so carrying a cumulative count into a round that only
+        # appends its own events would withhold the whole archive. The
+        # SEQUENCE is the stream's identity and only restarts once the old
+        # epoch is proven gone; when it has to carry over, the base records
+        # where this round starts so readers skip the retained epoch instead
+        # of counting it as missing.
+        task.captured_event_count = 0
+        task.captured_event_bytes = 0
+        if spool_cleared:
+            task.captured_event_seq = 0
+            task.captured_event_seq_base = 0
+        else:
+            task.captured_event_seq_base = task.captured_event_seq
         # Reset timestamps so the LLM sees honest staleness for the
         # resumed run, not leftover values from the prior asyncio.Task.
         task.last_checked_at = time.time()

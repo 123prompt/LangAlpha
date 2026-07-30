@@ -116,7 +116,7 @@ background_execution:
   admission_compaction_wait_timeout: 180 # Max seconds a new turn waits at admission for an in-progress compaction before returning "compacting" -> 409. Summarize is a full LLM call over a large transcript and can run minutes, so this is generous to avoid spurious 409s; keep it under the governing in-request limits — the upstream nginx proxy_read_timeout and the client read timeout (the connection is held open this long while the new turn waits). NOTE: server.py timeout_keep_alive (300) is NOT the bound — it only caps idle time BETWEEN requests, not an in-flight request. Admission floors this at compaction_timeout + ~20s so a healthy compaction is never 409'd before its own call budget self-terminates
   compaction_timeout: 180               # Wall-clock budget for a single compaction LLM call (auto Tier-2 summarize + manual /compact). Wrapped in asyncio.wait_for so a hung summarize fails naturally instead of blocking the thread forever; bounded below the httpx client timeout (600) and below admission_compaction_wait_timeout
   wait_for_persistence_timeout: 30      # Max seconds callers block waiting for persistence
-  stop_drain_timeout: 1.5               # Max seconds to drain killed-subagent events before teardown sentinel
+  stop_drain_timeout: 4.0               # Max seconds to drain killed-subagent events before teardown sentinel. MUST stay above redis.pool_timeout (2.0) plus a real paged XRANGE: a shorter deadline is spent queueing for a cache connection under contention, so the drain reports a timeout having issued no read at all and the run finalizes without its subagent archive
   max_workflow_retries: 3               # Max transient-error retry count
   merged_chunk_max_bytes: 16384         # Max bytes for merged SSE event chunks (16 KB)
 
@@ -128,7 +128,14 @@ background_execution:
 # Redis is used for caching and background workflow event storage
 redis:
   cache_enabled: true  # Enable/disable caching globally
-  max_connections: 150 # Connection pool size (override via REDIS_MAX_CONNECTIONS env)
+  # Three pools split by how long a connection is HELD, not by feature. Short
+  # cache ops must never queue behind a reader parked in XREAD BLOCK, and a
+  # subscriber holding a connection for 30 minutes must not sit in either.
+  # The three caps sum per worker (400 here) — keep workers x 400 under the Redis server's maxclients
+  max_connections: 150 # Cache pool: short ops only (override via REDIS_MAX_CONNECTIONS env)
+  stream_max_connections: 100 # Blocking stream readers, ~1 held per live SSE consumer (REDIS_STREAM_MAX_CONNECTIONS)
+  pubsub_max_connections: 150 # Long-lived subscriptions (REDIS_PUBSUB_MAX_CONNECTIONS)
+  pool_timeout: 2.0           # Seconds a cache op queues for a free connection (REDIS_POOL_TIMEOUT)
   socket_timeout: 5           # Redis socket read/write timeout (seconds)
   socket_connect_timeout: 5   # Redis socket connect timeout (seconds)
 

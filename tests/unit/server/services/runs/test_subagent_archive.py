@@ -20,7 +20,8 @@ import pytest
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
-from src.server.services.runs.subagent_collection import (
+from src.server.services.runs.subagent_archive import (
+    SubagentArchiveReadError,
     iter_subagent_events_full,
 )
 
@@ -58,7 +59,7 @@ async def test_xrange_yields_records_in_seq_order(monkeypatch) -> None:
     entries = [_stream_entry(seq, _record(seq, "agent-x", seq - 1)) for seq in range(1, 6)]
     fake_cache = _make_cache(entries)
     monkeypatch.setattr(
-        "src.server.services.runs.subagent_collection.get_cache_client",
+        "src.server.services.runs.subagent_archive.get_cache_client",
         lambda: fake_cache,
     )
 
@@ -84,7 +85,7 @@ async def test_filters_seq_above_high_water_snapshot(monkeypatch) -> None:
     entries = [_stream_entry(seq, _record(seq, "agent-x", 0)) for seq in range(1, 6)]
     fake_cache = _make_cache(entries)
     monkeypatch.setattr(
-        "src.server.services.runs.subagent_collection.get_cache_client",
+        "src.server.services.runs.subagent_archive.get_cache_client",
         lambda: fake_cache,
     )
 
@@ -110,7 +111,7 @@ async def test_entries_without_record_field_skipped(monkeypatch) -> None:
     ]
     fake_cache = _make_cache(entries)
     monkeypatch.setattr(
-        "src.server.services.runs.subagent_collection.get_cache_client",
+        "src.server.services.runs.subagent_archive.get_cache_client",
         lambda: fake_cache,
     )
 
@@ -133,7 +134,7 @@ async def test_malformed_record_json_skipped(monkeypatch) -> None:
     ]
     fake_cache = _make_cache(entries)
     monkeypatch.setattr(
-        "src.server.services.runs.subagent_collection.get_cache_client",
+        "src.server.services.runs.subagent_archive.get_cache_client",
         lambda: fake_cache,
     )
 
@@ -167,7 +168,7 @@ async def test_warns_when_stream_truncated(monkeypatch, caplog) -> None:
     entries = [_stream_entry(seq, _record(seq, "agent-x", 0)) for seq in (4, 5)]
     fake_cache = _make_cache(entries)
     monkeypatch.setattr(
-        "src.server.services.runs.subagent_collection.get_cache_client",
+        "src.server.services.runs.subagent_archive.get_cache_client",
         lambda: fake_cache,
     )
 
@@ -192,7 +193,7 @@ async def test_redis_disabled_yields_nothing(monkeypatch) -> None:
     fake_cache.enabled = False
     fake_cache.client = None
     monkeypatch.setattr(
-        "src.server.services.runs.subagent_collection.get_cache_client",
+        "src.server.services.runs.subagent_archive.get_cache_client",
         lambda: fake_cache,
     )
 
@@ -207,13 +208,15 @@ async def test_redis_disabled_yields_nothing(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_xrange_failure_yields_nothing_does_not_raise(monkeypatch) -> None:
+async def test_xrange_failure_raises_instead_of_yielding_a_prefix(monkeypatch) -> None:
+    # A read failure used to read as "the stream was empty". Callers can't
+    # tell that from a genuinely short archive, so it has to be loud.
     fake_cache = MagicMock()
     fake_cache.enabled = True
     fake_cache.client = MagicMock()
     fake_cache.client.xrange = AsyncMock(side_effect=RuntimeError("redis blip"))
     monkeypatch.setattr(
-        "src.server.services.runs.subagent_collection.get_cache_client",
+        "src.server.services.runs.subagent_archive.get_cache_client",
         lambda: fake_cache,
     )
 
@@ -223,8 +226,144 @@ async def test_xrange_failure_yields_nothing_does_not_raise(monkeypatch) -> None
     )
     task.captured_event_seq = 3
 
+    with pytest.raises(SubagentArchiveReadError):
+        [rec async for rec in iter_subagent_events_full("thread-x", task)]
+
+
+@pytest.mark.asyncio
+async def test_archive_read_is_bounded_and_paged(monkeypatch) -> None:
+    # The unbounded XRANGE topped the SLOWLOG under load. Reads now stop
+    # at the high-water mark and page, and the page loop must terminate on a
+    # SHORT page — waiting for an empty one spins forever when the last full
+    # page lands exactly on the boundary.
+    from src.server.services.runs import subagent_archive
+
+    monkeypatch.setattr(subagent_archive, "_ARCHIVE_PAGE", 2)
+    calls: list[dict] = []
+
+    def _entry(seq: int):
+        return (
+            f"{seq}-0".encode(),
+            {b"record": json.dumps({"seq": seq, "event": "x"}).encode()},
+        )
+
+    pages = [[_entry(1), _entry(2)], [_entry(3), _entry(4)]]
+
+    async def xrange(key, min=None, max=None, count=None):
+        calls.append({"min": min, "max": max, "count": count})
+        return pages.pop(0) if pages else []
+
+    fake_cache = MagicMock()
+    fake_cache.enabled = True
+    fake_cache.client = MagicMock()
+    fake_cache.client.xrange = xrange
+    monkeypatch.setattr(
+        "src.server.services.runs.subagent_archive.get_cache_client",
+        lambda: fake_cache,
+    )
+
+    registry = BackgroundTaskRegistry()
+    task = await registry.register(
+        tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
+    )
+    task.captured_event_seq = 4
+
+    out = [rec async for rec in iter_subagent_events_full("thread-x", task)]
+
+    assert [r["seq"] for r in out] == [1, 2, 3, 4]
+    # Bounded at the high-water mark, not "+".
+    assert all(c["max"] == "4-0" and c["count"] == 2 for c in calls)
+    # Second page resumes EXCLUSIVELY past the first page's last entry.
+    assert calls[0]["min"] == "-"
+    assert calls[1]["min"] == "(2-0"
+    # Third call returned empty, ending the loop.
+    assert len(calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# Round bounds: a resume that could not confirm its spool delete keeps the
+# prior round resident under ids <= captured_event_seq_base.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_starts_above_the_round_base(monkeypatch) -> None:
+    """Records at or below the base belong to a previous round on a retained
+    stream — the read starts past them instead of re-serving them."""
+    entries = [_stream_entry(seq, _record(seq, "agent-x", 0)) for seq in range(1, 9)]
+    fake_cache = _make_cache(entries)
+    monkeypatch.setattr(
+        "src.server.services.runs.subagent_archive.get_cache_client",
+        lambda: fake_cache,
+    )
+
+    registry = BackgroundTaskRegistry()
+    task = await registry.register(
+        tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
+    )
+    task.captured_event_seq = 8
+    task.captured_event_seq_base = 5
+
+    seqs = [rec["seq"] async for rec in iter_subagent_events_full("thread-x", task)]
+    assert seqs == [6, 7, 8]
+    _, kwargs = fake_cache.client.xrange.call_args
+    # Exclusive-start syntax, so entry 5-0 itself is not re-read.
+    assert kwargs["min"] == "(5-0"
+    assert kwargs["max"] == "8-0"
+
+
+@pytest.mark.asyncio
+async def test_high_water_at_the_base_yields_nothing(monkeypatch) -> None:
+    """A resumed round that appended nothing has no records of its own, and
+    the retained prior round is not its to serve."""
+    fake_cache = _make_cache(
+        [_stream_entry(seq, _record(seq, "agent-x", 0)) for seq in range(1, 6)]
+    )
+    monkeypatch.setattr(
+        "src.server.services.runs.subagent_archive.get_cache_client",
+        lambda: fake_cache,
+    )
+
+    registry = BackgroundTaskRegistry()
+    task = await registry.register(
+        tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
+    )
+    task.captured_event_seq = 5
+    task.captured_event_seq_base = 5
+
     out = [rec async for rec in iter_subagent_events_full("thread-x", task)]
     assert out == []
+    fake_cache.client.xrange.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_truncation_warning_spans_only_the_current_round(
+    monkeypatch, caplog
+) -> None:
+    """``expected`` is the round's span, not the whole stream — otherwise every
+    resumed round reports itself short by the size of the round before it."""
+    entries = [_stream_entry(seq, _record(seq, "agent-x", 0)) for seq in range(1, 9)]
+    fake_cache = _make_cache(entries)
+    monkeypatch.setattr(
+        "src.server.services.runs.subagent_archive.get_cache_client",
+        lambda: fake_cache,
+    )
+
+    registry = BackgroundTaskRegistry()
+    task = await registry.register(
+        tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
+    )
+    task.captured_event_seq = 8
+    task.captured_event_seq_base = 5
+
+    import logging
+    caplog.set_level(logging.WARNING)
+    seqs = [rec["seq"] async for rec in iter_subagent_events_full("thread-x", task)]
+
+    assert seqs == [6, 7, 8]
+    assert not [
+        r for r in caplog.records if "subagent_history_truncated" in r.getMessage()
+    ]
 
 
 # ---------------------------------------------------------------------------

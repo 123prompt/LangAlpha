@@ -219,6 +219,46 @@ def get_redis_max_connections() -> int:
     return get_infrastructure_config().redis.max_connections
 
 
+def get_redis_stream_max_connections() -> int:
+    """Pool size for blocking stream readers. Env REDIS_STREAM_MAX_CONNECTIONS."""
+    return _env_pool_size(
+        "REDIS_STREAM_MAX_CONNECTIONS",
+        default=get_infrastructure_config().redis.stream_max_connections,
+        ceiling=10000,
+    )
+
+
+def get_redis_pubsub_max_connections() -> int:
+    """Pool size for long-lived subscriptions. Env REDIS_PUBSUB_MAX_CONNECTIONS."""
+    return _env_pool_size(
+        "REDIS_PUBSUB_MAX_CONNECTIONS",
+        default=get_infrastructure_config().redis.pubsub_max_connections,
+        ceiling=10000,
+    )
+
+
+def get_redis_pool_timeout() -> float:
+    """Seconds a caller queues for a free cache connection. Env REDIS_POOL_TIMEOUT.
+
+    Converts "no slot right now" from an instant error that kills a turn into
+    a short wait — safe only because every long-held connection moved off the
+    cache pool.
+    """
+    raw = os.getenv("REDIS_POOL_TIMEOUT")
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            logger.warning("REDIS_POOL_TIMEOUT=%r is not a number; using config", raw)
+        else:
+            if 0 < parsed <= 60:
+                return parsed
+            logger.warning(
+                "REDIS_POOL_TIMEOUT=%s outside (0, 60]; using config", parsed
+            )
+    return get_infrastructure_config().redis.pool_timeout
+
+
 def get_redis_socket_timeout() -> int:
     """Socket read/write timeout in seconds."""
     return get_infrastructure_config().redis.socket_timeout

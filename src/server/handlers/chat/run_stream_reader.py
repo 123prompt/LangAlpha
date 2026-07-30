@@ -17,10 +17,17 @@ import asyncio
 import json
 from typing import AsyncGenerator, Awaitable, Callable, Optional
 
-from src.config.settings import get_redis_socket_timeout
+from src.server.handlers.chat.xread_tuning import (
+    XREAD_COUNT,
+    XREAD_ERROR_BACKOFF_S,
+    XREAD_EXHAUSTION_BACKOFF_S,
+    xread_block_ms,
+    xread_wait_timeout_s,
+)
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.runs.stream_writer import RUN_END_EVENT_TYPE
-from src.utils.cache.redis_cache import get_cache_client
+from src.utils.cache.redis_cache import get_cache_client, is_pool_exhaustion
+from src.utils.cache import stream_pool
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
@@ -33,41 +40,6 @@ logger = logging.getLogger("src.server.handlers.chat_handler")
 WORKFLOW_STREAM_END_EVENT = "workflow_stream_end"
 
 
-_XREAD_BLOCK_MARGIN_MS = 1_000
-_XREAD_BLOCK_FLOOR_MS = 500
-
-
-def _xread_block_ms() -> int:
-    """Compute XREAD's BLOCK arg given the pool's socket_timeout.
-
-    redis-py applies the connection's ``socket_timeout`` to every command,
-    blocking ones included. If BLOCK >= socket_timeout the socket read
-    raises ``Timeout reading from redis`` before XREAD ever returns. We
-    keep BLOCK strictly below socket_timeout by ``_XREAD_BLOCK_MARGIN_MS``
-    (1 s by default — the cost is one extra XREAD round-trip per
-    ``socket_timeout - 1`` s on idle streams, negligible vs LLM latency).
-
-    When ``socket_timeout`` is configured very low (1-2 s) the natural
-    ``timeout - margin`` would go to zero or negative; we floor at
-    ``_XREAD_BLOCK_FLOOR_MS`` (500 ms) so the consumer still polls at a
-    sane cadence. The accepted trade-off is that with ``socket_timeout=1
-    s`` the safety margin shrinks from 1 s to 500 ms — still positive, but
-    redis-py is more likely to win the race and surface a Timeout. Bump
-    ``redis.socket_timeout`` (config.yaml) above 2 s in production.
-    """
-    socket_seconds = get_redis_socket_timeout() or 5
-    socket_ms = max(1, socket_seconds) * 1_000
-    return max(_XREAD_BLOCK_FLOOR_MS, socket_ms - _XREAD_BLOCK_MARGIN_MS)
-
-
-# Cap entries per XREAD round. Keeps us responsive to terminal-check
-# polling under sustained traffic without per-event round-trips.
-_XREAD_COUNT = 100
-
-# Startup window for subagent: how long to wait for the registry/task
-# to come into existence before giving up. The registry is created when
-# the subagent middleware first runs; for short-lived turns it can take
-# a few seconds.
 def _is_stream_end_sentinel(raw: str, sentinel_event: str) -> bool:
     """True when ``raw`` is a terminal sentinel record ``{"event": <sentinel>}``.
 
@@ -162,6 +134,17 @@ async def _stream_from_redis_log(
         )
         return
 
+    # The blocking read lives on its own pool: this loop holds a connection for
+    # the life of the stream, and parking that in the cache pool is what
+    # starved every short op in the process.
+    reader = await stream_pool.get_stream_reader_client(cache)
+    if reader is None:
+        logger.warning(
+            "[stream_from_log] no stream-reader pool — cannot stream %s",
+            stream_key,
+        )
+        return
+
     if last_event_id is None or last_event_id <= 0:
         cursor: bytes = b"0"
     else:
@@ -170,7 +153,7 @@ async def _stream_from_redis_log(
         cursor = f"{last_event_id}-0".encode("utf-8")
 
     stream_key_bytes = stream_key.encode("utf-8")
-    block_ms = _xread_block_ms()
+    block_ms = xread_block_ms()
 
     if last_event_id is not None and last_event_id > 0:
         # Trimmed-head detection (1.5c): if the oldest surviving entry's seq
@@ -204,23 +187,17 @@ async def _stream_from_redis_log(
             try:
                 # asyncio.wait_for guards against the underlying redis-py
                 # XREAD hanging past BLOCK if the connection is poisoned.
-                #
-                # Sized so the outer wait_for fires AFTER redis-py's own
-                # socket_timeout. Recall ``block_ms = socket_timeout -
-                # _XREAD_BLOCK_MARGIN_MS`` (i.e. socket_timeout - 1 s) from
-                # ``_xread_block_ms``. Adding 2.0 s here gives an outer
-                # timeout of ``socket_timeout + 1 s`` — redis-py gets a full
-                # second past socket_timeout to surface its own
-                # ``Timeout reading from redis`` before wait_for races it.
-                # Using ``+ 1.0`` would equal socket_timeout and produce a
-                # racy double-fire.
+                # It must stay a backstop: it has to fire after redis-py's
+                # own socket_timeout AND after a cold connect's full budget,
+                # or it cancels mid-handshake and redials. Both terms are
+                # derived in ``xread_tuning.xread_wait_timeout_s``.
                 result = await asyncio.wait_for(
-                    cache.client.xread(
+                    reader.xread(
                         {stream_key_bytes: cursor},
                         block=block_ms,
-                        count=_XREAD_COUNT,
+                        count=XREAD_COUNT,
                     ),
-                    timeout=(block_ms / 1000.0) + 2.0,
+                    timeout=xread_wait_timeout_s(),
                 )
             except asyncio.TimeoutError:
                 # XREAD wedged — yield keepalive, recheck terminal, retry.
@@ -248,7 +225,11 @@ async def _stream_from_redis_log(
                 if await terminal_check():
                     return
                 # Brief backoff to avoid tight error loops, then retry.
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(
+                    XREAD_EXHAUSTION_BACKOFF_S
+                    if is_pool_exhaustion(exc)
+                    else XREAD_ERROR_BACKOFF_S
+                )
                 continue
 
             if not result:
