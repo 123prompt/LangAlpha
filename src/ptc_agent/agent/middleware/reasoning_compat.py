@@ -239,7 +239,13 @@ class ReasoningCompatibilityMiddleware(AgentMiddleware):
         target_lineage = lineage_for_route(route)
         sanitized, stats = _sanitize(request.messages, target_lineage)
         if stats:
-            logger.warning(
+            # Sanitizing is read-side and the checkpoint keeps the foreign
+            # blocks, so one provider switch re-sanitizes on every later call
+            # for the life of the thread. Only losing a whole message is an
+            # anomaly; stripping reasoning off messages that survive intact is
+            # the expected steady state after a switch.
+            emit = logger.warning if stats.msgs_removed else logger.info
+            emit(
                 "[ReasoningCompat] sanitized reasoning payloads",
                 target_route=route,
                 target_lineage=target_lineage,
