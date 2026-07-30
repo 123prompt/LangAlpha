@@ -24,6 +24,7 @@ _LOCK_VOLATILE_KEYS: frozenset[str] = frozenset({"installedAt", "updatedAt"})
 _MCP_SHARED_RUNTIME_FILES: tuple[str, ...] = (
     "_bootstrap.py",
     "_envelope.py",
+    "_schemas.py",
     "_yf_common.py",
 )
 

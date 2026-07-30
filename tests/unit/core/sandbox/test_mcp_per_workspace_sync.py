@@ -313,6 +313,31 @@ class TestManifestRegression:
         assert "price_data_mcp_server.py" in mcp_files
         assert "_bootstrap.py" in mcp_files
         assert "_envelope.py" in mcp_files
+        assert "_schemas.py" in mcp_files
+
+    def test_shared_runtime_files_cover_all_sibling_imports(self):
+        """Every ``_x`` sibling a server file imports must be in
+        ``_MCP_SHARED_RUNTIME_FILES`` — an unshipped sibling crashes the
+        server on import in synced sandboxes (and prune would delete it)."""
+        import re
+        from pathlib import Path
+
+        from ptc_agent.core.sandbox._shared import _MCP_SHARED_RUNTIME_FILES
+
+        root = Path(__file__).resolve().parents[4] / "mcp_servers"
+        pattern = re.compile(
+            r"^\s*(?:from (_[a-z]\w*) import|from mcp_servers\.(_[a-z]\w*) import"
+            r"|from mcp_servers import (_[a-z]\w*)|import (_[a-z]\w*))",
+            re.MULTILINE,
+        )
+        shipped = set(_MCP_SHARED_RUNTIME_FILES)
+        for server_file in sorted(root.glob("*_mcp_server.py")):
+            for match in pattern.finditer(server_file.read_text()):
+                module = next(g for g in match.groups() if g)
+                assert f"{module}.py" in shipped, (
+                    f"{server_file.name} imports {module} but {module}.py is "
+                    f"not in _MCP_SHARED_RUNTIME_FILES"
+                )
 
     @pytest.mark.asyncio
     async def test_manifest_omits_shared_siblings_without_server_files(self):
