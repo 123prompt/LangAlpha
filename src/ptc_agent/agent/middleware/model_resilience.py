@@ -24,16 +24,16 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import structlog
 from langchain.agents.middleware.types import (
     AgentMiddleware,
+    ModelCallResult,
     ModelRequest,
     ModelResponse,
 )
 
 from src.llms.error_classification import extract_status_code, is_retryable_error
+from src.llms.reasoning_payload import strip_all_reasoning
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-
-    from langchain_core.messages import AIMessage
 
 logger = structlog.get_logger(__name__)
 
@@ -48,6 +48,18 @@ _ERROR_SUMMARY_MAX_CHARS = 300
 def _summarize_error(exc: BaseException) -> str:
     text = str(exc) or type(exc).__name__
     return text[:_ERROR_SUMMARY_MAX_CHARS]
+
+
+@dataclass(slots=True)
+class _Recovery:
+    """One more attempt on the same candidate: back off, or send a fixed request.
+
+    ``request`` set means the payload was repaired rather than merely retried,
+    which the caller records so it only escalates once per candidate.
+    """
+
+    delay: float = 0.0
+    request: ModelRequest | None = None
 
 
 def _model_display_name(model: Any) -> str:
@@ -236,6 +248,51 @@ class ModelResilienceMiddleware(AgentMiddleware):
         status = extract_status_code(exc)
         return status, is_retryable_error(exc, status)
 
+    @staticmethod
+    def _escalate_reasoning(request: ModelRequest) -> ModelRequest | None:
+        """Rebuild the request without any reasoning payload.
+
+        ``None`` when there is nothing to strip, so the caller never spends a
+        call re-sending an identical request. Retrying in place is safe: a
+        request-validation 400 is raised while creating the stream, before any
+        chunk is emitted or any token billed.
+
+        Deliberately does *not* also disable thinking. Measured against
+        api.anthropic.com and the claude-oauth route across enabled, adaptive and
+        interleaved modes: replaying an assistant turn whose thinking block was
+        stripped is accepted while thinking is on. Disabling it would buy nothing
+        and would mask genuine config 400s — ``max_tokens`` below
+        ``thinking.budget_tokens`` succeeds once thinking is off, turning a
+        surfaced error into a silently thinking-free answer.
+        """
+        messages = strip_all_reasoning(request.messages)
+        if messages is request.messages:
+            return None
+        return request.override(messages=messages)
+
+    def _decide(
+        self, exc: Exception, attempts: int, req: ModelRequest, *, escalated: bool
+    ) -> tuple[int | None, _Recovery | None]:
+        """What to do about a failed attempt — shared by the sync and async loops.
+
+        ``None`` means give up on this candidate. A reasoning-payload 400 is the
+        one non-retryable status worth another call: the provider rejected the
+        history's reasoning blocks, and the same request without them can
+        succeed. Detected structurally — a 400 plus "we did send reasoning" —
+        rather than by matching provider error prose, which drifts between API
+        versions and fails silently when it does. The cost is one wasted call
+        when an unrelated 400 coincides with reasoning in history, on a turn that
+        is already failing anyway.
+        """
+        status, retryable = self._classify(exc)
+        if retryable and attempts <= self.max_retries:
+            return status, _Recovery(delay=self._calculate_delay(attempts - 1))
+        if not escalated and status == 400:
+            stripped = self._escalate_reasoning(req)
+            if stripped is not None:
+                return status, _Recovery(request=stripped)
+        return status, None
+
     # ------------------------------------------------------------------
     # Hooks
 
@@ -243,7 +300,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse | AIMessage:
+    ) -> ModelCallResult:
         # Sync twin of awrap_model_call. Unused in production (the graph is
         # only driven async) — time.sleep here would stall an event loop.
         candidates = self._candidates(request)
@@ -252,20 +309,24 @@ class ModelResilienceMiddleware(AgentMiddleware):
         for index, (name, client) in enumerate(candidates):
             req = request if client is None else request.override(model=client)
             attempts = 0
+            escalated = False
             while True:
                 attempts += 1
                 try:
                     return handler(req)
                 except Exception as exc:
-                    status, retryable = self._classify(exc)
-                    if retryable and attempts <= self.max_retries:
-                        delay = self._calculate_delay(attempts - 1)
-                        self._emit_retry(name, attempts, exc, status, delay)
-                        if delay > 0:
-                            time.sleep(delay)
-                        continue
-                    records.append(_AttemptRecord(name, exc, status, attempts))
-                    break
+                    status, recovery = self._decide(
+                        exc, attempts, req, escalated=escalated
+                    )
+                    if recovery is None:
+                        records.append(_AttemptRecord(name, exc, status, attempts))
+                        break
+                    self._emit_retry(name, attempts, exc, status, recovery.delay)
+                    if recovery.request is not None:
+                        req, escalated = recovery.request, True
+                    elif recovery.delay > 0:
+                        time.sleep(recovery.delay)
+                    continue
             if index + 1 < len(candidates):
                 self._emit_fallback(
                     records[-1], candidates[index + 1][0], from_is_primary=index == 0
@@ -277,27 +338,31 @@ class ModelResilienceMiddleware(AgentMiddleware):
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse | AIMessage:
+    ) -> ModelCallResult:
         candidates = self._candidates(request)
         records: list[_AttemptRecord] = []
 
         for index, (name, client) in enumerate(candidates):
             req = request if client is None else request.override(model=client)
             attempts = 0
+            escalated = False
             while True:
                 attempts += 1
                 try:
                     return await handler(req)
                 except Exception as exc:
-                    status, retryable = self._classify(exc)
-                    if retryable and attempts <= self.max_retries:
-                        delay = self._calculate_delay(attempts - 1)
-                        self._emit_retry(name, attempts, exc, status, delay)
-                        if delay > 0:
-                            await asyncio.sleep(delay)
-                        continue
-                    records.append(_AttemptRecord(name, exc, status, attempts))
-                    break
+                    status, recovery = self._decide(
+                        exc, attempts, req, escalated=escalated
+                    )
+                    if recovery is None:
+                        records.append(_AttemptRecord(name, exc, status, attempts))
+                        break
+                    self._emit_retry(name, attempts, exc, status, recovery.delay)
+                    if recovery.request is not None:
+                        req, escalated = recovery.request, True
+                    elif recovery.delay > 0:
+                        await asyncio.sleep(recovery.delay)
+                    continue
             if index + 1 < len(candidates):
                 self._emit_fallback(
                     records[-1], candidates[index + 1][0], from_is_primary=index == 0
