@@ -10,7 +10,10 @@ SANDBOX_NODE_VERSION = "24.14.1"  # Pinned; mirrored in Dockerfile.sandbox.
 
 DEFAULT_DEPENDENCIES = [
     # Core
-    "mcp",
+    # Pinned to 1.x: mcp 2.0.0 dropped ``mcp.server.fastmcp``, which scrapling's
+    # MCP entrypoint imports. Exact pin rather than "mcp<2" because mcp_setup
+    # joins this list into a shell command — "<" would parse as a redirect.
+    "mcp==1.29.0",
     "fastmcp",
     "fastapi",
     "pandas",
