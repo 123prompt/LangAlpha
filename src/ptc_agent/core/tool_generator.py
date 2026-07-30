@@ -960,7 +960,7 @@ import datetime
 import hashlib
 import json
 import os
-import select
+import queue
 import subprocess
 import sys
 import threading
@@ -1209,7 +1209,9 @@ def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout:
     Skips notifications and stale replies (abandoned ids from a prior timeout),
     answers server-initiated requests with -32601 (server->client requests are
     deprecated in 2026-07-28), and kills the process on timeout / EOF / invalid
-    framing so the next call restarts cleanly.
+    framing so the next call restarts cleanly. Lines come from the pump
+    thread's queue, never select() — a burst of messages lands in Python's
+    stdio buffer where select() on the fd would block forever.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -1219,11 +1221,11 @@ def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout:
             error_msg = f"MCP server {{server_name}} timed out after {{timeout:.0f}}s"
             print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
             raise RuntimeError(error_msg)
-        ready, _, _ = select.select([proc.stdout], [], [], remaining)
-        if not ready:
+        try:
+            line = proc.mcp_stdout_queue.get(timeout=remaining)
+        except queue.Empty:
             continue
-        line = proc.stdout.readline()
-        if not line:
+        if line is None:  # EOF sentinel from the pump thread
             _kill_server(server_name, proc)
             error_msg = f"MCP server {{server_name}} closed connection"
             print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
@@ -1278,6 +1280,22 @@ def _spawn_mcp_process(server_name: str{discovery_param}) -> subprocess.Popen:
     # MCP servers log INFO to stderr; if the 64KB pipe buffer fills, the
     # server blocks on write(stderr) and can't respond on stdout.
     threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
+
+    # Pump stdout lines onto a queue: readers wait on the queue, not
+    # select() on the fd, which goes quiet once a message burst has been
+    # slurped into Python's stdio buffer.
+    out_queue = queue.Queue()
+
+    def _pump(p=proc, q=out_queue):
+        try:
+            for line in p.stdout:
+                q.put(line)
+        except (OSError, ValueError):
+            pass
+        q.put(None)  # EOF sentinel
+
+    threading.Thread(target=_pump, daemon=True).start()
+    proc.mcp_stdout_queue = out_queue
 
     return proc
 
@@ -1366,7 +1384,9 @@ def _ensure_stdio_server(server_name: str{discovery_param}) -> tuple:
 def _mcp_headers(method: str, mcp_name: str, proto: dict, extra: dict) -> dict:
     """Spec headers for one HTTP request. Modern adds Mcp-Method/Mcp-Name
     (MCP-Protocol-Version must equal the body _meta); legacy echoes the
-    captured Mcp-Session-Id. Configured headers are applied last."""
+    captured Mcp-Session-Id. Configured headers are applied last.
+    Tool-declared x-mcp-header params are not emitted — a known limitation
+    for third-party servers that rely on them."""
     headers = {{"Accept": "application/json, text/event-stream"}}
     headers["MCP-Protocol-Version"] = proto["version"]
     if proto["mode"] == "modern":
