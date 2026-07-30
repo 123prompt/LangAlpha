@@ -3,31 +3,10 @@
 Reasoning blocks are opaque and provider-bound: an Anthropic ``thinking`` block
 carries a cryptographic ``signature`` only api.anthropic.com can verify, and an
 OpenAI reasoning item carries ``encrypted_content`` only OpenAI can decrypt.
-Replaying one provider's block to another is a hard 400.
-
-Lineage is the resolved provider *route* — the provider key, qualified by its
-endpoint when configuration has moved that key off its manifest endpoint (see
-``LLM._provider_route``). An off-manifest route always gets its own lineage: the
-key no longer names the upstream, so it cannot inherit the manifest route's
-trust. An on-manifest route's lineage is its key, unless ``providers.json``
-gives it a ``reasoning_compat_group``. **That field is declared on the group and
-inherited by its variants** (``_flatten_providers`` merges group fields into each
-variant), so a variant shares its group's lineage by default and must opt out to
-get its own:
-
-- ``anthropic`` declares ``anthropic``; ``claude-oauth`` inherits it, correctly —
-  both reach api.anthropic.com, so a signature from one verifies on the other.
-- ``openai`` declares ``openai``; ``codex-oauth`` **overrides** it with its own
-  key, because the two mint reasoning items the other cannot verify.
-
-Inheritance is a sharp edge: adding ``reasoning_compat_group`` to a group whose
-variants are *different* upstreams (``moonshot`` vs ``moonshot-coding``,
-``doubao-anthropic`` vs ``doubao-coding``) silently merges them. Declare it only
-on groups whose variants genuinely share an API, and give any exception its own
-key — ``test_reasoning_lineage`` locks the current partition so an accidental
-merge fails the suite rather than production. Absent the field entirely, every
-key is its own lineage, which is the safe default: an unnecessary split only
-drops a reasoning block, while an unwarranted merge breaks the turn.
+Replaying one provider's block to another is a hard 400, so the request path
+needs to know which routes can stand in for each other. That equivalence class
+is a lineage, and it is keyed on the resolved *route* rather than the provider
+key — see ``LLM._provider_route`` for why the two differ.
 """
 
 from __future__ import annotations
@@ -61,7 +40,13 @@ def _config() -> ModelConfig:
 
 
 def lineage_for_route(route: str | None, config: ModelConfig | None = None) -> str:
-    """Compatibility class for a resolved provider route."""
+    """Compatibility class for a resolved provider route.
+
+    A route's lineage is its own key unless ``providers.json`` merges it into a
+    ``reasoning_compat_group``. Absent that field every key stands alone, which
+    is the safe default: an unnecessary split only drops a reasoning block,
+    while an unwarranted merge breaks the turn.
+    """
     if not route:
         return UNKNOWN_LINEAGE
     if ROUTE_ENDPOINT_SEP in route:
@@ -69,6 +54,13 @@ def lineage_for_route(route: str | None, config: ModelConfig | None = None) -> s
         # about who can verify these signatures. The route stands alone.
         return route
     info = (config or _config()).get_provider_info(route)
+    # Declared on a provider *group* and inherited by its variants
+    # (``_flatten_providers`` merges group fields into each), so declaring it on
+    # a group whose variants are different upstreams — ``moonshot`` vs
+    # ``moonshot-coding``, ``doubao-anthropic`` vs ``doubao-coding`` — silently
+    # merges them. ``claude-oauth`` inherits ``anthropic`` correctly because
+    # both reach api.anthropic.com; ``codex-oauth`` opts out with its own key.
+    # ``test_reasoning_lineage`` locks the partition so a bad merge fails there.
     group = info.get("reasoning_compat_group")
     return group if isinstance(group, str) and group else route
 

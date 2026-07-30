@@ -1,23 +1,12 @@
 """Keep reasoning payloads inside the provider lineage that produced them.
 
-Reasoning blocks are opaque and provider-bound — an Anthropic ``thinking`` block
-carries a signature only api.anthropic.com can verify — but the message history
-is provider-agnostic. A mid-thread model switch, a ``/retry`` override, or a
+Reasoning blocks are opaque and provider-bound, but the message history is not:
+a mid-thread model switch, a ``/retry`` override, or a
 ``ModelResilienceMiddleware`` fallback replays one provider's blocks to another
-and the turn dies with a non-retryable 400. langchain cannot prevent this:
+and the turn dies with a non-retryable 400. langchain cannot prevent it —
 ``ChatAnthropic`` stamps ``model_provider="anthropic"`` for every
 Anthropic-compatible shim, so its own provenance field is not trustworthy.
-
-Two independent gates run on the request path, and the outgoing response is
-stamped with its true origin so later turns can attribute it:
-
-- **Gate A (origin)** drops reasoning whose lineage differs from the target's.
-  Unattributable history fails closed.
-- **Gate B (structure)** drops ``thinking`` blocks the real Anthropic API would
-  reject for shape, and repairs the signature-only orphans that an interrupted
-  stream checkpoints.
-
-Both are read-side only: the checkpoint keeps whatever it holds, and every
+Everything here is read-side: the checkpoint keeps whatever it holds and each
 request is sanitized on the way out, so already-broken threads heal on their
 next turn without a migration.
 """
@@ -52,7 +41,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 # Set on outgoing AIMessages: the provider key that actually produced them.
-# Resolved through ``lineage_for_provider`` on read so regrouping the manifest
+# Resolved through ``lineage_for_route`` on read so regrouping the manifest
 # retroactively re-attributes old messages.
 ORIGIN_KEY = "reasoning_origin"
 
@@ -93,6 +82,11 @@ def _message_lineage(msg: AIMessage) -> str:
 
 
 def _origin_gate(msg: AIMessage, stats: SanitizeStats) -> AIMessage | None:
+    """Gate A — drop reasoning minted by a lineage other than the target's.
+
+    The caller establishes that the lineages differ; unattributable history
+    resolves to ``UNKNOWN_LINEAGE``, which matches nothing and so fails closed.
+    """
     stripped = strip_reasoning(msg)
     if stripped is not msg:
         stats.msgs_stripped += 1
@@ -102,7 +96,7 @@ def _origin_gate(msg: AIMessage, stats: SanitizeStats) -> AIMessage | None:
 def _structure_gate(
     msg: AIMessage, stats: SanitizeStats, *, drop_unsigned: bool
 ) -> AIMessage | None:
-    """Repair and (optionally) drop Anthropic thinking blocks by shape.
+    """Gate B — repair and (optionally) drop Anthropic thinking blocks by shape.
 
     Repair is unconditional: langchain-anthropic streams ``signature_delta``
     into a block with no ``thinking`` field, and the API rejects that on replay.
@@ -154,6 +148,11 @@ def _structure_gate(
 def _sanitize(
     messages: list[AnyMessage], target_lineage: str
 ) -> tuple[list[AnyMessage], SanitizeStats]:
+    """Run both gates over a history — origin first, then structure.
+
+    Order matters only in that gate A already removes every reasoning block on a
+    cross-lineage message, so gate B sees nothing left to judge there.
+    """
     stats = SanitizeStats()
     # UNKNOWN targets carry no provenance to compare against, so gate A would
     # strip the entire history on no evidence. Skip it and keep the repair.
