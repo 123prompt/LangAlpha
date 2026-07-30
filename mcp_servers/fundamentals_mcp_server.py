@@ -34,6 +34,13 @@ from typing import Literal
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
 from mcp_servers._envelope import error_from_exception, make_error, make_response
+from mcp_servers._schemas import (
+    ANY,
+    RECORDS,
+    RECORDS_BY_KEY,
+    envelope_schema,
+    output_model,
+)
 from src.market_protocol.symbology import to_canonical, to_display
 
 
@@ -52,13 +59,27 @@ def _canonical(symbol: str) -> str:
         return symbol
 
 
+_OUT_GET_FINANCIAL_STATEMENTS = output_model(
+    "GetFinancialStatementsOut",
+    envelope_schema(
+        ANY,
+        frame=("symbol",),
+        echo={
+            "data_type": {"type": "string"},
+            "statement_type": {"type": "string"},
+            "period": {"type": "string"},
+        },
+    ),
+)
+
+
 @mcp.tool()
 async def get_financial_statements(
     symbol: str,
     statement_type: Literal["income", "balance", "cash", "all"] = "all",
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
-) -> dict:
+) -> _OUT_GET_FINANCIAL_STATEMENTS:
     """Fetch raw historical financial statements for trend analysis or model
     building. statement_type="all" returns income, balance sheet, and cash flow.
 
@@ -112,12 +133,22 @@ async def get_financial_statements(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_FINANCIAL_RATIOS = output_model(
+    "GetFinancialRatiosOut",
+    envelope_schema(
+        RECORDS_BY_KEY,
+        frame=("symbol",),
+        echo={"data_type": {"type": "string"}, "period": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_financial_ratios(
     symbol: str,
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
-) -> dict:
+) -> _OUT_GET_FINANCIAL_RATIOS:
     """Fetch raw historical key metrics and financial ratios — track P/E, ROE,
     and margins over time, or compare valuation across companies.
 
@@ -157,12 +188,22 @@ async def get_financial_ratios(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_GROWTH_METRICS = output_model(
+    "GetGrowthMetricsOut",
+    envelope_schema(
+        RECORDS_BY_KEY,
+        frame=("symbol",),
+        echo={"data_type": {"type": "string"}, "period": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_growth_metrics(
     symbol: str,
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
-) -> dict:
+) -> _OUT_GET_GROWTH_METRICS:
     """Fetch raw historical growth rates for trend analysis — chart revenue/EPS
     trajectory or compare growth across competitors.
 
@@ -206,12 +247,22 @@ async def get_growth_metrics(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_HISTORICAL_VALUATION = output_model(
+    "GetHistoricalValuationOut",
+    envelope_schema(
+        RECORDS_BY_KEY,
+        frame=("symbol",),
+        echo={"data_type": {"type": "string"}, "period": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_historical_valuation(
     symbol: str,
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
-) -> dict:
+) -> _OUT_GET_HISTORICAL_VALUATION:
     """Fetch DCF fair value and enterprise value history — track fair value vs
     price or build valuation trend charts.
 
@@ -257,11 +308,21 @@ async def get_historical_valuation(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_INSIDER_TRADES = output_model(
+    "GetInsiderTradesOut",
+    envelope_schema(
+        RECORDS_BY_KEY,
+        frame=("symbol",),
+        echo={"data_type": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_insider_trades(
     symbol: str,
     limit: int = 50,
-) -> dict:
+) -> _OUT_GET_INSIDER_TRADES:
     """Fetch insider trading transactions and aggregate buy/sell statistics —
     detect insider buying clusters, screen unusual activity, or gauge C-suite
     confidence.
@@ -300,10 +361,20 @@ async def get_insider_trades(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_DIVIDENDS_AND_SPLITS = output_model(
+    "GetDividendsAndSplitsOut",
+    envelope_schema(
+        RECORDS_BY_KEY,
+        frame=("symbol",),
+        echo={"data_type": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_dividends_and_splits(
     symbol: str,
-) -> dict:
+) -> _OUT_GET_DIVIDENDS_AND_SPLITS:
     """Fetch historical dividend payments and stock splits — analyze dividend
     growth, adjust prices for splits, or compare dividend history across peers.
 
@@ -340,10 +411,20 @@ async def get_dividends_and_splits(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_SHARES_FLOAT = output_model(
+    "GetSharesFloatOut",
+    envelope_schema(
+        RECORDS,
+        frame=("symbol",),
+        echo={"data_type": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_shares_float(
     symbol: str,
-) -> dict:
+) -> _OUT_GET_SHARES_FLOAT:
     """Fetch shares float, outstanding shares, and float percentage — flag
     low-float names, gauge ownership concentration, or screen squeeze candidates.
 
@@ -377,10 +458,20 @@ async def get_shares_float(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_KEY_EXECUTIVES = output_model(
+    "GetKeyExecutivesOut",
+    envelope_schema(
+        RECORDS,
+        frame=("symbol",),
+        echo={"data_type": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_key_executives(
     symbol: str,
-) -> dict:
+) -> _OUT_GET_KEY_EXECUTIVES:
     """Fetch key executives with title and compensation — identify the
     management team or compare executive pay across peers.
 
@@ -414,13 +505,28 @@ async def get_key_executives(
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
+_OUT_GET_TECHNICAL_INDICATOR = output_model(
+    "GetTechnicalIndicatorOut",
+    envelope_schema(
+        RECORDS,
+        frame=("symbol",),
+        echo={
+            "data_type": {"type": "string"},
+            "indicator": {"type": "string"},
+            "period": {"type": "integer", "description": "Indicator lookback length."},
+            "timeframe": {"type": "string", "description": "FMP-native bar size."},
+        },
+    ),
+)
+
+
 @mcp.tool()
 async def get_technical_indicator(
     symbol: str,
     indicator: str,
     period: int = 14,
     timeframe: str = "1day",
-) -> dict:
+) -> _OUT_GET_TECHNICAL_INDICATOR:
     """Fetch a technical indicator time series over OHLCV bars — plot RSI,
     overlay EMA/MACD, or screen by technical signals.
 

@@ -30,6 +30,7 @@ from typing import Optional
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
 from mcp_servers._envelope import error_from_exception, make_error, make_response
+from mcp_servers._schemas import RECORDS, envelope_schema, output_model
 
 
 mcp = MCPServer("MacroMCP", lifespan=fmp_lifespan)
@@ -39,11 +40,23 @@ _CLIENT_UNAVAILABLE = "FMP client is unavailable"
 _UPSTREAM_FAILED = "FMP request failed"
 
 
+_OUT_GET_ECONOMIC_INDICATOR = output_model(
+    "GetEconomicIndicatorOut",
+    envelope_schema(
+        RECORDS,
+        echo={
+            "data_type": {"type": "string"},
+            "indicator": {"type": "string", "description": "Echoed indicator name."},
+        },
+    ),
+)
+
+
 @mcp.tool()
 async def get_economic_indicator(
     name: str,
     limit: int = 50,
-) -> dict:
+) -> _OUT_GET_ECONOMIC_INDICATOR:
     """Fetch an economic indicator time series — GDP growth for the macro
     outlook, CPI/inflation for discount-rate assumptions, or unemployment and
     the Fed funds rate for economic context.
@@ -79,11 +92,25 @@ async def get_economic_indicator(
         return error_from_exception(e, _UPSTREAM_FAILED, indicator=name)
 
 
+_OUT_GET_ECONOMIC_CALENDAR = output_model(
+    "GetEconomicCalendarOut",
+    envelope_schema(
+        RECORDS,
+        echo={
+            "data_type": {"type": "string"},
+            # Echoed verbatim, so null when the caller omitted the bound.
+            "from_date": {"type": ["string", "null"]},
+            "to_date": {"type": ["string", "null"]},
+        },
+    ),
+)
+
+
 @mcp.tool()
 async def get_economic_calendar(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-) -> dict:
+) -> _OUT_GET_ECONOMIC_CALENDAR:
     """Fetch economic events with prior, estimate, and actual values — build a
     catalyst calendar, generate a morning note, or track Fed meetings, jobs
     reports, and CPI releases.
@@ -120,11 +147,25 @@ async def get_economic_calendar(
         return error_from_exception(e, _UPSTREAM_FAILED)
 
 
+_OUT_GET_TREASURY_RATES = output_model(
+    "GetTreasuryRatesOut",
+    envelope_schema(
+        RECORDS,
+        echo={
+            "data_type": {"type": "string"},
+            # Echoed verbatim, so null when the caller omitted the bound.
+            "from_date": {"type": ["string", "null"]},
+            "to_date": {"type": ["string", "null"]},
+        },
+    ),
+)
+
+
 @mcp.tool()
 async def get_treasury_rates(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-) -> dict:
+) -> _OUT_GET_TREASURY_RATES:
     """Fetch US Treasury rates across the full yield curve (1M to 30Y) — get the
     risk-free rate for DCF/WACC (typically 10Y), read the curve shape, or track
     rate trends.
@@ -162,8 +203,14 @@ async def get_treasury_rates(
         return error_from_exception(e, _UPSTREAM_FAILED)
 
 
+_OUT_GET_MARKET_RISK_PREMIUM = output_model(
+    "GetMarketRiskPremiumOut",
+    envelope_schema(RECORDS, echo={"data_type": {"type": "string"}}),
+)
+
+
 @mcp.tool()
-async def get_market_risk_premium() -> dict:
+async def get_market_risk_premium() -> _OUT_GET_MARKET_RISK_PREMIUM:
     """Fetch market risk premium by country for CAPM/WACC — get the equity risk
     premium for a DCF cost of equity, or compare premiums across markets.
 
@@ -192,11 +239,24 @@ async def get_market_risk_premium() -> dict:
         return error_from_exception(e, _UPSTREAM_FAILED)
 
 
+_OUT_GET_EARNINGS_CALENDAR = output_model(
+    "GetEarningsCalendarOut",
+    envelope_schema(
+        RECORDS,
+        echo={
+            "data_type": {"type": "string"},
+            "from_date": {"type": "string"},
+            "to_date": {"type": "string"},
+        },
+    ),
+)
+
+
 @mcp.tool()
 async def get_earnings_calendar(
     from_date: str,
     to_date: str,
-) -> dict:
+) -> _OUT_GET_EARNINGS_CALENDAR:
     """Fetch the earnings calendar for all companies reporting in a date range —
     build a catalyst calendar, generate a morning note, or track earnings-season
     volume.
