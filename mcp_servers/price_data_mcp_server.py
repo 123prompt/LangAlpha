@@ -62,6 +62,8 @@ except ModuleNotFoundError:  # imported as a package module (tests)
         normalize_interval,
     )
 
+from mcp_servers._schemas import RECORDS, RECORDS_BY_KEY, envelope_schema, output_model
+
 
 # ---------------------------------------------------------------------------
 # Clients
@@ -234,13 +236,19 @@ async def _fetch_stock_series(
 mcp = MCPServer("PriceDataMCP", lifespan=_lifespan)
 
 
+_OUT_GET_STOCK_DATA = output_model(
+    "GetStockDataOut",
+    envelope_schema(RECORDS, frame=("symbol", "interval", "currency", "timezone")),
+)
+
+
 @mcp.tool()
 async def get_stock_data(
     symbol: str,
     interval: str = "1day",
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-) -> dict:
+) -> _OUT_GET_STOCK_DATA:
     """Fetch OHLCV price bars for a stock; use for historical charts/analysis.
 
     Intervals: 1min|5min|15min|30min|1hour|4hour|1day (aliases like "1d"/"daily"
@@ -265,6 +273,16 @@ async def get_stock_data(
     return make_response(**env)
 
 
+_OUT_GET_ASSET_DATA = output_model(
+    "GetAssetDataOut",
+    envelope_schema(
+        RECORDS,
+        frame=("symbol", "interval", "currency", "timezone"),
+        echo={"asset_type": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_asset_data(
     symbol: str,
@@ -272,7 +290,7 @@ async def get_asset_data(
     interval: str = "1day",
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
-) -> dict:
+) -> _OUT_GET_ASSET_DATA:
     """Fetch OHLCV bars for a stock, commodity, crypto, or forex pair.
 
     Intervals: 1min|5min|1hour|1day (stock adds 15min|30min|4hour); dates
@@ -370,6 +388,22 @@ async def get_asset_data(
     )
 
 
+_OUT_GET_SHORT_DATA = output_model(
+    "GetShortDataOut",
+    envelope_schema(
+        RECORDS_BY_KEY,
+        frame=("symbol", "timezone"),
+        echo={
+            "data_type": {"type": "string"},
+            "errors": {
+                "type": "object",
+                "description": "Per-section upstream errors on partial success.",
+            },
+        },
+    ),
+)
+
+
 @mcp.tool()
 async def get_short_data(
     symbol: str,
@@ -377,7 +411,7 @@ async def get_short_data(
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
     limit: int = 20,
-) -> dict:
+) -> _OUT_GET_SHORT_DATA:
     """Fetch short interest and/or short volume for a US stock (short-squeeze work).
 
     Short interest is FINRA bi-monthly (settlement_date); short volume is daily

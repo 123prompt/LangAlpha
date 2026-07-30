@@ -49,6 +49,8 @@ except ModuleNotFoundError:  # imported as a package module (tests)
         normalize_interval,
     )
 
+from mcp_servers._schemas import RECORDS, envelope_schema, output_model
+
 
 # ---------------------------------------------------------------------------
 # Client
@@ -114,6 +116,16 @@ def _ginlix_error(result: dict, **context: Any) -> dict:
 mcp = MCPServer("OptionsMCP", lifespan=_lifespan)
 
 
+_OUT_GET_OPTIONS_CHAIN = output_model(
+    "GetOptionsChainOut",
+    envelope_schema(
+        RECORDS,
+        frame=("symbol", "currency", "timezone"),
+        echo={"underlying_ticker": {"type": "string"}},
+    ),
+)
+
+
 @mcp.tool()
 async def get_options_chain(
     underlying_ticker: str,
@@ -123,7 +135,7 @@ async def get_options_chain(
     strike_price_gte: Optional[float] = None,
     strike_price_lte: Optional[float] = None,
     limit: int = 50,
-) -> dict:
+) -> _OUT_GET_OPTIONS_CHAIN:
     """List options contracts for an underlying; use to discover/filter contracts.
 
     Filter by call/put, expiration range, and strike range. ginlix-data only.
@@ -178,13 +190,19 @@ async def get_options_chain(
     )
 
 
+_OUT_GET_OPTIONS_PRICES = output_model(
+    "GetOptionsPricesOut",
+    envelope_schema(RECORDS, frame=("symbol", "interval", "currency", "timezone")),
+)
+
+
 @mcp.tool()
 async def get_options_prices(
     options_ticker: str,
     from_date: str,
     to_date: str,
     interval: str = "1day",
-) -> dict:
+) -> _OUT_GET_OPTIONS_PRICES:
     """Fetch OHLCV bars for one options contract; use for option price history.
 
     Intervals: 1min|5min|15min|30min|1hour|4hour|1day|1week|1month (aliases like
@@ -240,10 +258,16 @@ async def get_options_prices(
     )
 
 
+_OUT_GET_OPTIONS_SNAPSHOT = output_model(
+    "GetOptionsSnapshotOut",
+    envelope_schema(RECORDS, frame=("currency", "timezone")),
+)
+
+
 @mcp.tool()
 async def get_options_snapshot(
     options_tickers: str,
-) -> dict:
+) -> _OUT_GET_OPTIONS_SNAPSHOT:
     """Fetch real-time snapshots for options contracts; use for live quotes.
 
     Session OHLCV is always present; bid/ask and last trade populate during
