@@ -366,6 +366,9 @@ class TestInhouseFetchAdapter:
         assert error.type == expected
         assert error.retryable is retryable
         assert error.provider_fault is provider_fault
+        # Several outcomes normalize to PROVIDER_ERROR; the crawler's own name
+        # is what keeps them apart in the attempt telemetry.
+        assert error.native_kind == error_type
 
     async def test_unmapped_outcome_is_not_a_provider_fault(self, monkeypatch):
         """An unrecognized outcome must not be able to open the breaker."""

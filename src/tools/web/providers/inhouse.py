@@ -69,6 +69,7 @@ class InhouseFetchAdapter:
                     message="Crawl was cancelled",
                     retryable=False,
                     provider_fault=False,
+                    native_kind=kind,
                 ),
             )
         mapped = _ERROR_TYPES.get(kind)
@@ -84,6 +85,7 @@ class InhouseFetchAdapter:
                 type=error_type,
                 message=str(result.error or kind)[:300],
                 provider_fault=provider_fault,
+                native_kind=kind,
             ),
         )
 

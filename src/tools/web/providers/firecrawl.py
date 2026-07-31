@@ -169,6 +169,7 @@ class FirecrawlFetchAdapter:
                     type=WebErrorType.PROVIDER_ERROR,
                     message=clip_error(f"[{code}] {message}" if code else message),
                     provider_fault=False,
+                    native_kind=str(code).lower() if code else None,
                 ),
             )
 
