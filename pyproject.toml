@@ -48,6 +48,7 @@ dependencies = [
     "youtube-transcript-api>=1.0.0",
     "playwright",
     "fastapi>=0.110.0",
+    "anyio>=4.0.0",
     "uvicorn>=0.27.1",
     "websockets>=12.0",
     "pandas>=2.2.3",
