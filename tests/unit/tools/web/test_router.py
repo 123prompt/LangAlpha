@@ -1,5 +1,6 @@
 """Tests for src/tools/web/router.py — chain semantics with fake adapters."""
 
+import logging
 from typing import Dict, List
 
 import pytest
@@ -429,6 +430,36 @@ class TestChainSemantics:
         assert not flaky.calls  # breaker open → provider never called
         assert second.provider == "inhouse"
         assert "flaky" not in second.providers_tried
+
+    async def test_breaker_open_log_carries_provider_and_cause(self, make_router, caplog):
+        """The transition is the only line emitted — routine failures stay
+        silent, so the one warning has to name the breaker and what opened it."""
+        flaky = FakeAdapter("flaky", {URL_A: WebErrorType.PROVIDER_ERROR})
+        router = make_router([flaky, FakeAdapter("inhouse", {})])
+        router._chain[0].breaker.failure_threshold = 1
+
+        with caplog.at_level(logging.WARNING, logger="src.tools.web.breaker"):
+            await router.fetch(FetchRequest(urls=[URL_A]))
+
+        opened = [r.getMessage() for r in caplog.records if "opening after" in r.getMessage()]
+        assert len(opened) == 1
+        assert "[fetch:flaky]" in opened[0]
+        assert "provider_error" in opened[0] and "scripted" in opened[0]
+
+    async def test_healthy_failures_emit_no_breaker_log(self, make_router, caplog):
+        """Target-side failures are routine; they must not log at all."""
+        flaky = FakeAdapter(
+            "flaky",
+            {URL_A: WebError(type=WebErrorType.PROVIDER_ERROR, message="Target server error",
+                             provider_fault=False)},
+        )
+        router = make_router([flaky, FakeAdapter("inhouse", {})])
+        router._chain[0].breaker.failure_threshold = 1
+
+        with caplog.at_level(logging.WARNING, logger="src.tools.web.breaker"):
+            await router.fetch(FetchRequest(urls=[URL_A]))
+
+        assert caplog.records == []
 
     async def test_target_fault_errors_do_not_trip_breaker(self, make_router):
         """All-URL failures that are the TARGET's fault (429/5xx from the

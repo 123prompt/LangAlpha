@@ -134,7 +134,7 @@ def build_chain(providers: List[str]) -> List["_ChainEntry"]:
                 provider=spec,
                 capability=cap,
                 adapter=builder(),
-                breaker=CircuitBreaker(),
+                breaker=CircuitBreaker(name=f"fetch:{name}"),
             )
         )
     return entries
@@ -335,7 +335,9 @@ class FetchRouter:
                 # its breaker. Per-URL failures (timeouts, anti_bot, and
                 # target-side 429/5xx) don't: a down target site must not
                 # open the shared provider breaker.
-                await entry.breaker.record_failure()
+                await entry.breaker.record_failure(
+                    reason="; ".join(str(r.error) for r in results if r.error)
+                )
 
             pending = [u for u in pending if u not in final]
             if not pending:
