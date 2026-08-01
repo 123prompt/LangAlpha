@@ -7,12 +7,15 @@
 import { isToolResultFailure } from './subagentStatus';
 import {
   WORKFLOW_TASK_TYPE, applyWorkflowLifecycle, isWorkflowRunTerminal, workflowRunDisplayStatus,
-  type WorkflowLifecycleFrame,
+  workflowRunStatusFromLedger,
+  type WorkflowLifecycleFrame, type WorkflowRunState,
 } from './workflowRunState';
 import type { MessageRecord, ToolCallRecord, ToolCallResultRecord } from '../../hooks/utils/types';
 import { getOrCreateTaskRefs, extractLastReasoningTitle } from '../streamRefs';
 import { isTaskAgentId } from '../../utils/agentId';
-import type { StreamRefs, ToolCallChunkRecord, UpdateSubagentCard } from '../streamRefs';
+import type {
+  StreamRefs, TaskRefs, ToolCallChunkRecord, UpdateSubagentCard,
+} from '../streamRefs';
 
 export function isSubagentEvent(event: Record<string, unknown> | null | undefined): boolean {
   return isTaskAgentId(event?.agent);
@@ -631,6 +634,74 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
  * `run_started` is the lane epoch: a full-lane (re)delivery rebuilds from
  * scratch instead of double-appending onto carried state.
  */
+/** Reduce one lifecycle frame into the run's state and stamp its card.
+ *
+ *  Split out so ledger-driven settlement shares it: `applyWorkflowLifecycle`
+ *  must stay the only writer of `workflowRun.status`, or a second writer and
+ *  the card's `run?.status ?? status` read can disagree about whether the run
+ *  ended. */
+function reduceWorkflowRunFrame(
+  taskId: string,
+  taskRefs: TaskRefs,
+  prev: WorkflowRunState | undefined,
+  event: WorkflowLifecycleFrame,
+  updateSubagentCard: UpdateSubagentCard,
+): void {
+  const next = applyWorkflowLifecycle(prev, event);
+  taskRefs.workflowRun = next;
+
+  const terminal = isWorkflowRunTerminal(next.status);
+  updateSubagentCard(taskId, {
+    type: WORKFLOW_TASK_TYPE,
+    workflowRun: next,
+    status: terminal ? workflowRunDisplayStatus(next.status) : 'active',
+    ...(terminal ? { isActive: false, ...(next.error ? { error: next.error } : {}) } : {}),
+  });
+}
+
+/**
+ * Settle a workflow run whose lane closed without a terminal lifecycle frame.
+ *
+ * The driver mints `workflow_lifecycle`, so a worker that dies mid-run emits
+ * none — recovery appends only `run_end`, which carries the ledger outcome but
+ * lands on the card's own status, where `workflowRun.status` shadows it. The
+ * card would spin until a reload, and reconnecting does not help: the client
+ * re-attaches and replays the same frames. Synthesizing the terminal frame the
+ * history projector already synthesizes on replay settles it live, and keeps
+ * both paths agreeing on the verdict.
+ */
+export function settleWorkflowRunFromClosure({
+  taskId, outcome, subagentStateRefs, updateSubagentCard,
+}: {
+  taskId: string;
+  outcome: string | null | undefined;
+  subagentStateRefs: Record<string, TaskRefs>;
+  updateSubagentCard: UpdateSubagentCard | null;
+}): boolean {
+  if (!taskId || !updateSubagentCard) return false;
+  const taskRefs = subagentStateRefs[taskId];
+  const prev = taskRefs?.workflowRun;
+  // Only a workflow run still believing it is running needs this — a run that
+  // got its own terminal frame carries richer truth (result, totals) than the
+  // ledger outcome, so it must never be overwritten.
+  if (!prev || isWorkflowRunTerminal(prev.status)) return false;
+  const status = workflowRunStatusFromLedger(outcome);
+  if (!status) return false;
+  reduceWorkflowRunFrame(
+    taskId,
+    taskRefs,
+    prev,
+    {
+      phase: 'run_completed',
+      status,
+      // The projector's fallback text: `run_end` carries no failure detail.
+      ...(status === 'completed' ? {} : { error: `run ended: ${outcome}` }),
+    } as WorkflowLifecycleFrame,
+    updateSubagentCard,
+  );
+  return true;
+}
+
 export function handleWorkflowLifecycle({ taskId, event, refs, updateSubagentCard }: {
   taskId: string;
   event: WorkflowLifecycleFrame;
@@ -643,16 +714,7 @@ export function handleWorkflowLifecycle({ taskId, event, refs, updateSubagentCar
 
   const taskRefs = getOrCreateTaskRefs(refs, taskId);
   const prev = event.phase === 'run_started' ? undefined : taskRefs.workflowRun;
-  const next = applyWorkflowLifecycle(prev, event);
-  taskRefs.workflowRun = next;
-
-  const terminal = isWorkflowRunTerminal(next.status);
-  updateSubagentCard(taskId, {
-    type: WORKFLOW_TASK_TYPE,
-    workflowRun: next,
-    status: terminal ? workflowRunDisplayStatus(next.status) : 'active',
-    ...(terminal ? { isActive: false, ...(next.error ? { error: next.error } : {}) } : {}),
-  });
+  reduceWorkflowRunFrame(taskId, taskRefs, prev, event, updateSubagentCard);
 
   // Stamp identity + ownership on the child's floating card as it is
   // dispatched, before its own lane streams anonymous content — the sidebar

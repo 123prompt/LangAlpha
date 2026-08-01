@@ -539,6 +539,56 @@ async def test_append_ui_record_advances_recorded_branch_tip(monkeypatch):
     assert kwargs["to_checkpoint_id"] != kwargs["from_checkpoint_id"]
 
 
+async def test_append_ui_record_anchors_to_the_tip_it_read(monkeypatch):
+    # A turn starting on another worker between the tip read and the append
+    # must not re-parent the record onto that turn's uncommitted checkpoint:
+    # the CAS guard is the tip that was read, so an unanchored write would
+    # still pass it and publish partial state as the thread's commit pointer.
+    saver = InMemorySaver()
+    graph = _echo_graph(saver)
+    await _run_turns(graph, 1)
+    reader = CheckpointHistoryReader(saver)
+    root_cfg = {"configurable": {"thread_id": THREAD}}
+    stale_tip = await saver.aget_tuple(root_cfg)
+    stale_id = stale_tip.config["configurable"]["checkpoint_id"]
+
+    # The concurrent turn lands. It has not finalized, so the recorded pointer
+    # still names the turn-1 tip — which is exactly why the CAS would pass.
+    await _run_turns(graph, 1, start=1)
+    moved = await saver.aget_tuple(root_cfg)
+    moved_id = moved.config["configurable"]["checkpoint_id"]
+    assert moved_id != stale_id
+
+    class _StaleTip:
+        """Models the read/write window: the reader holds the older tip."""
+
+        async def aget_tuple(self, config):
+            return stale_tip
+
+    monkeypatch.setattr(reader, "_checkpointer", _StaleTip())
+    advance = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "src.server.database.conversation.threads_write."
+        "advance_thread_checkpoint_id",
+        advance,
+    )
+
+    await reader.append_ui_record(THREAD, "image_capture", {"path_to_url": {}})
+
+    kwargs = advance.await_args.kwargs
+    assert kwargs["from_checkpoint_id"] == stale_id
+    written = await saver.aget_tuple(
+        {
+            "configurable": {
+                "thread_id": THREAD,
+                "checkpoint_id": kwargs["to_checkpoint_id"],
+            }
+        }
+    )
+    # The guard and the write agree on one parent — the whole point.
+    assert written.parent_config["configurable"]["checkpoint_id"] == stale_id
+
+
 async def test_task_ui_snapshot_readable_through_reader():
     # Cross-layer contract: the workflow driver persists its terminal ui
     # snapshot middleware-side (through the run's own checkpointer, so the

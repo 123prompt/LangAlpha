@@ -409,6 +409,14 @@ class CheckpointHistoryReader:
         sits beyond the recorded branch tip where the replay walk cannot see
         it — the recorded tip is CAS-advanced onto the new checkpoint (no-op
         when a concurrent turn or branch switch moved the tip first).
+
+        The append is anchored to the tip it read rather than to the
+        checkpointer's latest, because the same value is also the CAS guard:
+        left unanchored, a turn that starts on another worker between the read
+        and the write re-parents the record onto that turn's uncommitted
+        checkpoint while the CAS still passes, publishing partial state as the
+        thread's commit pointer. Anchoring costs a dead-branch record when the
+        tip moves — which is the no-op case this already accepts.
         """
         try:
             tip = await self._checkpointer.aget_tuple(
@@ -439,14 +447,27 @@ class CheckpointHistoryReader:
             "props": props,
             "metadata": {},
         }
+        tip_cfg = (tip.config.get("configurable") or {}) if tip is not None else {}
+        built_on = tip_cfg.get("checkpoint_id")
+        configurable: dict[str, Any] = {"thread_id": thread_id}
+        if built_on:
+            # The saver keys a write by (thread_id, checkpoint_ns, checkpoint_id),
+            # so the namespace has to ride along with the id.
+            configurable["checkpoint_ns"] = tip_cfg.get("checkpoint_ns", "")
+            configurable["checkpoint_id"] = built_on
         new_config = await self._updater.aupdate_state(
-            {"configurable": {"thread_id": thread_id}}, {"ui": [record]}
+            {"configurable": configurable}, {"ui": [record]}
         )
-        await self._advance_branch_tip(thread_id, tip, new_config)
+        await self._advance_branch_tip(thread_id, built_on, new_config)
 
     async def _advance_branch_tip(
-        self, thread_id: str, tip: Any, new_config: Any
+        self, thread_id: str, built_on: str | None, new_config: Any
     ) -> None:
+        """CAS the recorded tip from the checkpoint the append was anchored to.
+
+        ``built_on`` is the caller's write anchor, not a re-read: passing the
+        same value to both is what keeps the guard honest.
+        """
         from src.server.database.conversation.threads_write import (
             advance_thread_checkpoint_id,
         )
@@ -456,11 +477,6 @@ class CheckpointHistoryReader:
         )
         if not new_id:
             return
-        built_on = (
-            tip.config.get("configurable", {}).get("checkpoint_id")
-            if tip is not None
-            else None
-        )
         await advance_thread_checkpoint_id(
             thread_id, from_checkpoint_id=built_on, to_checkpoint_id=new_id
         )

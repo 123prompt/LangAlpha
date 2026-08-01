@@ -8,6 +8,7 @@
 import type { AssistantMessage, SubagentTask } from '@/types/chat';
 import { getThreadMux, type ThreadMuxSink } from '../stream/threadStreamMux';
 import { isTerminalStatus, normalizeWireStatus } from './subagentStatus';
+import { settleWorkflowRunFromClosure } from './liveEventHandlers';
 import { isTaskAgentId, taskIdFromAgentId } from '../../utils/agentId';
 import type { SSEEvent } from '../types';
 import type { SubagentRuntime } from '../runtime';
@@ -142,6 +143,16 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
       if (rt.updateSubagentCard) {
         rt.updateSubagentCard(`task:${shortTaskId}`, { status, isActive: false });
       }
+      // A workflow run reads its own lifecycle state ahead of the card status,
+      // so the stamp above is invisible to it. When the lane closed without a
+      // terminal lifecycle frame — the driver died with its worker — settle it
+      // from the ledger outcome the closure carried.
+      settleWorkflowRunFromClosure({
+        taskId: `task:${shortTaskId}`,
+        outcome,
+        subagentStateRefs: rt.subagentStateRefsRef.current,
+        updateSubagentCard: rt.updateSubagentCard,
+      });
       // Flip ONLY the just-closed task's inline chips, with its real outcome.
       // Positive closure per task — never a sweep over siblings: a sibling
       // with no open channel is not terminal (its chan_open may simply not

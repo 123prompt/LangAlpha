@@ -205,6 +205,22 @@ export function workflowRunCardKind(
   }
 }
 
+/** Map a run-ledger outcome onto a run status, mirroring the history
+ *  projector's `_mapped_run_status`. `null` while the row is absent or still
+ *  open — nothing to reconcile.
+ *
+ *  The two must agree: a run whose worker died settles from this on the live
+ *  stream and from the projector's synthesis after a reload, and a viewer who
+ *  reloads must not watch the card change verdict. */
+export function workflowRunStatusFromLedger(
+  ledgerStatus: string | null | undefined,
+): WorkflowRunTerminalStatus | null {
+  if (!ledgerStatus || ledgerStatus === 'in_progress') return null;
+  if (ledgerStatus === 'completed') return 'completed';
+  if (ledgerStatus === 'cancelled') return 'cancelled';
+  return 'failed';
+}
+
 /** Map a child's status onto the subagent card vocabulary so a replayed or
  *  lazily hydrated child lands with its real terminal state. `undefined` while
  *  the child is still running — the caller decides what an unsettled child
