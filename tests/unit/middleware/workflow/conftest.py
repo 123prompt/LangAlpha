@@ -37,10 +37,14 @@ class FakeBackend:
             raise FileNotFoundError(path)
         return self.files[path]
 
-    async def awrite_text(self, path: str, content: str) -> None:
+    async def awrite_text(self, path: str, content: str) -> bool:
+        # Returns the real backends' success bool, not None: the driver treats
+        # a falsy write as "did not land", so a fake that shrugs would make
+        # every artifact look lost.
         if self.fail_writes:
             raise OSError("read only")
         self.writes[path] = content
+        return True
 
 
 class FakeSandbox:

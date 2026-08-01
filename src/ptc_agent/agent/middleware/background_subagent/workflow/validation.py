@@ -54,11 +54,6 @@ def validate_dispatch(
         raise DispatchValidationError("opts must be a plain object")
     if not isinstance(prompt, str) or not prompt:
         raise DispatchValidationError("prompt must be a non-empty string")
-    if len(prompt) > caps.max_prompt_chars:
-        raise DispatchValidationError(
-            f"prompt is {len(prompt)} chars; max_prompt_chars cap is "
-            f"{caps.max_prompt_chars}"
-        )
 
     for key in ("model", "effort", "isolation"):
         if key in opts:
@@ -81,13 +76,51 @@ def validate_dispatch(
     if schema is not None:
         _validate_schema(schema, caps)
 
+    effective_prompt = compose_child_prompt(prompt, schema)
+    check_prompt_cap(effective_prompt, caps)
+
     return {
         "subagent_type": subagent_type,
-        "prompt": prompt,
+        "prompt": effective_prompt,
         "label": normalized_label,
         "phase": normalized_phase,
         "schema": schema,
     }
+
+
+def compose_child_prompt(
+    prompt: str,
+    schema: dict[str, Any] | None,
+    *,
+    validation_error: str | None = None,
+) -> str:
+    """The text a child is actually sent.
+
+    One composer for the first dispatch and the corrective retry, so the cap
+    below governs what goes out rather than the caller's fragment of it.
+    """
+    parts = [prompt]
+    if validation_error:
+        parts.append(f"Your previous response failed validation: {validation_error}")
+    if schema is not None:
+        parts.append(schema_instruction(schema))
+    return "\n\n".join(parts)
+
+
+def check_prompt_cap(prompt: str, caps: WorkflowOrchestrationConfig) -> None:
+    """Admit a composed prompt against the operator's cap.
+
+    Refuses rather than clips: a silently shortened prompt drops instructions
+    the script believed it sent, and the child's answer then reflects a task
+    nobody can reconstruct from the run record.
+    """
+    if len(prompt) > caps.max_prompt_chars:
+        # Measures the composed text, so the count can exceed what the script
+        # passed — a schema's response-format contract rides along with it.
+        raise DispatchValidationError(
+            f"prompt is {len(prompt)} chars as sent; max_prompt_chars cap is "
+            f"{caps.max_prompt_chars}"
+        )
 
 
 def schema_instruction(schema: dict[str, Any]) -> str:
@@ -123,7 +156,16 @@ def parse_schema_result(
         try:
             validator_for(schema)(schema, registry=_NO_REMOTE_REFS).validate(instance)
         except jsonschema_exceptions.ValidationError as error:
-            return str(error)
+            # `str(error)` pretty-prints the failing instance, so the reason
+            # for a rejected 90KB reply is a ~100KB string that is mostly that
+            # reply — echoed back at the child that just wrote it, and large
+            # enough on its own to overrun the prompt cap on the retry. The
+            # message plus its location is the whole signal; the instance is
+            # already on the record as `result` and `full_result_ref`.
+            location = error.json_path
+            if location and location != "$":
+                return f"{error.message} (at {location})"
+            return error.message
         except Unresolvable as error:
             # A ref the gate did not catch: unresolvable rather than fetched.
             # Reported like a mismatch so one bad schema fails its own child

@@ -341,25 +341,29 @@ class WorkflowOrchestrationConfig(BaseModel):
         default=8, ge=1, le=32, description="Max concurrently running children"
     )
     child_timeout: int = Field(
-        default=600, ge=1, le=7200, description="Per-child subagent timeout in seconds"
+        default=1800, ge=1, le=7200, description="Per-child subagent timeout in seconds"
     )
     run_timeout: int = Field(
-        default=1800,
+        default=14400,
         ge=1,
         le=86400,
-        description="Whole-run wall-clock timeout in seconds",
+        description=(
+            "Whole-run wall-clock timeout in seconds; must clear "
+            "ceil(max_dispatches_per_run / max_concurrent_children) waves of "
+            "child_timeout or the run dies before its children do"
+        ),
     )
     max_runs_per_thread: int = Field(
         default=2, ge=1, le=8, description="Max concurrently active runs per thread"
     )
     max_result_bytes: int = Field(
-        default=262144,
+        default=1024 * 1024,
         ge=1024,
         le=16 * 1024 * 1024,
         description="Per-child result dump cap; larger results are truncated",
     )
     max_prompt_chars: int = Field(
-        default=100_000,
+        default=400_000,
         ge=1,
         le=1_000_000,
         description="Per-dispatch prompt length cap",

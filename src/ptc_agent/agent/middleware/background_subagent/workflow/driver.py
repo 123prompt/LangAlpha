@@ -35,8 +35,9 @@ from ptc_agent.agent.middleware.background_subagent.workflow.ui_snapshot import 
 )
 from ptc_agent.agent.middleware.background_subagent.workflow.validation import (
     DispatchValidationError,
+    check_prompt_cap,
+    compose_child_prompt,
     parse_schema_result,
-    schema_instruction,
     validate_dispatch,
 )
 from src.config.models import WorkflowOrchestrationConfig
@@ -279,10 +280,22 @@ class WorkflowDriver:
             return _Terminal(error=f"Workflow {outcome.status}: {outcome.error}")
 
         result_json = json.dumps(outcome.result, ensure_ascii=False, default=str)
-        await self._write_json("result.json", outcome.result)
+        wrote_full = await self._write_json("result.json", outcome.result)
         display_result, truncated = truncate_to_bytes(
             result_json, self.spec.caps.max_result_bytes
         )
+        if truncated and not wrote_full:
+            # The clipped copy is all that is left and the file holding the
+            # rest never landed. Reporting success here would hand the agent a
+            # result_ref to nothing and silently drop the omitted portion, so
+            # the run fails with the reason instead.
+            return _Terminal(
+                error=(
+                    f"Result is {len(result_json)} bytes and was truncated for "
+                    f"display, but {self.base_rel}/result.json could not be "
+                    f"written — the full result would be unrecoverable"
+                )
+            )
         summary = (
             f"Workflow '{self.spec.meta.name}' completed: "
             f"{self._dispatched} subagent dispatch(es).\n"
@@ -290,13 +303,15 @@ class WorkflowDriver:
             f"Run files: {self.base_rel}/ "
             f"(per-child records under children/)"
         )
-        await self._archive_result(summary, truncated=truncated)
+        await self._archive_result(summary, truncated=truncated, has_full=wrote_full)
         return _Terminal(
             summary=summary,
             result_preview=self._emitter.clip_result_preview(result_json),
         )
 
-    async def _archive_result(self, text: str, *, truncated: bool) -> None:
+    async def _archive_result(
+        self, text: str, *, truncated: bool, has_full: bool
+    ) -> None:
         """Persist the run's TaskOutput text before anything reports success.
 
         Not best-effort, and ahead of the ``run_completed`` emit rather than
@@ -322,7 +337,9 @@ class WorkflowDriver:
             task_run_id=task_run_id,
             text=text,
             truncated=truncated,
-            result_ref=f"{self.base_rel}/result.json",
+            # Only advertise the file when it landed — a ref to a missing path
+            # reads as "the rest is over there" and sends the agent nowhere.
+            result_ref=f"{self.base_rel}/result.json" if has_full else None,
         )
 
     def phase(self, title: str) -> None:
@@ -356,14 +373,11 @@ class WorkflowDriver:
         phase = rec["phase"] or self._emitter.current_phase
         label = rec["label"] or prompt[:60]
         schema = rec["schema"]
-        effective_prompt = prompt
-        if schema is not None:
-            effective_prompt = f"{prompt}\n\n{schema_instruction(schema)}"
 
         child = await self._dispatch_child(
             seq=seq,
             rec=rec,
-            prompt=effective_prompt,
+            prompt=rec["prompt"],
             label=label,
             phase=phase,
             schema=schema,
@@ -377,11 +391,17 @@ class WorkflowDriver:
 
         if self._cap_reached():
             return None
-        self._dispatched += 1
-        retry_prompt = (
-            f"{prompt}\n\nYour previous response failed validation: {child.error}\n\n"
-            f"{schema_instruction(schema)}"
+        retry_prompt = compose_child_prompt(
+            prompt, schema, validation_error=child.error
         )
+        try:
+            # The retry is a dispatch like any other, so it clears the same cap
+            # — the first one passing says nothing about a prompt that has since
+            # grown a validation error.
+            check_prompt_cap(retry_prompt, self.spec.caps)
+        except DispatchValidationError as error:
+            raise WorkflowHostError(str(error)) from error
+        self._dispatched += 1
         retry = await self._dispatch_child(
             seq=self._next_seq(),
             rec=rec,
@@ -646,12 +666,19 @@ class WorkflowDriver:
         await self._write_json("status.json", payload)
         await self._emitter.persist_snapshot()
 
-    async def _write_json(self, path: str, value: Any) -> None:
+    async def _write_json(self, path: str, value: Any) -> bool:
+        """Write one run artifact; False if it did not land.
+
+        Most artifacts are best-effort and ignore the result — ``result.json``
+        does not, because it is the only full copy of a truncated result.
+        """
         full_path = f"{self.base_rel}/{path}"
         try:
-            await self.spec.backend.awrite_text(
-                full_path,
-                json.dumps(value, ensure_ascii=False, default=str),
+            return bool(
+                await self.spec.backend.awrite_text(
+                    full_path,
+                    json.dumps(value, ensure_ascii=False, default=str),
+                )
             )
         except Exception:
             logger.debug(
@@ -659,3 +686,4 @@ class WorkflowDriver:
                 path=full_path,
                 exc_info=True,
             )
+            return False

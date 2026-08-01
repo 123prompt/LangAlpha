@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from ptc_agent.agent.middleware.background_subagent.workflow.validation import (
     DispatchValidationError,
+    compose_child_prompt,
     validate_dispatch,
 )
 from src.config.models import WorkflowOrchestrationConfig
@@ -155,3 +156,40 @@ def test_new_config_field_bounds_are_active() -> None:
         WorkflowOrchestrationConfig(memory_limit_mb=15)
     with pytest.raises(ValidationError):
         WorkflowOrchestrationConfig(max_dispatches_per_run=0)
+
+
+def test_the_cap_governs_the_prompt_that_is_actually_sent() -> None:
+    """A schema adds its response-format contract to every dispatch, so a base
+    prompt that fits can still put the real prompt over the operator's cap."""
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    base = "p" * 150
+    caps = WorkflowOrchestrationConfig(max_prompt_chars=200)
+
+    # Fits on its own — and would have passed when only the base was checked.
+    assert len(base) <= caps.max_prompt_chars
+    with pytest.raises(DispatchValidationError, match="max_prompt_chars"):
+        _validate(prompt=base, opts={"schema": schema}, caps=caps)
+
+
+def test_the_returned_prompt_is_the_composed_one() -> None:
+    rec = _validate(
+        prompt="summarize it",
+        opts={"schema": {"type": "object", "properties": {"ok": {"type": "boolean"}}}},
+    )
+    assert rec["prompt"].startswith("summarize it")
+    assert "RESPONSE FORMAT REQUIREMENT" in rec["prompt"]
+
+
+def test_a_retry_composes_longer_than_the_dispatch_it_corrects() -> None:
+    """Why the retry gets its own cap check: it carries everything the first
+    dispatch did, plus the reason the first one failed."""
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    first = compose_child_prompt("do it", schema)
+    retry = compose_child_prompt(
+        "do it", schema, validation_error="'ok' is a required property"
+    )
+
+    assert retry.startswith("do it")
+    assert "'ok' is a required property" in retry
+    assert "RESPONSE FORMAT REQUIREMENT" in retry
+    assert len(retry) > len(first)

@@ -492,6 +492,43 @@ async def test_run_result_is_truncated_only_in_summary() -> None:
     assert len(json.loads(backend.writes[f"{driver.base_rel}/result.json"])) == 100
 
 
+def _fail_writing(backend: Any, filename: str) -> None:
+    """Make one artifact's write report failure, as a full sandbox would."""
+    real_write = backend.awrite_text
+
+    async def failing(path: str, content: str) -> bool:
+        if path.endswith(f"/{filename}"):
+            return False
+        return await real_write(path, content)
+
+    backend.awrite_text = failing
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_result_fails_when_its_full_copy_did_not_land() -> None:
+    """The clipped summary plus a missing result.json loses the remainder for
+    good, so the run must not report success and hand out a ref to nothing."""
+    driver, _, _, backend = await _make_driver(
+        _script("return 'x'.repeat(100);"),
+        caps=_caps(max_result_bytes=20),
+    )
+    _fail_writing(backend, "result.json")
+
+    with pytest.raises(WorkflowRunError, match="unrecoverable"):
+        await driver.run()
+
+
+@pytest.mark.asyncio
+async def test_a_complete_result_survives_a_failed_artifact_write() -> None:
+    """Nothing was omitted, so the summary already carries the whole result and
+    the missing file costs the caller nothing — only truncation makes it load
+    bearing."""
+    driver, _, _, backend = await _make_driver(_script("return 'small';"))
+    _fail_writing(backend, "result.json")
+
+    assert "small" in await driver.run()
+
+
 @pytest.mark.asyncio
 async def test_result_preview_tracks_the_result_cap() -> None:
     """The panel never shows more of the result than the run's own result cap

@@ -8,6 +8,8 @@ corrective re-dispatch and then a null in the script.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from ptc_agent.agent.middleware.background_subagent.workflow.validation import (
@@ -107,3 +109,21 @@ def test_the_candidate_that_satisfies_the_schema_wins() -> None:
     )
     assert valid
     assert parsed == {"ok": True}
+
+
+def test_a_rejection_reports_the_reason_not_the_reply() -> None:
+    """The reason travels back to the child in its retry prompt, so it carries
+    the diagnosis only. ``str(ValidationError)`` pretty-prints the offending
+    instance, which for a large reply is ~100KB of the child's own words — big
+    enough on its own to overrun the dispatch prompt cap.
+    """
+    reply = json.dumps({"rows": [{"note": "n" * 200} for _ in range(400)]})
+
+    valid, parsed, error = parse_schema_result(reply, SCHEMA)
+
+    assert not valid
+    assert parsed is None
+    assert "'ok' is a required property" in error
+    # The reply is already on the record as `result` / `full_result_ref`.
+    assert "n" * 200 not in error
+    assert len(error) < 200, f"reason echoed the reply back ({len(error)} chars)"
