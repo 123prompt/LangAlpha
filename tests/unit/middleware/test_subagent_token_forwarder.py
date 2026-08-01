@@ -340,25 +340,11 @@ async def test_arun_subagent_streaming_emits_error_event_on_exception(monkeypatc
     fake_subagent.astream = fake_astream
 
     tool = sa._create_task_tool(
-        default_model=MagicMock(),
-        default_tools=[],
-        default_middleware=[],
-        default_interrupt_on=None,
-        subagents=[],
-        general_purpose_agent=False,
+        subagent_graphs={"general-purpose": fake_subagent},
         registry=registry,
         checkpointer=None,
     )
     coroutine = tool.coroutine
-    closure_vars = {
-        cell_name: cell.cell_contents
-        for cell_name, cell in zip(
-            coroutine.__code__.co_freevars,
-            coroutine.__closure__ or (),
-        )
-    }
-    sg = closure_vars["subagent_graphs"]
-    sg["general-purpose"] = fake_subagent
 
     runtime = MagicMock()
     runtime.state = {"messages": []}
@@ -552,25 +538,11 @@ async def test_atask_pipeline_forwards_messages_chunks_to_registry(monkeypatch):
     fake_subagent.astream = fake_astream
 
     tool = sa._create_task_tool(
-        default_model=MagicMock(),
-        default_tools=[],
-        default_middleware=[],
-        default_interrupt_on=None,
-        subagents=[],
-        general_purpose_agent=False,
+        subagent_graphs={"general-purpose": fake_subagent},
         registry=registry,
         checkpointer=None,
     )
     coroutine = tool.coroutine
-    closure_vars = {
-        cell_name: cell.cell_contents
-        for cell_name, cell in zip(
-            coroutine.__code__.co_freevars,
-            coroutine.__closure__ or (),
-        )
-    }
-    sg = closure_vars["subagent_graphs"]
-    sg["general-purpose"] = fake_subagent
 
     runtime = MagicMock()
     runtime.state = {"messages": []}
@@ -749,25 +721,11 @@ async def test_atask_pipeline_forwards_custom_events_to_registry(monkeypatch):
     fake_subagent.astream = fake_astream
 
     tool = sa._create_task_tool(
-        default_model=MagicMock(),
-        default_tools=[],
-        default_middleware=[],
-        default_interrupt_on=None,
-        subagents=[],
-        general_purpose_agent=False,
+        subagent_graphs={"general-purpose": fake_subagent},
         registry=registry,
         checkpointer=None,
     )
     coroutine = tool.coroutine
-    closure_vars = {
-        cell_name: cell.cell_contents
-        for cell_name, cell in zip(
-            coroutine.__code__.co_freevars,
-            coroutine.__closure__ or (),
-        )
-    }
-    sg = closure_vars["subagent_graphs"]
-    sg["general-purpose"] = fake_subagent
 
     runtime = MagicMock()
     runtime.state = {"messages": []}

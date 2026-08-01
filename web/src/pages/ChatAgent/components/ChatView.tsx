@@ -12,7 +12,7 @@ import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { updateCurrentUser } from '../../Dashboard/utils/api';
-import { getWorkspace, summarizeThread, offloadThread, getThreadShareStatus, updateThreadSharing } from '../utils/api';
+import { getWorkspace, summarizeThread, offloadThread, getThreadShareStatus, updateThreadSharing, cancelSubagentTask } from '../utils/api';
 import { buildSharedServeUrl, buildWsfilesUrl } from './viewers/html/wsfilesUrl';
 import ShareReportLinkModal from './ShareReportLinkModal';
 import { toast } from '@/components/ui/use-toast';
@@ -23,6 +23,7 @@ import type { PreviewData } from '../hooks/utils/types';
 import { useCardState } from '../hooks/useCardState';
 import { useWorkspaceFiles } from '../hooks/useWorkspaceFiles';
 import { classifyAgentPath } from '../utils/agentPaths';
+import { taskIdFromAgentId } from '../utils/agentId';
 import {
   routeStopAction,
   compactionErrorCode,
@@ -35,6 +36,9 @@ import ChatInput, { type ChatInputHandle } from '../../../components/ui/chat-inp
 import { attachmentsToContexts, widgetSnapshotsToContexts, type Attachment } from '../utils/fileUpload';
 import MessageList, { normalizeSubagentText } from './MessageList';
 import { SubagentTelemetryContext } from './SubagentTelemetryContext';
+import { WorkflowRunContext } from './WorkflowRunContext';
+import WorkflowRunDetail from './WorkflowRunDetail';
+import { WORKFLOW_TASK_TYPE } from '../session/subagents/workflowRunState';
 import Markdown from './Markdown';
 import NavigationPanel from './NavigationPanel';
 import NavDisplayOptions from './NavDisplayOptions';
@@ -139,8 +143,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
 
 
-  // Ref for resolved thread ID — updated after useChatMessages, used in switchAgent
-  // to avoid referencing currentThreadId (defined later) in useCallback closure.
+  // Ref for resolved thread ID — updated after useChatMessages, handed to
+  // useSubagentTabs so its callbacks don't close over currentThreadId (defined later).
   const resolvedThreadIdRef = useRef(threadId);
 
 
@@ -328,6 +332,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     reconnectIfStaleRun,
     getSubagentHistory,
     resolveSubagentIdToAgentId,
+    hydrateTaskTranscript,
   } = useChatMessages(workspaceId, threadId, updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos, handleOnboardingRelatedToolComplete, handleFileArtifact, handleOpenPreviewFromStream, agentMode, clearSubagentCards, handleWorkspaceCreated, 'web');
 
   // Fallback-suggestion pill action: adopt the model that actually answered —
@@ -415,12 +420,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const {
     agents,
     activeAgent,
-    switchAgent,
     handleSelectAgent,
     handleOpenSubagentTask,
     handleRemoveAgent,
     handleSubagentInstruction,
     resolveSubagentTelemetry,
+    resolveWorkflowRun,
   } = useSubagentTabs({
     threadId,
     workspaceId,
@@ -432,6 +437,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     updateSubagentCard,
     getSubagentHistory,
     resolveSubagentIdToAgentId,
+    hydrateTaskTranscript,
     saveScrollPosition,
     scrollPositionsRef,
     skipSubagentAutoScrollRef,
@@ -919,7 +925,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       onThreadResolved?.(threadId, currentThreadId);
       if (isActive) {
         const activeTid = activeAgentIdRef.current !== 'main'
-          ? activeAgentIdRef.current.replace('task:', '')
+          ? taskIdFromAgentId(activeAgentIdRef.current) ?? activeAgentIdRef.current
           : null;
         const path = activeTid
           ? `/chat/t/${currentThreadId}/${activeTid}`
@@ -1149,7 +1155,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             <button
               onClick={() => {
                 if (activeAgentId !== 'main') {
-                  switchAgent('main');
+                  // Workflow-owned children step up to their run's view;
+                  // everything else returns to the main chat.
+                  handleSelectAgent(activeAgent?.ownerTaskId ?? 'main');
                 } else if (state?.fromThreadId) {
                   // Navigate back to the flash thread that dispatched this PTC thread
                   intentionalExitRef.current = true;
@@ -1167,7 +1175,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               }}
               className="p-2 rounded-md transition-colors flex-shrink-0"
               style={{ color: 'var(--color-text-primary)' }}
-              title={activeAgentId !== 'main' ? t('chat.backToMain', 'Back to main') : state?.fromThreadId ? t('chat.backToFlash', 'Back to Flash') : t('workspace.backToThreads')}
+              title={
+                activeAgentId !== 'main'
+                  ? activeAgent?.ownerTaskId
+                    ? t('chat.backToWorkflow', 'Back to workflow')
+                    : t('chat.backToMain', 'Back to main')
+                  : state?.fromThreadId ? t('chat.backToFlash', 'Back to Flash') : t('workspace.backToThreads')
+              }
               onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
               onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = ''; }}
             >
@@ -1394,6 +1408,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 but only context consumers re-render — MessageBubble /
                 MessageContentSegments stay React.memo'd. */}
             <SubagentTelemetryContext.Provider value={resolveSubagentTelemetry}>
+            <WorkflowRunContext.Provider value={resolveWorkflowRun}>
             <div
               ref={msgAreaRef}
               className="flex-1 overflow-hidden"
@@ -1459,6 +1474,28 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           handleSendMessage(`/self-improve ${instruction}`);
                         }}
                         onWidgetSendPrompt={handleSendMessage}
+                      />
+                    </div>
+                  </div>
+                </ScrollArea>
+              ) : activeAgent && activeAgent.type === WORKFLOW_TASK_TYPE ? (
+                // Workflow run detail — a run has no transcript of its own;
+                // its progress console replaces the generic subagent layout.
+                <ScrollArea ref={subagentScrollAreaRef} className="h-full w-full">
+                  <div className={`${isMobile ? 'px-3 py-3' : 'px-6 py-4'} flex justify-center`}>
+                    <div className="w-full max-w-3xl">
+                      <WorkflowRunDetail
+                        // Keyed per run: the detail owns local stop state, and
+                        // an unkeyed switch between two runs would carry it over.
+                        key={activeAgent.id}
+                        agent={activeAgent}
+                        onOpenChild={handleOpenSubagentTask}
+                        resolveChildTelemetry={resolveSubagentTelemetry}
+                        onStop={
+                          currentThreadId && currentThreadId !== '__default__'
+                            ? () => cancelSubagentTask(currentThreadId, taskIdFromAgentId(activeAgent.id) ?? activeAgent.id)
+                            : undefined
+                        }
                       />
                     </div>
                   </div>
@@ -1544,6 +1581,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 />
               )}
             </div>
+            </WorkflowRunContext.Provider>
             </SubagentTelemetryContext.Provider>
 
             {/* Input Area */}
@@ -1680,7 +1718,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       mode={isFlashMode ? 'fast' : 'ptc'}
                     />
                   </>
-                ) : activeAgent ? (
+                ) : activeAgent && activeAgent.type !== WORKFLOW_TASK_TYPE ? (
+                  // Workflow runs are script-driven and take no steering input —
+                  // the run detail above is their whole surface.
                   <SubagentStatusBar agent={activeAgent} threadId={threadId} onInstructionSent={handleSubagentInstruction} />
                 ) : null}
               </div>

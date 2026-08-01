@@ -50,6 +50,7 @@ COPY config.yaml .
 COPY agent_config.yaml .
 COPY mcp_servers/ mcp_servers/
 COPY skills/ skills/
+COPY workflows/ workflows/
 
 EXPOSE 8000
 

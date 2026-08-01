@@ -541,7 +541,7 @@
 }
 
 .widget-deck-clear:hover {
-  color: var(--color-danger, #c43d3d);
+  color: var(--color-loss);
 }
 
 /* Show-less pill — appears left of Clear when the deck is fanned. Pill
@@ -674,8 +674,8 @@
 }
 
 .widget-deck-card-remove:hover {
-  color: var(--color-danger, #c43d3d);
-  background: rgba(196, 61, 61, 0.08);
+  color: var(--color-loss);
+  background: var(--color-loss-soft);
 }
 
 /* Top card always shows its remove button. Fan-out reveals all of them. */

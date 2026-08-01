@@ -473,9 +473,10 @@ async def astream_ptc_workflow(
             session=session,
             config=config,
             subagent_names=subagents,
-            # Structural recursion gate: a notification turn's agent is
-            # built without Task/TaskOutput, so it cannot spawn background
-            # work whose completion would notify again.
+            # Optional structural gate: builds the agent without
+            # Task/TaskOutput. Task report-back turns don't set it (they
+            # need TaskOutput to fetch the result); their re-announce
+            # recursion is handled by the outbox's ledger arbitration.
             disable_subagents=bool(request.disable_subagents),
             operation_callback=None,
             # I2: the run's fenced session-bound saver when the WriterGuard

@@ -16,7 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from src.server.database import pool
-from src.server.contracts.status import TERMINAL_STATUSES
+from src.server.contracts.status import REPORT_BACK_STATUSES, TERMINAL_STATUSES
 from src.server.utils.pg_sanitize import SafeJson
 
 logger = logging.getLogger(__name__)
@@ -247,6 +247,7 @@ async def _enqueue_report_back_job(conn, run_row: Dict[str, Any]) -> None:
             "subagent_type": str(task_row.get("subagent_type") or "subagent"),
             "description": str(task_row.get("description") or "")[:500],
             "style": "pointer",
+            "final_status": str(run_row["status"]),
             "final_checkpoint_id": str(final_pin) if final_pin else None,
         },
         ordering_key=str(run_row["thread_id"]),
@@ -306,13 +307,14 @@ async def finalize_task_run(
                     ),
                 )
                 run_row = await cur.fetchone()
-            if run_row is not None and run_row["status"] == "completed":
-                # Report-back owed ⟺ run completed: the outbox row commits
-                # with the terminal CAS, so no crash window can lose the
-                # notification or record it against a run that never
-                # terminalized. Eligibility (already delivered, parent
-                # still live/interrupted) is the executor's call at claim
-                # time, against the ledger — not decided here.
+            if run_row is not None and run_row["status"] in REPORT_BACK_STATUSES:
+                # Report-back owed ⟺ the run reached a reportable outcome
+                # (REPORT_BACK_STATUSES carries the policy rationale): the
+                # outbox row commits with the terminal CAS, so no crash
+                # window can lose the notification or record it against a run
+                # that never terminalized. Eligibility (already delivered,
+                # parent still live/interrupted) is the executor's call at
+                # claim time, against the ledger — not decided here.
                 await _enqueue_report_back_job(conn, dict(run_row))
 
     if run_row is None:
@@ -510,6 +512,27 @@ async def list_open_runs_for_thread(thread_id: str) -> List[Dict[str, Any]]:
                 SELECT * FROM subagent_runs
                 WHERE thread_id = %s AND status = 'in_progress'
                 ORDER BY started_at
+                """,
+                (thread_id,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def list_open_workflow_runs_for_thread(thread_id: str) -> List[Dict[str, Any]]:
+    """Open workflow-kind runs — the cross-worker authority for RunWorkflow's
+    per-thread cap (the in-process registry only sees this worker's runs)."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT r.* FROM subagent_runs r
+                JOIN subagent_tasks t
+                  ON t.thread_id = r.thread_id AND t.task_id = r.task_id
+                WHERE r.thread_id = %s
+                  AND r.status = 'in_progress'
+                  AND t.subagent_type = 'workflow'
+                ORDER BY r.started_at
                 """,
                 (thread_id,),
             )

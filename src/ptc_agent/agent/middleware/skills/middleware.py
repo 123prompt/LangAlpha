@@ -58,6 +58,7 @@ from ptc_agent.agent.middleware.skills.discovery import (
     adiscover_skills,
 )
 from ptc_agent.agent.middleware.skills.registry import (
+    SKILL_REGISTRY,
     SkillDefinition,
     SkillMode,
     get_skill,
@@ -200,11 +201,13 @@ class SkillsMiddleware(AgentMiddleware):
         self._known_skills = known_skills or {}
         self.skill_registry = skill_registry or get_skill_registry(mode)
 
-        # Build mapping of tool names → skill names (a tool can belong to multiple skills)
+        # Build mapping of tool names → skill names (a tool can belong to multiple
+        # skills). get_tool_names() covers both registry tool objects and
+        # externally-registered tool names (per-thread factory tools like
+        # RunWorkflow that the skill gates but does not instantiate).
         self._tool_to_skills: dict[str, set[str]] = {}
         for skill_name, skill_def in self.skill_registry.items():
-            for t in skill_def.tools:
-                tool_name = getattr(t, "name", str(t))
+            for tool_name in skill_def.get_tool_names():
                 self._tool_to_skills.setdefault(tool_name, set()).add(skill_name)
 
         # Build mapping of SKILL.md paths → skill names (for PTC auto-load)
@@ -286,9 +289,12 @@ class SkillsMiddleware(AgentMiddleware):
                 ):
                     all_skills[skill["name"]] = skill
 
-            # Filter out registry skills — registry is source of truth for those
+            # Filter out registry skills — registry is source of truth for those.
+            # The catalog, not this build's copy: a skill gated off for this build
+            # must not return through the filesystem door as a user-installed one.
+            registry_owned = set(self.skill_registry) | set(SKILL_REGISTRY)
             update["discovered_skills"] = [
-                s for name, s in all_skills.items() if name not in self.skill_registry
+                s for name, s in all_skills.items() if name not in registry_owned
             ]
 
         skill_update = await self._inject_requested_skills(state, config)

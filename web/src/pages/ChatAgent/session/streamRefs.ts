@@ -15,6 +15,8 @@ interface TaskRefs {
   currentToolCallIdRef: { current: string | null };
   messages: MessageRecord[];
   runIndex: number;
+  /** Live accumulator for a workflow run task's workflow_lifecycle reducer. */
+  workflowRun?: import('./subagents/workflowRunState').WorkflowRunState;
 }
 
 /** Shape of refs passed to main-agent streaming handlers. */

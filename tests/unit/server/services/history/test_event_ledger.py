@@ -44,6 +44,8 @@ CHECKPOINT_PROJECTED = {
     "steering_delivered",
     "interrupt",
     "model_fallback",  # ui-channel record pushed by ModelResilienceMiddleware
+    "workflow_lifecycle",  # ui-channel `workflow_run` snapshot upserted by
+    # the workflow driver at terminal; frames re-emitted verbatim on replay
 }
 
 TABLE_SOURCED = {

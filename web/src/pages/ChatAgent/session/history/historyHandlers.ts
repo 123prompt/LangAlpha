@@ -3,8 +3,9 @@
  * Handles events from history replay (SSE stream of past conversations)
  */
 
-import { normalizeAction } from '../../hooks/utils/eventUtils';
 import { isToolResultFailure } from '../subagents/subagentStatus';
+import { isTaskAgentId } from '../../utils/agentId';
+import { deriveTaskSegment, applyTaskSegment } from '../subagents/taskSegmentBuilder';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 
 let _steeringIdCounter = 0;
@@ -44,11 +45,7 @@ interface HistorySteeringRefs {
  * Returns true if the event is from a subagent (agent field starts with "task:").
  */
 export function isSubagentHistoryEvent(event: HistoryEvent | null | undefined): boolean {
-  const agent = event?.agent;
-  if (!agent || typeof agent !== 'string') {
-    return false;
-  }
-  return agent.startsWith('task:');
+  return isTaskAgentId(event?.agent);
 }
 
 /** Handles user_message events from history replay. */
@@ -421,56 +418,11 @@ export function handleHistoryToolCalls({ assistantMessageId, toolCalls, pairStat
             };
           }
 
-          // If this tool is the Task tool (subagent spawner), also create a subagent_task segment
-          // Backend uses PascalCase "Task"; accept both for compatibility
-          const isTaskTool = toolCall.name === 'task' || toolCall.name === 'Task';
-          const action = normalizeAction((toolCall.args?.action as string) || (toolCall.args?.task_id ? 'resume' : 'init'));
-          const isNewSpawn = action === 'init';
-          if (isTaskTool && toolCallId && isNewSpawn) {
-            const subagentId = toolCallId;
-            // Only add the segment once per subagentId
-            const hasExistingSubagentSegment = contentSegments.some(
-              (s: Record<string, unknown>) => s.type === 'subagent_task' && s.subagentId === subagentId
-            );
-
-            if (!hasExistingSubagentSegment) {
-              contentSegments.push({
-                type: 'subagent_task',
-                subagentId,
-                order: currentOrder,
-              });
-            }
-
-            // Initialize or update subagent task metadata
-            subagentTasks[subagentId] = {
-              ...(subagentTasks[subagentId] || {}),
-              subagentId,
-              description: (toolCall.args?.description as string) || '',
-              prompt: (toolCall.args?.prompt as string) || (toolCall.args?.description as string) || '',
-              type: (toolCall.args?.subagent_type as string) || 'general-purpose',
-              action: 'init',
-              status: 'running',
-            };
-          } else if (isTaskTool && toolCallId && !isNewSpawn) {
-            // Resume/follow-up call — show a new card with "resumed" indicator
-            // Normalize to "task:xxx" format to match floating card keys
-            const rawTargetId = (toolCall.args?.task_id as string) || '';
-            const resumeTargetId = rawTargetId.startsWith('task:') ? rawTargetId : `task:${rawTargetId}`;
-            contentSegments.push({
-              type: 'subagent_task',
-              subagentId: toolCallId,
-              resumeTargetId,
-              order: currentOrder,
-            });
-            subagentTasks[toolCallId] = {
-              subagentId: toolCallId,
-              resumeTargetId,
-              description: (toolCall.args?.description as string) || '',
-              prompt: (toolCall.args?.prompt as string) || (toolCall.args?.description as string) || '',
-              type: (toolCall.args?.subagent_type as string) || 'general-purpose',
-              action,
-              status: 'running',
-            };
+          // Task spawns / resumes and RunWorkflow launches also render an
+          // inline card — same derivation the live stream uses.
+          const derived = deriveTaskSegment(toolCall, toolCallId, currentOrder);
+          if (derived) {
+            applyTaskSegment(derived, toolCallId, contentSegments, subagentTasks);
           }
 
           return {

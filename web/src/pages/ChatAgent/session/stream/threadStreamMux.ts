@@ -20,6 +20,7 @@
  * being buffered.
  */
 import { openThreadMuxStream } from '../../utils/api';
+import { taskIdFromAgentId } from '../../utils/agentId';
 
 type SSEEventObj = Record<string, unknown>;
 
@@ -80,7 +81,7 @@ function entryAfter(a: string, b: string): boolean {
 }
 
 function taskIdFromLane(lane: string): string | null {
-  return lane.startsWith('task:') ? lane.slice(5) || null : null;
+  return taskIdFromAgentId(lane) || null;
 }
 
 export class ThreadStreamMux {

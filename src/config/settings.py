@@ -12,7 +12,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from src.config.core import get_infrastructure_config
-from src.config.models import NewsPollConfig
+from src.config.models import NewsPollConfig, WorkflowOrchestrationConfig
 
 # Re-export env-var constants for backward compatibility
 from src.config.env import (  # noqa: F401
@@ -60,6 +60,11 @@ def get_flash_recursion_limit() -> int:
 def get_workflow_timeout() -> int:
     """Workflow timeout in seconds."""
     return get_infrastructure_config().workflow_timeout
+
+
+def get_workflow_orchestration_config() -> WorkflowOrchestrationConfig:
+    """Caps and timeouts for RunWorkflow programmatic subagent runs."""
+    return get_infrastructure_config().workflow
 
 
 def get_sse_keepalive_interval() -> float:

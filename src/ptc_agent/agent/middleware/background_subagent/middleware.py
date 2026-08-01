@@ -25,6 +25,10 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
 from ptc_agent.agent.middleware.background_subagent.redis_stream import (
     steering_queue_key,
 )
+from ptc_agent.agent.middleware.background_subagent.spawn import (
+    NamespaceUnfenced,
+    TaskRunRefused,
+)
 from ptc_agent.agent.middleware.background_subagent.tools import (
     create_task_output_tool,
 )
@@ -139,7 +143,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
             # BEFORE the sweep, so a meta read issued AFTER our push that
             # still says "running" proves the sweep hadn't started — it
             # will collect our entry if the run ends before delivery.
-            stale = task.completed or task.cancelled
+            stale = task.completed
             try:
                 if not stale:
                     from ptc_agent.agent.middleware.background_subagent.redis_stream import (
@@ -212,7 +216,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 exc_info=True,
             )
 
-    async def _admit_task_run(
+    async def admit_task_run(
         self,
         task: BackgroundTask,
         *,
@@ -220,16 +224,26 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         description: str,
         launch_tool_call_id: str,
         parent_run_id: str | None,
-    ) -> str | ToolMessage:
-        """Bear the ledger row for this execution (admission-authoritative).
+        acquire_fence: bool = True,
+    ) -> str:
+        """Fence the task's namespace and bear its ledger row — everything an
+        execution owes before its first spawn side effect. Returns the
+        task_run_id ("" when no ledger is injected).
 
-        Called under the task's namespace guard, before any spawn side
-        effect. Returns the task_run_id, or — after releasing the guard —
-        an error ToolMessage: on conflict the spawn is rejected, and on
-        ledger infra failure it fails closed (a run we cannot record is a
-        run we do not start). No ledger injected → returns "" and the task
-        keeps task_run_id=None.
+        Refusal raises ``TaskRunRefused`` holding nothing: a run we cannot
+        fence or record is a run we do not start, and the fence is released on
+        the way out so no writer is stranded behind it. ``acquire_fence=False``
+        is for a caller already holding it for its own arbitration (resume).
         """
+        if acquire_fence and self.namespace_owner is not None:
+            if not await self._acquire_task_ns(task.task_id):
+                # A fresh task_id is practically uncontended, so this is the
+                # fence itself being unusable (guard session dead) — refuse
+                # rather than spawn an unfenced writer.
+                raise NamespaceUnfenced(
+                    "its checkpoint namespace could not be fenced. Try again"
+                )
+
         ledger = getattr(self.registry, "run_ledger", None)
         if ledger is None:
             return ""
@@ -250,12 +264,8 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 reason=e.reason,
             )
             await self._release_task_ns(task.task_id)
-            return ToolMessage(
-                content=f"Error: could not start {task.display_id} — {e.reason}.",
-                tool_call_id=launch_tool_call_id,
-                name="Task",
-            )
-        except Exception:
+            raise TaskRunRefused(e.reason) from e
+        except Exception as e:
             logger.error(
                 "task-run ledger unavailable; refusing spawn",
                 task_id=task.task_id,
@@ -263,14 +273,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 exc_info=True,
             )
             await self._release_task_ns(task.task_id)
-            return ToolMessage(
-                content=(
-                    f"Error: could not start {task.display_id} — its run "
-                    f"could not be recorded. Try again."
-                ),
-                tool_call_id=launch_tool_call_id,
-                name="Task",
-            )
+            raise TaskRunRefused("its run could not be recorded. Try again") from e
 
     async def _abort_admitted_run(self, task: BackgroundTask, exc: Exception) -> None:
         """Post-INSERT setup failure: settle the just-born row as error
@@ -289,6 +292,12 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
             registry=self.registry,
             namespace_owner=self.namespace_owner,
         )
+        # An error settle owes a report-back, but this failure is already on
+        # its way to the agent as the launching call's own reply — the same
+        # "a reply that hands the agent a terminal fate IS the delivery" rule
+        # TaskOutput follows. Without the stamp the executor opens a synthetic
+        # turn to announce a failure the agent was handed synchronously.
+        await self.registry.mark_result_delivered(task)
 
     async def _finalize_cancelled_before_spawn(self, task: BackgroundTask) -> None:
         """A stop won the publish race: the admitted run never spawned (or
@@ -343,12 +352,11 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         would collide on replay), serialized on ``redis_spill_lock`` so a
         stale cleanup delete can't land after them and erase round-2 data.
         """
+        # Clearing the status also unseals: append_captured_event drops
+        # appends while the task reads cancelled (killed streams are final),
+        # and the resumed round is a fresh writer that must not inherit it.
         await self.registry.reclaim_for_resume(task)
-        task.completed = False
-        # Unseal: append_captured_event drops appends while ``cancelled`` is
-        # set (killed streams are final) — the resumed round is a fresh
-        # writer and must not inherit the seal.
-        task.cancelled = False
+        task.terminal_status = None
         # Drop the prior round's settled handles: until the publish fence
         # installs the new writer this is a STARTING task, and a stale done
         # handle would make the cancel paths misread it as a finished writer
@@ -540,7 +548,10 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 description=description,
                 prompt=description,
                 subagent_type=subagent_type,
-                completed=not running_elsewhere,
+                # A shell for a task settled on another worker: which outcome
+                # it settled with isn't known here, and the ledger is what
+                # TaskOutput reconciles against before reporting either way.
+                terminal_status=None if running_elsewhere else "completed",
                 result_seen=not running_elsewhere,
                 spawned_run_id=(meta or {}).get("spawned_run_id") or None,
                 task_run_id=(meta or {}).get("task_run_id") or None,

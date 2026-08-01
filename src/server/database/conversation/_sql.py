@@ -12,8 +12,15 @@ _RESPONSE_COLUMNS = (
 # row existed until finalize, so excluding it preserves reader semantics).
 # DISTINCT ON (turn_index) + attempt_no DESC picks that row without leaking a
 # rank column into SELECT-* consumers.
+#
+# ``xmin`` rides along for the replay projection cache, which fingerprints a
+# turn's table-sourced inputs: every one of them lives on this row, and any
+# UPDATE (the archive drain rewriting sse_events, an atomic context_window
+# append) writes a new tuple version. It is a tuple-header read, so it costs
+# nothing — and a subquery cannot expose it, which is why it belongs here
+# rather than at the replay call site.
 _SETTLED_ATTEMPTS = """
-    SELECT DISTINCT ON (turn_index) *
+    SELECT DISTINCT ON (turn_index) *, xmin
     FROM conversation_responses
     WHERE conversation_thread_id = %s AND status <> 'in_progress'
     ORDER BY turn_index ASC, attempt_no DESC

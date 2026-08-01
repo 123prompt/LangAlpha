@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from src.config.features import is_feature_enabled_system
+from src.config.settings import get_workflow_orchestration_config
 from src.tools.automation import AUTOMATION_TOOLS
 from src.tools.chart_annotation import CHART_ANNOTATION_TOOLS
 from src.tools.onboarding import ONBOARDING_TOOLS
@@ -27,13 +28,20 @@ class SkillDefinition:
         name: Unique skill identifier
         description: Human-readable description of what the skill does
         tools: List of LangChain tools included in this skill
+        tool_names: Names of externally-registered tools gated by this skill —
+            for per-thread factory tools that can't be instantiated at import
+            time (e.g. RunWorkflow). The tool object is registered by the agent
+            factory; the skill only controls its visibility.
         skill_md_path: Optional path to SKILL.md with detailed instructions
         exposure: Which agent mode(s) can use this skill ("ptc", "flash", or "both")
+        system_gate: Deployment kill switch for skills owned by a config section
+            rather than the feature catalog — False drops the skill everywhere.
     """
 
     name: str
     description: str
     tools: list[Any]
+    tool_names: tuple[str, ...] = ()
     skill_md_path: str | None = None
     exposure: Literal["ptc", "flash", "both", "hidden"] = "ptc"
     command: str | None = None
@@ -41,10 +49,11 @@ class SkillDefinition:
     # drops out of every accessor while the feature's system default is off.
     # Per-user resolution happens at agent build (SkillsMiddleware injection).
     feature: str | None = None
+    system_gate: Callable[[], bool] | None = None
 
     def get_tool_names(self) -> list[str]:
-        """Get list of tool names in this skill."""
-        return [getattr(t, "name", str(t)) for t in self.tools]
+        """Get list of tool names in this skill (including externally-registered ones)."""
+        return [getattr(t, "name", str(t)) for t in self.tools] + list(self.tool_names)
 
     def format_tool_descriptions(self, max_desc_len: int = 200) -> str:
         """Format tool descriptions for display.
@@ -65,17 +74,24 @@ class SkillDefinition:
         return "\n".join(lines)
 
 
+def _run_workflow_enabled() -> bool:
+    return get_workflow_orchestration_config().enabled
+
+
 def _is_enabled(
     skill: SkillDefinition, feature_resolver: Callable[[str], bool] | None = None
 ) -> bool:
-    """Feature-flag gate: skills of a disabled feature drop out of every
-    accessor (listings, lookups, sandbox sync).
+    """Availability gate: skills whose deployment switch or owning feature is
+    off drop out of every accessor (listings, lookups, sandbox sync).
 
     ``feature_resolver`` defaults to the system gate — the no-user-context
     default these accessors run under. The agent build injects a per-user
     resolver (via ``get_skill_registry``) so a user's opt-in/out is honored
-    when skills are assembled for that build.
+    when skills are assembled for that build. ``system_gate`` is a deployment
+    kill switch, so no resolver overrides it.
     """
+    if skill.system_gate is not None and not skill.system_gate():
+        return False
     if skill.feature is None:
         return True
     resolve = feature_resolver or is_feature_enabled_system
@@ -173,6 +189,23 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         tools=AUTOMATION_TOOLS,
         skill_md_path="skills/automation/SKILL.md",
         exposure="both",
+    ),
+    "run-workflow": SkillDefinition(
+        name="run-workflow",
+        # Keep in sync with the `description:` in skills/run-workflow/SKILL.md
+        # frontmatter (locked by a unit test). RunWorkflow itself is a per-thread
+        # factory tool registered in agent.py, so it's gated by name here.
+        description=(
+            "Orchestrate parallel subagent pipelines from a JavaScript workflow "
+            "script — fan out work across many items (tickers, filings, findings) "
+            "then synthesize, or run a saved workflow by name. "
+            "Unlocks the RunWorkflow tool."
+        ),
+        tools=[],
+        tool_names=("RunWorkflow",),
+        skill_md_path="skills/run-workflow/SKILL.md",
+        exposure="ptc",
+        system_gate=_run_workflow_enabled,
     ),
     "pdf": SkillDefinition(
         name="pdf",
@@ -502,7 +535,7 @@ def list_skills(mode: SkillMode | None = None) -> list[dict[str, Any]]:
         {
             "name": skill.name,
             "description": skill.description,
-            "tool_count": len(skill.tools),
+            "tool_count": len(skill.get_tool_names()),
             "tools": skill.get_tool_names(),
             "command": skill.command,
         }

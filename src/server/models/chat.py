@@ -362,10 +362,11 @@ class ChatRequest(BaseModel):
         description="Report-back dispatch generation token. Internal use only.",
     )
 
-    # Internal: structural recursion gate for synthetic notification turns.
-    # A task report-back turn is built WITHOUT the subagent machinery
-    # (no Task/TaskOutput tools), so it can never spawn background work
-    # whose completion would notify again.
+    # Internal: build this turn's agent without the subagent machinery
+    # (no Task/TaskOutput tools). Task report-back turns deliberately do
+    # NOT set it — TaskOutput is their retrieval path; re-announce
+    # recursion is prevented by the outbox's ledger arbitration
+    # (result_delivered_at), not structurally.
     disable_subagents: Optional[bool] = Field(
         default=None,
         description="Build this turn's agent without subagent tools. "

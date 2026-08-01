@@ -47,6 +47,8 @@ export function isTerminalStatus(
  * artifact is never a failure. For Task results this is the settle-or-spin
  * discriminator: a failed spawn opens no channel, so no chan_close will ever
  * arrive — the caller must stamp 'error' from this signal alone.
+ * Case-insensitive: older persisted turns carry "ERROR: …" spawn failures
+ * (pre-normalization RunWorkflow), which must settle the same way.
  */
 export function isToolResultFailure(result: {
   content?: unknown;
@@ -54,7 +56,7 @@ export function isToolResultFailure(result: {
 }): boolean {
   return (
     typeof result.content === 'string' &&
-    result.content.trim().startsWith('Error') &&
+    result.content.trim().slice(0, 5).toLowerCase() === 'error' &&
     !result.artifact
   );
 }

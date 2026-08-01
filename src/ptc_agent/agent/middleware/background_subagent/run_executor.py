@@ -50,7 +50,7 @@ def _make_task_done_callback(
     """Build a done_callback that bumps ``last_updated_at`` when the asyncio.Task finishes.
 
     Covers all completion paths (success, failure, cancellation) without
-    having to instrument every ``task.completed = True`` site.
+    having to instrument every site that settles a task.
     """
 
     def _on_task_done(_t: asyncio.Task) -> None:
@@ -235,7 +235,6 @@ async def _run_background_task(
     try:
         result = await asyncio.shield(handler_task)
         ledger_status, ledger_failure = "completed", None
-        _merge_subagent_usage(task, tracker, tool_tracker)
         if isinstance(result, ToolMessage) and result.status == "error":
             # e.g. schema validation rejected the call before the subagent
             # ran. The run did not succeed — ledger, task result, and
@@ -276,7 +275,7 @@ async def _run_background_task(
             label,
             display_id=task.display_id,
             result_type=type(result).__name__,
-            token_records=len(task.per_call_records),
+            token_records=len(tracker.per_call_records or []),
         )
         return {"success": True, "result": result}
     except asyncio.CancelledError:
@@ -288,7 +287,6 @@ async def _run_background_task(
         try:
             result = await handler_task
             ledger_status, ledger_failure = "completed", None
-            _merge_subagent_usage(task, tracker, tool_tracker)
             if task.redis_write_failed and not task.cancelled:
                 ledger_status = "error"
                 ledger_failure = _transport_lost_failure()
@@ -297,7 +295,6 @@ async def _run_background_task(
         except Exception as e:
             ledger_status = "error"
             ledger_failure = {"error": str(e), "error_type": _error_type(e)}
-            _merge_subagent_usage(task, tracker, tool_tracker)
             logger.error(
                 "%s failed after cancellation",
                 label,
@@ -308,7 +305,6 @@ async def _run_background_task(
     except Exception as e:
         ledger_status = "error"
         ledger_failure = {"error": str(e), "error_type": _error_type(e)}
-        _merge_subagent_usage(task, tracker, tool_tracker)
         logger.error(
             "%s failed",
             label,
@@ -320,8 +316,14 @@ async def _run_background_task(
         # A double-cancel can exit while the shielded handler still runs; in
         # that case keep the fence (the guard's teardown unlock_all reclaims
         # it) and leave the meta "running" until its TTL — never unfence a
-        # possibly-live writer.
+        # possibly-live writer. A live handler is also still appending to the
+        # tracker, so the merge below waits for the same condition.
         if handler_task.done():
+            # The one merge for every settle path. Doing it per-branch instead
+            # enumerates the ways a run can succeed, and a run force-cancelled
+            # mid-flight ends via a CancelledError that reaches none of them —
+            # its tokens were spent upstream and would go unbilled.
+            _merge_subagent_usage(task, tracker, tool_tracker)
             await _settle_terminal_run(
                 task,
                 ledger_status=ledger_status,

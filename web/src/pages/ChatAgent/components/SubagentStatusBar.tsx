@@ -1,11 +1,12 @@
 import React, { useState, useRef, useCallback } from 'react';
-import { AlertCircle, CheckCircle2, Circle, Loader2, MessageSquarePlus, Send, X, StopCircle } from 'lucide-react';
+import { AlertCircle, Loader2, MessageSquarePlus, Send, X } from 'lucide-react';
 import { cn } from '../../../lib/utils';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
 import Markdown from './Markdown';
 import { sendSubagentMessage } from '../utils/api';
 import { deriveSubagentStatus } from '../session/subagents/subagentStatus';
+import { SubagentStatusIcon } from './taskStatusUi';
 import './NavigationPanel.css';
 
 interface AgentMessage {
@@ -111,27 +112,14 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
   // Can send: subagent is not terminal (running/initializing), with thread + task.
   const canSend = !isTerminal && threadId && taskId != null;
 
-  const getStatusIcon = (): React.ReactElement => {
-    // Terminal outcome wins over the derived current tool: a task reaped
-    // mid-tool-call leaves that call forever "in progress", but the run is
-    // done — it must not still spin.
-    if (isCompleted) {
-      return <CheckCircle2 className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />;
-    }
-    if (isCancelled) {
-      return <StopCircle className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />;
-    }
-    if (isError) {
-      return <AlertCircle className="h-4 w-4" style={{ color: 'var(--color-danger, #c43d3d)' }} />;
-    }
-    if (derivedCurrentTool || isActive) {
-      return <Loader2 className="h-4 w-4 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />;
-    }
-    return <Circle className="h-4 w-4" style={{ color: 'var(--color-icon-muted)' }} />;
-  };
+  // Terminal outcome wins over the derived current tool: a task reaped
+  // mid-tool-call leaves that call forever "in progress", but the run is
+  // done — it must not still spin. Below terminal, a current tool is itself
+  // liveness, so it promotes a still-silent task to the running treatment.
+  const iconStatus = !isTerminal && derivedCurrentTool ? 'active' : effectiveStatus;
 
   const getStatusText = (): string => {
-    // Terminal outcome wins over the derived current tool (see getStatusIcon).
+    // Terminal outcome wins over the derived current tool, as above.
     if (isCompleted) {
       if (agent.toolCalls && agent.toolCalls > 0) {
         return `Completed (${agent.toolCalls} tool calls)`;
@@ -217,7 +205,7 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
         {/* Right side: status + instruction button stacked */}
         <div className="flex flex-col items-end gap-1.5 flex-shrink-0">
           <div className="flex items-center gap-1.5">
-            {getStatusIcon()}
+            <SubagentStatusIcon status={iconStatus} surface="statusBar" className="h-4 w-4" />
             <span className="text-xs whitespace-nowrap" style={{ color: isCompleted ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)' }}>
               {getStatusText()}
             </span>
@@ -256,13 +244,13 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
         <div
           className="flex items-start gap-2 px-4 py-2.5 rounded-lg"
           style={{
-            backgroundColor: 'var(--color-danger-soft, rgba(196, 61, 61, 0.08))',
-            border: '1px solid var(--color-danger-overlay, rgba(196, 61, 61, 0.25))',
+            backgroundColor: 'var(--color-loss-soft)',
+            border: '1px solid var(--color-border-loss)',
           }}
         >
-          <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-danger, #c43d3d)' }} />
+          <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-loss)' }} />
           <div className="min-w-0">
-            <div className="text-xs font-medium" style={{ color: 'var(--color-danger, #c43d3d)' }}>
+            <div className="text-xs font-medium" style={{ color: 'var(--color-loss)' }}>
               This agent stopped with an error
             </div>
             {agent.error && (

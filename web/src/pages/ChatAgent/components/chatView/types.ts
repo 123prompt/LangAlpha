@@ -78,6 +78,10 @@ export interface AgentInfo {
   messages: SubagentMessage[];
   isActive: boolean;
   isMainAgent: boolean;
+  /** Owning workflow run's agent id (`task:<id>`) for workflow-owned children. */
+  ownerTaskId?: string;
+  /** Reduced workflow-run progress, present only on a workflow run task. */
+  workflowRun?: import('../../session/subagents/workflowRunState').WorkflowRunState;
   [key: string]: unknown;
 }
 
@@ -105,6 +109,8 @@ export interface SubagentInfo {
   type?: string;
   status?: string;
   error?: string;
+  /** Owning workflow run's agent id (`task:<id>`) when opened via its drill-in. */
+  ownerTaskId?: string;
 }
 
 export interface SlashCommand {
