@@ -142,6 +142,15 @@ class SubagentRunCoordinator:
                     f"after lane_open failure; scanner will reap it",
                     exc_info=True,
                 )
+            else:
+                # That error settle enqueued a report-back, but the rejection
+                # below becomes the launching call's own reply — and a reply
+                # handing the agent a run's terminal fate IS the delivery
+                # (background_subagent.tools holds the same contract).
+                # Unstamped, the executor still believes a notification is
+                # owed and opens a synthetic turn to re-announce a launch
+                # failure the agent was handed synchronously.
+                await self._mark_delivered_quietly(task_run_id)
             raise TaskRunRejected(
                 "subagent event transport unavailable (lane_open failed)"
             ) from e
@@ -161,6 +170,21 @@ class SubagentRunCoordinator:
             parent_run_id=parent_run_id,
         )
         return str(run_row["task_run_id"])
+
+    async def _mark_delivered_quietly(self, task_run_id: str) -> None:
+        """Stamp the delivery, never failing the caller for it.
+
+        A missed stamp costs one redundant notification; raising here would
+        cost the launch failure its own reply.
+        """
+        try:
+            await sr_db.mark_result_delivered(task_run_id)
+        except Exception:
+            logger.warning(
+                f"[subagent_coordinator] could not stamp delivery for run "
+                f"{task_run_id}; a redundant report-back may follow",
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------- finalize
 

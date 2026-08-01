@@ -55,7 +55,12 @@ class FakeLedger:
         self.infra_down = infra_down
         self.started: list[dict] = []
         self.finalized: list[tuple] = []
+        self.delivered: list[str] = []
         self.journal = journal if journal is not None else []
+
+    async def mark_result_delivered(self, task_run_id: str) -> bool:
+        self.delivered.append(task_run_id)
+        return True
 
     async def start_task_run(self, **kwargs) -> str:
         self.started.append(kwargs)
@@ -78,9 +83,6 @@ class FakeLedger:
 
     async def append_run_end(self, task_run_id, *, task_id, outcome):
         self.journal.append(("run_end", task_run_id, outcome))
-
-    async def mark_result_delivered(self, task_run_id) -> bool:
-        return True
 
 
 class _Request(SimpleNamespace):
@@ -307,6 +309,27 @@ async def test_setup_failure_after_admission_aborts_the_born_run():
         )
     ]
     assert owner.released == [task.task_id]
+    # That error finalize owes a report-back, but the failure is already in
+    # `result.content` above — the launching call reported it synchronously.
+    # Unstamped, the executor would open a whole synthetic turn to announce a
+    # launch failure the agent was handed in the same breath.
+    assert ledger.delivered == ["run-uuid-5"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_really_spawned_is_not_pre_stamped():
+    """The stamp belongs only to a fate reported synchronously. Stamping a
+    live run would silence the notification its writer actually owes.
+    """
+    owner = FakeOwner()
+    ledger = FakeLedger(admit="run-uuid-6")
+    mw = _middleware(owner, ledger)
+
+    await mw.awrap_tool_call(
+        _request({"description": "d", "prompt": "p"}), _ok_handler
+    )
+
+    assert ledger.delivered == []
 
 
 # ---------------------------------------------------------------------------

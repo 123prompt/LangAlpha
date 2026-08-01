@@ -8,7 +8,10 @@ the EXECUTOR's decision at claim time, against the ledger: a run whose
 ``result_delivered_at`` is stamped (TaskOutput delivered it) is dropped
 with a cleared wake; a live or interrupted parent parks the job until the
 thread's next dead-turn finalize (completed, error or cancelled) releases
-it. The POST is a synthetic notification turn via the shared
+it. A release the user's own stop caused drops too, for a run that had
+already settled when they stopped (``_stop_already_covered``) — the whole
+point of a stop is that no new turn starts. The POST is a synthetic
+notification turn via the shared
 ``notify_turn`` machinery: it announces the outcome and leaves TaskOutput
 to fetch the result from the durable archive — nothing volatile rides the
 payload.
@@ -193,6 +196,29 @@ def _build_notification_message(payload: dict) -> str:
     )
 
 
+def _stop_already_covered(latest: dict | None, run_row: dict | None) -> bool:
+    """Whether the user's own stop is what released this job.
+
+    A cancel finalize releases every parked report-back on the thread, so
+    without this the stop itself opens a synthetic turn — billable model work
+    a second after the user asked for none. Narrow on purpose: only a result
+    that had already settled when they stopped. A run that terminalized
+    *after* the cancel is news the stop cannot have been about, and
+    announcing it is the entire job of this pipeline — a blanket "the thread
+    was cancelled once" test would silence every later completion instead.
+
+    Undecidable without both stamps, and silence is the worse failure, so a
+    missing one notifies.
+    """
+    if not latest or latest.get("status") != "cancelled":
+        return False
+    stopped_at = latest.get("cancel_requested_at")
+    settled_at = (run_row or {}).get("finalized_at")
+    if stopped_at is None or settled_at is None:
+        return False
+    return settled_at <= stopped_at
+
+
 async def execute_task_report_back(job: dict) -> None:
     """Execute one ``task_report_back`` outbox job.
 
@@ -274,6 +300,7 @@ async def execute_task_report_back(job: dict) -> None:
         # decided HERE, at claim time, against the durable row. TaskOutput
         # deliveries stamp result_delivered_at — a stamped run owes nothing.
         task_run_id = payload.get("task_run_id")
+        run_row: dict | None = None
         if task_run_id:
             from src.server.database.runs import subagent_runs as sr_db
 
@@ -329,6 +356,17 @@ async def execute_task_report_back(job: dict) -> None:
                         HookOutboxDrainer.get_instance().nudge()
                     except Exception:
                         pass
+            return
+
+        if _stop_already_covered(latest, run_row):
+            logger.info(
+                f"[TASK_REPORT_BACK] Thread {thread_id} was stopped after "
+                f"{subject} settled; dropping rather than opening a turn"
+            )
+            try:
+                await wake.publish_wake(get_cache_client(), thread_id, cleared=True)
+            except Exception:
+                pass
             return
 
         body = {

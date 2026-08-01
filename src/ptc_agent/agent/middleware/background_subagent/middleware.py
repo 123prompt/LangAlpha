@@ -292,6 +292,12 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
             registry=self.registry,
             namespace_owner=self.namespace_owner,
         )
+        # An error settle owes a report-back, but this failure is already on
+        # its way to the agent as the launching call's own reply — the same
+        # "a reply that hands the agent a terminal fate IS the delivery" rule
+        # TaskOutput follows. Without the stamp the executor opens a synthetic
+        # turn to announce a failure the agent was handed synchronously.
+        await self.registry.mark_result_delivered(task)
 
     async def _finalize_cancelled_before_spawn(self, task: BackgroundTask) -> None:
         """A stop won the publish race: the admitted run never spawned (or
