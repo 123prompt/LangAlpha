@@ -7,6 +7,7 @@ This module creates a PTC agent that:
 - Supports sub-agent delegation for specialized tasks
 """
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -19,6 +20,9 @@ from ptc_agent.agent.backends import (
     RequestScopedStoreCache,
     SandboxBackend,
     StoreBackend,
+    WorkflowsBackend,
+    prebuilt_workflow_backend,
+    workflow_namespace,
 )
 from ptc_agent.agent.middleware import SubAgentMiddleware
 from ptc_agent.agent.state import DeltaAgentState
@@ -64,6 +68,10 @@ from ptc_agent.core.paths import (
     MEMORY_USER_DIR,
     MEMORY_WORKSPACE_DIR,
     USER_PROFILE_DATA_DIR,
+    WORKFLOW_DIR,
+)
+from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+    get_prebuilt_workflows,
 )
 from ptc_agent.agent.backends.user_data import UserDataBackend
 from ptc_agent.agent.middleware.image_capture import ImageCaptureMiddleware
@@ -134,6 +142,57 @@ logger = structlog.get_logger(__name__)
 DEFAULT_MAX_CONCURRENT_TASK_UNITS = 3
 DEFAULT_MAX_TASK_ITERATIONS = 3
 DEFAULT_MAX_GENERAL_ITERATIONS = 10
+
+
+@dataclass(frozen=True)
+class _IdentityGates:
+    """Which identity-derived surfaces a build gets.
+
+    Memory, memo and the workflow store are opt-in on identity: without a user
+    id they are disabled entirely rather than falling back to a shared
+    namespace that would cross-pollinate unauthenticated sessions.
+    """
+
+    user_memory: bool
+    workspace_memory: bool
+    memo: bool
+    user_data: bool
+    workflow: bool
+    workflow_fs: bool
+    workflow_tool: bool
+
+    @property
+    def memory(self) -> bool:
+        return self.user_memory or self.workspace_memory
+
+
+def _resolve_identity_gates(
+    *,
+    store: Any | None,
+    user_id: str | None,
+    workspace_id: str | None,
+    disable_subagents: bool,
+) -> _IdentityGates:
+    from src.config.settings import get_workflow_orchestration_config
+
+    workflow = get_workflow_orchestration_config().enabled
+    identified = store is not None and bool(user_id)
+    return _IdentityGates(
+        user_memory=identified,
+        workspace_memory=identified and bool(workspace_id),
+        memo=identified,
+        # Independent of `store`: the user-profile data backend (portfolio +
+        # watchlist + preferences) talks to the application DB tables, not the
+        # LangGraph store.
+        user_data=bool(user_id),
+        workflow=workflow,
+        workflow_fs=workflow and identified,
+        # RunWorkflow dispatches subagents, so it drops with the recursion
+        # gate. The skill that advertises it is gated on the same flag —
+        # advertising a skill whose tool this build never registers strands
+        # the agent.
+        workflow_tool=workflow and not disable_subagents,
+    )
 
 
 class PTCAgent:
@@ -209,6 +268,174 @@ class PTCAgent:
             mcp_registry, mode=self.config.mcp.tool_exposure_mode
         )
 
+    def _build_filesystem_backend(
+        self,
+        *,
+        backend: Any,
+        gates: _IdentityGates,
+        store: Any | None,
+        user_id: str | None,
+        workspace_id: str | None,
+    ) -> tuple[Any, list[Any]]:
+        """Mount the store-backed routes over the sandbox filesystem.
+
+        Returns the backend the filesystem tools should see, and the middleware
+        that injects those routes' content after the prompt-cache breakpoint
+        (memory.md, the memo count block) — one list because they share that
+        position.
+        """
+        if not (gates.memory or gates.memo or gates.user_data or gates.workflow):
+            return backend, []
+
+        # One cache per agent (≈ per request). Shared by every memory/memo
+        # backend route + the two read-side middlewares so that across the
+        # K model calls in a turn we pay 1 set of store reads, not K.
+        # Agent-side writes invalidate the affected key so reads in later
+        # rounds within the same turn see the fresh value.
+        store_cache: RequestScopedStoreCache | None = (
+            RequestScopedStoreCache()
+            if (gates.memory or gates.memo or gates.workflow_fs)
+            else None
+        )
+        sandbox_root = backend.root_dir.rstrip("/")
+
+        # INVARIANT: these closures capture identity at agent-creation time
+        # (``user_id`` is bound once per call). Safe only because one PTCAgent
+        # is built per request — if an orchestrator ever reuses agent instances
+        # across requests, memory will cross-pollinate between users. Resolve
+        # identity at call time (e.g. via `langgraph.runtime.get_runtime()`)
+        # before introducing reuse.
+        routes: list[Any] = []
+        user_namespace_factory: NamespaceFactory | None = None
+        workspace_namespace_factory: NamespaceFactory | None = None
+        memo_namespace_factory: NamespaceFactory | None = None
+
+        if gates.user_memory:
+
+            def _user_namespace() -> tuple[str, ...]:
+                return (user_id, "memory")
+
+            user_namespace_factory = _user_namespace
+            routes.append(
+                StoreBackend(
+                    store=store,
+                    namespace_factory=_user_namespace,
+                    root_prefix=f"{sandbox_root}/{MEMORY_USER_DIR}/",
+                    sandbox_backend=backend,
+                    cache=store_cache,
+                )
+            )
+
+        if gates.workspace_memory:
+
+            def _workspace_namespace() -> tuple[str, ...]:
+                return (user_id, "workspaces", workspace_id, "memory")
+
+            workspace_namespace_factory = _workspace_namespace
+            routes.append(
+                StoreBackend(
+                    store=store,
+                    namespace_factory=_workspace_namespace,
+                    root_prefix=f"{sandbox_root}/{MEMORY_WORKSPACE_DIR}/",
+                    sandbox_backend=backend,
+                    cache=store_cache,
+                )
+            )
+
+        if gates.memo:
+
+            def _memo_namespace() -> tuple[str, ...]:
+                # Plural: avoid string-prefix collision with the
+                # ``(user_id, "memory")`` tier in AsyncPostgresStore,
+                # whose asearch is ``LIKE 'user_id.memo%'``.
+                return (user_id, "memos")
+
+            memo_namespace_factory = _memo_namespace
+            routes.append(
+                StoreBackend(
+                    store=store,
+                    namespace_factory=_memo_namespace,
+                    root_prefix=f"{sandbox_root}/{MEMO_USER_DIR}/",
+                    sandbox_backend=backend,
+                    read_only=True,
+                    read_only_error=(
+                        "Memo is user-managed. Ask the user to edit or "
+                        "upload via the memo panel."
+                    ),
+                    cache=store_cache,
+                )
+            )
+
+        if gates.workflow:
+            workflow_root = f"{sandbox_root}/{WORKFLOW_DIR}/"
+            prebuilt_route = prebuilt_workflow_backend(
+                files=get_prebuilt_workflows().files(),
+                root_prefix=workflow_root,
+                sandbox_backend=backend,
+            )
+            if gates.workflow_fs:
+
+                def _workflow_namespace() -> tuple[str, ...]:
+                    return workflow_namespace(user_id)
+
+                routes.append(
+                    WorkflowsBackend(
+                        store_backend=StoreBackend(
+                            store=store,
+                            namespace_factory=_workflow_namespace,
+                            root_prefix=workflow_root,
+                            sandbox_backend=backend,
+                            cache=store_cache,
+                        ),
+                        prebuilt_backend=prebuilt_route,
+                    )
+                )
+            else:
+                routes.append(prebuilt_route)
+
+        if gates.user_data:
+            routes.append(
+                UserDataBackend(
+                    user_id=user_id,
+                    sandbox_backend=backend,
+                    root_prefix=f"{sandbox_root}/{USER_PROFILE_DATA_DIR}/",
+                )
+            )
+
+        if not routes:
+            return backend, []
+
+        dynamic_context_middleware: list[Any] = []
+        if gates.memory:
+            dynamic_context_middleware = [
+                MemoryContextMiddleware(
+                    store=store,
+                    user_namespace_factory=user_namespace_factory,
+                    workspace_namespace_factory=workspace_namespace_factory,
+                    user_display_path=f"{MEMORY_USER_DIR}/{MEMORY_INDEX_FILENAME}",
+                    workspace_display_path=f"{MEMORY_WORKSPACE_DIR}/{MEMORY_INDEX_FILENAME}",
+                    index_key=MEMORY_INDEX_FILENAME,
+                    cache=store_cache,
+                )
+            ]
+        if gates.memo and memo_namespace_factory is not None:
+            # Memo's count block injects after the cache breakpoint
+            # alongside memory.md, hence the shared list.
+            dynamic_context_middleware.append(
+                MemoAwarenessMiddleware(
+                    store=store,
+                    user_namespace_factory=memo_namespace_factory,
+                    display_path=f"{MEMO_USER_DIR}/",
+                    index_key=MEMO_INDEX_FILENAME,
+                    cache=store_cache,
+                )
+            )
+
+        return (
+            CompositeFilesystemBackend(sandbox=backend, routes=routes),
+            dynamic_context_middleware,
+        )
+
     def create_agent(
         self,
         sandbox: PTCSandbox,
@@ -272,156 +499,28 @@ class PTCAgent:
         workspace_id_for_memory = (
             getattr(session, "conversation_id", None) if session else None
         )
-        user_memory_enabled = store is not None and bool(user_id)
-        workspace_memory_enabled = (
-            store is not None and bool(user_id) and bool(workspace_id_for_memory)
+        gates = _resolve_identity_gates(
+            store=store,
+            user_id=user_id,
+            workspace_id=workspace_id_for_memory,
+            disable_subagents=disable_subagents,
         )
-        memory_enabled = user_memory_enabled or workspace_memory_enabled
-
-        if store is not None and not memory_enabled:
+        if store is not None and not gates.memory:
             logger.warning(
                 "memory disabled due to missing identity",
                 user_id_present=bool(user_id),
                 workspace_id_present=bool(workspace_id_for_memory),
             )
 
-        # Memo (user-managed documents) mirrors user-tier memory: enabled
-        # whenever the store is wired and we have a user identity.
-        memo_enabled = store is not None and bool(user_id)
-
-        # User-profile data backend (portfolio + watchlist + preferences) —
-        # enabled whenever we have a user identity. Independent of `store`
-        # because it talks to the application DB tables, not the LangGraph store.
-        user_data_enabled = bool(user_id)
-
-        filesystem_backend: Any = backend
-        # Holds both MemoryContextMiddleware (memory.md injection) and
-        # MemoAwarenessMiddleware (memo count block). Both append content
-        # after the prompt-cache breakpoint, hence "dynamic context".
-        dynamic_context_middleware: list[Any] = []
-        # One cache per agent (≈ per request). Shared by every memory/memo
-        # backend route + the two read-side middlewares so that across the
-        # K model calls in a turn we pay 1 set of store reads, not K.
-        # Agent-side writes invalidate the affected key so reads in later
-        # rounds within the same turn see the fresh value.
-        store_cache: RequestScopedStoreCache | None = (
-            RequestScopedStoreCache() if (memory_enabled or memo_enabled) else None
+        filesystem_backend, dynamic_context_middleware = (
+            self._build_filesystem_backend(
+                backend=backend,
+                gates=gates,
+                store=store,
+                user_id=user_id,
+                workspace_id=workspace_id_for_memory,
+            )
         )
-        if memory_enabled or memo_enabled or user_data_enabled:
-            sandbox_root = backend.root_dir.rstrip("/")
-
-            # INVARIANT: these closures capture identity at agent-creation
-            # time. Safe only because one PTCAgent is built per request — if an
-            # orchestrator ever reuses agent instances across requests, memory
-            # will cross-pollinate between users. Resolve identity at call time
-            # (e.g. via `langgraph.runtime.get_runtime()`) before introducing
-            # reuse.
-            routes: list[Any] = []
-            user_namespace_factory: NamespaceFactory | None = None
-            workspace_namespace_factory: NamespaceFactory | None = None
-            memo_namespace_factory: NamespaceFactory | None = None
-
-            if user_memory_enabled:
-                captured_user_id = user_id
-                def _user_namespace() -> tuple[str, ...]:
-                    return (captured_user_id, "memory")
-
-                user_namespace_factory = _user_namespace
-                routes.append(
-                    StoreBackend(
-                        store=store,
-                        namespace_factory=_user_namespace,
-                        root_prefix=f"{sandbox_root}/{MEMORY_USER_DIR}/",
-                        sandbox_backend=backend,
-                        cache=store_cache,
-                    )
-                )
-
-            if workspace_memory_enabled:
-                captured_user_id = user_id
-                captured_workspace_id = workspace_id_for_memory
-                def _workspace_namespace() -> tuple[str, ...]:
-                    return (
-                        captured_user_id,
-                        "workspaces",
-                        captured_workspace_id,
-                        "memory",
-                    )
-
-                workspace_namespace_factory = _workspace_namespace
-                routes.append(
-                    StoreBackend(
-                        store=store,
-                        namespace_factory=_workspace_namespace,
-                        root_prefix=f"{sandbox_root}/{MEMORY_WORKSPACE_DIR}/",
-                        sandbox_backend=backend,
-                        cache=store_cache,
-                    )
-                )
-
-            if memo_enabled:
-                captured_user_id = user_id
-                def _memo_namespace() -> tuple[str, ...]:
-                    # Plural: avoid string-prefix collision with the
-                    # ``(user_id, "memory")`` tier in AsyncPostgresStore,
-                    # whose asearch is ``LIKE 'user_id.memo%'``.
-                    return (captured_user_id, "memos")
-
-                memo_namespace_factory = _memo_namespace
-                routes.append(
-                    StoreBackend(
-                        store=store,
-                        namespace_factory=_memo_namespace,
-                        root_prefix=f"{sandbox_root}/{MEMO_USER_DIR}/",
-                        sandbox_backend=backend,
-                        read_only=True,
-                        read_only_error=(
-                            "Memo is user-managed. Ask the user to edit or "
-                            "upload via the memo panel."
-                        ),
-                        cache=store_cache,
-                    )
-                )
-
-            if user_data_enabled:
-                captured_user_id = user_id
-                routes.append(
-                    UserDataBackend(
-                        user_id=captured_user_id,
-                        sandbox_backend=backend,
-                        root_prefix=f"{sandbox_root}/{USER_PROFILE_DATA_DIR}/",
-                    )
-                )
-
-            if routes:
-                filesystem_backend = CompositeFilesystemBackend(
-                    sandbox=backend,
-                    routes=routes,
-                )
-                if memory_enabled:
-                    dynamic_context_middleware = [
-                        MemoryContextMiddleware(
-                            store=store,
-                            user_namespace_factory=user_namespace_factory,
-                            workspace_namespace_factory=workspace_namespace_factory,
-                            user_display_path=f"{MEMORY_USER_DIR}/{MEMORY_INDEX_FILENAME}",
-                            workspace_display_path=f"{MEMORY_WORKSPACE_DIR}/{MEMORY_INDEX_FILENAME}",
-                            index_key=MEMORY_INDEX_FILENAME,
-                            cache=store_cache,
-                        )
-                    ]
-                if memo_enabled and memo_namespace_factory is not None:
-                    # Memo's count block injects after the cache breakpoint
-                    # alongside memory.md, hence the shared list.
-                    dynamic_context_middleware.append(
-                        MemoAwarenessMiddleware(
-                            store=store,
-                            user_namespace_factory=memo_namespace_factory,
-                            display_path=f"{MEMO_USER_DIR}/",
-                            index_key=MEMO_INDEX_FILENAME,
-                            cache=store_cache,
-                        )
-                    )
 
         # Create the execute_code tool for MCP invocation
         execute_code_tool = create_execute_code_tool(
@@ -552,6 +651,12 @@ class PTCAgent:
         skill_registry = get_skill_registry(
             "ptc", feature_resolver=self.config.feature_enabled
         )
+        # RunWorkflow is skill-gated: the run-workflow skill hides the tool from
+        # model requests until the agent reads its SKILL.md. Drop the skill on
+        # any build that registers no tool for it to gate.
+        if not gates.workflow_tool:
+            skill_registry.pop("run-workflow", None)
+
         skill_loader_middleware = SkillsMiddleware(
             skill_registry=skill_registry,
             mode="ptc",
@@ -653,13 +758,14 @@ class PTCAgent:
             if short_thread_id
             else ".agents/large_tool_results"
         )
+
         system_prompt = self._build_system_prompt(
             tool_summary,
             subagent_summary,
             plan_mode=plan_mode,
             thread_id=short_thread_id,
-            memory_enabled=memory_enabled,
-            memo_enabled=memo_enabled,
+            memory_enabled=gates.memory,
+            memo_enabled=gates.memo,
             crawl_enabled=bool(crawl_tools),
         )
 
@@ -674,8 +780,6 @@ class PTCAgent:
                 "description": subagent.get("description", ""),
                 "tools": tool_names,
             }
-
-        self.native_tools = [t.name if hasattr(t, "name") else str(t) for t in tools]
 
         logger.debug(
             "Creating agent with custom middleware stack",
@@ -738,6 +842,55 @@ class PTCAgent:
             )
         ]
 
+        # Compiled subagent graphs live on this middleware; the RunWorkflow
+        # dispatcher below shares the same instances so direct dispatches get
+        # identical model resolution and middleware wiring. default_tools is
+        # snapshotted so appending RunWorkflow to the main tools afterwards
+        # can never leak it into subagents. Absent entirely under the
+        # recursion gate: this middleware is the sole provider of the Task
+        # tool, so skipping it (plus the TaskOutput extend above) makes a
+        # notification turn structurally unable to spawn subagents —
+        # RunWorkflow drops with it below.
+        subagent_task_middleware = (
+            SubAgentMiddleware(
+                default_model=model,
+                default_tools=list(tools),
+                subagents=subagents if subagents else [],
+                default_middleware=subagent_middleware,
+                registry=background_middleware.registry,
+                checkpointer=checkpointer,
+            )
+            if not disable_subagents
+            else None
+        )
+
+        # RunWorkflow: programmatic subagent orchestration (main agent only —
+        # deliberately absent from subagent tool sets, so children can't nest
+        # workflows).
+        if gates.workflow_tool and subagent_task_middleware is not None:
+            from ptc_agent.agent.middleware.background_subagent.dispatch import (
+                SubagentDispatcher,
+            )
+            from ptc_agent.agent.middleware.background_subagent.workflow import (
+                create_run_workflow_tool,
+            )
+
+            subagent_dispatcher = SubagentDispatcher(
+                background_middleware,
+                subagent_task_middleware.subagent_graphs,
+                thread_id or "",
+            )
+            run_workflow_tool = create_run_workflow_tool(
+                dispatcher=subagent_dispatcher,
+                backend=filesystem_backend,
+                thread_id=thread_id or "",
+                short_thread_id=short_thread_id,
+                store=store,
+                user_id=user_id,
+                prebuilt_workflows=get_prebuilt_workflows(),
+            )
+            tools.append(run_workflow_tool)
+
         # Main agent middleware (includes SubAgentMiddleware + main_only)
         # Ordering matters for prompt caching:
         #   - AnthropicPromptCachingMiddleware (cache_control) and
@@ -753,20 +906,7 @@ class PTCAgent:
                 LargeResultEvictionMiddleware(
                     backend=backend, eviction_dir=eviction_dir
                 ),
-                # Absent entirely under the recursion gate: this middleware
-                # is the sole provider of the Task tool, so skipping it (plus
-                # the TaskOutput extend above) makes a notification turn
-                # structurally unable to spawn subagents.
-                SubAgentMiddleware(
-                    default_model=model,
-                    default_tools=tools,
-                    subagents=subagents if subagents else [],
-                    default_middleware=subagent_middleware,
-                    registry=background_middleware.registry,
-                    checkpointer=checkpointer,
-                )
-                if not disable_subagents
-                else None,
+                subagent_task_middleware,
                 *shared_middleware,
                 *main_only_middleware,
                 image_capture,
