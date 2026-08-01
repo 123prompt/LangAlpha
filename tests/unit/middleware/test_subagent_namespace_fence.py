@@ -84,7 +84,7 @@ async def test_init_refused_namespace_spawns_nothing():
     assert "could not start" in result.content
     task = mw.registry._tasks["tc-1"]
     assert task.asyncio_task is None  # no writer spawned
-    assert task.completed and task.cancelled  # inert: no collector claims it
+    assert task.terminal_status == "never_started"  # inert: no collector claims it
 
 
 @pytest.mark.asyncio
@@ -130,7 +130,7 @@ def _seed_task(mw, *, completed: bool, asyncio_task=None) -> BackgroundTask:
         prompt="p",
         subagent_type="general-purpose",
         agent_id="general-purpose:x",
-        completed=completed,
+        terminal_status="completed" if completed else None,
         asyncio_task=asyncio_task,
     )
     mw.registry._tasks["tc-orig"] = task

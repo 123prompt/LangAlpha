@@ -31,6 +31,18 @@ PUBLIC_STATUSES = frozenset(
 # test-bound to it, so a new outcome cannot land in one store only.
 TERMINAL_STATUSES = ("completed", "interrupted", "error", "cancelled")
 
+# Task-run outcomes that owe the user a report-back. One notification policy,
+# imported by every site that decides *whether a run is owed one*: the outbox
+# producer (subagent_runs.finalize_task_run), its drainer nudge, and the
+# ledger-path TaskOutput reply that settles the obligation. Errors report: a
+# failure the user never hears about is a silently lost task. Cancelled
+# doesn't: cancellation is intentful and its UX is the cancel act itself.
+#
+# Not the same set as "may be stamped delivered" — mark_result_delivered
+# admits any terminal status, because reporting a stop to the agent is a
+# delivery too (it is what keeps the sweep from re-announcing the task).
+REPORT_BACK_STATUSES = ("completed", "error")
+
 # Live-run internal spellings, refined by durable intent/liveness below.
 _LIVE = ("in_progress", "active")
 

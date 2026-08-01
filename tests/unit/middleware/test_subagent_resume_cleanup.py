@@ -30,7 +30,7 @@ def _make_completed_task(task_id: str = "abc123") -> BackgroundTask:
         subagent_type="general-purpose",
         agent_id="general-purpose",
     )
-    task.completed = True
+    task.terminal_status = "completed"
     task.result = {"messages": []}
     # Pretend the prior run captured events
     task.captured_event_seq = 7
@@ -111,7 +111,7 @@ async def test_reset_for_resume_unseals_cancelled_task():
     registry = BackgroundTaskRegistry(thread_id="thread-x")
     middleware = BackgroundSubagentMiddleware(registry=registry, enabled=True)
     task = _make_completed_task()
-    task.cancelled = True
+    task.terminal_status = "cancelled"
 
     cache = MagicMock()
     cache.enabled = True

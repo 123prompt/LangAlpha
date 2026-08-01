@@ -116,7 +116,7 @@ async def _round_one(stream: _FakeStream):
         run_id=RUN_ONE,
     )
     await _append(registry, task, 5)
-    task.completed = True
+    task.terminal_status = "completed"
     return registry, middleware, task
 
 

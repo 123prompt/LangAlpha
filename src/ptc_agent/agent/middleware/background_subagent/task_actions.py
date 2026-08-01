@@ -14,7 +14,6 @@ from langchain_core.messages import ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 
-from ptc_agent.agent.middleware.background_subagent import run_executor
 from ptc_agent.agent.middleware.background_subagent.context import (
     current_background_agent_id,
     current_background_tool_call_id,
@@ -23,11 +22,13 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTask,
     TaskWriterLive,
 )
-from src.observability.tracing import (
-    create_task_with_context,
-    emit_subagent_launch,
+from ptc_agent.agent.middleware.background_subagent.spawn import (
+    SpawnSetupError,
+    SpawnStoppedError,
+    TaskRunRefused,
+    settle_never_started,
+    spawn_task_writer,
 )
-from src.utils.tracking.per_call_token_tracker import PerCallTokenTracker
 
 if TYPE_CHECKING:
     from ptc_agent.agent.middleware.background_subagent.middleware import (
@@ -130,6 +131,18 @@ async def handle_task_action(
     )
 
 
+def _settle_resume_failure(task: BackgroundTask, exc: Exception) -> None:
+    """Pre-spawn settle for a resume: errored, not inert.
+
+    The task's durable result survives in its ``task:{id}`` checkpoint, so a
+    resume that never got off the ground has to leave the entry resumable —
+    marking it never-started would both bar the retry and mark the result
+    seen, silently dropping the turn notification.
+    """
+    task.terminal_status = "error"
+    task.error = f"resume setup failed before spawn: {exc}"
+
+
 async def _spawn_writer(
     mw: "BackgroundSubagentMiddleware",
     task: BackgroundTask,
@@ -141,73 +154,46 @@ async def _spawn_writer(
     tool_call_id: str,
     action: str,
 ) -> ToolMessage | None:
-    """The shared spawn pipeline for init and resume: launch telemetry →
-    pre-spawn "running" meta → run-opener event → fenced writer publish →
-    done-callback. Returns an error/stop ToolMessage when no writer spawned
-    (the admitted run is settled before returning), or None on success.
+    """The Task tool's face on the canonical spawn (``spawn_task_writer``).
+
+    Adds only what the tool call needs: a ToolMessage per refusal instead of
+    an exception, and the resume settle — a failed resume keeps its durable
+    result in the ``task:{id}`` checkpoint, so the entry stays resumable
+    rather than going inert. Returns None once the writer is spawned.
     """
     resume = action == "resume"
-    # Create a dedicated token tracker for this subagent
-    subagent_token_tracker = PerCallTokenTracker()
-
-    # Spawn in background. create_task_with_context propagates the current
-    # OTel context (via contextvars snapshot) so spans emitted inside the
-    # subagent inherit the launching chat.turn trace.
     try:
-        emit_subagent_launch(
-            task.subagent_type, action=action, description_len=len(description),
-        )
-        # Meta before spawn: a fast writer's terminal meta (written at
-        # settle) must never be overwritten by a late "running".
-        await mw.registry.write_task_meta(task, "running")
-        await mw._append_run_opener(task, prompt)
-        asyncio_task = await mw.registry.publish_writer(
+        await spawn_task_writer(
+            mw,
             task,
-            lambda: create_task_with_context(
-                run_executor._run_background_task(
-                    task, handler, request, subagent_token_tracker,
-                    "Resumed background subagent" if resume else "Background subagent",
-                    registry=mw.registry,
-                    namespace_owner=mw.namespace_owner,
-                ),
-                name=(
-                    f"background_subagent_resume_{task.display_id}"
-                    if resume
-                    else f"background_subagent_{task.display_id}"
-                ),
+            handler,
+            prompt=prompt,
+            label="Resumed background subagent" if resume else "Background subagent",
+            name=(
+                f"background_subagent_resume_{task.display_id}"
+                if resume
+                else f"background_subagent_{task.display_id}"
+            ),
+            action=action,
+            request=request,
+            description=description,
+            on_setup_failure=(
+                _settle_resume_failure if resume else settle_never_started
             ),
         )
-    except Exception as e:
-        # An admitted run either spawns or terminates — never a stranded
-        # in_progress row. Resume re-settles the entry so the task stays
-        # resumable (its durable result survives in the task:{id}
-        # checkpoint); init marks the entry inert.
-        await mw._abort_admitted_run(task, e)
-        if resume:
-            task.completed = True
-            task.error = f"resume setup failed before spawn: {e}"
-            return ToolMessage(
-                content=(
-                    f"Error: could not resume {task.display_id} — setup "
-                    f"failed before the subagent spawned. Try again."
-                ),
-                tool_call_id=tool_call_id,
-                name="Task",
-            )
-        task.mark_never_started(f"setup failed before spawn: {e}")
+    except SpawnSetupError:
         return ToolMessage(
             content=(
-                f"Error: could not start {task.display_id} — setup "
+                f"Error: could not resume {task.display_id} — setup "
+                f"failed before the subagent spawned. Try again."
+                if resume
+                else f"Error: could not start {task.display_id} — setup "
                 f"failed before the subagent spawned. Try again."
             ),
             tool_call_id=tool_call_id,
             name="Task",
         )
-    if asyncio_task is None:
-        # A stop stamped the (handle-less) task during a setup await — the
-        # publish fence refused the writer, so the run ends here,
-        # admitted-but-never-spawned.
-        await mw._finalize_cancelled_before_spawn(task)
+    except SpawnStoppedError:
         return ToolMessage(
             content=(
                 f"Background subagent {task.display_id} was stopped "
@@ -216,11 +202,6 @@ async def _spawn_writer(
             tool_call_id=tool_call_id,
             name="Task",
         )
-    asyncio_task.add_done_callback(
-        run_executor._make_task_done_callback(
-            task, mw._finalize_cancelled_before_spawn
-        )
-    )
     return None
 
 
@@ -251,6 +232,17 @@ async def _handle_update(
     if task.cancelled:
         return ToolMessage(
             content=f"Error: Task-{target_task_id} was cancelled and cannot be updated.",
+            tool_call_id=tool_call_id,
+            name="Task",
+        )
+
+    if task.terminal_status == "never_started":
+        return ToolMessage(
+            content=(
+                f"Error: Task-{target_task_id} never started "
+                f"({task.error}) — there is no running subagent to instruct. "
+                f"Dispatch it again with action='init'."
+            ),
             tool_call_id=tool_call_id,
             name="Task",
         )
@@ -364,6 +356,21 @@ async def _handle_resume(
             name="Task",
         )
 
+    # Never-started tasks are refused here rather than retried through the
+    # resume pipeline: there is no checkpoint to continue from, and a resume
+    # would re-admit a ledger row for work that has to go back through init
+    # (a refused workflow run task would come back as an unknown subagent).
+    if task.terminal_status == "never_started":
+        return ToolMessage(
+            content=(
+                f"Error: Task-{target_task_id} never started "
+                f"({task.error}) — there is nothing to resume. Dispatch it "
+                f"again with action='init'."
+            ),
+            tool_call_id=tool_call_id,
+            name="Task",
+        )
+
     # Validate subagent_type if explicitly provided
     if subagent_type and subagent_type != task.subagent_type:
         return ToolMessage(
@@ -429,18 +436,27 @@ async def _handle_resume(
         # BEFORE the v1 reset destroys the prior round's streams — a
         # rejected resume must leave them intact.
         resume_run_id = current_run_id or mw.registry.current_run_id
-        admitted = await mw._admit_task_run(
-            task,
-            cause="resume",
-            # Args aren't backfilled yet at admission time; a model
-            # that omitted description would otherwise ledger the
-            # schema default instead of the task's real one.
-            description=args.get("description") or task.description or "",
-            launch_tool_call_id=tool_call_id,
-            parent_run_id=resume_run_id,
-        )
-        if isinstance(admitted, ToolMessage):
-            return admitted  # fence already released by _admit_task_run
+        try:
+            admitted = await mw.admit_task_run(
+                task,
+                cause="resume",
+                # Args aren't backfilled yet at admission time; a model
+                # that omitted description would otherwise ledger the
+                # schema default instead of the task's real one.
+                description=args.get("description") or task.description or "",
+                launch_tool_call_id=tool_call_id,
+                parent_run_id=resume_run_id,
+                # Held since the liveness arbitration above.
+                acquire_fence=False,
+            )
+        except TaskRunRefused as refusal:
+            # No settle: the task keeps the result of its last run and stays
+            # resumable, so this refusal costs the model only a retry.
+            return ToolMessage(
+                content=f"Error: could not start {task.display_id} — {refusal.reason}.",
+                tool_call_id=tool_call_id,
+                name="Task",
+            )
         task.task_run_id = admitted or None
 
         await mw._reset_task_for_resume(task)
@@ -591,35 +607,23 @@ async def _handle_init(
         description=description[:100],
     )
 
-    if mw.namespace_owner is not None and not await mw._acquire_task_ns(
-        task.task_id
-    ):
-        # A fresh task_id is practically uncontended, so this is the
-        # fence itself being unusable (guard session dead) — refuse
-        # rather than spawn an unfenced writer, and leave the entry
-        # inert so no collector claims it.
-        task.mark_never_started("namespace fence unavailable")
+    try:
+        admitted = await mw.admit_task_run(
+            task,
+            cause="init",
+            description=description,
+            launch_tool_call_id=tool_call_id,
+            parent_run_id=task.spawned_run_id,
+        )
+    except TaskRunRefused as refusal:
+        # Nothing will ever run under this entry, so leave it inert — no
+        # collector claims it and no scanner retries it.
+        task.mark_never_started(refusal.settle_reason)
         return ToolMessage(
-            content=(
-                f"Error: could not start {task.display_id} — its "
-                f"checkpoint namespace could not be fenced. Try again."
-            ),
+            content=f"Error: could not start {task.display_id} — {refusal.reason}.",
             tool_call_id=tool_call_id,
             name="Task",
         )
-
-    # Ledger row born under N(thread, task:id), before any spawn side
-    # effect — admission-authoritative from day one.
-    admitted = await mw._admit_task_run(
-        task,
-        cause="init",
-        description=description,
-        launch_tool_call_id=tool_call_id,
-        parent_run_id=task.spawned_run_id,
-    )
-    if isinstance(admitted, ToolMessage):
-        task.mark_never_started("run admission rejected")
-        return admitted
     task.task_run_id = admitted or None
 
     current_background_tool_call_id.set(tool_call_id)

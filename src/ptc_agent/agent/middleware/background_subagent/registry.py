@@ -12,25 +12,35 @@ import secrets
 import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from . import redis_stream
+from .task import BackgroundTask, TerminalStatus
 
 if TYPE_CHECKING:
     from ptc_agent.agent.middleware.background_subagent.utils import MessageChecker
 
 logger = structlog.get_logger(__name__)
 
-
+# Re-exported: ``BackgroundTask`` moved to its own leaf module, and every
+# caller already reaches for it here.
+__all__ = [
+    "CANCEL_UNWIND_TIMEOUT",
+    "BackgroundTask",
+    "BackgroundTaskRegistry",
+    "TaskRunRejected",
+    "TaskWriterLive",
+    "TerminalStatus",
+    "TransportLostError",
+]
 
 # Bounded wait for a cancelled task's unwind before its registry entry drops
 # (normal unwind is milliseconds; see ``cancel_run_tasks``).
 CANCEL_UNWIND_TIMEOUT = 15.0
 
-# Cap on the pre-signal durable cancel-intent stamp (``_stamp_cancel_intent``):
+# Cap on the pre-signal durable cancel-intent stamp (``stamp_cancel_intent``):
 # a hung ledger call must not block the user-facing local cancel.
 _CANCEL_INTENT_STAMP_TIMEOUT_S = 2.0
 
@@ -74,6 +84,28 @@ class TaskWriterLive(Exception):
         super().__init__(f"live writer already registered for {task.tool_call_id}")
 
 
+def take_task_usage(
+    tasks: list[BackgroundTask], response_id: str
+) -> list[tuple[BackgroundTask, list, dict]]:
+    """Snapshot-and-clear the usage records ``response_id`` still owns.
+
+    Module-level so a torn-down thread with no registry left to lock can run
+    the same body: it has no awaits, so it is atomic either way, and the lock
+    only orders it against concurrent registry mutation.
+    """
+    taken: list[tuple[BackgroundTask, list, dict]] = []
+    for task in tasks:
+        if task.collector_response_id != response_id:
+            continue
+        if not (task.per_call_records or task.tool_usage):
+            continue
+        records, tool_usage = task.per_call_records, task.tool_usage
+        task.per_call_records = []
+        task.tool_usage = {}
+        taken.append((task, records, tool_usage))
+    return taken
+
+
 def _estimate_record_bytes(record: dict[str, Any]) -> int:
     """Cheap upper-bound estimate of a captured-event record's serialized size.
 
@@ -84,187 +116,6 @@ def _estimate_record_bytes(record: dict[str, Any]) -> int:
         return len(json.dumps(record, ensure_ascii=False, default=str))
     except Exception:
         return 256
-
-
-@dataclass
-class BackgroundTask:
-    """Represents a background subagent task."""
-
-    tool_call_id: str
-    """The LangGraph tool_call_id that triggered this task."""
-
-    task_id: str
-    """6-char alphanumeric identifier (e.g., 'k7Xm2p')."""
-
-    description: str
-    """Short description/label of the task."""
-
-    prompt: str
-    """Detailed instructions for the subagent."""
-
-    subagent_type: str
-    """Type of subagent (e.g., 'research', 'general-purpose')."""
-
-    asyncio_task: asyncio.Task | None = None
-    """The asyncio.Task object running the background wrapper."""
-
-    handler_task: asyncio.Task | None = None
-    """The underlying tool handler task executing the subagent."""
-
-    created_at: float = field(default_factory=time.time)
-    """Timestamp when the task was created."""
-
-    result: Any = None
-    """Result from the subagent once completed."""
-
-    error: str | None = None
-    """Error message if the task failed."""
-
-    completed: bool = False
-    """Whether the task has completed."""
-
-    result_seen: bool = False
-    """Whether the agent has seen this task's result (via task_output, wait, or notification)."""
-
-    # Tool call tracking
-    tool_call_counts: dict[str, int] = field(default_factory=dict)
-    """Count of tool calls by tool name."""
-
-    total_tool_calls: int = 0
-    """Total number of tool calls made."""
-
-    current_tool: str = ""
-    """Name of the tool currently being executed."""
-
-    last_checked_at: float = field(default_factory=time.time)
-    """Epoch seconds. Bumped whenever the agent inspects this task via the
-    Task tool (status/list/update/resume/cancel actions) or via TaskOutput.
-    Surfaced to the LLM so it can gauge how recently it polled, independent
-    of whether anything changed."""
-
-    last_updated_at: float = field(default_factory=time.time)
-    """Epoch seconds. Bumped only on meaningful transitions:
-
-    - Task completion (via asyncio done_callback, covers success / failure /
-      cancellation).
-    - Explicit ``cancelled = True``.
-    - A follow-up message queued via the ``update`` action.
-    - A user-visible text ``message_chunk`` event is captured.
-
-    Reasoning, reasoning-signal, tool_calls, and tool_call_result events
-    are deliberately excluded — they're high-volume pacing noise. The
-    OrphanCollector liveness check falls back to ``cur_events > prev_events``
-    for tool-only progression, so idle detection still works."""
-
-    agent_id: str = ""
-    """Stable unique identity: '{subagent_type}:{uuid4}'."""
-
-    captured_event_seq: int = 0
-    """Monotonic seq counter. Each captured event gets ``captured_event_seq + 1``;
-    the value is also the XADD entry ID (``<seq>-0``) on the per-task stream."""
-
-    captured_event_seq_base: int = 0
-    """XADD sequence floor of the current round: everything at or below it
-    belongs to a previous round on a stream the resume could not prove it
-    cleared. Readers start past it so a retained epoch is skipped rather than
-    counted, which is what makes the archive look identical whether or not the
-    resume's spool delete landed."""
-
-    captured_event_count: int = 0
-    """Events captured in the CURRENT round — reset on every resume, whether or
-    not the sequence restarts with it. The completeness gates compare it against
-    what they recover above ``captured_event_seq_base``, so a cumulative value
-    here would make a resumed round's archive look permanently short."""
-
-    captured_event_bytes: int = 0
-    """Bytes captured in the current round (telemetry only; estimated)."""
-
-    redis_write_failed: bool = False
-    """Sticky circuit-break: a failed spill permanently stops this task's Redis
-    writes, and the run ends as ``error(transport_lost)`` rather than degrading
-    to the in-memory tail — a gap in the replay archive is not recoverable."""
-
-    cancelled: bool = False
-    """Whether the task was explicitly cancelled (distinct from completed with error)."""
-
-    spawned_turn_index: int = 0
-    """The turn_index of the parent turn that spawned this subagent."""
-
-    spawned_run_id: str | None = None
-    """The run_id of the parent turn that spawned this subagent. Set from
-    ``registry.current_run_id`` at register time. Collectors filter by this
-    so subagents from prior turns can't get claimed by a later turn's
-    collector after the registry is reused across turns."""
-
-    task_run_id: str | None = None
-    """This execution's ledger identity (subagent_runs row). Stamped by the
-    middleware after the admission INSERT, re-stamped on every resume (a
-    resume is a NEW run). None when no ledger is injected (CLI/tests) or
-    for pre-ledger launches."""
-
-    per_call_records: list[dict[str, Any]] = field(default_factory=list)
-    """Token usage records collected when subagent completes."""
-
-    tool_usage: dict[str, int] = field(default_factory=dict)
-    """Billing-keyed infrastructure tool usage (e.g. "TavilySearchTool:deep" → 2),
-    snapshotted from the per-task ToolUsageTracker when the subagent completes."""
-
-    collector_response_id: str | None = None
-    """Response ID of the collector that claimed this task for persistence.
-    Set atomically during the _mark_completed filter to prevent two collectors
-    from persisting the same subagent events to different response_ids."""
-
-    sse_drain_complete: asyncio.Event = field(default_factory=asyncio.Event)
-    """Set by stream_subagent_from_log after its final drain.
-    The collector awaits this before clearing the captured-event tail so that
-    live SSE consumers are guaranteed to have emitted all events."""
-
-    sse_consumer_count: int = 0
-    """Number of active SSE consumers for this task. sse_drain_complete is
-    only set when the last consumer finishes, preventing the collector from
-    clearing the captured-event tail while another consumer is still draining."""
-
-    redis_spill_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
-    """Per-task lock that serializes XADD writes so concurrent appends to
-    the same task can't interleave commands. Without this, two appends that
-    release the registry-wide lock back-to-back can hit different Redis
-    pool connections and land at the server in reverse order, breaking the
-    explicit ``<seq>-0`` ordering on the stream. Off the registry-wide lock
-    so a slow Redis blip on one task can't stall appends to other tasks."""
-
-    def mark_cancelled(self) -> None:
-        """User-facing cancel transition, with the result payload readers expect."""
-        self.completed = True
-        self.cancelled = True
-        self.error = "Cancelled"
-        self.last_updated_at = time.time()
-        self.result = {
-            "success": False,
-            "error": "Cancelled",
-            "status": "cancelled",
-        }
-
-    def mark_never_started(self, error: str) -> None:
-        """Inert pre-spawn terminal: the entry stays registered so nothing
-        re-launches it, but no collector claims it and no result surfaces."""
-        self.completed = True
-        self.cancelled = True
-        self.result_seen = True
-        self.error = error
-
-    @property
-    def display_id(self) -> str:
-        """Return Task-<id> format for display."""
-        return f"Task-{self.task_id}"
-
-    @property
-    def is_pending(self) -> bool:
-        """True if the task is still running or registered but not yet started."""
-        if self.completed:
-            return False
-        if self.asyncio_task is None:
-            return True  # Registered but not yet started
-        return not self.asyncio_task.done()
 
 
 class BackgroundTaskRegistry:
@@ -285,11 +136,16 @@ class BackgroundTaskRegistry:
         self.current_turn_index: int = 0
         self.current_run_id: str | None = None
         self.thread_id: str = thread_id
-        # (thread_id, task_id) -> durable result text, injected by the server
-        # (checkpoint-backed). None in CLI/tests — delivery then falls back to
-        # the in-memory handler result.
+        # (thread_id, task_id, task_run_id) -> durable result text, injected by
+        # the server (checkpoint-backed). None in CLI/tests — delivery then
+        # falls back to the in-memory handler result.
         self.result_resolver: (
-            Callable[[str, str], Awaitable[str | None]] | None
+            Callable[[str, str, str | None], Awaitable[str | None]] | None
+        ) = None
+        # Same read, archive-only: for callers holding a failed/unknown verdict,
+        # where the transcript half of result_resolver would fabricate.
+        self.archived_result_resolver: (
+            Callable[[str, str, str], Awaitable[str | None]] | None
         ) = None
         # Admission-authoritative run ledger (server-injected, same pattern
         # as result_resolver): duck-typed `start_task_run`/`finalize_task_run`
@@ -312,23 +168,52 @@ class BackgroundTaskRegistry:
                     exc_info=True,
                 )
 
-    async def resolve_result_text(self, task_id: str) -> str | None:
+    async def resolve_result_text(
+        self, task_id: str, task_run_id: str | None = None
+    ) -> str | None:
         """Derive a task's result text from its durable archive.
 
         The registry entry is volatile (evicted after collection, wiped on
-        stop/restart, absent on other workers) while the subagent's answer is
+        stop/restart, absent on other workers) while the task's answer is
         checkpointed under ``task:{task_id}`` — the resolver reads the latter,
-        so delivery survives the registry. Never raises; None means "nothing
-        archived / no resolver", and callers fall back to in-memory state.
+        so delivery survives the registry. ``task_run_id`` scopes the read to
+        one ledger run; without it only the transcript derivation applies.
+        Never raises; None means "nothing archived / no resolver", and callers
+        fall back to in-memory state.
         """
         if self.result_resolver is None:
             return None
         try:
-            return await self.result_resolver(self.thread_id, task_id)
+            return await self.result_resolver(self.thread_id, task_id, task_run_id)
         except Exception:
             logger.warning(
                 "Durable result resolve failed; falling back to in-memory",
                 task_id=task_id,
+                exc_info=True,
+            )
+            return None
+
+    async def resolve_archived_result_text(
+        self, task_id: str, task_run_id: str
+    ) -> str | None:
+        """A run's explicitly archived result text — never transcript-derived.
+
+        The strict counterpart to ``resolve_result_text``, for callers whose
+        run verdict is failed or unknown: only a run that produced a result
+        archives one, so presence proves the work finished even when the
+        ledger says otherwise. Never raises; None means "nothing archived".
+        """
+        if self.archived_result_resolver is None:
+            return None
+        try:
+            return await self.archived_result_resolver(
+                self.thread_id, task_id, task_run_id
+            )
+        except Exception:
+            logger.warning(
+                "Durable archived result resolve failed",
+                task_id=task_id,
+                task_run_id=task_run_id,
                 exc_info=True,
             )
             return None
@@ -341,6 +226,7 @@ class BackgroundTaskRegistry:
         subagent_type: str,
         asyncio_task: asyncio.Task | None = None,
         run_id: str | None = None,
+        owner_task_id: str | None = None,
     ) -> BackgroundTask:
         """Register a new background task and return it.
 
@@ -383,6 +269,7 @@ class BackgroundTaskRegistry:
                 description=description,
                 prompt=prompt,
                 subagent_type=subagent_type,
+                owner_task_id=owner_task_id,
                 asyncio_task=asyncio_task,
                 agent_id=agent_id,
                 spawned_turn_index=self.current_turn_index,
@@ -409,9 +296,109 @@ class BackgroundTaskRegistry:
             return [task for task in self._tasks.values() if task.is_pending]
 
     async def get_all_tasks(self) -> list[BackgroundTask]:
-        """Return all registered tasks."""
+        """Return all registered tasks — infrastructure view (teardown,
+        liveness, workflow child cancellation). Agent-facing aggregates must
+        use ``get_turn_visible_tasks``."""
         async with self._lock:
             return list(self._tasks.values())
+
+    async def get_turn_visible_tasks(self) -> list[BackgroundTask]:
+        """The task set the agent is allowed to see in aggregate.
+
+        The door for the TaskOutput aggregates, where applying
+        ``is_turn_visible`` per call site is how a workflow's children leaked
+        into one branch while the branch beside it filtered them out. The two
+        other visibility-filtered readers inline the predicate instead, and
+        have to: ``wait_for_all`` already holds ``self._lock``, and the
+        notification scan folds it into a compound filter. Tighten the rule
+        here and those two need the same edit.
+        """
+        async with self._lock:
+            return [t for t in self._tasks.values() if t.is_turn_visible]
+
+    def _has_collectible_work(self, task: BackgroundTask) -> bool:
+        """Still running, or holding capture a collector has to persist."""
+        return bool(
+            task.is_pending
+            or task.captured_event_count > 0
+            or task.per_call_records
+            or task.tool_usage
+        )
+
+    async def _claim_for_collector(
+        self, response_id: str, in_scope: Callable[[BackgroundTask], bool]
+    ) -> list[BackgroundTask]:
+        """Atomically claim one scope's unclaimed tasks for a collector.
+
+        Scan and claim share the registry lock: two collectors that both saw
+        a task unclaimed would each persist its events under a different
+        response_id, so the check and the stamp must not be separable — which
+        is why every claim scope is a registry method rather than a getter the
+        caller loops over.
+        """
+        async with self._lock:
+            claimed = []
+            for task in self._tasks.values():
+                if task.collector_response_id or not in_scope(task):
+                    continue
+                if self._has_collectible_work(task):
+                    task.collector_response_id = response_id
+                    claimed.append(task)
+            return claimed
+
+    async def claim_owner_children(
+        self, owner_task_id: str, response_id: str
+    ) -> list[BackgroundTask]:
+        """Claim an owner's unclaimed children for a collector."""
+        return await self._claim_for_collector(
+            response_id, lambda task: task.owner_task_id == owner_task_id
+        )
+
+    async def claim_run_subagents(
+        self, run_id: str, response_id: str
+    ) -> list[BackgroundTask]:
+        """Claim the subagents a turn spawned for that turn's collector.
+
+        An unstamped ``spawned_run_id`` matches — compat shim for tasks
+        registered before run-id stamping shipped.
+        """
+        return await self._claim_for_collector(
+            response_id,
+            lambda task: task.spawned_run_id is None or task.spawned_run_id == run_id,
+        )
+
+    async def take_owned_usage(
+        self, tasks: list[BackgroundTask], response_id: str
+    ) -> list[tuple[BackgroundTask, list, dict]]:
+        """Take the usage records this collector already owns, under the lock.
+
+        The billing sibling of the claim family: ownership is checked rather
+        than stamped, because the caller claimed these tasks earlier — and the
+        snapshot and the clear are one step, or a concurrent accrual is billed
+        twice or lost.
+        """
+        async with self._lock:
+            return take_task_usage(tasks, response_id)
+
+    async def live_writers_where(
+        self, predicate: Callable[[BackgroundTask], bool]
+    ) -> list[asyncio.Task]:
+        """Snapshot the still-running writer handles of matching tasks.
+
+        Under the lock so a handle can't be swapped mid-scan. The predicate is
+        the caller's because the scopes that need this aren't the registry's to
+        know — the guard drain matches on writer namespace, which no registry
+        field records.
+        """
+        async with self._lock:
+            writers: list[asyncio.Task] = []
+            for task in self._tasks.values():
+                if not predicate(task):
+                    continue
+                for writer in (task.asyncio_task, task.handler_task):
+                    if writer is not None and not writer.done():
+                        writers.append(writer)
+            return writers
 
     async def get_by_task_id(self, task_id: str) -> BackgroundTask | None:
         """Return the task for a given 6-char task_id, or None."""
@@ -463,7 +450,6 @@ class BackgroundTaskRegistry:
         async with self._lock:
             if (
                 self._tasks.get(task.tool_call_id) is not task
-                or task.cancelled
                 or task.completed
                 or task.asyncio_task is not None
             ):
@@ -736,22 +722,15 @@ class BackgroundTaskRegistry:
         # --- collect result ----------------------------------------------
         async with self._lock:
             if task.asyncio_task.done():
-                task.completed = True
-                try:
-                    result = task.asyncio_task.result()
-                    task.result = result
-                    self._results[tool_call_id] = result
-                    logger.info(
-                        "Specific task completed",
-                        task_id=task_id,
-                        display_id=task.display_id,
-                    )
-                    return result
-                except Exception as e:
-                    task.error = str(e)
-                    error_result = {"success": False, "error": str(e)}
-                    self._results[tool_call_id] = error_result
-                    return error_result
+                result = task.adopt_writer_outcome(task.asyncio_task)
+                self._results[tool_call_id] = result
+                logger.info(
+                    "Specific task settled",
+                    task_id=task_id,
+                    display_id=task.display_id,
+                    terminal_status=task.terminal_status,
+                )
+                return result
             else:
                 return {
                     "success": False,
@@ -770,12 +749,17 @@ class BackgroundTaskRegistry:
 
         Returns a dict mapping tool_call_id to result. Still-running tasks
         on interrupt get ``status="interrupted"``.
+
+        Workflow-owned children (``owner_task_id`` set) are excluded: their
+        driver waits on them; the turn only waits on the run task itself.
         """
         async with self._lock:
             tasks_to_wait = {
                 tool_call_id: task.asyncio_task
                 for tool_call_id, task in self._tasks.items()
-                if not task.completed and task.asyncio_task is not None
+                if not task.completed
+                and task.asyncio_task is not None
+                and task.is_turn_visible
             }
 
         if not tasks_to_wait:
@@ -834,26 +818,12 @@ class BackgroundTaskRegistry:
                     continue
 
                 if asyncio_task.done():
-                    task.completed = True
-                    try:
-                        result = asyncio_task.result()
-                        task.result = result
-                        results[tool_call_id] = result
-                        logger.info(
-                            "Background task completed",
-                            tool_call_id=tool_call_id,
-                            success=result.get("success", False)
-                            if isinstance(result, dict)
-                            else True,
-                        )
-                    except Exception as e:
-                        task.error = str(e)
-                        results[tool_call_id] = {"success": False, "error": str(e)}
-                        logger.error(
-                            "Background task failed",
-                            tool_call_id=tool_call_id,
-                            error=str(e),
-                        )
+                    results[tool_call_id] = task.adopt_writer_outcome(asyncio_task)
+                    logger.info(
+                        "Background task settled",
+                        tool_call_id=tool_call_id,
+                        terminal_status=task.terminal_status,
+                    )
                 elif interrupted:
                     results[tool_call_id] = {
                         "success": False,
@@ -877,7 +847,7 @@ class BackgroundTaskRegistry:
 
         return results
 
-    async def _stamp_cancel_intent(self, tasks: list["BackgroundTask"]) -> None:
+    async def stamp_cancel_intent(self, tasks: list["BackgroundTask"]) -> None:
         """Best-effort durable cancel intent for ledgered tasks, stamped
         BEFORE their writers are signalled: a worker that dies mid-unwind
         must recover as `cancelled`, not `worker_lost`. Ledger failure —
@@ -925,7 +895,11 @@ class BackgroundTaskRegistry:
         return task.asyncio_task is None or not task.asyncio_task.done()
 
     def _cancel_marked(
-        self, intent_targets: list["BackgroundTask"], *, force: bool
+        self,
+        intent_targets: list["BackgroundTask"],
+        *,
+        force: bool,
+        reason: str = "Cancelled",
     ) -> int:
         """Cancel + mark exactly the re-validated stamp targets. Caller holds
         ``self._lock``. Only stamped targets: a task registered during the
@@ -938,18 +912,14 @@ class BackgroundTaskRegistry:
                 continue
             if not self._cancellable(task):
                 continue
-            if task.asyncio_task is not None:
-                if force and task.handler_task and not task.handler_task.done():
-                    task.handler_task.cancel()
-                task.asyncio_task.cancel()
-            # else: STARTING task — registered but its spawn is still
-            # awaiting setup (admission/meta/opener). There is no writer to
-            # cancel, but the stamp seals its capture and the publish fence
-            # (``publish_writer``) turns the pending spawn into an abort.
-            # Without this the task would be classified writer-less,
+            # A STARTING task — registered but its spawn still awaiting setup
+            # (admission/meta/opener) — reaches here with no writer to cancel,
+            # and gets stamped anyway: the stamp seals its capture and the
+            # publish fence (``publish_writer``) turns the pending spawn into
+            # an abort. Without it the task would be classified writer-less,
             # dropped, and its later-spawned writer would run to completion
             # with every append silently discarded.
-            task.mark_cancelled()
+            task.force_cancel(reason, cancel_handler=force)
             cancelled += 1
         return cancelled
 
@@ -957,7 +927,7 @@ class BackgroundTaskRegistry:
         """Cancel all pending background tasks; returns the count cancelled."""
         async with self._lock:
             intent_targets = [t for t in self._tasks.values() if self._cancellable(t)]
-        await self._stamp_cancel_intent(intent_targets)
+        await self.stamp_cancel_intent(intent_targets)
         async with self._lock:
             cancelled = self._cancel_marked(intent_targets, force=force)
 
@@ -965,6 +935,27 @@ class BackgroundTaskRegistry:
             logger.info("Cancelled background tasks", count=cancelled, force=force)
 
         return cancelled
+
+    async def cancel_task(self, task_id: str, *, force: bool = False) -> bool:
+        """Cancel one live task by its short id (user-targeted stop).
+
+        Same stamp-then-cancel flow as ``cancel_all``; the entry stays
+        registered — its turn collector still claims and drains it.
+        """
+        async with self._lock:
+            intent_targets = [
+                t
+                for t in self._tasks.values()
+                if t.task_id == task_id and self._cancellable(t)
+            ]
+        if not intent_targets:
+            return False
+        await self.stamp_cancel_intent(intent_targets)
+        async with self._lock:
+            cancelled = self._cancel_marked(intent_targets, force=force)
+        if cancelled:
+            logger.info("Cancelled background task by request", task_id=task_id)
+        return cancelled > 0
 
     async def cancel_run_tasks(self, run_id: str, *, force: bool = False) -> int:
         """Cancel and drop only the tasks spawned by ``run_id``.
@@ -981,7 +972,7 @@ class BackgroundTaskRegistry:
                 for t in self._tasks.values()
                 if t.spawned_run_id == run_id and self._cancellable(t)
             ]
-        await self._stamp_cancel_intent(intent_targets)
+        await self.stamp_cancel_intent(intent_targets)
         scoped: list[str] = []
         async with self._lock:
             cancelled = self._cancel_marked(intent_targets, force=force)
@@ -1041,6 +1032,40 @@ class BackgroundTaskRegistry:
                 run_id=run_id,
                 count=cancelled,
                 force=force,
+            )
+        return cancelled
+
+    async def cancel_owner_children(self, owner_task_id: str, *, reason: str) -> int:
+        """Cancel one owner's live children — the teardown a workflow run does
+        when it ends before its children do.
+
+        Owner-scoped cancel belongs here for the reason ``claim_owner_children``
+        does: the eligibility check and the act must not be separable, and the
+        predicate is the registry's (a finished writer awaiting its
+        done-callback settles as what it was, not as cancelled). Entries stay
+        registered — unlike ``cancel_run_tasks`` the owning turn is still live
+        and its collector still drains them. Always forceful: the owner is gone,
+        so a shielded handler left running has nothing to report to.
+        """
+        async with self._lock:
+            intent_targets = [
+                t
+                for t in self._tasks.values()
+                if t.owner_task_id == owner_task_id and self._cancellable(t)
+            ]
+        if not intent_targets:
+            return 0
+        await self.stamp_cancel_intent(intent_targets)
+        async with self._lock:
+            cancelled = self._cancel_marked(
+                intent_targets, force=True, reason=reason
+            )
+        if cancelled > 0:
+            logger.info(
+                "Cancelled owner-scoped background tasks",
+                owner_task_id=owner_task_id,
+                count=cancelled,
+                reason=reason,
             )
         return cancelled
 

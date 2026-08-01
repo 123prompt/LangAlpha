@@ -50,7 +50,7 @@ def _make_task_done_callback(
     """Build a done_callback that bumps ``last_updated_at`` when the asyncio.Task finishes.
 
     Covers all completion paths (success, failure, cancellation) without
-    having to instrument every ``task.completed = True`` site.
+    having to instrument every site that settles a task.
     """
 
     def _on_task_done(_t: asyncio.Task) -> None:

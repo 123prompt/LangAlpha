@@ -923,7 +923,7 @@ async def test_cancelled_task_appends_are_dropped() -> None:
         tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
     )
     await registry.append_captured_event(task.tool_call_id, _event(0))
-    task.cancelled = True
+    task.terminal_status = "cancelled"
     await registry.append_captured_event(task.tool_call_id, _event(1))
 
     assert task.captured_event_seq == 1
@@ -940,7 +940,7 @@ async def test_cancelled_task_terminal_append_lands() -> None:
     task = await registry.register(
         tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
     )
-    task.cancelled = True
+    task.terminal_status = "cancelled"
     await registry.append_captured_event(task.tool_call_id, _event(0))
     await registry.append_captured_event(
         task.tool_call_id,
@@ -949,4 +949,19 @@ async def test_cancelled_task_terminal_append_lands() -> None:
     )
 
     assert task.captured_event_seq == 1
+    assert task.captured_event_count == 1
+
+
+@pytest.mark.asyncio
+async def test_settled_but_uncancelled_task_appends_still_land() -> None:
+    """The seal keys off ``cancelled``, never ``completed``: a task that ran to
+    the end is settled too, so sealing on mere settlement would drop the
+    trailing frames of every normal finish instead of only post-kill output."""
+    registry = BackgroundTaskRegistry()
+    task = await registry.register(
+        tool_call_id="tc1", description="d", prompt="p", subagent_type="general-purpose"
+    )
+    task.terminal_status = "completed"
+    await registry.append_captured_event(task.tool_call_id, _event(0))
+
     assert task.captured_event_count == 1

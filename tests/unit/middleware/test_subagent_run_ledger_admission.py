@@ -132,7 +132,7 @@ async def test_init_rejected_spawns_nothing_and_releases_fence():
     assert "task already has a live run" in result.content
     task = mw.registry._tasks["tc-1"]
     assert task.asyncio_task is None
-    assert task.completed and task.cancelled  # inert: no collector claims it
+    assert task.terminal_status == "never_started"  # inert: no collector claims it
     assert owner.released == [task.task_id]  # fence not left held
     assert ledger.finalized == []  # nothing was born
 
@@ -204,7 +204,7 @@ async def test_cancelled_flag_maps_to_cancelled_finalize():
     mw.registry.write_task_meta = AsyncMock()
 
     async def _cancelling_handler(_request):
-        mw.registry._tasks["tc-1"].cancelled = True
+        mw.registry._tasks["tc-1"].terminal_status = "cancelled"
         return ToolMessage(content="done", tool_call_id="tc-1", name="Task")
 
     await mw.awrap_tool_call(
@@ -269,7 +269,7 @@ async def test_cancel_wins_over_torn_stream_escalation():
     async def _torn_cancelled_handler(_request):
         task = mw.registry._tasks["tc-1"]
         task.redis_write_failed = True
-        task.cancelled = True
+        task.terminal_status = "cancelled"
         return ToolMessage(content="done", tool_call_id="tc-1", name="Task")
 
     await mw.awrap_tool_call(
@@ -294,7 +294,7 @@ async def test_setup_failure_after_admission_aborts_the_born_run():
     assert "setup failed before the subagent spawned" in result.content
     task = mw.registry._tasks["tc-1"]
     assert task.asyncio_task is None
-    assert task.completed and task.cancelled
+    assert task.terminal_status == "never_started"
     # The admitted row terminates instead of stranding in_progress.
     assert ledger.finalized == [
         (
@@ -322,7 +322,7 @@ async def _register_settled_task(mw) -> object:
         subagent_type="general-purpose",
         asyncio_task=None,
     )
-    task.completed = True
+    task.terminal_status = "completed"
     task.task_run_id = "run-uuid-prev"
     return task
 
@@ -349,6 +349,37 @@ async def test_resume_rejected_before_reset_leaves_task_resumable():
     assert task.completed and not task.cancelled  # still resumable later
     assert task.task_run_id == "run-uuid-prev"  # identity not clobbered
     assert owner.released == [task.task_id]
+
+
+@pytest.mark.asyncio
+async def test_resume_setup_failure_leaves_the_task_resumable_not_inert():
+    """A resume that dies in setup must not go inert: its durable result is
+    still in the ``task:{id}`` checkpoint, so the entry has to stay
+    resumable — and marking it never-started would also flip ``result_seen``,
+    silently dropping the turn notification for a task the agent never saw."""
+    owner = FakeOwner()
+    ledger = FakeLedger(admit="run-uuid-next")
+    mw = _middleware(owner, ledger)
+    task = await _register_settled_task(mw)
+    task.result_seen = False
+    mw._reset_task_for_resume = AsyncMock()
+    mw.registry.write_task_meta = AsyncMock(side_effect=RuntimeError("redis gone"))
+
+    result = await mw.awrap_tool_call(
+        _request(
+            {"action": "resume", "task_id": task.task_id, "prompt": "more"},
+            tool_call_id="tc-2",
+        ),
+        _ok_handler,
+    )
+
+    assert "could not resume" in result.content
+    assert task.terminal_status == "error"
+    assert task.error == "resume setup failed before spawn: redis gone"
+    assert task.result_seen is False
+    assert task.asyncio_task is None
+    # The admitted row terminates rather than stranding in_progress.
+    assert ledger.finalized[-1][:2] == ("run-uuid-next", "error")
 
 
 @pytest.mark.asyncio
