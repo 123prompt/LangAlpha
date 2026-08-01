@@ -82,7 +82,11 @@ dependencies = [
     # and switched PatchToolCallsMiddleware off the id-less `Overwrite` write, so
     # langgraph's ensure_message_ids covers every id-less messages write and no
     # app-side id-stamping shim is needed.
-    "deepagents>=0.6.11",
+    # Ceiling at <0.8: the four symbols we import (PatchToolCallsMiddleware,
+    # BackendProtocol, backends.utils) all sit outside deepagents' declared
+    # __all__, so a 0.x minor is free to delete them without notice — 0.7.0
+    # dropped WriteResult.files_update exactly that way. Bump deliberately.
+    "deepagents>=0.6.11,<0.8",
     "daytona>=0.200.1",
     "boto3>=1.42.28",
     "tavily-python>=0.7.18",
@@ -95,6 +99,8 @@ dependencies = [
     "charset-normalizer>=3.4.0",
     "opentelemetry-api>=1.41.1",
     "exchange-calendars>=4.13.2",
+    "quickjs-rs>=0.2.4,<0.3.0",
+    "jsonschema>=4.0",
 ]
 
 [tool.uv.sources]
