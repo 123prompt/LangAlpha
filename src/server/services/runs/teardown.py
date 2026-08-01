@@ -193,9 +193,12 @@ async def drain_killed_subagent_events(
         open_reasoning: dict[tuple[str, str], None] = {}
         task_events: list[dict] = []
         run_id = getattr(task, "spawned_run_id", None)
-        # Same epoch rule as the collector: a run-stamped task's records
-        # are always stamped, so unstamped ones are a foreign pre-stamp
-        # writer's — never this round's.
+        # Always the stamped arm in practice: step 2's snapshot admits only
+        # spawned_run_id == run_id tasks and run_id is a non-empty uuid, so
+        # agreement with the collector's epoch rule comes from that upstream
+        # filter, not from re-deriving the rule here. The collector's
+        # unstamped arm serves cross-worker hydrated shells — a population
+        # the filter excludes; the (None,) arm is defensive only.
         allowed = (run_id,) if run_id else (None,)
         eligible = 0
         try:

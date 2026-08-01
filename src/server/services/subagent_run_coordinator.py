@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional
 
 from ptc_agent.agent.middleware.background_subagent.registry import TaskRunRejected
 
+from src.server.contracts.status import REPORT_BACK_STATUSES
 from src.server.database.runs import subagent_runs as sr_db
 
 logger = logging.getLogger(__name__)
@@ -199,7 +200,7 @@ class SubagentRunCoordinator:
                     payload={"outcome": run["status"]},
                     terminal=True,
                 )
-            if run["status"] == "completed" and run.get("parent_run_id"):
+            if run["status"] in REPORT_BACK_STATUSES and run.get("parent_run_id"):
                 # The report-back job committed with the CAS; wake the
                 # drainer so a tail completion notifies promptly instead of
                 # riding the poll interval. Best-effort — the job is durable.
@@ -262,6 +263,13 @@ class SubagentRunCoordinator:
         if latest is None:
             return None
         return await sr_db.get_task_run(str(latest))
+
+    async def list_open_workflow_runs(self) -> list[Dict[str, Any]]:
+        """This thread's open workflow-kind runs across ALL workers — the
+        admission authority for RunWorkflow's per-thread cap (boundary
+        adapter for the injected port; the local registry is a per-process
+        view and undercounts)."""
+        return await sr_db.list_open_workflow_runs_for_thread(self.thread_id)
 
     async def request_task_run_cancel(self, task_run_id: str) -> Dict[str, Any]:
         """Durable cancel intent, thread-scoped (boundary adapter — binds

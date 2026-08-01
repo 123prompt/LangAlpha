@@ -458,10 +458,15 @@ async def finalize_run(
                     )
 
                 # Deferred task report-backs wait for exactly this event: a
-                # completed finalize proves no pending HITL checkpoint can
-                # collide with their synthetic POST. Same transaction as the
-                # terminal CAS, so release and successor hooks commit together.
-                if final_status == "completed":
+                # dead-turn finalize (completed, error, or cancelled) proves
+                # no pending HITL checkpoint can collide with their synthetic
+                # POST. Interrupted keeps them parked — the checkpoint is
+                # live and a POST would collide with it; an interrupted
+                # parent that later errors or cancels releases here, so a
+                # parked job can never be stranded. Same transaction as the
+                # terminal CAS, so release and successor hooks commit
+                # together.
+                if final_status in ("completed", "error", "cancelled"):
                     released = await release_deferred_jobs(
                         conn, thread_id, "task_report_back"
                     )

@@ -265,6 +265,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start LocalRunExecutor cleanup task: {e}")
 
+    # Warm and validate repository-shipped workflows so bad seeds are logged
+    # during startup rather than on the first request.
+    try:
+        from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
+            get_prebuilt_workflows,
+        )
+
+        prebuilts = get_prebuilt_workflows()
+        logger.info(f"Loaded {len(prebuilts.names())} pre-built workflow(s)")
+    except Exception as e:
+        logger.warning(f"Pre-built workflow warmup failed: {e}")
+
     # Initialize PTC Agent configuration and session service
     try:
         from ptc_agent.config import load_from_files, ConfigContext
@@ -990,6 +1002,7 @@ from src.server.app.skills import router as skills_router
 from src.server.app.vault import router as vault_router
 from src.server.app.memo import router as memo_router
 from src.server.app.memory import router as memory_router
+from src.server.app.workflows import include_workflow_router
 from src.server.app.mcp_catalog import router as mcp_catalog_router
 from src.server.app.mcp_servers import router as mcp_servers_router
 
@@ -1065,6 +1078,7 @@ app.include_router(
 app.include_router(
     memo_router
 )  # /api/v1/memo/* - User-managed document memos (upload, read, write, delete, download)
+include_workflow_router(app)  # /api/v1/workflows/* - Reusable JavaScript workflows
 app.include_router(
     mcp_catalog_router
 )  # /api/v1/mcp/servers - User-level MCP server catalog (templates)

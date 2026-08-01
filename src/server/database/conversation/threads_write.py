@@ -319,6 +319,35 @@ async def update_thread_checkpoint_id(
         return False
 
 
+async def advance_thread_checkpoint_id(
+    conversation_thread_id: str,
+    *,
+    from_checkpoint_id: Optional[str],
+    to_checkpoint_id: str,
+) -> bool:
+    """CAS tip advance for root-namespace ui appends after a turn finalized.
+
+    Not the turn-lifecycle writer (``database/runs/lifecycle.py`` owns that):
+    this only moves the tip when it still points at the exact checkpoint the
+    append built on, so a concurrent turn or branch switch keeps ownership.
+    """
+    try:
+        sql = """
+            UPDATE conversation_threads
+            SET latest_checkpoint_id = %s, updated_at = NOW()
+            WHERE conversation_thread_id = %s
+              AND latest_checkpoint_id IS NOT DISTINCT FROM %s
+        """
+        params = (to_checkpoint_id, conversation_thread_id, from_checkpoint_id)
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(sql, params)
+                return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"Error advancing thread checkpoint_id: {e}")
+        return False
+
+
 async def ensure_thread_exists(
     workspace_id: str,
     conversation_thread_id: str,

@@ -17,7 +17,9 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_STATUSES = ("completed", "cancelled", "error")
+# Client vocabulary (see _LEDGER_TO_CLIENT), not the ledger's — everything
+# ``resolve_task_details`` can report except "running".
+TERMINAL_TASK_STATUSES = ("completed", "cancelled", "error")
 
 # Ledger run status -> client vocabulary — a deliberate SECOND lane beside
 # contracts.status (whose public mapping keeps 'interrupted' for
@@ -125,7 +127,7 @@ async def _resolve_legacy_statuses(
         )
         if live is None and meta_status == "running":
             statuses[task_id] = "running"
-        elif meta_status in _TERMINAL_STATUSES:
+        elif meta_status in TERMINAL_TASK_STATUSES:
             statuses[task_id] = meta_status
         else:
             statuses[task_id] = "completed"
