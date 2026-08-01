@@ -22,6 +22,9 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTask,
     TaskWriterLive,
 )
+from ptc_agent.agent.middleware.background_subagent.task import (
+    WORKFLOW_SUBAGENT_TYPE,
+)
 from ptc_agent.agent.middleware.background_subagent.spawn import (
     SpawnSetupError,
     SpawnStoppedError,
@@ -366,6 +369,24 @@ async def _handle_resume(
                 f"Error: Task-{target_task_id} never started "
                 f"({task.error}) — there is nothing to resume. Dispatch it "
                 f"again with action='init'."
+            ),
+            tool_call_id=tool_call_id,
+            name="Task",
+        )
+
+    # A workflow run's task is a driver entry, not a subagent. Resuming it
+    # would admit a fresh ledger row and hand it to the ordinary spawn path,
+    # which answers an unknown type with prose *as a successful result* — so
+    # the new run completes, becomes the task's latest, and TaskOutput starts
+    # resolving against it instead of the workflow's archived result. Refused
+    # before admission for the same reason `never_started` is: the damage is
+    # the row, not the spawn.
+    if task.subagent_type == WORKFLOW_SUBAGENT_TYPE:
+        return ToolMessage(
+            content=(
+                f"Error: Task-{target_task_id} is a workflow run and cannot be "
+                f'resumed. Use TaskOutput(task_id="{target_task_id}") for its '
+                f"result, or RunWorkflow to start a new run."
             ),
             tool_call_id=tool_call_id,
             name="Task",

@@ -9,10 +9,12 @@ corrective re-dispatch and then a null in the script.
 from __future__ import annotations
 
 import json
+import tracemalloc
 
 import pytest
 
 from ptc_agent.agent.middleware.background_subagent.workflow.validation import (
+    _MAX_REASON_CHARS,
     parse_schema_result,
 )
 
@@ -127,3 +129,56 @@ def test_a_rejection_reports_the_reason_not_the_reply() -> None:
     # The reply is already on the record as `result` / `full_result_ref`.
     assert "n" * 200 not in error
     assert len(error) < 200, f"reason echoed the reply back ({len(error)} chars)"
+
+
+@pytest.mark.parametrize(
+    ("schema", "reply", "expectation"),
+    [
+        ({"type": "integer"}, '"{}"', "is not of type 'integer'"),
+        (
+            {"type": "string", "maxLength": 8},
+            '"{}"',
+            "is too long",
+        ),
+        ({"enum": ["yes", "no"]}, '"{}"', "is not one of"),
+    ],
+    ids=["type", "maxLength", "enum"],
+)
+def test_a_bounded_reason_survives_a_validator_that_embeds_the_instance(
+    schema: dict, reply: str, expectation: str
+) -> None:
+    """``required`` names the missing key, so its message is small no matter
+    how big the reply is — which is why it cannot stand in for this. The
+    common validators interpolate ``instance!r`` into ``.message`` itself, so
+    a rejected reply comes back as its own reason unless it is clipped.
+
+    Clipped in the middle, because the expectation lives at the tail: a child
+    told only what it wrote cannot fix anything.
+    """
+    body = "z" * 90_000
+    valid, parsed, error = parse_schema_result(reply.format(body), schema)
+
+    assert not valid
+    assert parsed is None
+    assert len(error) <= _MAX_REASON_CHARS
+    assert body not in error
+    assert expectation in error
+
+
+def test_the_candidate_scan_is_bounded_by_the_cap_not_the_reply() -> None:
+    """The reply is validated before it is truncated, so a scan that collects
+    every delimiter up front is sized by the child's output rather than by
+    ``_MAX_JSON_CANDIDATES``.
+    """
+    reply = "{" * 2_000_000
+
+    tracemalloc.start()
+    try:
+        valid, _, _ = parse_schema_result(reply, SCHEMA)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert not valid
+    # One int per delimiter would be tens of MB; the cap admits 32 of them.
+    assert peak < 8 * 1024 * 1024, f"scan allocated {peak / 1e6:.1f}MB"

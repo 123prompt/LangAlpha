@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 from jsonschema import exceptions as jsonschema_exceptions
@@ -42,6 +43,15 @@ _MAX_JSON_CANDIDATES = 32
 # a worker thread whose caller unwinds the whole run on anything it does not
 # name. `json` recurses per level on both the decoder and the validator.
 _UNREADABLE_JSON = (json.JSONDecodeError, RecursionError)
+# A validation reason is sized by the schema, never by the reply. `jsonschema`
+# interpolates `instance!r` into `ValidationError.message` itself for the
+# common validators (`type`, `enum`, `maxLength`), so a rejected 90KB reply
+# yields a 90KB reason — which `compose_child_prompt` then echoes back at the
+# child that just wrote it, spending the retry's context on its own output and,
+# for a large enough reply, overrunning `max_prompt_chars` outright. That turns
+# a mismatch the script was promised a retry for into a throw.
+_MAX_REASON_CHARS = 400
+_REASON_ELISION = " …[clipped]… "
 
 
 class DispatchValidationError(Exception):
@@ -146,6 +156,19 @@ def schema_instruction(schema: dict[str, Any]) -> str:
     )
 
 
+def _clip_reason(text: str) -> str:
+    """Bound a validation reason without discarding what it was measured against.
+
+    Clips the middle rather than the tail: every validator that embeds the
+    instance puts it *first* (``<instance> is not of type 'integer'``), so a
+    tail clip would keep only the reply and drop the actual expectation.
+    """
+    if len(text) <= _MAX_REASON_CHARS:
+        return text
+    keep = (_MAX_REASON_CHARS - len(_REASON_ELISION)) // 2
+    return f"{text[:keep]}{_REASON_ELISION}{text[-keep:]}"
+
+
 def parse_schema_result(
     content: str, schema: dict[str, Any]
 ) -> tuple[bool, Any, str | None]:
@@ -167,16 +190,16 @@ def parse_schema_result(
         try:
             validator_for(schema)(schema, registry=_NO_REMOTE_REFS).validate(instance)
         except jsonschema_exceptions.ValidationError as error:
-            # `str(error)` pretty-prints the failing instance, so the reason
-            # for a rejected 90KB reply is a ~100KB string that is mostly that
-            # reply — echoed back at the child that just wrote it, and large
-            # enough on its own to overrun the prompt cap on the retry. The
-            # message plus its location is the whole signal; the instance is
+            # `str(error)` pretty-prints the failing instance *and* the schema;
+            # `.message` still interpolates the instance for most validators.
+            # Neither is bounded by anything we control, so the reason is
+            # clipped before it can become a retry prompt. The instance is
             # already on the record as `result` and `full_result_ref`.
             location = error.json_path
+            reason = _clip_reason(error.message)
             if location and location != "$":
-                return f"{error.message} (at {location})"
-            return error.message
+                return f"{reason} (at {location})"
+            return reason
         except RecursionError:
             return "response nests too deeply to validate"
         except Unresolvable as error:
@@ -205,8 +228,11 @@ def parse_schema_result(
     # stray bracket in the surrounding prose from swallowing the real value.
     # The first candidate that also satisfies the schema wins, so a bracketed
     # aside that happens to be valid JSON cannot shadow the actual reply.
-    starts = [index for index, char in enumerate(text) if char in "{["]
-    for index in starts[:_MAX_JSON_CANDIDATES]:
+    # Lazily: the reply is validated before it is truncated, so materializing
+    # every delimiter offset would size an allocation by the reply rather than
+    # by the cap that is supposed to bound this scan.
+    starts = (index for index, char in enumerate(text) if char in "{[")
+    for index in islice(starts, _MAX_JSON_CANDIDATES):
         try:
             parsed, _ = decoder.raw_decode(text, index)
         except _UNREADABLE_JSON as error:

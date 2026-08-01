@@ -25,6 +25,15 @@ the task pending, and ``never_started`` has none either — a run that never
 spawned either has no row or already settled its own as ``error``.
 """
 
+WORKFLOW_SUBAGENT_TYPE = "workflow"
+"""The ``subagent_type`` a workflow run's task carries.
+
+Deliberately not a key in ``subagent_graphs``: a workflow is driven by
+``WorkflowDriver``, not by a subagent graph. Anything that would hand a task
+to the ordinary spawn path has to refuse this type first, because that path
+answers an unknown type with prose rather than an error.
+"""
+
 
 @dataclass
 class BackgroundTask:

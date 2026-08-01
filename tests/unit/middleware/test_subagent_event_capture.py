@@ -965,3 +965,67 @@ async def test_settled_but_uncancelled_task_appends_still_land() -> None:
     await registry.append_captured_event(task.tool_call_id, _event(0))
 
     assert task.captured_event_count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_childs_progress_counts_as_its_owners() -> None:
+    """The orphan collector's idle timer resets on ``last_updated_at``, and it
+    watches an owner alone — owner-children are not claimed until the owner
+    settles. A workflow parent emits nothing between ``child_started`` and
+    ``child_done``, so without this a fan-out whose children legitimately run
+    past the idle timeout reads as abandoned and loses its collector.
+    """
+    registry = BackgroundTaskRegistry()
+    owner = await registry.register(
+        tool_call_id="tc-owner", description="d", prompt="p",
+        subagent_type="workflow",
+    )
+    child = await registry.register(
+        tool_call_id="tc-child", description="d", prompt="p",
+        subagent_type="general-purpose", owner_task_id=owner.task_id,
+    )
+    owner.last_updated_at = 0.0
+
+    await registry.append_captured_event(child.tool_call_id, _text_event(0))
+
+    assert owner.last_updated_at == child.last_updated_at > 0.0
+
+
+@pytest.mark.asyncio
+async def test_pacing_noise_does_not_refresh_an_owner() -> None:
+    """The owner inherits exactly the child's own progress predicate — tool
+    calls and reasoning are excluded there, so they cannot revive an owner the
+    child itself would have left idle."""
+    registry = BackgroundTaskRegistry()
+    owner = await registry.register(
+        tool_call_id="tc-owner", description="d", prompt="p",
+        subagent_type="workflow",
+    )
+    child = await registry.register(
+        tool_call_id="tc-child", description="d", prompt="p",
+        subagent_type="general-purpose", owner_task_id=owner.task_id,
+    )
+    owner.last_updated_at = 0.0
+
+    await registry.append_captured_event(child.tool_call_id, _event(0))
+
+    assert owner.last_updated_at == 0.0
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_subagent_refreshes_nobody() -> None:
+    """No owner, no propagation — and no crash looking for one."""
+    registry = BackgroundTaskRegistry()
+    other = await registry.register(
+        tool_call_id="tc-other", description="d", prompt="p",
+        subagent_type="general-purpose",
+    )
+    task = await registry.register(
+        tool_call_id="tc1", description="d", prompt="p",
+        subagent_type="general-purpose",
+    )
+    other.last_updated_at = 0.0
+
+    await registry.append_captured_event(task.tool_call_id, _text_event(0))
+
+    assert other.last_updated_at == 0.0

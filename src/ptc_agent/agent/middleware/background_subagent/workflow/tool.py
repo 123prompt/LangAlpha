@@ -21,6 +21,9 @@ from ptc_agent.agent.middleware.background_subagent.dispatch import (
     SubagentDispatcher,
 )
 from ptc_agent.agent.middleware.background_subagent.registry import TaskWriterLive
+from ptc_agent.agent.middleware.background_subagent.task import (
+    WORKFLOW_SUBAGENT_TYPE,
+)
 from ptc_agent.agent.middleware.background_subagent.spawn import (
     DispatchSpawnError,
     TaskRunRefused,
@@ -400,7 +403,7 @@ def create_run_workflow_tool(
                 tool_call_id=launch_tool_call_id,
                 description=description or meta.description,
                 prompt=script[:500],
-                subagent_type="workflow",
+                subagent_type=WORKFLOW_SUBAGENT_TYPE,
                 run_id=str(launch_run_id) if launch_run_id else None,
             )
         except TaskWriterLive as exc:

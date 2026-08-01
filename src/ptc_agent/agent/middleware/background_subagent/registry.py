@@ -400,13 +400,15 @@ class BackgroundTaskRegistry:
                         writers.append(writer)
             return writers
 
+    def _locked_get_by_task_id(self, task_id: str) -> BackgroundTask | None:
+        """Resolve a 6-char task_id. Caller must hold ``self._lock``."""
+        tool_call_id = self._task_id_to_tool_call_id.get(task_id)
+        return self._tasks.get(tool_call_id) if tool_call_id else None
+
     async def get_by_task_id(self, task_id: str) -> BackgroundTask | None:
         """Return the task for a given 6-char task_id, or None."""
         async with self._lock:
-            tool_call_id = self._task_id_to_tool_call_id.get(task_id)
-            if tool_call_id:
-                return self._tasks.get(tool_call_id)
-            return None
+            return self._locked_get_by_task_id(task_id)
 
     async def reclaim_for_resume(self, task: BackgroundTask) -> None:
         """Atomically steal a task back from any collector for a resume.
@@ -539,7 +541,20 @@ class BackgroundTaskRegistry:
                 event.get("event") == "message_chunk"
                 and (event.get("data") or {}).get("content_type") == "text"
             ):
-                task.last_updated_at = time.time()
+                now = time.time()
+                task.last_updated_at = now
+                # A child's progress is its owner's progress. The orphan
+                # collector watches an owner alone — owner-children are not
+                # claimed until the owner settles — and a workflow parent
+                # emits nothing between child_started and child_done. Without
+                # this, a fan-out whose children legitimately outrun the idle
+                # timeout reads as abandoned, and the collector releases the
+                # claim that would have persisted their events and billed
+                # their usage.
+                if task.owner_task_id:
+                    owner = self._locked_get_by_task_id(task.owner_task_id)
+                    if owner is not None:
+                        owner.last_updated_at = now
 
         # Spill OUTSIDE the lock — Redis I/O must not block subsequent appends.
         await self._spill_record_to_redis(task, record)
