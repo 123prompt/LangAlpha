@@ -5,7 +5,10 @@ import re
 
 # httpx includes request URLs in some exception messages. Strip basic-auth
 # userinfo before those messages reach clients or durable conversation rows.
-_URL_USERINFO_RE = re.compile(r"(https?://)[^@/\s]+@")
+# Any scheme, not just http(s): the exceptions most likely to carry a password
+# here are the connection failures, and those quote a DSN
+# (`postgresql://user:pw@host`, `redis://…`, `amqp://…`) rather than a URL.
+_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^@/\s]+@")
 
 # Provider exceptions can echo request headers or key parameters. Mask the
 # common credential shapes without replacing otherwise useful diagnostics.

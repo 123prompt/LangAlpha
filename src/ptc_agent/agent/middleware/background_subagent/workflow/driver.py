@@ -49,6 +49,10 @@ logger = structlog.get_logger(__name__)
 # more of the failure than the 500-byte SSE clip — bounded all the same, since
 # the text is an upstream exception sized by nothing we control.
 _RECORD_ERROR_BYTES = 4000
+# How long a timed-out child's writer gets to finish unwinding before this run
+# reads its usage. Generous for an already-cancelled task, and the cost of
+# overrunning it is a token count, never a stuck run.
+_CANCEL_SETTLE_TIMEOUT = 5.0
 
 
 def run_dir(short_thread_id: str, run_task_id: str) -> str:
@@ -260,9 +264,20 @@ class WorkflowDriver:
         if terminal.error is None:
             await self._finalize("completed", result_preview=terminal.result_preview)
             return terminal.summary
-        await self._cancel_children(reason=terminal.error)
-        await self._finalize("failed", error=terminal.error)
-        raise WorkflowRunError(terminal.error)
+        # Scrubbed and clipped once, here, because every delivery below shares
+        # this string: the ledger row, the task result TaskOutput reads back,
+        # and the reason the children are told. Terminal bookkeeping reaches
+        # this branch as a raw exception — a checkpointer or database failure
+        # carries whatever the driver happened to be holding — and unlike the
+        # child record and the lifecycle frame, neither delivery scrubs it.
+        # Sanitize before clipping: clipping first can split a credential and
+        # leave a fragment no pattern matches.
+        error = truncate_to_bytes(
+            sanitize_error_text(terminal.error), _RECORD_ERROR_BYTES
+        )[0]
+        await self._cancel_children(reason=error)
+        await self._finalize("failed", error=error)
+        raise WorkflowRunError(error)
 
     async def _finish_outcome(self, outcome: WorkflowOutcome) -> _Terminal:
         if outcome.status != "completed":
@@ -535,6 +550,16 @@ class WorkflowDriver:
             # rather than through the registry's owner-scoped cancel.
             await self.spec.registry.stamp_cancel_intent([task])
             task.force_cancel(run.error, status="timeout")
+            # `force_cancel` only *schedules* the cancellation, and the writer
+            # merges its token tracker in its own settle `finally`. Accrual
+            # runs the moment this returns and caches what it reads, so
+            # without this wait a timed-out child reports zero tokens for the
+            # life of the run. Bounded, and already cancelled: this waits on
+            # an unwind, not on the work.
+            if task.asyncio_task is not None:
+                await asyncio.wait(
+                    [task.asyncio_task], timeout=_CANCEL_SETTLE_TIMEOUT
+                )
         except asyncio.CancelledError:
             # Either signal alone misses an ordering: the sweep sets _stopping
             # before children unwind, while a stop delivered straight to this

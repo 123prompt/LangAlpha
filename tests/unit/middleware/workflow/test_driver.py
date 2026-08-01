@@ -73,6 +73,19 @@ class Hang:
     started: asyncio.Event
 
 
+@dataclass
+class HangThenBill:
+    """A child whose usage exists only once its cancellation has been delivered.
+
+    ``_merge_subagent_usage`` runs in the real writer's settle ``finally``, so
+    a timed-out child's records are never populated at the instant
+    ``force_cancel`` returns — a ``Hang`` that bills up front cannot show it.
+    """
+
+    started: asyncio.Event
+    usage: list[dict[str, Any]]
+
+
 class RecordingRegistry(BackgroundTaskRegistry):
     """Records what actually lands, by standing in for the Redis spill seam
     rather than the append itself: the real append seals a cancelled task's
@@ -120,7 +133,18 @@ class FakeDispatcher:
             owner_task_id=kwargs["owner_task_id"],
         )
         self.tasks.append(task)
-        if isinstance(behavior, Hang):
+        if isinstance(behavior, HangThenBill):
+
+            async def _hang_then_bill() -> Any:
+                behavior.started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    task.per_call_records = list(behavior.usage)
+
+            task.asyncio_task = asyncio.create_task(_hang_then_bill())
+            task.handler_task = asyncio.create_task(asyncio.Event().wait())
+        elif isinstance(behavior, Hang):
 
             async def _hang() -> Any:
                 behavior.started.set()
@@ -234,6 +258,59 @@ async def test_token_accrual_is_read_only() -> None:
     assert done["tokens_used"] == 17
     assert done["tokens_spent"] == 17
     assert dispatcher.tasks[0].per_call_records == records
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_child_still_reports_the_tokens_it_spent() -> None:
+    """A timeout must not zero a child's usage on the run card.
+
+    ``force_cancel`` only schedules the cancellation, and accrual caches the
+    first number it reads — so reading before the writer's settle pins that
+    child at zero for the life of the run.
+    """
+    started = asyncio.Event()
+    driver, registry, dispatcher, _ = await _make_driver(
+        _script("await agent('slow'); return 'done';"),
+        behaviors=[HangThenBill(started, [{"usage": {"total_tokens": 4096}}])],
+        caps=_caps(child_timeout=0.05),
+    )
+
+    await driver.run()
+
+    done = next(e for e in registry.events if e["phase"] == "child_done")
+    assert done["status"] == "timeout"
+    assert done["tokens_used"] == 4096
+    assert done["tokens_spent"] == 4096
+    assert registry.events[-1]["tokens_spent"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_a_bookkeeping_failure_is_scrubbed_before_it_becomes_the_result() -> None:
+    """The terminal error reaches the ledger, the task result and TaskOutput.
+
+    Its two siblings — the child record and the lifecycle frame — already
+    scrub and clip; an infrastructure exception arriving here raw is the one
+    delivery that does not.
+    """
+    driver, _, _, _ = await _make_driver(_script("return 'ok';"))
+    leak = (
+        "connection failed: postgresql://svc:hunter2@db.internal:5432/app "
+        "authorization: Bearer abcd1234efgh5678 " + "x" * 8000
+    )
+
+    async def _explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(leak)
+
+    driver._finish_outcome = _explode  # type: ignore[method-assign]
+
+    with pytest.raises(WorkflowRunError) as caught:
+        await driver.run()
+
+    delivered = str(caught.value)
+    assert "hunter2" not in delivered
+    assert "abcd1234efgh5678" not in delivered
+    assert "Bearer [REDACTED]" in delivered
+    assert len(delivered.encode()) <= 4000 + len("\n... [truncated]")
 
 
 @pytest.mark.asyncio

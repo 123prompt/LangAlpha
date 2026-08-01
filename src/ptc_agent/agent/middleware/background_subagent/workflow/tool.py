@@ -35,6 +35,7 @@ from ptc_agent.agent.middleware.background_subagent.workflow.driver import (
     run_dir,
 )
 from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+    MAX_DESCRIPTION_CHARS,
     WorkflowScriptError,
     acompile_check,
 )
@@ -407,6 +408,13 @@ def create_run_workflow_tool(
                 f"'{meta.name}'. Rename one so they agree, then run it again."
             )
 
+        # One bounded launch description for every sink. `meta.description`
+        # is capped at extraction precisely because it is copied into the
+        # registry, the run ledger, the launch stream and the task artifact —
+        # the tool argument overrides it and reaches all four, so it answers
+        # to the same cap rather than to the model's restraint.
+        launch_description = (description or meta.description)[:MAX_DESCRIPTION_CHARS]
+
         # Capture turn attribution at call time: the run stamp children
         # inherit and the configurable they run under. The turn's run_id
         # must come from metadata — langchain's patch_config strips the
@@ -422,7 +430,7 @@ def create_run_workflow_tool(
         try:
             run_task = await registry.register(
                 tool_call_id=launch_tool_call_id,
-                description=description or meta.description,
+                description=launch_description,
                 prompt=script[:500],
                 subagent_type=WORKFLOW_SUBAGENT_TYPE,
                 run_id=str(launch_run_id) if launch_run_id else None,
@@ -436,7 +444,7 @@ def create_run_workflow_tool(
                 f'`TaskOutput(task_id="{existing.task_id}")` for progress '
                 "or the final result.",
                 workflow_name=meta.name,
-                description=description or meta.description,
+                description=launch_description,
                 tool_call_id=tool_call_id,
             )
 
@@ -447,7 +455,7 @@ def create_run_workflow_tool(
             await _admit_run(
                 run_task,
                 caps,
-                description=description or meta.description,
+                description=launch_description,
                 launch_tool_call_id=launch_tool_call_id,
             )
         except _Refused as refused:
@@ -489,7 +497,7 @@ def create_run_workflow_tool(
                 mw,
                 run_task,
                 driver.run,
-                prompt=description or meta.description,
+                prompt=launch_description,
                 label="Workflow run",
                 name=f"workflow_run_{run_task.display_id}",
                 action="init",
@@ -506,7 +514,7 @@ def create_run_workflow_tool(
         return _run_started_reply(
             run_task,
             workflow_name=meta.name,
-            description=description or meta.description,
+            description=launch_description,
             base_rel=base_rel,
             tool_call_id=tool_call_id,
         )

@@ -45,8 +45,11 @@ _HOST_TEXT_LIMIT = 500
 # `meta.name` is bounded by its pattern; the description had no bound but the
 # script's own size cap, and it is retained for the life of a compile-cache
 # entry and copied into the registry, lifecycle frames and checkpoint records.
-# Well past any real one-line summary, far short of a payload.
-_MAX_DESCRIPTION_CHARS = 512
+# Well past any real one-line summary, far short of a payload. Public because
+# the launch description is the same value reaching the same sinks, and a
+# caller-supplied one overrides this: the bound belongs to the field, not to
+# the door it came through.
+MAX_DESCRIPTION_CHARS = 512
 # Compiling goes through `new Function`, the one primitive QuickJS offers that
 # parses without executing. The candidate crosses as a global string rather
 # than being spliced into the evaluated source, so a script cannot close the
@@ -289,10 +292,10 @@ def compile_check(script: str) -> WorkflowMeta:
     description = raw.get("description")
     if not isinstance(description, str) or not description.strip():
         raise WorkflowScriptError("meta.description must be a non-empty string")
-    if len(description) > _MAX_DESCRIPTION_CHARS:
+    if len(description) > MAX_DESCRIPTION_CHARS:
         raise WorkflowScriptError(
             f"meta.description is {len(description)} chars; the cap is "
-            f"{_MAX_DESCRIPTION_CHARS}"
+            f"{MAX_DESCRIPTION_CHARS}"
         )
     # Only the two fields the server reads survive the literal, and both are
     # length-bounded above. The rest is script-declared and unbounded —
@@ -345,7 +348,50 @@ def _script_error(error: quickjs_rs.JSError) -> WorkflowOutcome:
     )
 
 
-def _install_stop_aware_interrupt(runtime: Runtime, stop: threading.Event) -> None:
+@dataclass
+class _Preemption:
+    """Whether this run's interrupt handler stopped JavaScript on the deadline.
+
+    QuickJS abandons the job it is running the moment the handler returns
+    True, which leaves the top-level promise pending with no host call in
+    flight — the exact shape quickjs-rs reports as a deadlock, and it checks
+    for that before it checks its own deadline. Without a record of who
+    tripped the handler, a CPU-budget overrun after the first host await is
+    indistinguishable from a script awaiting a promise nothing resolves.
+    """
+
+    deadline: bool = False
+
+
+def _cpu_timeout(limits: WorkflowLimits) -> WorkflowOutcome:
+    return WorkflowOutcome(
+        status="cpu_timeout",
+        error=f"Workflow exceeded the {limits.cpu_budget_s:g}s CPU budget",
+    )
+
+
+def _cancelled_if_unwinding(error: BaseException) -> None:
+    """Convert a QuickJS failure into cancellation when this task is unwinding.
+
+    A cancel reaches the worker as an interrupt, so the engine sees whatever
+    the abandoned job raised rather than ``CancelledError``.
+    """
+    current_task = asyncio.current_task()
+    if current_task is not None and current_task.cancelling():
+        raise asyncio.CancelledError from error
+
+
+def _unexpected_failure(error: BaseException) -> WorkflowOutcome:
+    logger.exception("Unexpected workflow QuickJS failure")
+    return WorkflowOutcome(
+        status="script_error",
+        error=f"Workflow execution failed: {type(error).__name__}: {error}",
+    )
+
+
+def _install_stop_aware_interrupt(
+    runtime: Runtime, stop: threading.Event, preemption: _Preemption
+) -> None:
     """Let a stop interrupt the JavaScript that runs *after* cancellation.
 
     quickjs-rs clears the runtime's deadline slot before draining pending jobs
@@ -370,7 +416,10 @@ def _install_stop_aware_interrupt(runtime: Runtime, stop: threading.Event) -> No
         if stop.is_set():
             return True
         deadline = runtime._deadline
-        return deadline is not None and time.monotonic() >= deadline
+        if deadline is None or time.monotonic() < deadline:
+            return False
+        preemption.deadline = True
+        return True
 
     try:
         runtime._engine_rt.set_interrupt_handler(_interrupt)
@@ -393,6 +442,7 @@ async def run_workflow_script(
     prelude = resources.files(__package__).joinpath("prelude.js").read_text(encoding="utf-8")
     worker = ThreadWorker(name="workflow-quickjs")
     stop = threading.Event()
+    preemption = _Preemption()
 
     async def _inner() -> WorkflowOutcome:
         runtime = None
@@ -427,7 +477,7 @@ async def run_workflow_script(
                 memory_limit=limits.memory_limit_mb * 1024 * 1024,
                 transform_flags=SourceTransform.TOP_LEVEL_CONST_TO_VAR,
             )
-            _install_stop_aware_interrupt(runtime, stop)
+            _install_stop_aware_interrupt(runtime, stop, preemption)
             ctx = runtime.new_context(timeout=limits.cpu_budget_s)
             ctx.register("__host_agent", _host_agent, is_async=True)
             ctx.register("__host_phase", _host_phase, is_async=False)
@@ -456,10 +506,20 @@ async def run_workflow_script(
         except quickjs_rs.MemoryLimitError as error:
             return WorkflowOutcome(status="out_of_memory", error=str(error))
         except (quickjs_rs.TimeoutError, quickjs_rs.InterruptError):
-            return WorkflowOutcome(
-                status="cpu_timeout",
-                error=f"Workflow exceeded the {limits.cpu_budget_s:g}s CPU budget",
-            )
+            return _cpu_timeout(limits)
+        except quickjs_rs.DeadlockError as error:
+            # The budget IS enforced across host awaits — quickjs-rs suspends
+            # its deadline while parked in a host call and re-arms it extended
+            # by the parked time — but a script that overruns *after* its
+            # first await never reaches the deadline check: the interrupt
+            # abandons the job first, and the pending-promise check runs
+            # before it. Only a handler that never tripped means a genuinely
+            # unresolved promise, which is the script's bug and keeps the
+            # library's own wording.
+            _cancelled_if_unwinding(error)
+            if preemption.deadline:
+                return _cpu_timeout(limits)
+            return _unexpected_failure(error)
         except quickjs_rs.JSError as error:
             return _script_error(error)
         except quickjs_rs.MarshalError as error:
@@ -470,14 +530,8 @@ async def run_workflow_script(
         except quickjs_rs.HostCancellationError:
             raise asyncio.CancelledError from None
         except Exception as error:
-            current_task = asyncio.current_task()
-            if current_task is not None and current_task.cancelling():
-                raise asyncio.CancelledError from error
-            logger.exception("Unexpected workflow QuickJS failure")
-            return WorkflowOutcome(
-                status="script_error",
-                error=f"Workflow execution failed: {type(error).__name__}: {error}",
-            )
+            _cancelled_if_unwinding(error)
+            return _unexpected_failure(error)
         finally:
             if ctx is not None:
                 try:

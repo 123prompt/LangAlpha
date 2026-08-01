@@ -141,6 +141,49 @@ async def test_cpu_spin_maps_to_timeout() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_spin_after_a_host_await_is_still_a_budget_overrun() -> None:
+    """The budget survives host awaits, and so must its name for the failure.
+
+    quickjs-rs suspends its deadline while parked in a host call and re-arms
+    it extended by the parked time, so the overrun IS caught — but the
+    interrupt abandons the job, and the library's pending-promise check runs
+    before its deadline check. Reported as a deadlock, the agent is told to go
+    looking for a missing `is_async=True` that was never the problem.
+    """
+
+    class SlowHost(FakeHost):
+        async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
+            # Longer than the whole budget: if parked time counted, a script
+            # that never spins at all would trip this.
+            await asyncio.sleep(0.4)
+            return "child"
+
+    outcome = await run_workflow_script(
+        _script("await agent('slow'); while (true) {}"),
+        None,
+        SlowHost(),
+        WorkflowLimits(cpu_budget_s=0.2),
+    )
+
+    assert outcome.status == "cpu_timeout"
+    assert "0.2s CPU budget" in (outcome.error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_promise_nothing_resolves_is_still_the_scripts_own_bug() -> None:
+    """The counterpart: a genuine deadlock must keep its own diagnosis."""
+    outcome = await run_workflow_script(
+        _script("await new Promise(() => {}); return 1;"),
+        None,
+        FakeHost(),
+        WorkflowLimits(cpu_budget_s=5),
+    )
+
+    assert outcome.status == "script_error"
+    assert "Deadlock" in (outcome.error or "")
+
+
+@pytest.mark.asyncio
 async def test_javascript_throw_maps_to_script_error_with_stack() -> None:
     outcome = await run_workflow_script(
         _script("throw new Error('x');"), None, FakeHost(), WorkflowLimits()

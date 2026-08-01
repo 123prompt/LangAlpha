@@ -11,6 +11,9 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
 )
 from ptc_agent.agent.middleware.background_subagent.spawn import NamespaceUnfenced
 from ptc_agent.agent.middleware.background_subagent.workflow import tool as tool_module
+from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+    MAX_DESCRIPTION_CHARS,
+)
 from ptc_agent.agent.middleware.background_subagent.workflow.tool import (
     _script_path_is_unreadable,
     create_run_workflow_tool,
@@ -202,6 +205,35 @@ async def test_tool_invokes_through_langchain_schema_layer() -> None:
     assert artifact["action"] == "workflow"
     assert artifact["type"] == "workflow"
     assert artifact["workflow"] == "demo"
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_description_argument_is_bounded_like_the_declared_one() -> (
+    None
+):
+    """`meta.description` is capped at extraction because it is copied into
+    the registry, the ledger, the launch stream and the task artifact. The
+    tool argument overrides it and reaches all four, so it answers to the same
+    cap — otherwise the bound is only as good as the model's restraint."""
+    workflow_tool = _make_tool(FakeBackend())
+
+    message = await workflow_tool.ainvoke(
+        {
+            "name": "RunWorkflow",
+            "type": "tool_call",
+            "id": "tc-long-description",
+            "args": {"script": _script(), "description": "D" * 40_000},
+        }
+    )
+
+    run_task = CapturingDriver.specs[0].run_task
+    assert len(run_task.description) == MAX_DESCRIPTION_CHARS
+    assert len(message.additional_kwargs["task_artifact"]["description"]) == (
+        MAX_DESCRIPTION_CHARS
+    )
+    assert len(message.additional_kwargs["task_artifact"]["prompt"]) == (
+        MAX_DESCRIPTION_CHARS
+    )
 
 
 @pytest.mark.asyncio
