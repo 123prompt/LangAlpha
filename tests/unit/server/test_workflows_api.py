@@ -292,3 +292,36 @@ async def test_router_is_registered_only_when_enabled(
         assert response.status_code != 404
     else:
         assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_listing_bounds_the_compiles_a_single_request_can_spend(
+    store: InMemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent mount writes scripts this router never compiled, so a
+    namespace can hold more uncompiled rows than the memo holds entries —
+    without a bound every listing recompiles all of them on the shared
+    executor. Past the budget a row is reported without a verdict, which is
+    not the same as reporting it invalid.
+    """
+    from src.server.app import workflows as workflows_router
+
+    monkeypatch.setattr(workflows_router, "_MAX_LIST_COMPILES", 2)
+    names = [f"row{index}" for index in range(5)]
+    for name in names:
+        await _seed(store, name, _script(name, f"description {name}"))
+
+    entries = {entry.name: entry for entry in await list_workflows(user_id=USER_ID)}
+    described = [entries[name] for name in names if entries[name].valid is True]
+    unchecked = [entries[name] for name in names if entries[name].valid is None]
+
+    assert len(described) == 2
+    assert len(unchecked) == 3
+    # Unchecked is silent, not wrong: no row is branded invalid for having
+    # arrived after the budget ran out.
+    assert all(entry.valid is not False for entry in entries.values() if entry.name in names)
+    assert all(entry.description is None for entry in unchecked)
+
+    # A second listing is free for everything the first one compiled.
+    again = {entry.name: entry for entry in await list_workflows(user_id=USER_ID)}
+    assert len([e for e in again.values() if e.name in names and e.valid is True]) >= 4

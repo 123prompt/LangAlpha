@@ -13,7 +13,12 @@ import type { SubagentTelemetry } from '../session/subagents/resolveSubagentTele
 import { useWorkflowRun } from './WorkflowRunContext';
 import { MONO_STACK, INTER_STACK } from './TaskCardShell';
 import { TaskStatusChip, type TaskCardStatusKind } from './taskStatusUi';
-import { SECTION_LABEL_STYLE, WorkflowChildRow, summarizeRun } from './workflowRunUi';
+import {
+  SECTION_LABEL_STYLE,
+  WorkflowChildRow,
+  summarizeRun,
+  workflowChildStatusColor,
+} from './workflowRunUi';
 import StructuredResultBlock from './messageList/StructuredResultBlock';
 import { parseResultPreview } from '../utils/structuredResult';
 import type { AgentInfo, SubagentInfo } from './chatView/types';
@@ -211,7 +216,7 @@ function PhaseGroup({
                   style={{
                     margin: '0 0 4px 22px',
                     fontSize: 11,
-                    color: 'var(--color-loss)',
+                    color: workflowChildStatusColor(child.status),
                     whiteSpace: 'pre-wrap',
                     wordBreak: 'break-word',
                     display: '-webkit-box',

@@ -68,6 +68,14 @@ export function workflowChildLabelKey(status: WorkflowChildStatus): string {
   return (WORKFLOW_CHILD_UI[status] ?? WORKFLOW_CHILD_UI.error).labelKey;
 }
 
+/** The one colour a child's status is allowed to read as, row and detail alike.
+ *
+ * A schema miss is amber because the child ran — rendering its detail red
+ * would contradict the row directly above it. */
+export function workflowChildStatusColor(status: WorkflowChildStatus): string {
+  return (WORKFLOW_CHILD_UI[status] ?? WORKFLOW_CHILD_UI.error).color;
+}
+
 export function WorkflowChildStatusIcon({
   status,
   size = 11,

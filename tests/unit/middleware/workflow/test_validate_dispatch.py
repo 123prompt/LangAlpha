@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from ptc_agent.agent.middleware.background_subagent.workflow.validation import (
     DispatchValidationError,
     compose_child_prompt,
+    parse_schema_result,
     validate_dispatch,
 )
 from src.config.models import WorkflowOrchestrationConfig
@@ -216,3 +217,19 @@ def test_a_retry_composes_longer_than_the_dispatch_it_corrects() -> None:
     assert "'ok' is a required property" in retry
     assert "RESPONSE FORMAT REQUIREMENT" in retry
     assert len(retry) > len(first)
+
+
+def test_a_reply_too_deep_to_decode_fails_its_own_child() -> None:
+    """`parse_schema_result` runs in a worker thread whose caller unwinds the
+    whole run on any exception it does not name, so an unreadable reply has to
+    come back as a mismatch. Nesting deep enough to exhaust the interpreter
+    stack is unreadable like any other malformed reply.
+    """
+    deep = "[" * 20_000 + "1" + "]" * 20_000
+    valid, parsed, error = parse_schema_result(deep, {"type": "object"})
+    assert valid is False
+    assert parsed is None
+    assert error
+
+    shallow = "[" * 100 + "1" + "]" * 100
+    assert parse_schema_result(shallow, {"type": "object"})[0] is False

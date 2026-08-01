@@ -10,6 +10,7 @@ import {
   formatRunDuration,
   summarizeRun,
   workflowChildLabelKey,
+  workflowChildStatusColor,
   WorkflowChildRow,
   WorkflowChildStatusIcon,
 } from '../workflowRunUi';
@@ -209,5 +210,24 @@ describe('summarizeRun', () => {
     const summary = summarizeRun(withChildren([child()], { childrenTotal: 9, durationS: 61.2 }));
     expect(summary.agentCount).toBe(9);
     expect(summary.duration).toBe('1m 01s');
+  });
+});
+
+describe('workflowChildStatusColor', () => {
+  it('gives a schema miss the same amber the row already shows', () => {
+    // The detail panel prints the child's error directly beneath its row. A
+    // hardcoded loss colour there made one child read calm amber and alarming
+    // red at once, for a child that ran fine and only mismatched its schema.
+    expect(workflowChildStatusColor('invalid_schema')).toBe('var(--color-warning)');
+    expect(workflowChildStatusColor('error')).toBe('var(--color-loss)');
+    expect(workflowChildStatusColor('invalid_schema')).not.toBe(
+      workflowChildStatusColor('error'),
+    );
+  });
+
+  it('falls back to the error colour for a status it does not know', () => {
+    expect(workflowChildStatusColor('unheard-of' as WorkflowChildStatus)).toBe(
+      workflowChildStatusColor('error'),
+    );
   });
 });

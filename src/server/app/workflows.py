@@ -21,6 +21,7 @@ from ptc_agent.agent.backends.workflows import (
 from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
     WorkflowScriptError,
     acompile_check,
+    compile_is_memoized,
 )
 from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
     get_prebuilt_workflows,
@@ -38,6 +39,13 @@ from src.server.utils.api import CurrentUserId
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["Workflows"])
 
+# Describing a row means compiling it, and the agent mount writes scripts this
+# router never saw — so a namespace can hold more uncompiled rows than the memo
+# holds entries, and every listing would recompile all of them on the shared
+# executor. Past this many fresh compiles a listing reports the row without a
+# verdict; a namespace of ordinary size never reaches it.
+_MAX_LIST_COMPILES = 32
+
 
 class WorkflowWriteRequest(BaseModel):
     content: str
@@ -46,7 +54,9 @@ class WorkflowWriteRequest(BaseModel):
 class WorkflowListEntry(BaseModel):
     name: str
     description: str | None
-    valid: bool
+    # None when this listing did not check — see _MAX_LIST_COMPILES. Absent is
+    # not invalid: GET /{name} still answers for the row.
+    valid: bool | None
     builtin: bool
     shadows_builtin: bool = False
 
@@ -95,6 +105,7 @@ async def list_workflows(user_id: CurrentUserId) -> list[WorkflowListEntry]:
     prebuilts = get_prebuilt_workflows()
     builtin_names = set(prebuilts.names())
     entries: dict[str, WorkflowListEntry] = {}
+    compiles_left = _MAX_LIST_COMPILES
     for key, value in rows:
         # Skips keys this router could never address again — listing one
         # would only offer a name whose every route 400s.
@@ -102,11 +113,16 @@ async def list_workflows(user_id: CurrentUserId) -> list[WorkflowListEntry]:
         if name is None:
             continue
         content = _script_or_none(value)
-        description, valid = (
-            await _describe(content, expected_name=name)
-            if content is not None
-            else (None, False)
-        )
+        description: str | None = None
+        valid: bool | None = False
+        if content is not None:
+            memoized = compile_is_memoized(content)
+            if memoized or compiles_left > 0:
+                if not memoized:
+                    compiles_left -= 1
+                description, valid = await _describe(content, expected_name=name)
+            else:
+                valid = None
         entries[name] = WorkflowListEntry(
             name=name,
             description=description,

@@ -4,9 +4,10 @@ Pydantic models for infrastructure configuration.
 These models define the schema for config.yaml (infrastructure settings).
 """
 
+import math
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class BackgroundExecutionConfig(BaseModel):
@@ -344,7 +345,7 @@ class WorkflowOrchestrationConfig(BaseModel):
         default=1800, ge=1, le=7200, description="Per-child subagent timeout in seconds"
     )
     run_timeout: int = Field(
-        default=14400,
+        default=16200,
         ge=1,
         le=86400,
         description=(
@@ -386,6 +387,26 @@ class WorkflowOrchestrationConfig(BaseModel):
         le=4 * 1024 * 1024,
         description="Workflow script size cap in bytes",
     )
+
+    @model_validator(mode="after")
+    def _run_timeout_covers_every_wave(self) -> "WorkflowOrchestrationConfig":
+        """Reject a run timeout that cannot outlast its own children.
+
+        Below the floor the run-level kill always beats the per-child one, so
+        every timeout is reported as the blunt whole-run failure and no child
+        is ever named. The floor is the bound, not the recommendation — the
+        shipped default carries margin over it for scheduling overhead.
+        """
+        waves = math.ceil(self.max_dispatches_per_run / self.max_concurrent_children)
+        floor = waves * self.child_timeout
+        if self.run_timeout < floor:
+            raise ValueError(
+                f"workflow.run_timeout={self.run_timeout} is below the "
+                f"{floor}s floor implied by {self.max_dispatches_per_run} "
+                f"dispatches at {self.max_concurrent_children} wide "
+                f"({waves} waves of child_timeout={self.child_timeout})"
+            )
+        return self
 
 
 class InfrastructureConfig(BaseModel):

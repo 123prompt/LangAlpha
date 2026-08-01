@@ -12,8 +12,10 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
 from ptc_agent.agent.middleware.background_subagent.spawn import NamespaceUnfenced
 from ptc_agent.agent.middleware.background_subagent.workflow import tool as tool_module
 from ptc_agent.agent.middleware.background_subagent.workflow.tool import (
+    _script_path_is_unreadable,
     create_run_workflow_tool,
 )
+from ptc_agent.core.paths import MEMO_USER_DIR, MEMORY_USER_DIR
 from src.config.models import WorkflowOrchestrationConfig
 
 from .conftest import FakeBackend, workflow_script
@@ -568,3 +570,24 @@ async def test_a_refused_admission_names_its_reason_and_leaves_the_entry_inert()
     assert run_task.terminal_status == "never_started"
     assert run_task.error == "namespace fence unavailable"
     assert CapturingDriver.specs == []
+
+
+@pytest.mark.parametrize(
+    ("path", "unreadable"),
+    [
+        ("workflows/company_internal.js", False),
+        ("notes/my_memory_notes.js", False),
+        ("_internal/x.js", True),
+        ("nested/_internal/x.js", True),
+        (f"{MEMORY_USER_DIR}/x.js", True),
+        (f"{MEMO_USER_DIR}/x.js", True),
+    ],
+)
+def test_script_paths_are_refused_by_segment_not_substring(
+    path: str, unreadable: bool
+) -> None:
+    """Both vocabularies name directories. Matching them anywhere in the text
+    refuses ordinary files whose name merely contains one, and the refusal
+    lands before the backend is ever asked whether the file exists.
+    """
+    assert _script_path_is_unreadable(path) is unreadable

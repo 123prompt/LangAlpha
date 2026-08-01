@@ -67,8 +67,15 @@ class _Refused(Exception):
 
 
 def _script_path_is_unreadable(path: str) -> bool:
-    return any(prefix in path for prefix in _UNREADABLE_SCRIPT_PREFIXES) or any(
-        name in path for name in HIDDEN_DIR_NAMES
+    # Whole segments, not substrings: both vocabularies name directories, and
+    # matching them anywhere in the text refuses ordinary files whose name
+    # merely contains one (`workflows/company_internal.js`).
+    normalized = path.strip("/")
+    segments = [segment for segment in normalized.split("/") if segment not in ("", ".")]
+    if any(segment in HIDDEN_DIR_NAMES for segment in segments):
+        return True
+    return any(
+        normalized.startswith(prefix) for prefix in _UNREADABLE_SCRIPT_PREFIXES
     )
 
 

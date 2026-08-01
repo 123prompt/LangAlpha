@@ -207,3 +207,51 @@ async def test_acompile_check_memoizes_by_content(
         with pytest.raises(WorkflowScriptError, match="meta.description"):
             await engine.acompile_check(bad)
     assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("label", "quoted"),
+    [
+        ("block comment", "/*\nexport const meta = {{ name: 'old', description: 'x' }}\n*/"),
+        ("template literal", "const quoted = `\nexport const meta = {{ name: 'old', description: 'x' }}\n`;"),
+        ("line comment", "// export const meta = {{ name: 'old', description: 'x' }}"),
+    ],
+)
+def test_a_quoted_meta_export_does_not_shadow_the_live_one(
+    label: str, quoted: str
+) -> None:
+    """Stripping the first textual `export` leaves the real one inside the
+    async wrapper, where nothing parses — so a script that merely *mentions*
+    an earlier metadata block would be rejected as a syntax error it does not
+    have. Which declaration is code is the parser's answer, not a regex's.
+    """
+    script = (
+        f"{quoted.format()}\n"
+        "export const meta = { name: 'live-one', description: 'the real one' };\n"
+        "return 1;"
+    )
+    meta = compile_check(script)
+    assert meta.name == "live-one", label
+    assert meta.description == "the real one"
+
+
+def test_a_quoted_export_keeps_its_own_text() -> None:
+    """The scan blanks candidates in a throwaway copy. Blanking the script
+    itself would silently rewrite a string the workflow goes on to use.
+    """
+    script = (
+        "const quoted = 'export const meta = zzz';\n"
+        "export const meta = { name: 'intact', description: 'd' };\n"
+        "return quoted;"
+    )
+    assert compile_check(script).name == "intact"
+
+
+def test_a_script_that_cannot_parse_reports_its_own_error() -> None:
+    """No live declaration is locatable in a script that does not parse, and
+    the useful thing to say about it is the syntax error — not that its
+    metadata could not be found.
+    """
+    script = "export const meta = { name: 'x', description: 'd' };\nreturn 1 +;"
+    with pytest.raises(WorkflowScriptError, match="syntax error"):
+        compile_check(script)

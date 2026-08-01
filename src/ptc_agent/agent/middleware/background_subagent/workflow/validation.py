@@ -37,6 +37,11 @@ _NO_REMOTE_REFS = Registry()
 # Prose around the JSON is tolerated (below), but each candidate start costs a
 # decode attempt, so only the first few are tried.
 _MAX_JSON_CANDIDATES = 32
+# A reply is only ever text a model wrote, so nesting deep enough to exhaust
+# the interpreter stack is a malformed reply like any other — and this runs in
+# a worker thread whose caller unwinds the whole run on anything it does not
+# name. `json` recurses per level on both the decoder and the validator.
+_UNREADABLE_JSON = (json.JSONDecodeError, RecursionError)
 
 
 class DispatchValidationError(Exception):
@@ -172,6 +177,8 @@ def parse_schema_result(
             if location and location != "$":
                 return f"{error.message} (at {location})"
             return error.message
+        except RecursionError:
+            return "response nests too deeply to validate"
         except Unresolvable as error:
             # A ref the gate did not catch: unresolvable rather than fetched.
             # Reported like a mismatch so one bad schema fails its own child
@@ -186,7 +193,7 @@ def parse_schema_result(
     # a schema mismatch is worth reporting over what the scan finds.
     try:
         whole = json.loads(text)
-    except json.JSONDecodeError:
+    except _UNREADABLE_JSON:
         pass
     else:
         reason = matches(whole)
@@ -202,8 +209,8 @@ def parse_schema_result(
     for index in starts[:_MAX_JSON_CANDIDATES]:
         try:
             parsed, _ = decoder.raw_decode(text, index)
-        except json.JSONDecodeError as error:
-            first_error = first_error or str(error)
+        except _UNREADABLE_JSON as error:
+            first_error = first_error or str(error) or type(error).__name__
             continue
         reason = matches(parsed)
         if reason is None:

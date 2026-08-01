@@ -8,9 +8,11 @@ Covers:
 - settings.py accessors delegate to InfrastructureConfig (backward compat)
 """
 
+import math
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 from src.config.models import (
     BackgroundExecutionConfig,
@@ -216,3 +218,23 @@ class TestSettingsBackwardCompat:
         with self._patch_infra_config(background_execution=bg):
             assert get_max_concurrent_workflows() == 25
             assert get_subagent_collector_timeout() == 60
+
+
+def test_workflow_run_timeout_must_outlast_its_own_children() -> None:
+    """Below the floor the run-level kill always beats the per-child one, so
+    every timeout surfaces as the blunt whole-run failure and no child is ever
+    named. The shipped default clears the floor with margin.
+    """
+    from src.config.models import WorkflowOrchestrationConfig
+
+    default = WorkflowOrchestrationConfig()
+    waves = math.ceil(default.max_dispatches_per_run / default.max_concurrent_children)
+    assert default.run_timeout > waves * default.child_timeout
+
+    with pytest.raises(ValidationError, match="below the .* floor"):
+        WorkflowOrchestrationConfig(
+            max_dispatches_per_run=64,
+            max_concurrent_children=8,
+            child_timeout=1800,
+            run_timeout=3600,
+        )

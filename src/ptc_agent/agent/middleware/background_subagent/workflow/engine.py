@@ -26,6 +26,12 @@ _EXPORT_META_RE = re.compile(
     r"^\s*export\s+(?=const\s+meta\b)",
     flags=re.MULTILINE,
 )
+# Anchored at the end of whatever precedes the live declaration, so it can only
+# ever remove that declaration's own keyword.
+_EXPORT_KEYWORD_RE = re.compile(r"\bexport\s+$")
+# Every candidate keyword, live or quoted. Matches the word alone so blanking
+# it preserves each surrounding whitespace character, and with it every offset.
+_EXPORT_BEFORE_META_RE = re.compile(r"\bexport\b(?=\s+const\s+meta\b)")
 _META_DECL_RE = re.compile(r"\bconst\s+meta\b\s*=")
 # A parser probe costs milliseconds, so both meta scans are bounded — a script
 # is agent-authored and may be hostile, and the per-eval compile timeout cannot
@@ -93,11 +99,57 @@ class WorkflowHost(Protocol):
     def log(self, message: str) -> None: ...
 
 
-def _transform_source(script: str, *, invoke: bool) -> tuple[str, str]:
+def _transform_source(
+    script: str, parses: Callable[[str], bool] | None, *, invoke: bool
+) -> tuple[str, str]:
     """Strip the meta export and wrap the script in an async IIFE."""
-    transformed = _EXPORT_META_RE.sub("", script, count=1)
+    transformed = _strip_meta_export(script, parses)
     suffix = ")()" if invoke else ")"
     return transformed, f"(async () => {{\n{transformed}\n}}{suffix}"
+
+
+def _strip_meta_export(script: str, parses: Callable[[str], bool] | None) -> str:
+    """Remove the ``export`` keyword introducing the *live* meta declaration.
+
+    A line-initial ``export const meta`` inside a block comment or template
+    literal matches the same pattern the real declaration does; stripping that
+    one leaves the real export inside the wrapper, where nothing parses. The
+    probe says which declaration is code. Falling back to the first textual
+    match when there is none keeps a script that does not parse at all
+    reporting its own syntax error rather than a missing-metadata one.
+    """
+    declaration = _find_meta_declaration(_blank_meta_exports(script), parses) if parses else None
+    if declaration is None:
+        return _EXPORT_META_RE.sub("", script, count=1)
+    start = declaration.start()
+    return _EXPORT_KEYWORD_RE.sub("", script[:start]) + script[start:]
+
+
+def _blank_meta_exports(script: str) -> str:
+    """Blank every ``export`` that introduces a ``const meta``, in place.
+
+    The scan asks whether a prefix parses as a function body, and ``export``
+    never does — so with the keywords left in, the live declaration is
+    rejected for the same reason a quoted one is. Blanking is length
+    preserving, so an offset in the answer is an offset in the script.
+    """
+    return _EXPORT_BEFORE_META_RE.sub(lambda match: " " * len(match.group()), script)
+
+
+@contextmanager
+def _probe_context() -> Iterator[Callable[[str], bool]]:
+    """A throwaway parse context for locating the live meta declaration.
+
+    Its own runtime rather than the caller's: the scan must not spend a run's
+    CPU budget, and it never touches a script's globals.
+    """
+    runtime = Runtime(memory_limit=_COMPILE_MEMORY_LIMIT)
+    ctx = runtime.new_context(timeout=_COMPILE_TIMEOUT)
+    try:
+        yield _compile_probe(ctx)
+    finally:
+        ctx.close()
+        runtime.close()
 
 
 def _js_detail(error: quickjs_rs.JSError) -> str:
@@ -115,14 +167,14 @@ def _find_meta_literal(script: str, parses: Callable[[str], bool]) -> str:
     handing a candidate to the engine's own parser, so regex literals,
     template substitutions and escapes cost nothing to support.
     """
-    declaration_end = _find_meta_declaration_end(script, parses)
-    if declaration_end is None:
+    declaration = _find_meta_declaration(script, parses)
+    if declaration is None:
         raise WorkflowScriptError(
             "export const meta = { name, description } literal is required"
         )
 
-    start = script.find("{", declaration_end)
-    if start < 0 or script[declaration_end:start].strip():
+    start = script.find("{", declaration.end())
+    if start < 0 or script[declaration.end() : start].strip():
         raise WorkflowScriptError("meta must be a pure object literal with name and description")
     end = start
     for _ in range(_MAX_BRACE_PROBES):
@@ -138,7 +190,9 @@ def _find_meta_literal(script: str, parses: Callable[[str], bool]) -> str:
     )
 
 
-def _find_meta_declaration_end(script: str, parses: Callable[[str], bool]) -> int | None:
+def _find_meta_declaration(
+    script: str, parses: Callable[[str], bool]
+) -> re.Match[str] | None:
     for match in islice(_META_DECL_RE.finditer(script), _MAX_DECL_CANDIDATES):
         # Only live code both parses on its own and rejects a stray token
         # appended to it — a prefix ending inside a line comment swallows the
@@ -146,7 +200,7 @@ def _find_meta_declaration_end(script: str, parses: Callable[[str], bool]) -> in
         # literal does not parse at all.
         body = script[: match.start()]
         if _parses_body(parses, body) and not _parses_body(parses, f"{body})"):
-            return match.end()
+            return match
     return None
 
 
@@ -201,10 +255,11 @@ def _compile_probe(ctx: Any) -> Callable[[str], bool]:
 
 def compile_check(script: str) -> WorkflowMeta:
     """Syntax-check a workflow and return its validated metadata."""
-    transformed, syntax_source = _transform_source(script, invoke=False)
     runtime = Runtime(memory_limit=_COMPILE_MEMORY_LIMIT)
     ctx = runtime.new_context(timeout=_COMPILE_TIMEOUT)
     try:
+        parses = _compile_probe(ctx)
+        transformed, syntax_source = _transform_source(script, parses, invoke=False)
         try:
             with _compile_stage("script syntax check"):
                 _compile(ctx, syntax_source)
@@ -213,7 +268,7 @@ def compile_check(script: str) -> WorkflowMeta:
                 f"JavaScript syntax error: {_js_detail(error)}"
             ) from error
 
-        literal = _find_meta_literal(transformed, _compile_probe(ctx))
+        literal = _find_meta_literal(transformed, parses)
         try:
             with _compile_stage("meta evaluation"):
                 raw = ctx.eval(f"({literal})")
@@ -272,6 +327,16 @@ async def acompile_check(script: str) -> WorkflowMeta:
     return cached
 
 
+def compile_is_memoized(script: str) -> bool:
+    """Whether ``acompile_check`` can answer for ``script`` without compiling.
+
+    Lets a caller that describes many scripts at once spend its compiles on
+    the ones that actually need one, rather than paying the full price for a
+    namespace larger than the memo.
+    """
+    return hashlib.sha256(script.encode()).hexdigest() in _COMPILE_CACHE
+
+
 def _script_error(error: quickjs_rs.JSError) -> WorkflowOutcome:
     return WorkflowOutcome(
         status="script_error",
@@ -325,7 +390,6 @@ async def run_workflow_script(
 ) -> WorkflowOutcome:
     """Execute one workflow in an isolated QuickJS worker thread."""
     server_loop = asyncio.get_running_loop()
-    _transformed, wrapped = _transform_source(script, invoke=True)
     prelude = resources.files(__package__).joinpath("prelude.js").read_text(encoding="utf-8")
     worker = ThreadWorker(name="workflow-quickjs")
     stop = threading.Event()
@@ -354,6 +418,11 @@ async def run_workflow_script(
             host.log(str(message)[:_HOST_TEXT_LIMIT])
 
         try:
+            # On the worker thread and in its own context: the scan must agree
+            # with the one compile_check ran, without spending this run's CPU
+            # budget or blocking the server loop to do it.
+            with _probe_context() as parses:
+                _transformed, wrapped = _transform_source(script, parses, invoke=True)
             runtime = Runtime(
                 memory_limit=limits.memory_limit_mb * 1024 * 1024,
                 transform_flags=SourceTransform.TOP_LEVEL_CONST_TO_VAR,
