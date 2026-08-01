@@ -483,13 +483,47 @@ async def test_unknown_agent_type_is_js_catchable() -> None:
 async def test_run_result_is_truncated_only_in_summary() -> None:
     driver, _, _, backend = await _make_driver(
         _script("return 'x'.repeat(100);"),
-        caps=_caps(max_result_bytes=20),
+        caps=_caps(max_summary_bytes=20),
     )
 
     result = await driver.run()
 
     assert "... [truncated]" in result
     assert len(json.loads(backend.writes[f"{driver.base_rel}/result.json"])) == 100
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_summary_says_where_the_rest_is() -> None:
+    """Clipping is only safe because the whole value sits somewhere reachable,
+    and the agent has to be told where — otherwise the omission reads as the
+    result simply ending there. A complete summary advertises no such file.
+    """
+    clipped, _, _, _ = await _make_driver(
+        _script("return 'x'.repeat(100);"), caps=_caps(max_summary_bytes=20)
+    )
+    assert f"{clipped.base_rel}/result.json" in await clipped.run()
+
+    whole, _, _, _ = await _make_driver(_script("return 'small';"))
+    assert "result.json" not in await whole.run()
+
+
+@pytest.mark.asyncio
+async def test_the_result_dump_cap_does_not_size_the_summary() -> None:
+    """The two caps are independent: what a script manipulates in JS is not
+    what a reader is handed. Sizing the summary off the dump cap put its whole
+    allowance — up to megabytes of JSON, past any context window — into both
+    the tool result and the checkpoint archive.
+    """
+    driver, _, _, backend = await _make_driver(
+        _script("return 'x'.repeat(4000);"),
+        caps=_caps(max_result_bytes=16 * 1024 * 1024, max_summary_bytes=1024),
+    )
+
+    summary = await driver.run()
+
+    assert "... [truncated]" in summary
+    assert len(summary.encode()) < 4000
+    assert len(json.loads(backend.writes[f"{driver.base_rel}/result.json"])) == 4000
 
 
 def _fail_writing(backend: Any, filename: str) -> None:
@@ -510,7 +544,7 @@ async def test_a_truncated_result_fails_when_its_full_copy_did_not_land() -> Non
     good, so the run must not report success and hand out a ref to nothing."""
     driver, _, _, backend = await _make_driver(
         _script("return 'x'.repeat(100);"),
-        caps=_caps(max_result_bytes=20),
+        caps=_caps(max_summary_bytes=20),
     )
     _fail_writing(backend, "result.json")
 
@@ -530,12 +564,12 @@ async def test_a_complete_result_survives_a_failed_artifact_write() -> None:
 
 
 @pytest.mark.asyncio
-async def test_result_preview_tracks_the_result_cap() -> None:
-    """The panel never shows more of the result than the run's own result cap
-    allows, and a fan-out-sized result under the ceiling arrives parseable."""
+async def test_result_preview_tracks_the_summary_cap() -> None:
+    """The panel never shows more of the result than the summary the same run
+    produced, and a result under the cap arrives parseable."""
     driver, registry, _, _ = await _make_driver(
         _script("return 'x'.repeat(400);"),
-        caps=_caps(max_result_bytes=64),
+        caps=_caps(max_summary_bytes=64),
     )
     await driver.run()
 
@@ -553,11 +587,11 @@ async def test_result_preview_tracks_the_result_cap() -> None:
 
 @pytest.mark.asyncio
 async def test_result_preview_stays_under_the_checkpoint_ceiling() -> None:
-    """max_result_bytes is configurable to 16 MiB; the frame that carries the
+    """max_summary_bytes is configurable to 1 MiB; the frame that carries the
     preview into the checkpoint is not."""
     driver, registry, _, _ = await _make_driver(
         _script("return 'z'.repeat(400000);"),
-        caps=_caps(max_result_bytes=16 * 1024 * 1024),
+        caps=_caps(max_summary_bytes=1024 * 1024),
     )
     await driver.run()
 

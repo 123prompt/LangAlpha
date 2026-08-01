@@ -660,15 +660,24 @@ function reduceWorkflowRunFrame(
 }
 
 /**
- * Settle a workflow run whose lane closed without a terminal lifecycle frame.
+ * Settle a workflow run against the ledger outcome its lane closed with.
  *
- * The driver mints `workflow_lifecycle`, so a worker that dies mid-run emits
- * none — recovery appends only `run_end`, which carries the ledger outcome but
- * lands on the card's own status, where `workflowRun.status` shadows it. The
- * card would spin until a reload, and reconnecting does not help: the client
- * re-attaches and replays the same frames. Synthesizing the terminal frame the
- * history projector already synthesizes on replay settles it live, and keeps
- * both paths agreeing on the verdict.
+ * Two cases, one rule — the ledger row is the status authority and the
+ * snapshot the detail authority, which is exactly what `workflow_run_items`
+ * does on replay:
+ *
+ *  - No terminal frame at all (a worker that died mid-run emits none, since
+ *    the driver mints `workflow_lifecycle`). Recovery appends only `run_end`,
+ *    which lands on the card's own status where `workflowRun.status` shadows
+ *    it, so the card spins until a reload — and reconnecting does not help,
+ *    because the client replays the same frames.
+ *  - A terminal frame the ledger then contradicted. The driver stamps its
+ *    frame BEFORE the ledger CAS, so a raced cancel or a downgraded event
+ *    stream can leave the card reading "completed" against a `cancelled` row.
+ *
+ * Reconciling means replacing the status, never the frame: the reducer keeps
+ * result, totals and duration (`?? state`), so the richer local truth
+ * survives while the verdict comes from the ledger.
  */
 export function settleWorkflowRunFromClosure({
   taskId, outcome, subagentStateRefs, updateSubagentCard,
@@ -681,12 +690,15 @@ export function settleWorkflowRunFromClosure({
   if (!taskId || !updateSubagentCard) return false;
   const taskRefs = subagentStateRefs[taskId];
   const prev = taskRefs?.workflowRun;
-  // Only a workflow run still believing it is running needs this — a run that
-  // got its own terminal frame carries richer truth (result, totals) than the
-  // ledger outcome, so it must never be overwritten.
-  if (!prev || isWorkflowRunTerminal(prev.status)) return false;
+  if (!prev) return false;
   const status = workflowRunStatusFromLedger(outcome);
-  if (!status) return false;
+  // Agreement is the common case and needs no write; a non-terminal outcome
+  // resolves to nothing to adopt.
+  if (!status || prev.status === status) return false;
+  // `run_completed` assigns `error` outright rather than defaulting it, so a
+  // reconcile has to carry the frame's own detail across or it would erase it.
+  // `run_end` carries none of its own — hence the projector's fallback text.
+  const error = prev.error ?? (status === 'completed' ? undefined : `run ended: ${outcome}`);
   reduceWorkflowRunFrame(
     taskId,
     taskRefs,
@@ -694,8 +706,7 @@ export function settleWorkflowRunFromClosure({
     {
       phase: 'run_completed',
       status,
-      // The projector's fallback text: `run_end` carries no failure detail.
-      ...(status === 'completed' ? {} : { error: `run ended: ${outcome}` }),
+      ...(error ? { error } : {}),
     } as WorkflowLifecycleFrame,
     updateSubagentCard,
   );

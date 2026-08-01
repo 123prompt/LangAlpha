@@ -86,28 +86,89 @@ describe('settleWorkflowRunFromClosure', () => {
     ).toEqual(['cancelled', 'cancelled']);
   });
 
-  it('never overwrites a run that got its own terminal frame', () => {
-    // The driver's frame carries result/totals the ledger outcome lacks, and
-    // a late closure must not downgrade a genuine success to a failure.
-    const completed = applyWorkflowLifecycle(runningRun(), {
+  const completedRun = (): WorkflowRunState =>
+    applyWorkflowLifecycle(runningRun(), {
       phase: 'run_completed',
       status: 'completed',
       result_preview: '{"ok":true}',
+      children_total: 2,
     });
-    const subagentStateRefs = refsWith(completed);
+
+  it('adopts the ledger verdict over a terminal frame that contradicts it', () => {
+    // The driver stamps its frame BEFORE the ledger CAS, so a raced cancel can
+    // leave a card reading "completed" against a row that says otherwise. The
+    // projector reconciles the same snapshot on reload; live must agree, or the
+    // verdict changes under the viewer when they refresh.
+    const subagentStateRefs = refsWith(completedRun());
     const updateSubagentCard = vi.fn();
 
     const handled = settleWorkflowRunFromClosure({
       taskId: TASK,
+      outcome: 'cancelled',
+      subagentStateRefs,
+      updateSubagentCard,
+    });
+
+    expect(handled).toBe(true);
+    expect(subagentStateRefs[TASK].workflowRun?.status).toBe('cancelled');
+    expect(updateSubagentCard).toHaveBeenCalledWith(
+      TASK,
+      expect.objectContaining({ status: 'cancelled', isActive: false }),
+    );
+  });
+
+  it('keeps the frame detail the ledger outcome does not carry', () => {
+    // Reconciling replaces the status, not the frame: `run_end` has no result,
+    // no totals and no duration, so overwriting with it would strip the panel.
+    const subagentStateRefs = refsWith(completedRun());
+    settleWorkflowRunFromClosure({
+      taskId: TASK,
       outcome: 'error',
+      subagentStateRefs,
+      updateSubagentCard: vi.fn(),
+    });
+
+    const run = subagentStateRefs[TASK].workflowRun;
+    expect(run?.status).toBe('failed');
+    expect(run?.resultPreview).toBe('{"ok":true}');
+    expect(run?.childrenTotal).toBe(2);
+  });
+
+  it('leaves a terminal frame the ledger agrees with untouched', () => {
+    const subagentStateRefs = refsWith(completedRun());
+    const updateSubagentCard = vi.fn();
+
+    const handled = settleWorkflowRunFromClosure({
+      taskId: TASK,
+      outcome: 'completed',
       subagentStateRefs,
       updateSubagentCard,
     });
 
     expect(handled).toBe(false);
-    expect(subagentStateRefs[TASK].workflowRun?.status).toBe('completed');
-    expect(subagentStateRefs[TASK].workflowRun?.resultPreview).toBe('{"ok":true}');
     expect(updateSubagentCard).not.toHaveBeenCalled();
+  });
+
+  it('preserves the driver failure detail instead of the generic fallback', () => {
+    // A run that failed with a reason and then closed as `error` must keep the
+    // reason — the projector only fills its fallback text when none is present.
+    const failed = applyWorkflowLifecycle(runningRun(), {
+      phase: 'run_completed',
+      status: 'failed',
+      error: 'Workflow timeout: script exceeded cpu budget',
+    });
+    const subagentStateRefs = refsWith(failed);
+
+    settleWorkflowRunFromClosure({
+      taskId: TASK,
+      outcome: 'cancelled',
+      subagentStateRefs,
+      updateSubagentCard: vi.fn(),
+    });
+
+    const run = subagentStateRefs[TASK].workflowRun;
+    expect(run?.status).toBe('cancelled');
+    expect(run?.error).toBe('Workflow timeout: script exceeded cpu budget');
   });
 
   it('leaves a plain subagent task alone', () => {

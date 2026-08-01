@@ -112,16 +112,18 @@ class WorkflowEmitter:
         registry: BackgroundTaskRegistry,
         checkpointer: Any,
         thread_id: str,
-        max_result_bytes: int,
+        max_summary_bytes: int,
     ) -> None:
         self._run_task = run_task
         self._registry = registry
         self._checkpointer = checkpointer
         self._thread_id = thread_id
-        # The preview never shows more of the result than the run's own result
-        # cap allows, so lowering that cap lowers the panel with it.
+        # The panel never shows more than the summary the same result produced,
+        # so lowering that cap lowers the panel with it. Keyed to the summary
+        # rather than the result dump because both are read by someone; the
+        # dump is sized for what the script manipulates in JS.
         self._result_preview_bytes = min(
-            max_result_bytes, self._UI_RESULT_PREVIEW_CEILING
+            max_summary_bytes, self._UI_RESULT_PREVIEW_CEILING
         )
         self.current_phase: str | None = None
         self._task_id = run_task.task_id

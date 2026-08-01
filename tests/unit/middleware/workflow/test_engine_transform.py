@@ -108,6 +108,26 @@ def test_empty_description_is_rejected() -> None:
         compile_check("export const meta = { name: 'demo', description: '   ' };")
 
 
+def test_oversized_description_is_rejected() -> None:
+    """`meta.name` is bounded by its pattern; the description was bounded only
+    by the script cap, yet it is pinned for the life of a compile-cache entry
+    and copied into the registry, lifecycle frames and checkpoint records."""
+    padded = "d" * 4096
+    with pytest.raises(WorkflowScriptError, match="meta.description is 4096 chars"):
+        compile_check(
+            f"export const meta = {{ name: 'demo', description: '{padded}' }};"
+        )
+
+
+def test_a_normal_description_still_compiles() -> None:
+    """The cap sits well past any real one-line summary."""
+    summary = "Fan out research across tickers, then synthesize a brief. " * 4
+    meta = compile_check(
+        f"export const meta = {{ name: 'demo', description: '{summary}' }};"
+    )
+    assert meta.description == summary
+
+
 def test_syntax_error_is_reported_with_js_detail() -> None:
     with pytest.raises(WorkflowScriptError, match="JavaScript syntax error") as exc_info:
         compile_check(

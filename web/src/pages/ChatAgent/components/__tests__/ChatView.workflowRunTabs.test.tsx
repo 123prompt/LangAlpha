@@ -11,7 +11,7 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import '@testing-library/jest-dom';
-import { screen, fireEvent } from '@testing-library/react';
+import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/utils';
 
 vi.mock('framer-motion', async () => {
@@ -189,10 +189,19 @@ vi.mock('../../hooks/useNavigationData', async (importOriginal) => ({
   }),
 }));
 
-// Stop never settles here — the run's terminal frame is what clears the
-// button in production, so the pending promise holds "Stopping…" on screen.
+type CancelOutcome = {
+  cancelled: boolean;
+  task_id: string;
+  state?: string;
+  message: string;
+};
+
+// Default: never settles — a real stop is cleared by the run's terminal frame,
+// so the pending promise is what holds "Stopping…" on screen. Tests that need
+// the endpoint's no-op answer override it per call.
 const cancelSubagentTask = vi.fn(
-  (_threadId: string, _taskId: string): Promise<never> => new Promise<never>(() => {}),
+  (_threadId: string, _taskId: string): Promise<CancelOutcome> =>
+    new Promise<CancelOutcome>(() => {}),
 );
 
 vi.mock('../../utils/api', async (importOriginal) => ({
@@ -265,6 +274,25 @@ describe('ChatView workflow run tabs', () => {
     cancelSubagentTask.mockClear();
     fireEvent.click(stopButton());
     expect(cancelSubagentTask).toHaveBeenCalledWith(THREAD_ID, 'wfb');
+  });
+
+  it('releases the stop button when the cancel stopped nothing', async () => {
+    // The endpoint answers HTTP 200 with cancelled:false for a run the ledger
+    // already settled or lost, and no terminal frame follows a stop that was
+    // never sent — so nothing else would ever clear the button.
+    mountAtRun('wfa');
+    cancelSubagentTask.mockResolvedValueOnce({
+      cancelled: false,
+      task_id: 'wfa',
+      state: 'already_finished',
+      message: 'Task already completed; nothing to cancel.',
+    });
+
+    fireEvent.click(stopButton());
+    expect(stopButton()).toBeDisabled();
+
+    await waitFor(() => expect(stopButton()).toBeEnabled());
+    expect(stopButton()).toHaveTextContent('chat.workflowRun.stop');
   });
 
   it('does not carry a stop back to the run the user came from', () => {

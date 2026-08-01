@@ -250,34 +250,41 @@ def create_run_workflow_tool(
         """Take the per-thread run slot and bear the ledger row under one lock,
         stamping ``task_run_id``; refuses without leaving a claimable entry."""
         async with admission_lock:
-            # The ledger is the cross-worker authority: the local registry only
-            # sees this process's runs, so counting it alone lets every worker
-            # admit a full quota. Fall back to the local view when no ledger is
-            # injected (CLI) or the read fails — a cap check must never block
-            # runs on infra trouble.
-            active_ids: list[str] | None = None
+            active_ids: list[str]
             run_ledger = getattr(registry, "run_ledger", None)
-            if run_ledger is not None:
-                try:
-                    rows = await run_ledger.list_open_workflow_runs()
-                    active_ids = [
-                        str(row["task_id"])
-                        for row in rows
-                        if str(row["task_id"]) != run_task.task_id
-                    ]
-                except Exception:
-                    logger.warning(
-                        "Workflow cap ledger read failed; using local registry",
-                        thread_id=thread_id,
-                        exc_info=True,
-                    )
-            if active_ids is None:
+            if run_ledger is None:
+                # No ledger to consult (CLI): one process holds every run, so
+                # its registry is the whole truth rather than a slice of it.
                 active_ids = [
                     task.task_id
                     for task in await registry.get_all_tasks()
                     if task.subagent_type == "workflow"
                     and task.is_pending
                     and task.task_id != run_task.task_id
+                ]
+            else:
+                try:
+                    rows = await run_ledger.list_open_workflow_runs()
+                except Exception as error:
+                    # A ledgered deployment is multi-worker, so the local
+                    # registry is a fraction of the truth, not a degraded
+                    # copy of it — counting it here would hand every worker a
+                    # fresh quota. Refuse: this is admission, where a re-read
+                    # is the caller's next message, not a stuck state.
+                    logger.warning(
+                        "Workflow cap ledger read failed; refusing admission",
+                        thread_id=thread_id,
+                        exc_info=True,
+                    )
+                    run_task.mark_never_started("workflow cap ledger unreadable")
+                    raise _Refused(
+                        "Error: could not read the workflow run ledger to "
+                        "check the per-thread cap. Try again shortly."
+                    ) from error
+                active_ids = [
+                    str(row["task_id"])
+                    for row in rows
+                    if str(row["task_id"]) != run_task.task_id
                 ]
             if len(active_ids) >= caps.max_runs_per_thread:
                 running = ", ".join(active_ids)

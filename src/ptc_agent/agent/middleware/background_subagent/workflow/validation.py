@@ -25,6 +25,12 @@ _REGEX_KEYWORDS = ("pattern", "patternProperties")
 # server makes on the script's behalf, with the response echoed back in the
 # validation error. A response schema only ever refers within itself.
 _REF_KEYWORDS = ("$ref", "$schema", "$dynamicRef", "$recursiveRef")
+# Keywords whose cost scales with the *reply*, not the schema. `uniqueItems`
+# compares array members pairwise, and object members are unhashable, so
+# `jsonschema` falls back to O(n²) equality: 4000 members measured ~6.5s. The
+# reply is validated before it is truncated, so nothing upstream bounds n, and
+# validation runs in a worker thread that a cancelled run cannot reclaim.
+_INSTANCE_COST_KEYWORDS = ("uniqueItems",)
 # An empty registry resolves nothing outside the schema document, so the
 # retrieval path cannot be reached even if a ref keyword slips past the gate.
 _NO_REMOTE_REFS = Registry()
@@ -250,6 +256,15 @@ def _check_schema_shape(
                     f"opts.schema must not use '{keyword}'. Constrain the shape with "
                     "type/enum/required instead, and check string formatting in the "
                     "workflow script."
+                )
+        for keyword in _INSTANCE_COST_KEYWORDS:
+            # Truthiness, not presence: `uniqueItems: false` is the default and
+            # costs nothing, so refusing it would only confuse.
+            if value.get(keyword):
+                raise DispatchValidationError(
+                    f"opts.schema must not use '{keyword}'. Validating it is "
+                    "quadratic in the length of the child's reply; check "
+                    "uniqueness in the workflow script instead."
                 )
         for keyword in _REF_KEYWORDS:
             reference = value.get(keyword)

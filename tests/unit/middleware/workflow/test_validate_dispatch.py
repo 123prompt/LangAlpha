@@ -109,6 +109,29 @@ def test_regex_schema_keywords_are_rejected_at_any_depth(
         _validate(opts={"schema": schema})
 
 
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "array", "uniqueItems": True},
+        {
+            "type": "object",
+            "properties": {"rows": {"type": "array", "uniqueItems": True}},
+        },
+    ],
+)
+def test_uniqueitems_is_rejected_at_any_depth(schema: dict[str, Any]) -> None:
+    """Unhashable members make `jsonschema` compare pairwise, so the cost is
+    quadratic in the *reply* — which nothing bounds, since validation runs
+    before truncation and on a thread a cancelled run cannot reclaim."""
+    with pytest.raises(DispatchValidationError, match="quadratic"):
+        _validate(opts={"schema": schema})
+
+
+def test_uniqueitems_false_is_admitted() -> None:
+    """The default costs nothing; refusing it would only confuse."""
+    _validate(opts={"schema": {"type": "array", "uniqueItems": False}})
+
+
 def test_schema_must_be_an_object() -> None:
     with pytest.raises(DispatchValidationError, match="opts.schema must be an object"):
         _validate(opts={"schema": []})

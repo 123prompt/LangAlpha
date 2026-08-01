@@ -233,7 +233,8 @@ workflow:
   child_timeout: 1800            # Per-child subagent timeout (seconds) — genuine deep work runs well past 10 min
   run_timeout: 14400             # Whole-run wall clock (seconds) — 64 dispatches at 8 wide is 8 waves, so this must exceed 8x child_timeout
   max_runs_per_thread: 2         # Concurrent runs per thread
-  max_result_bytes: 1048576      # Per-child result dump cap (bytes)
+  max_result_bytes: 1048576      # Per-child result dump cap (bytes) — what the script sees in JS
+  max_summary_bytes: 65536       # Run summary handed to the model + archived for TaskOutput (bytes); result.json keeps the rest
   max_prompt_chars: 400000       # Per-dispatch prompt length cap (~100K tokens)
   max_script_bytes: 204800       # Workflow script size cap (bytes)
 

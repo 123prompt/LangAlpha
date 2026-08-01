@@ -232,6 +232,21 @@ function PhaseGroup({
 }
 
 /**
+ * Whether a cancel request stopped nothing.
+ *
+ * The endpoint answers HTTP 200 with `cancelled: false` when there was nothing
+ * to stop (`already_finished`, `task_not_found`), so a resolved promise is not
+ * proof that a stop is on its way.
+ */
+export function isNoOpCancellation(outcome: unknown): boolean {
+  return (
+    typeof outcome === 'object' &&
+    outcome !== null &&
+    (outcome as { cancelled?: unknown }).cancelled === false
+  );
+}
+
+/**
  * Right-panel detail for a workflow run task: header + status, a quiet stat
  * band, the children grouped by phase (each row opens that child's own task
  * view), and the run's log lines. A workflow run has no transcript of its own
@@ -254,12 +269,20 @@ function WorkflowRunDetail({
   const handleStop = useCallback(() => {
     if (!onStop || stopping) return;
     setStopping(true);
-    onStop().catch((err: unknown) => {
-      console.error('[WorkflowRunDetail] stop failed:', err);
-      setStopping(false);
-    });
-    // On success the run's lifecycle events flip the status; the button
-    // stays in "Stopping…" until the terminal frame lands.
+    onStop()
+      .then((outcome: unknown) => {
+        // Only a cancellation that was actually sent produces the terminal
+        // frame this waits for. A no-op resolves the same way, so without
+        // this the button reads "Stopping…" for the life of the view.
+        if (isNoOpCancellation(outcome)) setStopping(false);
+        // Deliberately not reconciling the card here: the stream layer is the
+        // only writer of workflowRun.status, and a stale card that no longer
+        // has a run settles from its own lane closure.
+      })
+      .catch((err: unknown) => {
+        console.error('[WorkflowRunDetail] stop failed:', err);
+        setStopping(false);
+      });
   }, [onStop, stopping]);
 
   const openChild = useCallback(

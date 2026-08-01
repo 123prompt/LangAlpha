@@ -424,8 +424,13 @@ async def test_run_cap_local_fallback_counts_only_pending_workflows() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_cap_ledger_read_failure_falls_open_to_local() -> None:
-    """A cap check must never block runs on infra trouble."""
+async def test_run_cap_ledger_read_failure_refuses_instead_of_counting_locally() -> None:
+    """Falling back to the local registry here defeats the cap outright: a
+    ledgered deployment is multi-worker, so this process's view is a fraction
+    of the truth rather than a degraded copy of it, and every worker would
+    admit a fresh quota. Admission is the one place refusing is cheap — the
+    re-read is the caller's next message, not a stuck state.
+    """
     dispatcher = FakeDispatcher()
     ledger = FakeRunLedger(error=RuntimeError("db down"))
     dispatcher.registry.run_ledger = ledger
@@ -434,9 +439,13 @@ async def test_run_cap_ledger_read_failure_falls_open_to_local() -> None:
 
     message = await workflow_tool.coroutine(script=_script())
 
-    assert "Workflow run started" in message
+    assert "could not read the workflow run ledger" in message
     assert ledger.calls == 1
-    assert len(CapturingDriver.specs) == 1
+    assert CapturingDriver.specs == []
+    # The refusal must not itself hold the slot it declined to grant, or the
+    # retry it invites would be blocked by its own predecessor.
+    tasks = await dispatcher.registry.get_all_tasks()
+    assert [t for t in tasks if t.is_pending] == []
 
 
 @pytest.mark.asyncio

@@ -360,7 +360,19 @@ class WorkflowOrchestrationConfig(BaseModel):
         default=1024 * 1024,
         ge=1024,
         le=16 * 1024 * 1024,
-        description="Per-child result dump cap; larger results are truncated",
+        description=(
+            "Per-child result dump cap; bounds what the script manipulates in "
+            "JS, not what any reader is handed"
+        ),
+    )
+    max_summary_bytes: int = Field(
+        default=64 * 1024,
+        ge=1024,
+        le=1024 * 1024,
+        description=(
+            "Cap on the run summary — the text handed to the model and "
+            "archived for TaskOutput; the full value stays in result.json"
+        ),
     )
     max_prompt_chars: int = Field(
         default=400_000,

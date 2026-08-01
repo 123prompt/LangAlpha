@@ -194,7 +194,7 @@ class WorkflowDriver:
             registry=spec.registry,
             checkpointer=spec.checkpointer,
             thread_id=spec.thread_id,
-            max_result_bytes=spec.caps.max_result_bytes,
+            max_summary_bytes=spec.caps.max_summary_bytes,
         )
         self._sem: asyncio.Semaphore | None = None
         self._dispatched = 0
@@ -282,7 +282,7 @@ class WorkflowDriver:
         result_json = json.dumps(outcome.result, ensure_ascii=False, default=str)
         wrote_full = await self._write_json("result.json", outcome.result)
         display_result, truncated = truncate_to_bytes(
-            result_json, self.spec.caps.max_result_bytes
+            result_json, self.spec.caps.max_summary_bytes
         )
         if truncated and not wrote_full:
             # The clipped copy is all that is left and the file holding the
@@ -296,10 +296,20 @@ class WorkflowDriver:
                     f"written — the full result would be unrecoverable"
                 )
             )
+        # Named only where it is load bearing, and only because it is known to
+        # exist: past the guard above, a truncated display always has its full
+        # copy on disk, so this never points the agent at a missing file.
+        remainder = (
+            f"Result truncated for display — the full value is "
+            f"{self.base_rel}/result.json\n"
+            if truncated
+            else ""
+        )
         summary = (
             f"Workflow '{self.spec.meta.name}' completed: "
             f"{self._dispatched} subagent dispatch(es).\n"
-            f"Result:\n{display_result}\n\n"
+            f"Result:\n{display_result}\n"
+            f"{remainder}\n"
             f"Run files: {self.base_rel}/ "
             f"(per-child records under children/)"
         )

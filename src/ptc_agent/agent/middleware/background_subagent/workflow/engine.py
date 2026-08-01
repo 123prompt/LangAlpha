@@ -36,6 +36,11 @@ _MAX_BRACE_PROBES = 256
 _COMPILE_MEMORY_LIMIT = 16 * 1024 * 1024
 _COMPILE_TIMEOUT = 2.0
 _HOST_TEXT_LIMIT = 500
+# `meta.name` is bounded by its pattern; the description had no bound but the
+# script's own size cap, and it is retained for the life of a compile-cache
+# entry and copied into the registry, lifecycle frames and checkpoint records.
+# Well past any real one-line summary, far short of a payload.
+_MAX_DESCRIPTION_CHARS = 512
 # Compiling goes through `new Function`, the one primitive QuickJS offers that
 # parses without executing. The candidate crosses as a global string rather
 # than being spliced into the evaluated source, so a script cannot close the
@@ -229,9 +234,15 @@ def compile_check(script: str) -> WorkflowMeta:
     description = raw.get("description")
     if not isinstance(description, str) or not description.strip():
         raise WorkflowScriptError("meta.description must be a non-empty string")
-    # Only the two fields the server reads survive the literal. The rest is
-    # script-declared and unbounded — anything kept here is pinned for the life
-    # of the compile memo, so a padded meta would retain megabytes per entry.
+    if len(description) > _MAX_DESCRIPTION_CHARS:
+        raise WorkflowScriptError(
+            f"meta.description is {len(description)} chars; the cap is "
+            f"{_MAX_DESCRIPTION_CHARS}"
+        )
+    # Only the two fields the server reads survive the literal, and both are
+    # length-bounded above. The rest is script-declared and unbounded —
+    # anything kept here is pinned for the life of the compile memo, so a
+    # padded meta would retain megabytes per entry.
     return WorkflowMeta(name=name, description=description)
 
 
