@@ -26,6 +26,33 @@ export interface StructuredResult {
 /** A single fence wrapping the whole message, with an optional info string. */
 const FENCE_WRAP_RE = /^```[\w-]*[ \t]*\n([\s\S]*?)\n?```$/;
 
+/** Strings first, so every digit run left in the body is a number literal. */
+const JSON_STRING_RE = /"(?:[^"\\]|\\.)*"/g;
+const JSON_NUMBER_RE = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
+
+/**
+ * Whether every number in the source survives a `JSON.parse` round trip.
+ *
+ * JSON bounds no number; a double does. `9007199254740993` silently becomes
+ * `...992`, and `1e400` becomes `Infinity` and reserializes as `null` — and
+ * because the raw disclosure is regenerated from the parsed object, the
+ * fields and the "raw" view would agree on a value the subagent never sent.
+ * Declining renders the message as its own text instead.
+ *
+ * Only integers are held to exactness. Decimal notation is lossy against
+ * binary floating point by construction, so demanding it round-trip would
+ * reject ordinary prices.
+ */
+function numbersSurviveParsing(body: string): boolean {
+  const literals = body.replace(JSON_STRING_RE, '""').match(JSON_NUMBER_RE);
+  if (!literals) return true;
+  return literals.every((literal) => {
+    const value = Number(literal);
+    if (!Number.isFinite(value)) return false;
+    return /[.eE]/.test(literal) || Number.isSafeInteger(value);
+  });
+}
+
 /**
  * Parses a whole-message JSON object, or returns null.
  *
@@ -53,6 +80,7 @@ export function parseStructuredResult(
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return null;
   }
+  if (!numbersSurviveParsing(body)) return null;
 
   const entries = Object.entries(parsed as Record<string, StructuredValue>);
   if (entries.length === 0) return null;

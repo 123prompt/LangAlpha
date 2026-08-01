@@ -207,10 +207,20 @@ def _stop_already_covered(latest: dict | None, run_row: dict | None) -> bool:
     announcing it is the entire job of this pipeline — a blanket "the thread
     was cancelled once" test would silence every later completion instead.
 
+    Scoped to the task's own parent attempt, not merely to the newest one.
+    A task launched by turn A can settle while turn B runs, parking its job;
+    cancelling B then releases it, and a timestamp-only test would read A's
+    earlier settle as "covered" and drop a result the stop was never about.
+
     Undecidable without both stamps, and silence is the worse failure, so a
     missing one notifies.
     """
     if not latest or latest.get("status") != "cancelled":
+        return False
+    parent_run_id = (run_row or {}).get("parent_run_id")
+    if parent_run_id is None or str(parent_run_id) != str(
+        latest.get("conversation_response_id")
+    ):
         return False
     stopped_at = latest.get("cancel_requested_at")
     settled_at = (run_row or {}).get("finalized_at")

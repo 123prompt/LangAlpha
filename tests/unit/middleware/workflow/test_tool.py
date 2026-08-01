@@ -451,11 +451,10 @@ async def test_run_cap_counts_open_ledger_rows_across_workers() -> None:
     assert "task_aaa111" in message and "task_bbb222" in message
     assert ledger.calls == 1
     assert CapturingDriver.specs == []
-    # Registration precedes the cap check (idempotency first); the
-    # rejected run stays as an inert never-started entry.
-    tasks = await dispatcher.registry.get_all_tasks()
-    assert [t for t in tasks if t.is_pending] == []
-    assert all("cap reached" in (t.error or "") for t in tasks)
+    # Registration precedes the cap check (idempotency first), so the refused
+    # run leaves an entry behind — and its id went nowhere, so nothing else
+    # would ever claim or evict it. It has to be dropped here.
+    assert await dispatcher.registry.get_all_tasks() == []
 
 
 @pytest.mark.asyncio
@@ -603,12 +602,11 @@ async def test_concurrent_launches_cannot_exceed_the_per_thread_run_cap() -> Non
 
 
 @pytest.mark.asyncio
-async def test_a_refused_admission_names_its_reason_and_leaves_the_entry_inert() -> (
-    None
-):
+async def test_a_refused_admission_names_its_reason_and_drops_the_entry() -> None:
     """The tool's reply is the model's only signal that nothing started, so it
-    has to carry the refusal's own reason — and the registered entry must go
-    inert, or a collector waits forever on a run that was never born."""
+    has to carry the refusal's own reason — and the entry goes with it. A
+    refused id is never returned, and a never-started entry has no writer,
+    capture or usage for a collector to claim, so nothing else evicts it."""
     dispatcher = FakeDispatcher()
 
     async def _refuse(task: Any, **kwargs: Any) -> str:
@@ -621,13 +619,11 @@ async def test_a_refused_admission_names_its_reason_and_leaves_the_entry_inert()
 
     message = await workflow_tool.coroutine(script=_script(), tool_call_id="wf-1")
 
-    (run_task,) = await dispatcher.registry.get_all_tasks()
-    assert message == (
-        f"Error: could not start {run_task.display_id} — its checkpoint "
-        "namespace could not be fenced. Try again."
+    assert message.startswith("Error: could not start Task-")
+    assert message.endswith(
+        "— its checkpoint namespace could not be fenced. Try again."
     )
-    assert run_task.terminal_status == "never_started"
-    assert run_task.error == "namespace fence unavailable"
+    assert await dispatcher.registry.get_all_tasks() == []
     assert CapturingDriver.specs == []
 
 

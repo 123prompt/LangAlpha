@@ -496,10 +496,15 @@ async def test_terminal_pointer_row_read_failure_leaves_recents():
 # ---------------------------------------------------------------------------
 
 _STOPPED_AT = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+_STOPPED_RUN = "attempt-stopped"
 
 
 def _cancelled_attempt() -> dict:
-    return {"status": "cancelled", "cancel_requested_at": _STOPPED_AT}
+    return {
+        "status": "cancelled",
+        "cancel_requested_at": _STOPPED_AT,
+        "conversation_response_id": _STOPPED_RUN,
+    }
 
 
 @pytest.mark.asyncio
@@ -513,6 +518,7 @@ async def test_dispatch_drops_when_the_users_own_stop_released_it():
         run_row={
             "status": "completed",
             "result_delivered_at": None,
+            "parent_run_id": _STOPPED_RUN,
             "finalized_at": _STOPPED_AT - timedelta(seconds=30),
         },
         latest_statuses=[_cancelled_attempt()],
@@ -523,6 +529,29 @@ async def test_dispatch_drops_when_the_users_own_stop_released_it():
 
     post.assert_not_awaited()
     assert wake.await_args.kwargs.get("cleared") is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_announces_a_task_the_stopped_turn_did_not_launch():
+    """The task belongs to an earlier turn and settled while a later one ran,
+    so its job was parked. Cancelling that later turn releases it — but the
+    stop was never about this result, and a timestamp-only test would read the
+    earlier settle as covered and lose the notification for good.
+    """
+    post = AsyncMock(return_value=("dispatched", "rb-run-1"))
+    with _arb_env(
+        run_row={
+            "status": "completed",
+            "result_delivered_at": None,
+            "parent_run_id": "attempt-earlier",
+            "finalized_at": _STOPPED_AT - timedelta(seconds=30),
+        },
+        latest_statuses=[_cancelled_attempt()],
+        post=post,
+    ):
+        await execute_task_report_back(_arb_job())
+
+    post.assert_awaited_once()
 
 
 @pytest.mark.asyncio

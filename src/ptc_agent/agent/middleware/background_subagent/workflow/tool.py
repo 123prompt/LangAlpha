@@ -253,8 +253,19 @@ def create_run_workflow_tool(
             try:
                 from_file = await backend.aread_text(script_path)
             except Exception as error:
+                # The reason stays in the log: a backend failure here is a
+                # store or transport error whose text can carry hosts and
+                # query fragments, and this reply is handed to the model and
+                # persisted with the turn. Retryability is all the caller can
+                # act on anyway.
+                logger.warning(
+                    "Workflow script_path read failed",
+                    script_path=script_path,
+                    exc_info=True,
+                )
                 raise _Refused(
-                    f"Error: Could not read script_path '{script_path}': {error}"
+                    f"Error: could not read script_path '{script_path}'. "
+                    "Try again, or pass the script inline."
                 ) from error
             if not from_file:
                 raise _Refused(
@@ -274,8 +285,7 @@ def create_run_workflow_tool(
                 )
                 raise _Refused(
                     f"Error: could not read workflow '{workflow}' from the "
-                    f"workflow store: {error}. Try again, or pass the script "
-                    "inline."
+                    "workflow store. Try again, or pass the script inline."
                 ) from error
             if resolved is None:
                 raise _Refused(_unknown_workflow_error(workflow))
@@ -458,6 +468,12 @@ def create_run_workflow_tool(
         # Admission runs AFTER registration so a checkpoint re-execution of a
         # live call reattaches idempotently above instead of tripping over its
         # own run in the count.
+        # A refused admission answers with an error rather than the entry, so
+        # the id dies here — and a never-started entry has no writer, capture
+        # or usage, which is exactly what stops a collector claiming and
+        # evicting it. Same asymmetry the direct-dispatch path handles, and
+        # the same guard: `discard_unstarted` refuses anything that settled
+        # some other way, so a stop mid-admission keeps its entry.
         try:
             await _admit_run(
                 run_task,
@@ -466,7 +482,11 @@ def create_run_workflow_tool(
                 launch_tool_call_id=launch_tool_call_id,
             )
         except _Refused as refused:
+            await registry.discard_unstarted(launch_tool_call_id)
             return refused.reply
+        except BaseException:
+            await registry.discard_unstarted(launch_tool_call_id)
+            raise
 
         base_rel = run_dir(short_thread_id, run_task.task_id)
         artifacts = {

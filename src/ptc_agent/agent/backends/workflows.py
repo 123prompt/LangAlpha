@@ -165,9 +165,13 @@ class WorkflowsBackend:
         """Absolute paths the user tier owns — these shadow pre-builts.
 
         Anchored at the mount root, not the caller's path: shadowing is a
-        property of the tier, not of the subtree being searched.
+        property of the tier, not of the subtree being searched. Strict
+        because the caller reads absence out of a miss, and a store timeout
+        would otherwise end the walk early and answer "no rows".
         """
-        return set(await self._store.aglob_paths("*", self.root_prefix))
+        return set(
+            await self._store.aglob_paths("*", self.root_prefix, strict=True)
+        )
 
     async def _shadows_a_prebuilt(self, file_path: str) -> bool:
         """Whether a user row owns this path even though the read came back empty.
@@ -180,15 +184,20 @@ class WorkflowsBackend:
         in the user tier, so an ordinary read-modify-write replaces the
         user's workflow with a derivative of ours.
 
-        Listing is a second chance at the same question, not a proof: enough
-        store pressure fails both. It closes the malformed-row case outright
-        and narrows the timeout one.
+        So an unreadable listing is reported as a shadow, not as absence: the
+        caller answers "no such file" and the user retries, where guessing
+        the other way loses their script. Only a listing that completed and
+        did not name this path is treated as proof there is no user row.
         """
         try:
             return file_path in await self._saved_paths()
-        except Exception:  # noqa: BLE001 - listing is the fallback, not the truth
-            logger.debug("workflow shadow check failed", path=file_path)
-            return False
+        except Exception:  # noqa: BLE001 - unreadable is not absent
+            logger.warning(
+                "workflow shadow check failed; refusing prebuilt fallback",
+                path=file_path,
+                exc_info=True,
+            )
+            return True
 
     async def aread_text(self, file_path: str) -> str | None:
         saved = await self._store.aread_text(file_path)

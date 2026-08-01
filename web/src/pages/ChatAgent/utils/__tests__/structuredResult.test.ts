@@ -82,3 +82,34 @@ describe('humanizeKey', () => {
     expect(humanizeKey(input)).toBe(expected);
   });
 });
+
+describe('parseStructuredResult number fidelity', () => {
+  it('declines an integer that JSON.parse cannot hold', () => {
+    // Rendering it would show ...992, and the raw disclosure is regenerated
+    // from the parsed object, so both views would agree on the wrong number.
+    expect(parseStructuredResult('{"cik": 9007199254740993}')).toBeNull();
+  });
+
+  it('declines an exponent that overflows to Infinity', () => {
+    expect(parseStructuredResult('{"notional": 1e400}')).toBeNull();
+  });
+
+  it('keeps ordinary prices and counts', () => {
+    const result = parseStructuredResult('{"price": 231.47, "volume": 91320045}');
+    expect(result?.entries).toEqual([
+      ['price', 231.47],
+      ['volume', 91320045],
+    ]);
+  });
+
+  it('ignores digits that live inside strings', () => {
+    const result = parseStructuredResult('{"note": "id 9007199254740993 stays"}');
+    expect(result?.entries).toEqual([['note', 'id 9007199254740993 stays']]);
+  });
+
+  it('holds the boundary itself', () => {
+    expect(parseStructuredResult('{"n": 9007199254740991}')?.entries).toEqual([
+      ['n', 9007199254740991],
+    ]);
+  });
+});

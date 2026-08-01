@@ -6,6 +6,8 @@ every row it creates has to stay reachable from ``/api/v1/workflows/{name}``.
 
 from __future__ import annotations
 
+import asyncio
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -148,3 +150,63 @@ class TestScriptByteCap:
             ),
         )
         assert workflow_script_byte_cap() == 4096
+
+
+class TestUnreadableIsNotAbsent:
+    """A store that cannot answer must not be read as "the user saved nothing".
+
+    Read falls through to the shipped tier while write always lands in the
+    user tier, so guessing "absent" under store pressure serves the builtin
+    and lets an ordinary read-modify-write replace the user's own script.
+    """
+
+    @staticmethod
+    def _stalled_overlay(sandbox, store, prebuilt: dict[str, str]):
+        class StalledStore(InMemoryStore):
+            async def asearch(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                await asyncio.sleep(3600)
+
+        return WorkflowsBackend(
+            store_backend=StoreBackend(
+                store=StalledStore(),
+                namespace_factory=lambda: NAMESPACE,
+                root_prefix=WORKFLOW_PREFIX,
+                sandbox_backend=sandbox,
+            ),
+            prebuilt_backend=prebuilt_workflow_backend(
+                files=prebuilt, root_prefix=WORKFLOW_PREFIX, sandbox_backend=sandbox
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_listing_refuses_rather_than_serving_the_prebuilt(
+        self, sandbox, store, monkeypatch
+    ):
+        import ptc_agent.agent.backends.langgraph_store as store_module
+
+        monkeypatch.setattr(store_module, "_STORE_OP_TIMEOUT_S", 0.05)
+        overlay = self._stalled_overlay(
+            sandbox, store, {"flow.js": "export const meta = { name: 'shipped' }"}
+        )
+
+        assert await overlay.aread_text(WORKFLOW_PREFIX + "flow.js") is None
+        assert await overlay.aread_range(WORKFLOW_PREFIX + "flow.js") is None
+
+    @pytest.mark.asyncio
+    async def test_a_completed_listing_still_falls_through(self, overlay, sandbox):
+        """The guard only fires on an unreadable listing — an empty user tier
+        that answered is still proof there is no shadow."""
+        served = WorkflowsBackend(
+            store_backend=StoreBackend(
+                store=InMemoryStore(),
+                namespace_factory=lambda: NAMESPACE,
+                root_prefix=WORKFLOW_PREFIX,
+                sandbox_backend=sandbox,
+            ),
+            prebuilt_backend=prebuilt_workflow_backend(
+                files={"flow.js": "shipped body"},
+                root_prefix=WORKFLOW_PREFIX,
+                sandbox_backend=sandbox,
+            ),
+        )
+        assert await served.aread_text(WORKFLOW_PREFIX + "flow.js") == "shipped body"

@@ -36,6 +36,10 @@ class StoreContentTooLargeError(ValueError):
     """Raised when a write would exceed ``MAX_CONTENT_BYTES``."""
 
 
+class StoreListingIncomplete(RuntimeError):
+    """A namespace walk ended early, so absence cannot be concluded from it."""
+
+
 class ReadOnlyStoreError(PermissionError):
     """Raised when ``awrite_text`` is called against a read-only tier.
 
@@ -385,7 +389,7 @@ class StoreBackend:
             ),
         }
 
-    async def _all_items(self) -> list[Any]:
+    async def _all_items(self, *, strict: bool = False) -> list[Any]:
         """Page through every Item under the backend's namespace.
 
         Pages are fetched in fan-out batches of ``fanout`` so that a 300-key
@@ -395,6 +399,12 @@ class StoreBackend:
         offset and stop. Tiny namespaces (≤ page_size) issue exactly one
         round-trip in either implementation, so there's no overhead in the
         common case.
+
+        A timed-out page ends the walk with what it has, which reads as a
+        short listing and not as a failure — right for search and grep, where
+        partial beats nothing. ``strict`` is for the callers that infer
+        absence from a miss, and for whom a truncated listing and an empty
+        namespace must not look alike.
         """
         namespace = self._namespace()
         page_size = 100
@@ -424,6 +434,10 @@ class StoreBackend:
                     offset=offset,
                     timeout_s=_STORE_OP_TIMEOUT_S,
                 )
+                if strict:
+                    raise StoreListingIncomplete(
+                        f"listing {namespace} timed out at offset {offset}"
+                    ) from None
                 break
             stop = False
             for page in pages:
@@ -442,7 +456,9 @@ class StoreBackend:
     def _absolute(self, key: str) -> str:
         return f"{self._root_prefix}{key}"
 
-    async def aglob_paths(self, pattern: str, path: str = ".") -> list[str]:
+    async def aglob_paths(
+        self, pattern: str, path: str = ".", *, strict: bool = False
+    ) -> list[str]:
         normalized_path = self.normalize_path(path)
         try:
             subtree = ""
@@ -453,7 +469,7 @@ class StoreBackend:
         except Exception:
             return []
 
-        items = await self._all_items()
+        items = await self._all_items(strict=strict)
         out: list[str] = []
         for item in items:
             key = str(item.key)
