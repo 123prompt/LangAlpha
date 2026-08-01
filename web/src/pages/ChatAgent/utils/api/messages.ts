@@ -490,6 +490,38 @@ export async function getSubagentTaskStatus(
 }
 
 /**
+ * On-demand checkpoint transcript for one subagent task. Serves drill-in
+ * views for tasks replay never projects as lanes (workflow children).
+ * Items are the same SSE-shaped events replay emits.
+ */
+export async function getSubagentTaskHistory(
+  threadId: string,
+  taskId: string,
+): Promise<{
+  task_id: string;
+  items: Array<{ event: string; data: Record<string, unknown> }>;
+}> {
+  const { data } = await api.get(
+    `/api/v1/threads/${threadId}/tasks/${taskId}/history`,
+  );
+  return data;
+}
+
+/**
+ * Stop one background task (e.g. a workflow run) without cancelling the turn.
+ * @returns { cancelled, task_id, state?, message }
+ */
+export async function cancelSubagentTask(
+  threadId: string,
+  taskId: string,
+): Promise<{ cancelled: boolean; task_id: string; state?: string; message: string }> {
+  const { data } = await api.post(
+    `/api/v1/threads/${threadId}/tasks/${taskId}/cancel`,
+  );
+  return data;
+}
+
+/**
  * List files in a workspace sandbox
  * @param {string} workspaceId
  * @param {string} dirPath - e.g. "results"

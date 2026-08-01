@@ -4,8 +4,8 @@
  * `setMessages`; subagent (task-namespace) events never enter this module.
  */
 
-import { normalizeAction } from '../../hooks/utils/eventUtils';
 import { isToolResultFailure } from '../subagents/subagentStatus';
+import { deriveTaskSegment, applyTaskSegment } from '../subagents/taskSegmentBuilder';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { ProvenanceEvent } from '@/types/sse';
 import type { ProvenanceRecord } from '@/types/chat';
@@ -306,55 +306,12 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
             };
           }
 
-          // If this tool is the Task tool (subagent spawner), also create a subagent_task segment
-          // Mirrors historyEventHandlers.js logic for consistency
+          // Task spawns / resumes and RunWorkflow launches also render an
+          // inline card — same derivation history replay uses.
           const subagentTasks = { ...((msg.subagentTasks as Record<string, Record<string, unknown>>) || {}) };
-          const isTaskTool = toolCall.name === 'task' || toolCall.name === 'Task';
-          const action = normalizeAction((toolCall.args?.action as string) || (toolCall.args?.task_id ? 'resume' : 'init'));
-          const isNewSpawn = action === 'init';
-          if (isTaskTool && toolCallId && isNewSpawn) {
-            const subagentId = toolCallId;
-            const hasExistingSubagentSegment = contentSegments.some(
-              (s: Record<string, unknown>) => s.type === 'subagent_task' && s.subagentId === subagentId
-            );
-
-            if (!hasExistingSubagentSegment) {
-              contentSegments.push({
-                type: 'subagent_task',
-                subagentId,
-                order: currentOrder,
-              });
-            }
-
-            subagentTasks[subagentId] = {
-              ...(subagentTasks[subagentId] || {}),
-              subagentId,
-              description: (toolCall.args?.description as string) || '',
-              prompt: (toolCall.args?.prompt as string) || (toolCall.args?.description as string) || '',
-              type: (toolCall.args?.subagent_type as string) || 'general-purpose',
-              action: 'init',
-              status: 'running',
-            };
-          } else if (isTaskTool && toolCallId && !isNewSpawn) {
-            // Resume/follow-up call — show a new card with "resumed" indicator
-            // Normalize to "task:xxx" format to match floating card keys
-            const rawTargetId = (toolCall.args?.task_id as string) || '';
-            const resumeTargetId = rawTargetId.startsWith('task:') ? rawTargetId : `task:${rawTargetId}`;
-            contentSegments.push({
-              type: 'subagent_task',
-              subagentId: toolCallId,
-              resumeTargetId,
-              order: currentOrder,
-            });
-            subagentTasks[toolCallId] = {
-              subagentId: toolCallId,
-              resumeTargetId,
-              description: (toolCall.args?.description as string) || '',
-              prompt: (toolCall.args?.prompt as string) || (toolCall.args?.description as string) || '',
-              type: (toolCall.args?.subagent_type as string) || 'general-purpose',
-              action,
-              status: 'running',
-            };
+          const derived = deriveTaskSegment(toolCall, toolCallId, currentOrder);
+          if (derived) {
+            applyTaskSegment(derived, toolCallId, contentSegments, subagentTasks);
           }
 
           return {

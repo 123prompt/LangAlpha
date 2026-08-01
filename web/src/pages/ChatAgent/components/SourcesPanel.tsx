@@ -25,6 +25,7 @@ import { provenanceDisplayKey, countDedupedSources, type ProvenanceRecord } from
 import type { ProvenanceSourceType } from '@/types/sse';
 import { AnimatedTabs } from '@/components/ui/animated-tabs';
 import { workspaceRelativePath } from '@/pages/ChatAgent/utils/agentPaths';
+import { isTaskAgentId } from '@/pages/ChatAgent/utils/agentId';
 import { Favicon } from './Favicon';
 import './SourcesPanel.css';
 
@@ -152,11 +153,6 @@ function formatTimestamp(ts?: string): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return ts;
   return d.toLocaleString();
-}
-
-/** `task:<id>` agent attribution → true. */
-function isSubagentRecord(agent?: string): boolean {
-  return typeof agent === 'string' && agent.startsWith('task:');
 }
 
 /** "mcp_tool" → "Mcp Tool": humanize an unmapped enum for the i18n fallback. */
@@ -603,7 +599,7 @@ function SourceRow({
           record={record}
           title={title}
           subtitle={subtitle}
-          subagent={isSubagentRecord(record.agent)}
+          subagent={isTaskAgentId(record.agent)}
           trailing={<ViewChevron />}
         />
       </button>
@@ -818,7 +814,7 @@ function SourceDeck({
                 record={r}
                 title={collapsedFront ? frontLabel : cardTitle}
                 subtitle={subtitle}
-                subagent={isSubagentRecord(r.agent)}
+                subagent={isTaskAgentId(r.agent)}
                 trailing={trailing}
               />
             )}
@@ -915,7 +911,7 @@ function SourceDetailDialog({
                 >
                   {typeLabel}
                 </span>
-                {record && isSubagentRecord(record.agent) && (
+                {record && isTaskAgentId(record.agent) && (
                   <span
                     className="inline-flex flex-shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium"
                     style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}

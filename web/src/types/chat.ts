@@ -41,6 +41,31 @@ export interface SubagentTaskSegment {
   resumeTargetId?: string;
 }
 
+/**
+ * The card record a `SubagentTaskSegment` points at: what the Task/RunWorkflow
+ * tool call recorded, plus the fields the stream stamps on it afterwards.
+ */
+export interface SubagentTaskRecord {
+  subagentId: string;
+  description: string;
+  prompt: string;
+  /** Subagent name for a spawn; the workflow discriminant for a run. */
+  type: string;
+  /** Normalized card verb — `init` / `update` / `resume`, or an unrecognized
+   *  wire spelling passed through verbatim. */
+  action: string;
+  status: string;
+  /** Resume cards only: the `task:<id>` the follow-up call targets. */
+  resumeTargetId?: string;
+  /** Spawn tool result text, stamped once the Task call returns — written by
+   *  the replay path (`historyHandlers`) and the field every reader consumes. */
+  result?: string;
+  /** The same datum under the live path's spelling (`mainEventHandlers`). The
+   *  two transports have never converged on one name, so a live thread carries
+   *  this one and a replayed thread carries `result`. */
+  toolCallResult?: string;
+}
+
 export interface NotificationSegment {
   type: 'notification';
   content: string;

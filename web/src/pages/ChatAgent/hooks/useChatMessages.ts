@@ -49,6 +49,9 @@ export type { ModelStatus, FallbackSuggestion } from '../session/types';
 import type { ChatSessionRuntime } from '../session/runtime';
 import { projectSubagentHistory } from '../session/subagents/projectHistory';
 import { createSubagentMuxController, getTaskIdFromEvent } from '../session/subagents/muxSink';
+import {
+  hydrateTaskTranscript, type TaskTranscriptMeta,
+} from '../session/subagents/hydrateTaskTranscript';
 import { loadConversationHistory as replayConversationHistory } from '../session/history/replayHistory';
 import { createStreamEventProcessor, type StreamRouterDeps } from '../session/stream/processStreamEvent';
 import {
@@ -2575,5 +2578,7 @@ export function useChatMessages(
       const data = subagentHistoryRef.current?.[agentId];
       return data ? { ...data, agentId } : null;
     },
+    hydrateTaskTranscript: (subagentId: string, meta?: TaskTranscriptMeta) =>
+      hydrateTaskTranscript(runtime, threadId, subagentId, meta),
   };
 }

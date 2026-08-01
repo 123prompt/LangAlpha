@@ -13,6 +13,7 @@ import { useTheme } from '@/contexts/ThemeContext';
 import WorkspaceImage from './WorkspaceImage';
 import { isFilePath, isImagePath, normalizeFilePath, parseWsPath } from './FileCard';
 import { normalizeFileRefs } from '../utils/normalizeFileRefs';
+import { mapOutsideCode, mapOutsideFences } from '../utils/markdownSegments';
 import CitationBubble from './CitationBubble';
 
 // Sanitize schema: extends GitHub-style defaults to allow KaTeX output,
@@ -615,10 +616,22 @@ interface MarkdownProps {
 
 function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, codeTheme }: MarkdownProps): React.ReactElement {
   const config = VARIANTS[variant];
-  const processed = useMemo(
-    () => normalizeLatexDelimiters(escapeCurrencyDollars(transformCitationBubbles(fixMarkdownTables(normalizeFileRefs(stripFrontMatter(content)))))),
-    [content]
-  );
+  // Every pass below rewrites prose before the markdown parser sees it, so each
+  // one has to say how much of the string it may touch. Inside code, markdown
+  // stops interpreting escapes and raw HTML — a rewrite that lands there is
+  // visible corruption and makes the Copy button return unparseable text.
+  const processed = useMemo(() => {
+    // Whole-string by design: front matter is anchored at the start, and
+    // normalizeFileRefs deliberately unwraps backticks around file refs.
+    const base = normalizeFileRefs(stripFrontMatter(content));
+    // Table repair is line-structural; inline code cannot span lines, so it
+    // only needs to stay out of fenced blocks.
+    const tables = mapOutsideFences(base, fixMarkdownTables);
+    // These inject characters and tags, which is corruption inside any code.
+    return mapOutsideCode(tables, (prose) =>
+      normalizeLatexDelimiters(escapeCurrencyDollars(transformCitationBubbles(prose)))
+    );
+  }, [content]);
 
   const lineKey = useMemo(() => (processed.match(/\n/g) || []).length, [processed]);
 

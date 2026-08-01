@@ -29,6 +29,7 @@ import {
 } from './api';
 import type { SharedThreadMetadata, SSEEvent } from './api';
 import { buildSharedServeUrl } from '../ChatAgent/components/viewers/html/wsfilesUrl';
+import { isTaskAgentId } from '../ChatAgent/utils/agentId';
 
 // Message record type compatible with historyEventHandlers
 type MessageRecord = Record<string, unknown>;
@@ -126,7 +127,7 @@ export default function SharedChatView() {
           }
 
           // Skip subagent events in shared view
-          if (event.agent && typeof event.agent === 'string' && event.agent.startsWith('task:')) {
+          if (isTaskAgentId(event.agent)) {
             return;
           }
 

@@ -7,8 +7,7 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-
 import { CSS } from '@dnd-kit/utilities';
 import {
   ChevronRight, Folder, FolderOpen, Zap, Pin, MessageSquareText,
-  Check, Circle, Loader2, X, ChevronsDown, MoreHorizontal, SquarePen, Pencil,
-  AlertCircle, StopCircle,
+  Loader2, X, ChevronsDown, MoreHorizontal, SquarePen, Pencil,
 } from 'lucide-react';
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../../../components/ui/dropdown-menu';
@@ -22,7 +21,8 @@ import {
   toggleWorkspaceExpansion,
   toggleThreadExpansion,
 } from './navExpansionStore';
-import { deriveSubagentStatus } from '../session/subagents/subagentStatus';
+import { deriveSubagentStatus, type SubagentDisplayStatus } from '../session/subagents/subagentStatus';
+import { SubagentStatusIcon } from './taskStatusUi';
 import './NavigationPanel.css';
 
 interface WorkspaceEntry {
@@ -303,7 +303,7 @@ function NavigationPanel({
 
   // Derive agent status for display — shared with SubagentStatusBar so the
   // nav tree and the detail header can never disagree.
-  const getAgentStatus = useCallback((agent: AgentEntry): string => {
+  const getAgentStatus = useCallback((agent: AgentEntry): SubagentDisplayStatus => {
     if (agent.isMainAgent) return 'active';
     return deriveSubagentStatus(agent);
   }, []);
@@ -536,9 +536,6 @@ function NavigationPanel({
                                 // Narrow agent-running flag; named distinctly from the
                                 // component's isActive prop (panel visibility) to avoid shadowing.
                                 const isAgentActive = status === 'active';
-                                const isCompleted = status === 'completed';
-                                const isError = status === 'error';
-                                const isCancelled = status === 'cancelled';
 
                                 const trimmedDescription = typeof agent.description === 'string' ? agent.description.trim() : '';
                                 const rowLabel = !isMainAgent && trimmedDescription
@@ -570,23 +567,9 @@ function NavigationPanel({
                                     >
                                       {rowLabel}
                                     </span>
-                                    {/* Status badge. Terminal outcomes read at a
-                                        glance: error = red alert, cancelled = stop,
-                                        completed = check; a genuinely running task
-                                        spins, otherwise an idle circle. */}
                                     {!isMainAgent && (
                                       <span className="flex-shrink-0 ml-auto flex items-center">
-                                        {isError ? (
-                                          <AlertCircle className="h-3 w-3" style={{ color: 'var(--color-danger, #c43d3d)' }} />
-                                        ) : isCancelled ? (
-                                          <StopCircle className="h-3 w-3" style={{ color: 'var(--color-text-tertiary)' }} />
-                                        ) : isCompleted ? (
-                                          <Check className="h-3 w-3" style={{ color: 'var(--color-text-tertiary)' }} />
-                                        ) : isAgentActive ? (
-                                          <Loader2 className="h-3 w-3 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />
-                                        ) : (
-                                          <Circle className="h-3 w-3" style={{ color: 'var(--color-icon-muted)' }} />
-                                        )}
+                                        <SubagentStatusIcon status={status} className="h-3 w-3" />
                                       </span>
                                     )}
                                     {/* Remove button -- non-main agents only, on hover */}

@@ -27,6 +27,7 @@ import {
 import {
   isSubagentEvent, handleSubagentMessageChunk, handleSubagentToolCallChunks,
   handleSubagentToolCalls, handleSubagentToolCallResult, handleTaskSteeringAccepted,
+  handleWorkflowLifecycle,
 } from '../subagents/liveEventHandlers';
 import { getOrCreateTaskRefs } from '../streamRefs';
 import { handleMarketWatchUpdate, type MarketWatchState } from '../marketWatchEvents';
@@ -534,6 +535,13 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
               loading: true,
             });
           }
+        } else if (eventType === 'workflow_lifecycle') {
+          handleWorkflowLifecycle({
+            taskId,
+            event: event as unknown as Record<string, unknown>,
+            refs,
+            updateSubagentCard: rt.updateSubagentCard,
+          });
         } else if (eventType === 'steering_delivered') {
           if (event.content) {
             handleTaskSteeringAccepted({
@@ -759,7 +767,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           pendingTaskToolCallIds.push(...updated);
         }
 
-        if (action === 'init') {
+        // 'workflow' is a RunWorkflow launch: a distinct action (the history
+        // projector claims no checkpoint namespace for it) but identical card
+        // mechanics, and the payload already carries type 'workflow'. Its
+        // progress arrives as workflow_lifecycle events on the same task lane.
+        if (action === 'init' || action === 'workflow') {
           // A duplicate/replayed spawn for a task we already saw settle must
           // resurface with its REAL terminal outcome (completed/cancelled/error),
           // never a blanket 'completed' that would launder a failure as success.

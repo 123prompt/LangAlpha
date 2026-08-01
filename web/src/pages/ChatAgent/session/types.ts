@@ -168,6 +168,12 @@ interface SubagentHistoryEntry {
    *  projection contained — the run-level watermark the mux drain guard
    *  filters against. */
   projectedRunStartedMs?: number;
+  /** Reduced workflow-run progress, present only for a workflow run task
+   *  (type 'workflow'), rebuilt from replayed workflow_lifecycle events. */
+  workflowRun?: import('./subagents/workflowRunState').WorkflowRunState;
+  /** Owning workflow run's agent id, present only for a workflow child —
+   *  such tasks are hidden from the sidebar and reached via the run's card. */
+  ownerTaskId?: string;
 }
 
 /** Per-task ref state used by stream handlers.
@@ -178,6 +184,8 @@ interface TaskRefs {
   currentToolCallIdRef: { current: string | null };
   messages: Record<string, unknown>[];
   runIndex: number;
+  /** Live accumulator for a workflow run task's workflow_lifecycle reducer. */
+  workflowRun?: import('./subagents/workflowRunState').WorkflowRunState;
 }
 
 /** History interrupt info stored during replay. */

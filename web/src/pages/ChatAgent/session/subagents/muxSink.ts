@@ -8,6 +8,7 @@
 import type { AssistantMessage, SubagentTask } from '@/types/chat';
 import { getThreadMux, type ThreadMuxSink } from '../stream/threadStreamMux';
 import { isTerminalStatus, normalizeWireStatus } from './subagentStatus';
+import { isTaskAgentId, taskIdFromAgentId } from '../../utils/agentId';
 import type { SSEEvent } from '../types';
 import type { SubagentRuntime } from '../runtime';
 
@@ -21,7 +22,7 @@ export function getTaskIdFromEvent(event: SSEEvent): string | null {
   // e.g., agent = "task:pkyRHQ" → taskId = "task:pkyRHQ"
   // This is the agent_id used as key throughout the frontend.
   const agent = event?.agent;
-  if (!agent || typeof agent !== 'string' || !agent.startsWith('task:')) {
+  if (!isTaskAgentId(agent)) {
     if (import.meta.env.DEV) {
       console.warn('[Stream] Subagent event without task: agent field:', event);
     }
@@ -106,7 +107,7 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
       // transcript. Live (non-drain) frames always flow.
       if (ev._drain === true) {
         const agentId = typeof ev.agent === 'string' ? ev.agent : '';
-        const shortId = agentId.startsWith('task:') ? agentId.slice(5) : '';
+        const shortId = taskIdFromAgentId(agentId) ?? '';
         const hist = rt.subagentHistoryRef.current?.[agentId];
         if (isSettledTask(shortId)) {
           return;

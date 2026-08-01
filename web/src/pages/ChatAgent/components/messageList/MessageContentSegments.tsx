@@ -10,12 +10,14 @@ import CreateWorkspaceCard from '../CreateWorkspaceCard';
 import StartQuestionCard from '../StartQuestionCard';
 import PTCAgentCard from '../PTCAgentCard';
 import SecretaryConfirmCard from '../SecretaryConfirmCard';
-import SubagentTaskMessageContent from '../SubagentTaskMessageContent';
+import TaskSegmentCard from './TaskSegmentCard';
 import TextMessageContent from '../TextMessageContent';
 import InlineWidget from '../viewers/InlineWidget';
 import ToolCallMessageContent from '../ToolCallMessageContent';
 import { NotificationDivider } from './NotificationDivider';
 import { normalizeSubagentText } from './normalizeSubagentText';
+import StructuredResultBlock from './StructuredResultBlock';
+import { parseStructuredResult } from '../../utils/structuredResult';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, SubagentInfo, ToolCallProcessRecord } from './types';
 import {
@@ -96,10 +98,22 @@ interface TextBlockProps {
 }
 
 function TextBlock({ block, isFirst, isStreaming, hasError, structuredError, isSubagentView, onOpenFile }: TextBlockProps): React.ReactElement | null {
-  const textContent = isSubagentView
-    ? normalizeSubagentText(block.segment.content)
-    : (block.segment.content ?? '');
-  const textEl = (
+  const raw = block.segment.content ?? '';
+  // A schema-constrained subagent answers with one JSON object, which the
+  // transcript would otherwise show as a raw dump. Mid-stream text is excluded
+  // because a partial answer can parse as valid JSON and then change shape, and
+  // an error payload already has its own display.
+  const structured = useMemo(
+    () =>
+      isSubagentView && !isStreaming && !hasError
+        ? parseStructuredResult(raw)
+        : null,
+    [isSubagentView, isStreaming, hasError, raw]
+  );
+  const textContent = isSubagentView && !structured ? normalizeSubagentText(raw) : raw;
+  const textEl = structured ? (
+    <StructuredResultBlock result={structured} onOpenFile={onOpenFile} />
+  ) : (
     <TextMessageContent
       content={textContent}
       isStreaming={isStreaming}
@@ -290,26 +304,14 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
 
           if (block.type === 'subagent_task') {
             const subId = (block as SubagentTaskRenderBlock).segment.subagentId!;
-            const task = subagentTasks[subId];
-            if (!task) return null;
-            const rawToolCallProcess = toolCallProcesses[subId] || undefined;
-            const toolCallProcess = rawToolCallProcess ? {
-              ...rawToolCallProcess,
-              _subagentResult: (task.result as string) || null,
-              _subagentStatus: (task.status as string) || null,
-            } : undefined;
             return (
-              <SubagentTaskMessageContent
+              <TaskSegmentCard
                 key={block.key}
                 subagentId={subId}
-                description={task.description as string}
-                type={task.type as string}
-                status={task.status as string}
-                action={task.action as 'init' | 'update' | 'resume' | undefined}
-                resumeTargetId={task.resumeTargetId as string}
+                task={subagentTasks[subId]}
+                toolCallProcess={toolCallProcesses[subId] || undefined}
                 onOpen={readOnly ? undefined : onOpenSubagentTask}
-                onDetailOpen={readOnly ? undefined : (onToolCallDetailClick as any)} // TODO: type properly
-                toolCallProcess={toolCallProcess as any} // TODO: type properly — ToolCallProcess not exported
+                onDetailOpen={readOnly ? undefined : onToolCallDetailClick}
               />
             );
           }
@@ -464,22 +466,14 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           );
         } else if (segment.type === 'subagent_task') {
           const subId = segment.subagentId!;
-          const task = subagentTasks[subId];
-          if (task) {
-            return (
-              <SubagentTaskMessageContent
-                key={`subagent-task-${subId}`}
-                subagentId={subId}
-                description={task.description as string}
-                type={task.type as string}
-                status={task.status as string}
-                action={task.action as 'init' | 'update' | 'resume' | undefined}
-                resumeTargetId={task.resumeTargetId as string}
-                onOpen={onOpenSubagentTask}
-              />
-            );
-          }
-          return null;
+          return (
+            <TaskSegmentCard
+              key={`subagent-task-${subId}`}
+              subagentId={subId}
+              task={subagentTasks[subId]}
+              onOpen={onOpenSubagentTask}
+            />
+          );
         } else if (segment.type === 'plan_approval') {
           const pd = planApprovals[segment.planApprovalId!];
           if (pd) {

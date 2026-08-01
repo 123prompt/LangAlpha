@@ -5,16 +5,17 @@
  */
 
 import { isToolResultFailure } from './subagentStatus';
+import {
+  WORKFLOW_TASK_TYPE, applyWorkflowLifecycle, isWorkflowRunTerminal, workflowRunDisplayStatus,
+  type WorkflowLifecycleFrame,
+} from './workflowRunState';
 import type { MessageRecord, ToolCallRecord, ToolCallResultRecord } from '../../hooks/utils/types';
 import { getOrCreateTaskRefs, extractLastReasoningTitle } from '../streamRefs';
+import { isTaskAgentId } from '../../utils/agentId';
 import type { StreamRefs, ToolCallChunkRecord, UpdateSubagentCard } from '../streamRefs';
 
 export function isSubagentEvent(event: Record<string, unknown> | null | undefined): boolean {
-  const agent = event?.agent;
-  if (!agent || typeof agent !== 'string') {
-    return false;
-  }
-  return agent.startsWith('task:');
+  return isTaskAgentId(event?.agent);
 }
 
 /**
@@ -620,6 +621,53 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
     messages: updatedMessages,
     currentTool: finalCurrentTool, // Explicitly pass empty string to clear when failed or no tools in progress
   });
+  return true;
+}
+
+/**
+ * Reduces one `workflow_lifecycle` frame into the run task's card state, which
+ * the inline WorkflowRunCard and the detail view both read.
+ *
+ * `run_started` is the lane epoch: a full-lane (re)delivery rebuilds from
+ * scratch instead of double-appending onto carried state.
+ */
+export function handleWorkflowLifecycle({ taskId, event, refs, updateSubagentCard }: {
+  taskId: string;
+  event: WorkflowLifecycleFrame;
+  refs: StreamRefs;
+  updateSubagentCard: UpdateSubagentCard;
+}): boolean {
+  if (!taskId || !updateSubagentCard) {
+    return false;
+  }
+
+  const taskRefs = getOrCreateTaskRefs(refs, taskId);
+  const prev = event.phase === 'run_started' ? undefined : taskRefs.workflowRun;
+  const next = applyWorkflowLifecycle(prev, event);
+  taskRefs.workflowRun = next;
+
+  const terminal = isWorkflowRunTerminal(next.status);
+  updateSubagentCard(taskId, {
+    type: WORKFLOW_TASK_TYPE,
+    workflowRun: next,
+    status: terminal ? workflowRunDisplayStatus(next.status) : 'active',
+    ...(terminal ? { isActive: false, ...(next.error ? { error: next.error } : {}) } : {}),
+  });
+
+  // Stamp identity + ownership on the child's floating card as it is
+  // dispatched, before its own lane streams anonymous content — the sidebar
+  // hides owner-children, and the label names the drill-in.
+  if (event.phase === 'child_started' && typeof event.child_task_id === 'string') {
+    const childAgentId = `task:${event.child_task_id}`;
+    updateSubagentCard(childAgentId, {
+      agentId: childAgentId,
+      displayId: `Task-${event.child_task_id}`,
+      taskId: childAgentId,
+      description: (event.label as string) || '',
+      type: (event.subagent_type as string) || 'general-purpose',
+      ownerTaskId: taskId,
+    });
+  }
   return true;
 }
 
