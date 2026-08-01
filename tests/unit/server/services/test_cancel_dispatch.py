@@ -548,3 +548,35 @@ async def test_task_cancel_terminal_cas_race_answers_already_finished():
     assert result["cancelled"] is False
     assert result["state"] == "already_finished"
     nudge.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_failure_does_not_put_infrastructure_text_on_the_wire():
+    """A ledger or transport exception names hosts, queries and sometimes
+    credential fragments. The log keeps it; the authenticated caller gets a
+    fixed string (src/server/AGENTS.md: sanitize before the wire).
+    """
+    from fastapi import HTTPException
+
+    from src.server.services.cancel_dispatch import cancel_workflow
+
+    secret = "could not connect to db-prod-7.internal?password=hunter2"
+    (
+        patches, _registry_store, _manager, _runner, get_active_run, _intent,
+    ) = _patch_common(manager_cancel_returns=True, active_run=_active_run())
+    get_active_run.side_effect = RuntimeError(secret)
+
+    for p in patches:
+        p.start()
+    try:
+        with pytest.raises(HTTPException) as caught:
+            await cancel_workflow("thread-x")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert caught.value.status_code == 500
+    assert secret not in str(caught.value.detail)
+    assert "db-prod-7" not in str(caught.value.detail)
+    # Still says which operation failed — a fixed string, not a bare 500.
+    assert "Failed to cancel workflow" in str(caught.value.detail)

@@ -9,6 +9,7 @@ corrective re-dispatch and then a null in the script.
 from __future__ import annotations
 
 import json
+import sys
 import tracemalloc
 
 import pytest
@@ -182,3 +183,18 @@ def test_the_candidate_scan_is_bounded_by_the_cap_not_the_reply() -> None:
     assert not valid
     # One int per delimiter would be tens of MB; the cap admits 32 of them.
     assert peak < 8 * 1024 * 1024, f"scan allocated {peak / 1e6:.1f}MB"
+
+
+def test_an_integer_past_the_digit_limit_fails_its_own_child() -> None:
+    """`json` raises a bare ``ValueError`` — not ``JSONDecodeError`` — for a
+    number past ``sys.get_int_max_str_digits()``. Uncaught it escapes the
+    worker thread and unwinds the whole run, so one child's malformed reply
+    would take every sibling with it.
+    """
+    reply = '{"ok": ' + "1" * (sys.get_int_max_str_digits() + 100) + "}"
+
+    valid, parsed, error = parse_schema_result(reply, SCHEMA)
+
+    assert not valid
+    assert parsed is None
+    assert error

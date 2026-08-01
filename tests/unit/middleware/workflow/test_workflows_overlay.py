@@ -129,3 +129,31 @@ async def test_mismatched_roots_are_rejected() -> None:
                 sandbox_backend=sandbox,
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_saved_row_never_resolves_to_the_shipped_script() -> None:
+    """`StoreBackend` answers unreadable and absent with the same `None`, so a
+    straight fall-through hands back the shipped script of the same name.
+
+    The sharp cost is not the wrong run: read falls through to the built-in
+    while write always lands in the user tier, so an ordinary
+    read-modify-write replaces the user's workflow with a derivative of ours.
+    """
+    store = InMemoryStore()
+    # An envelope carrying no `content` string — what `aread_text` reports
+    # as absent and `workflow_script_from_value` rejects outright.
+    store.put(("user-1", "workflows"), "shipped.js", {"encoding": "utf-8"})
+    overlay = _overlay(store)
+
+    assert await overlay.aread_text(f"{ROOT}shipped.js") is None
+    assert await overlay.aread_range(f"{ROOT}shipped.js") is None
+
+
+@pytest.mark.asyncio
+async def test_a_path_the_user_never_saved_still_reads_the_shipped_script(
+    overlay: WorkflowsBackend,
+) -> None:
+    """The shadow check must not swallow the overlay's whole reason to exist."""
+    assert "shipped" in (await overlay.aread_text(f"{ROOT}shipped.js") or "")
+    assert "other" in (await overlay.aread_range(f"{ROOT}other.js") or "")

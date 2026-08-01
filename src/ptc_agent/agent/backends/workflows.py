@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
 from langgraph.store.memory import InMemoryStore
 
 from ptc_agent.agent.backends.langgraph_store import (
@@ -23,6 +24,8 @@ from ptc_agent.agent.backends.langgraph_store import (
     StoreContentTooLargeError,
 )
 from ptc_agent.agent.backends.sandbox import SandboxBackend
+
+logger = structlog.get_logger(__name__)
 
 PREBUILT_READ_ONLY_ERROR = (
     "Pre-built workflows are read-only here. Sign in so writes can fork them "
@@ -166,10 +169,33 @@ class WorkflowsBackend:
         """
         return set(await self._store.aglob_paths("*", self.root_prefix))
 
+    async def _shadows_a_prebuilt(self, file_path: str) -> bool:
+        """Whether a user row owns this path even though the read came back empty.
+
+        ``StoreBackend`` answers unreadable and absent with the same ``None``
+        — a malformed envelope and a store timeout both look like "no such
+        row" — so falling straight through would resolve a saved workflow to
+        the *shipped* script of the same name. Worse than running the wrong
+        script: read falls through to the built-in while write always lands
+        in the user tier, so an ordinary read-modify-write replaces the
+        user's workflow with a derivative of ours.
+
+        Listing is a second chance at the same question, not a proof: enough
+        store pressure fails both. It closes the malformed-row case outright
+        and narrows the timeout one.
+        """
+        try:
+            return file_path in await self._saved_paths()
+        except Exception:  # noqa: BLE001 - listing is the fallback, not the truth
+            logger.debug("workflow shadow check failed", path=file_path)
+            return False
+
     async def aread_text(self, file_path: str) -> str | None:
         saved = await self._store.aread_text(file_path)
         if saved is not None:
             return saved
+        if await self._shadows_a_prebuilt(file_path):
+            return None
         return await self._prebuilt.aread_text(file_path)
 
     async def aread_range(
@@ -178,6 +204,8 @@ class WorkflowsBackend:
         saved = await self._store.aread_range(file_path, offset, limit)
         if saved is not None:
             return saved
+        if await self._shadows_a_prebuilt(file_path):
+            return None
         return await self._prebuilt.aread_range(file_path, offset, limit)
 
     async def awrite_text(self, file_path: str, content: str) -> bool:

@@ -591,3 +591,57 @@ def test_script_paths_are_refused_by_segment_not_substring(
     lands before the backend is ever asked whether the file exists.
     """
     assert _script_path_is_unreadable(path) is unreadable
+
+
+class _PathBackend:
+    """The sandbox path contract the guard has to agree with: normalize maps
+    any spelling onto the working dir, virtualize strips it back off."""
+
+    WORK_DIR = "/home/workspace"
+
+    def normalize_path(self, path: str) -> str:
+        if path.startswith(self.WORK_DIR):
+            return path
+        return f"{self.WORK_DIR}/{path.lstrip('/')}"
+
+    def virtualize_path(self, path: str) -> str:
+        return path[len(self.WORK_DIR):] if path.startswith(self.WORK_DIR) else path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"{MEMO_USER_DIR}/x.js",
+        f"/home/workspace/{MEMO_USER_DIR}/x.js",
+        f"/{MEMORY_USER_DIR}/x.js",
+        "/home/workspace/nested/_internal/x.js",
+    ],
+)
+def test_a_managed_path_is_refused_however_it_is_spelled(path: str) -> None:
+    """The router picks a mount from the normalized path, so a guard reading
+    only the caller's text refuses the relative spelling while admitting the
+    absolute spelling of the very same file.
+    """
+    forms = tool_module._script_path_forms(_PathBackend(), path)
+
+    assert any(_script_path_is_unreadable(form) for form in forms)
+
+
+def test_canonicalization_cannot_admit_what_the_raw_check_refused() -> None:
+    """A backend without the path helpers degrades to the raw check rather
+    than opening a hole — the forms are a union, never a replacement."""
+
+    class _NoHelpers:
+        pass
+
+    forms = tool_module._script_path_forms(_NoHelpers(), f"{MEMO_USER_DIR}/x.js")
+
+    assert forms == {f"{MEMO_USER_DIR}/x.js"}
+    assert any(_script_path_is_unreadable(form) for form in forms)
+
+
+def test_an_ordinary_workspace_script_survives_canonicalization() -> None:
+    """Normalizing must not turn a plain workspace path into a managed one."""
+    forms = tool_module._script_path_forms(_PathBackend(), "workflows/company_internal.js")
+
+    assert not any(_script_path_is_unreadable(form) for form in forms)

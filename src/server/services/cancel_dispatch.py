@@ -199,9 +199,13 @@ async def cancel_workflow(thread_id: str, run_id: Optional[str] = None) -> dict:
 
     except Exception as e:
         logger.exception(f"Error cancelling workflow {thread_id}: {e}")
+        # The log keeps the exception; the wire gets a fixed string. A ledger
+        # or transport failure names hosts, queries and occasionally
+        # credential fragments, and this reply crosses to an authenticated
+        # caller (src/server/AGENTS.md: sanitize before the wire).
         raise HTTPException(
-            status_code=500, detail=f"Failed to cancel workflow: {str(e)}"
-        )
+            status_code=500, detail="Failed to cancel workflow."
+        ) from e
 
 
 async def cancel_subagent_task(thread_id: str, task_id: str) -> dict:
@@ -294,7 +298,11 @@ async def cancel_subagent_task(thread_id: str, task_id: str) -> dict:
         )
     except Exception as e:
         logger.exception(f"Error cancelling task {task_id} in {thread_id}: {e}")
+        # The log keeps the exception; the wire gets a fixed string. A ledger
+        # or transport failure names hosts, queries and occasionally
+        # credential fragments, and this reply crosses to an authenticated
+        # caller (src/server/AGENTS.md: sanitize before the wire).
         raise HTTPException(
-            status_code=500, detail=f"Failed to cancel task: {str(e)}"
-        )
+            status_code=500, detail="Failed to cancel task."
+        ) from e
 

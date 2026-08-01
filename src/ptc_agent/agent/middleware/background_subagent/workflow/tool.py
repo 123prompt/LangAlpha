@@ -69,6 +69,24 @@ class _Refused(Exception):
         self.reply = reply
 
 
+def _script_path_forms(backend: Any, path: str) -> set[str]:
+    """Every spelling of ``path`` the guard has to answer for.
+
+    The router picks a mount from the *normalized* path, so a guard reading
+    only the caller's text refuses `.agents/user/memo/x.js` while admitting
+    the absolute spelling of that same file. Checking both forms rather than
+    replacing one with the other keeps canonicalization able to add refusals
+    and never to remove them, so a backend without these helpers degrades to
+    the raw check instead of opening a hole.
+    """
+    forms = {path}
+    try:
+        forms.add(backend.virtualize_path(backend.normalize_path(path)))
+    except Exception:  # noqa: BLE001 - a backend that cannot canonicalize
+        logger.debug("script_path canonicalization unavailable", path=path)
+    return forms
+
+
 def _script_path_is_unreadable(path: str) -> bool:
     # Whole segments, not substrings: both vocabularies name directories, and
     # matching them anywhere in the text refuses ordinary files whose name
@@ -213,7 +231,10 @@ def create_run_workflow_tool(
         """Resolve whichever of the three source modes was given to
         ``(script, source)``, refusing rather than returning on failure."""
         if script_path is not None:
-            if _script_path_is_unreadable(script_path):
+            if any(
+                _script_path_is_unreadable(form)
+                for form in _script_path_forms(backend, script_path)
+            ):
                 raise _Refused(
                     f"Error: script_path '{script_path}' is not on the "
                     "workspace filesystem — memory, memo and _internal paths "

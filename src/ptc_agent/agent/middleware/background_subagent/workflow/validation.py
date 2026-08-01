@@ -38,11 +38,14 @@ _NO_REMOTE_REFS = Registry()
 # Prose around the JSON is tolerated (below), but each candidate start costs a
 # decode attempt, so only the first few are tried.
 _MAX_JSON_CANDIDATES = 32
-# A reply is only ever text a model wrote, so nesting deep enough to exhaust
-# the interpreter stack is a malformed reply like any other — and this runs in
-# a worker thread whose caller unwinds the whole run on anything it does not
-# name. `json` recurses per level on both the decoder and the validator.
-_UNREADABLE_JSON = (json.JSONDecodeError, RecursionError)
+# A reply is only ever text a model wrote, so anything the decoder refuses is
+# a malformed reply like any other — and this runs in a worker thread whose
+# caller unwinds the whole run on any exception it does not name. Deliberately
+# `ValueError` rather than its `JSONDecodeError` subclass: a number past
+# `sys.get_int_max_str_digits()` raises the bare parent, and nesting deep
+# enough to exhaust the stack raises neither (`json` recurses per level on
+# both the decoder and the validator).
+_UNREADABLE_JSON = (ValueError, RecursionError)
 # A validation reason is sized by the schema, never by the reply. `jsonschema`
 # interpolates `instance!r` into `ValidationError.message` itself for the
 # common validators (`type`, `enum`, `maxLength`), so a rejected 90KB reply

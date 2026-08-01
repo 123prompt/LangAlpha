@@ -25,7 +25,7 @@ export const meta = { name: 'ticker-briefs', description: 'Fan out research, syn
 - `phase(title)` / `log(message)` — progress markers streamed live to the user.
 - `args` — the `params` value passed to `RunWorkflow`, verbatim.
 
-Failure semantics: `agent()` **throws** on dispatch-time errors (unknown `agentType`, oversized prompt or schema, dispatch cap) and resolves to **`null`** when the child itself fails or times out — write your synthesis to handle partial results. Child concurrency is capped run-wide; extra `agent()` calls queue automatically, so fan out freely.
+Failure semantics: `agent()` **throws** only on calls your script got wrong (unknown `agentType`, oversized prompt or schema, dispatch cap). Everything else resolves to **`null`**: the child failed, timed out, or never launched because the platform was unavailable. Treat `null` as "no result from this call", not as "the child ran and had nothing" — a run whose children all return `null` has produced nothing, so check before reporting success, and write your synthesis to handle partial results. Child concurrency is capped run-wide; extra `agent()` calls queue automatically, so fan out freely.
 
 ## Example
 
