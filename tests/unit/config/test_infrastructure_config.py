@@ -221,20 +221,34 @@ class TestSettingsBackwardCompat:
 
 
 def test_workflow_run_timeout_must_outlast_its_own_children() -> None:
-    """Below the floor the run-level kill always beats the per-child one, so
-    every timeout surfaces as the blunt whole-run failure and no child is ever
-    named. The shipped default clears the floor with margin.
+    """At or below one child_timeout the run-level kill always beats the
+    per-child one, so every timeout surfaces as the blunt whole-run failure and
+    no child is ever named. The shipped default clears it with margin.
     """
     from src.config.models import WorkflowOrchestrationConfig
 
     default = WorkflowOrchestrationConfig()
     waves = math.ceil(default.max_dispatches_per_run / default.max_concurrent_children)
+    # The default still covers a fully serialized worst case; the validator
+    # below no longer demands it.
     assert default.run_timeout > waves * default.child_timeout
 
-    with pytest.raises(ValidationError, match="below the .* floor"):
-        WorkflowOrchestrationConfig(
-            max_dispatches_per_run=64,
-            max_concurrent_children=8,
-            child_timeout=1800,
-            run_timeout=3600,
-        )
+    with pytest.raises(ValidationError, match="must exceed child_timeout"):
+        WorkflowOrchestrationConfig(child_timeout=1800, run_timeout=1800)
+
+
+def test_a_narrow_fan_out_is_a_configuration_not_a_contradiction() -> None:
+    """The floor must not encode how wide a script chooses to fan out.
+
+    Requiring the run to cover every dispatch serialized made settings each
+    field accepts on its own unsatisfiable together: one child at a time needs
+    64 waves of child_timeout, past the maximum run_timeout the field allows,
+    so no value of run_timeout could load the config at all.
+    """
+    from src.config.models import WorkflowOrchestrationConfig
+
+    serial = WorkflowOrchestrationConfig(max_concurrent_children=1)
+    assert serial.max_concurrent_children == 1
+
+    patient = WorkflowOrchestrationConfig(max_concurrent_children=4, child_timeout=7200)
+    assert patient.child_timeout == 7200

@@ -61,6 +61,12 @@ _UNREADABLE_SCRIPT_PREFIXES: tuple[str, ...] = (
 )
 
 
+# The budget every other store reader on the agent side carries. Resolution
+# runs inline in the tool body, before the run exists, so `run_timeout` is not
+# standing behind this read — nothing is.
+_STORE_OP_TIMEOUT_S = 2.0
+
+
 class _Refused(Exception):
     """Carries the reply a refused call answers with, raised by the phase
     helpers so a resolved script has exactly one shape at the call site."""
@@ -200,13 +206,14 @@ def create_run_workflow_tool(
     async def _load_named_workflow(name: str) -> tuple[str, str] | None:
         """Resolve a workflow name to ``(script, source)`` — user-saved shadows builtin.
 
-        A failing or unreadable store read propagates: swallowing either would
-        resolve the user's saved workflow to the shipped builtin of the same
-        name and run a different script under that name.
+        A failing, slow, or unreadable store read propagates: swallowing any of
+        them would resolve the user's saved workflow to the shipped builtin of
+        the same name and run a different script under that name.
         """
         if store is not None and bound_user_id:
-            item = await store.aget(
-                workflow_namespace(bound_user_id), workflow_key(name)
+            item = await asyncio.wait_for(
+                store.aget(workflow_namespace(bound_user_id), workflow_key(name)),
+                timeout=_STORE_OP_TIMEOUT_S,
             )
             if item is not None:
                 return workflow_script_from_value(item.value), "saved"

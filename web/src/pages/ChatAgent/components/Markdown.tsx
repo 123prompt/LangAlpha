@@ -13,7 +13,7 @@ import { useTheme } from '@/contexts/ThemeContext';
 import WorkspaceImage from './WorkspaceImage';
 import { isFilePath, isImagePath, normalizeFilePath, parseWsPath } from './FileCard';
 import { normalizeFileRefs } from '../utils/normalizeFileRefs';
-import { mapOutsideCode, mapOutsideFences } from '../utils/markdownSegments';
+import { mapOutsideCode, mapOutsideMultilineCode } from '../utils/markdownSegments';
 import CitationBubble from './CitationBubble';
 
 // Sanitize schema: extends GitHub-style defaults to allow KaTeX output,
@@ -624,9 +624,9 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
     // Whole-string by design: front matter is anchored at the start, and
     // normalizeFileRefs deliberately unwraps backticks around file refs.
     const base = normalizeFileRefs(stripFrontMatter(content));
-    // Table repair is line-structural; inline code cannot span lines, so it
-    // only needs to stay out of fenced blocks.
-    const tables = mapOutsideFences(base, fixMarkdownTables);
+    // Table repair is line-structural, so it reads whole lines and has to stay
+    // out of the code spans that own one — fenced, or inline across a break.
+    const tables = mapOutsideMultilineCode(base, fixMarkdownTables);
     // These inject characters and tags, which is corruption inside any code.
     return mapOutsideCode(tables, (prose) =>
       normalizeLatexDelimiters(escapeCurrencyDollars(transformCitationBubbles(prose)))

@@ -321,6 +321,33 @@ async def test_a_malformed_saved_row_never_resolves_to_the_builtin() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_stalled_store_refuses_instead_of_wedging_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Name resolution runs inline in the tool body, before the run exists, so
+    ``run_timeout`` is not standing behind this read — an unbounded one would
+    hold the tool call, and the turn making it, for as long as the store hangs.
+    """
+
+    class StalledStore(FakeStore):
+        async def aget(self, namespace: tuple[str, str], key: str) -> Any:
+            await asyncio.sleep(3600)
+
+    monkeypatch.setattr(tool_module, "_STORE_OP_TIMEOUT_S", 0.05)
+    prebuilt = FakePrebuilt({"named": _script("named")})
+    workflow_tool = _make_tool(
+        FakeBackend(), store=StalledStore({}), prebuilt=prebuilt
+    )
+
+    message = await asyncio.wait_for(workflow_tool.coroutine(workflow="named"), 5)
+
+    # Refused, not resolved: a timeout that fell through would run the shipped
+    # script under a name the user may have saved their own script as.
+    assert "could not read workflow 'named'" in message
+    assert CapturingDriver.specs == []
+
+
+@pytest.mark.asyncio
 async def test_prebuilt_fallback_and_unknown_workflow_message() -> None:
     prebuilt = FakePrebuilt({"alpha": _script("alpha")})
     workflow_tool = _make_tool(FakeBackend(), prebuilt=prebuilt)

@@ -1098,6 +1098,26 @@ class BackgroundTaskRegistry:
             self._remove_entry_unlocked(tool_call_id)
             return True
 
+    async def discard_unstarted(self, tool_call_id: str) -> bool:
+        """Evict an entry whose id never reached a caller.
+
+        ``mark_never_started`` keeps a refused entry registered so nothing
+        re-launches it, which only means something for an id someone holds. A
+        direct dispatch mints its own and raises instead of returning it, so
+        the entry is unreachable — and with no writer, capture or usage no
+        collector claims it away either, leaving its prompt pinned for the
+        life of the thread. Anything that settled some other way is refused,
+        so a stop mid-spawn keeps its entry for the guard drain.
+        """
+        async with self._lock:
+            task = self._tasks.get(tool_call_id)
+            if task is None or task.terminal_status != "never_started":
+                return False
+            if self._has_collectible_work(task):
+                return False
+            self._remove_entry_unlocked(tool_call_id)
+            return True
+
     def _remove_entry_unlocked(self, tool_call_id: str) -> None:
         task = self._tasks.pop(tool_call_id, None)
         if task is None:

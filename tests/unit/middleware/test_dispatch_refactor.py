@@ -376,6 +376,55 @@ async def test_dispatch_admission_rejection_aborts_before_spawn():
 
 
 @pytest.mark.asyncio
+async def test_a_refused_dispatch_leaves_nothing_behind_in_the_registry():
+    """This path mints its own tool_call_id and raises instead of returning it,
+    so a settled entry left registered is one nobody can name — and with no
+    writer, capture or usage no collector ever claims it away. Its prompt would
+    stay resident for the life of the thread, once per refusal, and a ledger
+    outage refuses every dispatch a workflow makes.
+    """
+    mw = FakeMiddleware()
+    mw.admission_refusal = spawn_mod.TaskRunRefused("slot busy")
+    graphs = {"research": _RecordingGraph()}
+
+    for _ in range(3):
+        with pytest.raises(spawn_mod.DispatchSpawnError):
+            await dispatch_background_subagent(
+                mw,
+                graphs,
+                subagent_type="research",
+                description="d",
+                prompt="P" * 4096,
+                parent_thread_id="t",
+                run_id="r1",
+            )
+
+    assert len(mw.admissions) == 3  # each attempt did register and refuse
+    assert await mw.registry.get_all_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_that_spawns_keeps_its_entry():
+    """The eviction above is keyed on the raise, not on the settle: an entry
+    whose handle reached the caller is the caller's to read afterwards."""
+    mw = FakeMiddleware()
+    graphs = {"research": _RecordingGraph()}
+
+    task = await dispatch_background_subagent(
+        mw,
+        graphs,
+        subagent_type="research",
+        description="d",
+        prompt="p",
+        parent_thread_id="t",
+        run_id="r1",
+    )
+
+    assert mw.registry.get_by_tool_call_id(task.tool_call_id) is task
+    await task.asyncio_task  # drain to avoid a pending task at teardown
+
+
+@pytest.mark.asyncio
 async def test_dispatch_reports_a_fence_refusal_in_its_own_words():
     """A refusal at the fence and one at the ledger are different failures to
     whoever reads the raised message, so the fence keeps its own wording — and

@@ -176,59 +176,68 @@ async def dispatch_background_subagent(
         owner_task_id=owner_task_id,
     )
 
-    # The ledger row is what routes the child's captured events onto a live v2
-    # lane and puts it under scanner recovery. parent_run_id stays None:
-    # report-back jobs are only enqueued for runs with a parent, and a workflow
-    # child reports to its driver, never to the launching turn's transcript.
+    # The entry is returned only on success, so a raise from here on leaves one
+    # nobody can name — this id was minted above rather than handed in.
+    # `discard_unstarted` refuses anything that settled some other way, which
+    # is what keeps a stop mid-spawn registered for its guard drain.
     try:
-        admitted = await mw.admit_task_run(
+        # The ledger row is what routes the child's captured events onto a live
+        # v2 lane and puts it under scanner recovery. parent_run_id stays None:
+        # report-back jobs are only enqueued for runs with a parent, and a
+        # workflow child reports to its driver, never to the launching turn's
+        # transcript.
+        try:
+            admitted = await mw.admit_task_run(
+                task,
+                cause="init",
+                description=description,
+                launch_tool_call_id=task.tool_call_id,
+                parent_run_id=None,
+            )
+        except NamespaceUnfenced as refusal:
+            task.mark_never_started(refusal.settle_reason)
+            raise DispatchSpawnError(
+                f"could not fence checkpoint namespace for {task.display_id}"
+            ) from refusal
+        except TaskRunRefused as refusal:
+            task.mark_never_started(refusal.settle_reason)
+            raise DispatchSpawnError(
+                f"Error: could not start {task.display_id} — {refusal.reason}."
+            ) from refusal
+        task.task_run_id = admitted or None
+
+        subagent_graph = subagent_graphs[subagent_type]
+
+        async def _dispatch_runner(_request: Any) -> Command:
+            # Set inside the spawned task's context: the event-capture and
+            # steering middleware attribute tool calls to the active background
+            # task by reading these vars during graph execution.
+            current_background_tool_call_id.set(task.tool_call_id)
+            current_background_agent_id.set(task.agent_id)
+            return await run_subagent_graph(
+                subagent_graph,
+                prompt=prompt,
+                parent_thread_id=parent_thread_id,
+                task_id=task.task_id,
+                subagent_type=subagent_type,
+                registry=mw.registry,
+                tool_call_id=task.tool_call_id,
+                base_configurable=base_configurable,
+                task_run_id=task.task_run_id,
+            )
+
+        await spawn_task_writer(
+            mw,
             task,
-            cause="init",
-            description=description,
-            launch_tool_call_id=task.tool_call_id,
-            parent_run_id=None,
-        )
-    except NamespaceUnfenced as refusal:
-        task.mark_never_started(refusal.settle_reason)
-        raise DispatchSpawnError(
-            f"could not fence checkpoint namespace for {task.display_id}"
-        ) from refusal
-    except TaskRunRefused as refusal:
-        task.mark_never_started(refusal.settle_reason)
-        raise DispatchSpawnError(
-            f"Error: could not start {task.display_id} — {refusal.reason}."
-        ) from refusal
-    task.task_run_id = admitted or None
-
-    subagent_graph = subagent_graphs[subagent_type]
-
-    async def _dispatch_runner(_request: Any) -> Command:
-        # Set inside the spawned task's context: the event-capture and
-        # steering middleware attribute tool calls to the active background
-        # task by reading these vars during graph execution.
-        current_background_tool_call_id.set(task.tool_call_id)
-        current_background_agent_id.set(task.agent_id)
-        return await run_subagent_graph(
-            subagent_graph,
+            _dispatch_runner,
             prompt=prompt,
-            parent_thread_id=parent_thread_id,
-            task_id=task.task_id,
-            subagent_type=subagent_type,
-            registry=mw.registry,
-            tool_call_id=task.tool_call_id,
-            base_configurable=base_configurable,
-            task_run_id=task.task_run_id,
+            label="Dispatched subagent",
+            name=f"background_subagent_dispatch_{task.display_id}",
+            action="dispatch",
         )
-
-    await spawn_task_writer(
-        mw,
-        task,
-        _dispatch_runner,
-        prompt=prompt,
-        label="Dispatched subagent",
-        name=f"background_subagent_dispatch_{task.display_id}",
-        action="dispatch",
-    )
+    except BaseException:
+        await mw.registry.discard_unstarted(task.tool_call_id)
+        raise
 
     logger.info(
         "Dispatched background subagent",

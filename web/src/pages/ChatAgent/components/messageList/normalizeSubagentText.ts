@@ -1,4 +1,4 @@
-import { mapOutsideFences } from '../../utils/markdownSegments';
+import { mapOutsideFences, mapOutsideMultilineCode } from '../../utils/markdownSegments';
 
 // --- Helpers ---
 
@@ -64,9 +64,11 @@ export function normalizeSubagentText(content: string | null | undefined): strin
   if (!content || typeof content !== 'string') return '';
   const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   // Unescaping can reveal fences that were not distinct lines beforehand, so
-  // the second pass re-splits instead of reusing the first pass's spans.
+  // the second pass re-splits instead of reusing the first pass's spans. It is
+  // also why only the reflow guards inline code: before this runs, a code span
+  // written as a literal `\n` does not cross a line yet.
   const unescaped = mapOutsideFences(normalized, (prose) =>
     prose.replace(/\\n/g, '\n')
   );
-  return mapOutsideFences(unescaped, collapseSoftWraps);
+  return mapOutsideMultilineCode(unescaped, collapseSoftWraps);
 }

@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { mapOutsideCode, mapOutsideFences } from '../markdownSegments';
+import {
+  mapOutsideCode,
+  mapOutsideFences,
+  mapOutsideMultilineCode,
+} from '../markdownSegments';
 
 const upper = (s: string): string => s.toUpperCase();
 
@@ -62,11 +66,42 @@ describe('mapOutsideCode', () => {
 });
 
 describe('mapOutsideFences', () => {
-  it('still transforms inline code, which cannot span lines', () => {
+  it('still transforms inline code', () => {
     expect(mapOutsideFences('a `b` c', upper)).toBe('A `B` C');
   });
 
   it('leaves fenced blocks untouched', () => {
     expect(mapOutsideFences('a\n```\nb\n```\nc', upper)).toBe('A\n```\nb\n```\nC');
+  });
+});
+
+describe('mapOutsideMultilineCode', () => {
+  it('protects a code span that crosses a line break', () => {
+    // CommonMark folds the line endings inside a span to spaces, so this is
+    // one code span and none of its lines are markdown.
+    const doc = 'see `head\ntail` after';
+    expect(mapOutsideMultilineCode(doc, upper)).toBe('SEE `head\ntail` AFTER');
+  });
+
+  it('keeps a single-line span in the line its transform is repairing', () => {
+    // The whole point of the line-structural pass: hiding the span would take
+    // the table row with it and nothing would be repaired.
+    const row = '| `AAPL` | 231 |';
+    expect(mapOutsideMultilineCode(row, (s) => `[${s}]`)).toBe(`[${row}]`);
+  });
+
+  it('hands the transform one contiguous string across single-line spans', () => {
+    const calls: string[] = [];
+    mapOutsideMultilineCode('a `b` c `d` e', (s) => {
+      calls.push(s);
+      return s;
+    });
+    expect(calls).toEqual(['a `b` c `d` e']);
+  });
+
+  it('leaves fenced blocks untouched', () => {
+    expect(mapOutsideMultilineCode('a\n```\nb\n```\nc', upper)).toBe(
+      'A\n```\nb\n```\nC'
+    );
   });
 });

@@ -87,8 +87,15 @@ function findClosingRun(text: string, from: number, length: number): number {
  * Cuts one fence-free span at inline-code boundaries. A code span opens with a
  * run of N backticks and closes with a run of exactly N; an unmatched run is
  * literal text, not an opener.
+ *
+ * `isOpaque` picks which code spans the caller must not rewrite. The rest are
+ * marked as prose, so `push` merges them back into the text around them and a
+ * caller that protects only some spans still hands its transform whole lines.
  */
-function splitInlineCode(text: string): Span[] {
+function splitInlineCode(
+  text: string,
+  isOpaque: (span: string) => boolean = () => true
+): Span[] {
   const spans: Span[] = [];
   let i = 0;
   while (i < text.length) {
@@ -107,17 +114,22 @@ function splitInlineCode(text: string): Span[] {
       i += run;
       continue;
     }
-    push(spans, text.slice(i, close + run), true);
+    const span = text.slice(i, close + run);
+    push(spans, span, isOpaque(span));
     i = close + run;
   }
   return spans;
 }
 
+const crossesLines = (span: string): boolean => span.includes('\n');
+
 /**
  * Applies `transform` to everything outside fenced code blocks.
  *
- * Use for line-structural rewrites (table repair, prose reflow) — inline code
- * cannot span lines, so protecting fences is enough.
+ * The weakest guard here: it leaves inline code exposed. Line-structural
+ * rewrites want `mapOutsideMultilineCode` and character-level ones want
+ * `mapOutsideCode` — reach for this only where inline code is the point, as
+ * `normalizeFileRefs` does when it unwraps backticks around a file reference.
  */
 export function mapOutsideFences(
   content: string,
@@ -140,6 +152,28 @@ export function mapOutsideCode(
 ): string {
   return mapOutsideFences(content, (prose) =>
     splitInlineCode(prose)
+      .map((span) => (span.code ? span.text : transform(span.text)))
+      .join('')
+  );
+}
+
+/**
+ * Applies `transform` to everything outside fenced blocks and *line-crossing*
+ * inline code spans. Use for line-structural rewrites — table repair, prose
+ * reflow.
+ *
+ * A code span may cross line endings (CommonMark folds them to spaces), so a
+ * line-oriented pass can walk into one and rewrite lines that were never
+ * markdown. Single-line spans stay in the text the transform sees, because
+ * they sit inside the very lines it exists to repair: hiding `` `AAPL` ``
+ * would take its table row with it.
+ */
+export function mapOutsideMultilineCode(
+  content: string,
+  transform: (prose: string) => string
+): string {
+  return mapOutsideFences(content, (prose) =>
+    splitInlineCode(prose, crossesLines)
       .map((span) => (span.code ? span.text : transform(span.text)))
       .join('')
   );

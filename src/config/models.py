@@ -4,7 +4,6 @@ Pydantic models for infrastructure configuration.
 These models define the schema for config.yaml (infrastructure settings).
 """
 
-import math
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -349,9 +348,9 @@ class WorkflowOrchestrationConfig(BaseModel):
         ge=1,
         le=86400,
         description=(
-            "Whole-run wall-clock timeout in seconds; must clear "
-            "ceil(max_dispatches_per_run / max_concurrent_children) waves of "
-            "child_timeout or the run dies before its children do"
+            "Whole-run wall-clock timeout in seconds; must exceed "
+            "child_timeout or the run dies before any child of it can. The "
+            "default clears several sequential waves of children"
         ),
     )
     max_runs_per_thread: int = Field(
@@ -389,22 +388,24 @@ class WorkflowOrchestrationConfig(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _run_timeout_covers_every_wave(self) -> "WorkflowOrchestrationConfig":
-        """Reject a run timeout that cannot outlast its own children.
+    def _run_timeout_outlasts_one_child(self) -> "WorkflowOrchestrationConfig":
+        """Reject a run timeout no child can time out inside.
 
-        Below the floor the run-level kill always beats the per-child one, so
-        every timeout is reported as the blunt whole-run failure and no child
-        is ever named. The floor is the bound, not the recommendation — the
-        shipped default carries margin over it for scheduling overhead.
+        At or below one ``child_timeout`` the run-level kill always beats the
+        per-child one, so every timeout is reported as the blunt whole-run
+        failure and no child is ever named. The bound stops at one child on
+        purpose: covering a worst-case wave would assume every child burns its
+        full timeout with none overlapping, which is a property of the script
+        rather than of the configuration — and asserting it here left in-range
+        settings (``max_concurrent_children: 1``) unsatisfiable at every
+        ``run_timeout``. The shipped default still carries several waves of
+        margin, as a recommendation rather than a rule.
         """
-        waves = math.ceil(self.max_dispatches_per_run / self.max_concurrent_children)
-        floor = waves * self.child_timeout
-        if self.run_timeout < floor:
+        if self.run_timeout <= self.child_timeout:
             raise ValueError(
-                f"workflow.run_timeout={self.run_timeout} is below the "
-                f"{floor}s floor implied by {self.max_dispatches_per_run} "
-                f"dispatches at {self.max_concurrent_children} wide "
-                f"({waves} waves of child_timeout={self.child_timeout})"
+                f"workflow.run_timeout={self.run_timeout} must exceed "
+                f"child_timeout={self.child_timeout}, or the run dies before "
+                "any child of it can"
             )
         return self
 
