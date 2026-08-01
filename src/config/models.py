@@ -297,6 +297,81 @@ class MarketWatchConfig(BaseModel):
     )
 
 
+class WorkflowOrchestrationConfig(BaseModel):
+    """Caps and timeouts for RunWorkflow programmatic subagent runs."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Expose the RunWorkflow tool to the PTC main agent",
+    )
+    memory_limit_mb: int = Field(
+        default=128,
+        ge=16,
+        le=1024,
+        description="QuickJS heap limit per workflow run (MB)",
+    )
+    cpu_budget_s: float = Field(
+        default=30.0,
+        gt=0,
+        le=600,
+        description="Continuous-JS interrupt budget in seconds (host awaits excluded)",
+    )
+    schema_max_bytes: int = Field(
+        default=4096,
+        ge=256,
+        le=65536,
+        description="Max serialized size of a dispatch schema",
+    )
+    schema_max_depth: int = Field(
+        default=5,
+        ge=1,
+        le=16,
+        description="Max nesting depth of a dispatch schema",
+    )
+    schema_max_properties: int = Field(
+        default=32,
+        ge=1,
+        le=256,
+        description="Max keys at any schema object level",
+    )
+    max_dispatches_per_run: int = Field(
+        default=64, ge=1, le=256, description="Max subagent dispatches per run"
+    )
+    max_concurrent_children: int = Field(
+        default=8, ge=1, le=32, description="Max concurrently running children"
+    )
+    child_timeout: int = Field(
+        default=600, ge=1, le=7200, description="Per-child subagent timeout in seconds"
+    )
+    run_timeout: int = Field(
+        default=1800,
+        ge=1,
+        le=86400,
+        description="Whole-run wall-clock timeout in seconds",
+    )
+    max_runs_per_thread: int = Field(
+        default=2, ge=1, le=8, description="Max concurrently active runs per thread"
+    )
+    max_result_bytes: int = Field(
+        default=262144,
+        ge=1024,
+        le=16 * 1024 * 1024,
+        description="Per-child result dump cap; larger results are truncated",
+    )
+    max_prompt_chars: int = Field(
+        default=100_000,
+        ge=1,
+        le=1_000_000,
+        description="Per-dispatch prompt length cap",
+    )
+    max_script_bytes: int = Field(
+        default=200 * 1024,
+        ge=1024,
+        le=4 * 1024 * 1024,
+        description="Workflow script size cap in bytes",
+    )
+
+
 class InfrastructureConfig(BaseModel):
     """Root model for infrastructure configuration (config.yaml)."""
 
@@ -357,3 +432,8 @@ class InfrastructureConfig(BaseModel):
     market_data: MarketDataConfig = Field(default_factory=MarketDataConfig)
     news_data: NewsDataConfig = Field(default_factory=NewsDataConfig)
     news_poll: NewsPollConfig = Field(default_factory=NewsPollConfig)
+
+    # RunWorkflow orchestration caps
+    workflow: WorkflowOrchestrationConfig = Field(
+        default_factory=WorkflowOrchestrationConfig
+    )

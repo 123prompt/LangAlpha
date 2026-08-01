@@ -220,6 +220,23 @@ news_poll:
     - provider: null       # Provider-chain general feed / Market tab (news:general:<limit>)
       limit: 50
 
+# RunWorkflow programmatic subagent orchestration
+workflow:
+  enabled: true                  # Expose the RunWorkflow tool to the PTC main agent
+  memory_limit_mb: 128           # QuickJS heap limit per workflow run (MB)
+  cpu_budget_s: 30.0             # Continuous-JS interrupt budget; host awaits excluded (seconds)
+  schema_max_bytes: 4096         # Max serialized dispatch schema size (bytes)
+  schema_max_depth: 5            # Max dispatch schema nesting depth
+  schema_max_properties: 32      # Max keys at any dispatch schema object level
+  max_dispatches_per_run: 64     # Subagent dispatches allowed per run
+  max_concurrent_children: 8     # Children running at once per run
+  child_timeout: 600             # Per-child subagent timeout (seconds)
+  run_timeout: 1800              # Whole-run wall clock (seconds)
+  max_runs_per_thread: 2         # Concurrent runs per thread
+  max_result_bytes: 262144       # Per-child result dump cap (bytes)
+  max_prompt_chars: 100000       # Per-dispatch prompt length cap
+  max_script_bytes: 204800       # Workflow script size cap (bytes)
+
 
 # =============================================================================
 # MARKET WATCH CONFIGURATION

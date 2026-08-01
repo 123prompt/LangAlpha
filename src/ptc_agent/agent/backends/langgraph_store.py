@@ -271,7 +271,18 @@ class StoreBackend:
         new_string: str,
         *,
         replace_all: bool = False,
+        base_content: str | None = None,
+        max_bytes: int | None = None,
     ) -> dict[str, Any]:
+        """Edit a stored file; ``base_content`` forks it when the key is absent.
+
+        An overlay tier (shipped scripts shadowed by the user's own) passes the
+        shipped source so the fork and the edit land as one ``aput`` under this
+        lock — two separate writes would race, skip the size check, and report
+        success even when the fork never persisted. ``max_bytes`` lets a tier
+        whose own limit is tighter than the store's apply it to the edited
+        result; it can only tighten.
+        """
         if self._read_only:
             return {"success": False, "error": self._read_only_error}
         try:
@@ -302,8 +313,11 @@ class StoreBackend:
                     "error": "Long-term store timed out. Retry shortly.",
                 }
             if item is None:
-                return {"success": False, "error": f"File not found: {file_path}"}
-            content = self._content_from_value(item.value)
+                if base_content is None:
+                    return {"success": False, "error": f"File not found: {file_path}"}
+                content: str | None = base_content
+            else:
+                content = self._content_from_value(item.value)
             if content is None:
                 return {
                     "success": False,
@@ -327,16 +341,19 @@ class StoreBackend:
             else:
                 new_content = content.replace(old_string, new_string, 1)
 
-            if len(new_content.encode("utf-8")) > MAX_CONTENT_BYTES:
+            cap = min(max_bytes or MAX_CONTENT_BYTES, MAX_CONTENT_BYTES)
+            if len(new_content.encode("utf-8")) > cap:
                 return {
                     "success": False,
                     "error": (
-                        f"Edit would grow content past {MAX_CONTENT_BYTES} bytes; "
+                        f"Edit would grow content past {cap} bytes; "
                         "split the file or shorten the replacement."
                     ),
                 }
 
-            value = self._build_value(content=new_content, existing=item.value)
+            value = self._build_value(
+                content=new_content, existing=item.value if item else None
+            )
             try:
                 await asyncio.wait_for(
                     self._store.aput(namespace, key, value),
