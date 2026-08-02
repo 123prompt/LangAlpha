@@ -43,7 +43,7 @@ function DetailPanel({ toolCallProcess, planData, onClose, onOpenFile, onOpenSub
             <Zap className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
             <span
               className="font-semibold truncate"
-              style={{ color: 'var(--color-text-primary)', fontSize: 14 }}
+              style={{ color: 'var(--color-text-primary)', fontSize: '0.875rem' }}
             >
               {t('toolArtifact.planDetails')}
             </span>
@@ -101,17 +101,17 @@ function DetailPanel({ toolCallProcess, planData, onClose, onOpenFile, onOpenSub
           )}
           <span
             className="font-semibold truncate"
-            style={{ color: 'var(--color-text-primary)', fontSize: 14 }}
+            style={{ color: 'var(--color-text-primary)', fontSize: '0.875rem' }}
           >
             {displayName}
           </span>
           {isTaskTool && subagentType && (
-            <span style={{ color: 'var(--Labels-Tertiary)', fontSize: 13 }}>
+            <span style={{ color: 'var(--Labels-Tertiary)', fontSize: '0.8125rem' }}>
               — {subagentType}
             </span>
           )}
           {!isTaskTool && (toolCallProcess.toolCall?.args?.symbol as string | undefined) && (
-            <span style={{ color: 'var(--Labels-Tertiary)', fontSize: 13 }}>
+            <span style={{ color: 'var(--Labels-Tertiary)', fontSize: '0.8125rem' }}>
               — {toolCallProcess.toolCall!.args!.symbol as string}
             </span>
           )}

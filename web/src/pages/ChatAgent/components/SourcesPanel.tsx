@@ -460,7 +460,7 @@ export default function SourcesPanel({
                 </span>
                 <span
                   data-testid={`group-count-${group.type}`}
-                  className="inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+                  className="inline-flex items-center rounded-full px-1.5 py-0.5 text-[0.625rem] font-medium"
                   style={{ backgroundColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
                 >
                   {group.rows.length}
@@ -524,7 +524,7 @@ function SourceCardBody({
       </span>
       {subagent && (
         <span
-          className="inline-flex flex-shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+          className="inline-flex flex-shrink-0 items-center rounded-full px-1.5 py-0.5 text-[0.625rem] font-medium"
           style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}
         >
           {t('chat.sources.subagent')}
@@ -766,7 +766,7 @@ function SourceDeck({
           !fanned && isTop ? (
             <span className="inline-flex flex-shrink-0 items-center gap-1">
               <span
-                className="inline-flex items-center justify-center rounded-full px-1 text-[10px] font-medium"
+                className="inline-flex items-center justify-center rounded-full px-1 text-[0.625rem] font-medium"
                 style={{
                   minWidth: 16,
                   height: 16,
@@ -831,7 +831,7 @@ function SectionLabel({ children }: { children: React.ReactNode }): React.ReactE
   return (
     <div className="mb-2 flex items-center gap-2.5">
       <span
-        className="whitespace-nowrap text-[10px] font-semibold uppercase tracking-[0.12em]"
+        className="whitespace-nowrap text-[0.625rem] font-semibold uppercase tracking-[0.12em]"
         style={TERTIARY}
       >
         {children}
@@ -906,14 +906,14 @@ function SourceDetailDialog({
             <div className="flex min-w-0 flex-1 flex-col gap-1">
               <div className="flex items-center gap-2">
                 <span
-                  className="truncate text-[10px] font-semibold uppercase tracking-[0.12em]"
+                  className="truncate text-[0.625rem] font-semibold uppercase tracking-[0.12em]"
                   style={TERTIARY}
                 >
                   {typeLabel}
                 </span>
                 {record && isTaskAgentId(record.agent) && (
                   <span
-                    className="inline-flex flex-shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+                    className="inline-flex flex-shrink-0 items-center rounded-full px-1.5 py-0.5 text-[0.625rem] font-medium"
                     style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}
                   >
                     {t('chat.sources.subagent')}
@@ -941,9 +941,9 @@ function SourceDetailDialog({
             onClick={handleOpen}
             className="group inline-flex w-fit items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium outline-none transition-all hover:gap-2 focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
             style={{
-              backgroundColor: 'var(--color-accent-soft)',
-              borderColor: 'var(--color-accent-soft)',
-              color: 'var(--color-accent-primary)',
+              backgroundColor: 'var(--color-bg-elevated)',
+              borderColor: 'var(--color-border-elevated)',
+              color: 'var(--color-text-primary)',
             }}
           >
             {canOpenLink ? <ExternalLink className="h-3.5 w-3.5" /> : <FileText className="h-3.5 w-3.5" />}

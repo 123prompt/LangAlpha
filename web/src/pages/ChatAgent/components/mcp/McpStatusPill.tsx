@@ -46,19 +46,19 @@ const STATUS_META: Record<McpStatus, StatusMeta> = {
   pending: {
     label: 'Pending',
     color: 'var(--color-text-tertiary)',
-    bg: 'var(--color-bg-default)',
+    bg: 'var(--color-bg-tag)',
     icon: Clock,
   },
   disabled: {
     label: 'Disabled',
     color: 'var(--color-text-tertiary)',
-    bg: 'var(--color-bg-default)',
+    bg: 'var(--color-bg-tag)',
     icon: MinusCircle,
   },
   unknown: {
     label: 'Unknown',
     color: 'var(--color-text-tertiary)',
-    bg: 'var(--color-bg-default)',
+    bg: 'var(--color-bg-tag)',
     icon: HelpCircle,
   },
 };
@@ -78,7 +78,7 @@ export function McpStatusPill({ status, enabled }: McpStatusPillProps) {
   const Icon = meta.icon;
   return (
     <span
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded font-medium"
+      className="inline-flex items-center gap-1 text-[0.6875rem] px-1.5 py-0.5 rounded font-medium"
       style={{ color: meta.color, backgroundColor: meta.bg }}
       title={effective === 'pending' ? PENDING_HINT : undefined}
       data-testid={`mcp-status-${effective}`}

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { Server, Plus, Trash2, Pencil, Loader2, PackagePlus } from 'lucide-react';
+import { Server, Plus, Trash2, Pencil, PackagePlus } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import {
   useMcpCatalog,
   useCreateMcpCatalogServer,
@@ -137,7 +138,7 @@ export function TemplatesView({
           disabled={atCap}
           title={atCap ? `At ${maxServers}/${maxServers} — delete one first` : undefined}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-          style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+          style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
         >
           <Plus className="h-3 w-3" />
           New template
@@ -169,12 +170,12 @@ export function TemplatesView({
                     <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
                       {t.name}
                     </span>
-                    <span className="text-[10px] px-1.5 py-0.5 rounded uppercase" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-default)' }}>
+                    <span className="text-[0.625rem] px-1.5 py-0.5 rounded uppercase" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-tag)' }}>
                       {t.transport}
                     </span>
                   </div>
                   {t.description && (
-                    <p className="text-[11px] line-clamp-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                    <p className="text-[0.6875rem] line-clamp-2" style={{ color: 'var(--color-text-tertiary)' }}>
                       {t.description}
                     </p>
                   )}
@@ -186,10 +187,10 @@ export function TemplatesView({
                     onClick={() => handleAdd(t.name)}
                     disabled={alreadyAdded || addingName === t.name}
                     title={alreadyAdded ? 'Already in this workspace' : 'Add to this workspace'}
-                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded-md transition-colors disabled:opacity-50"
-                    style={{ color: 'var(--color-accent-primary)', border: '1px solid var(--color-border-muted)' }}
+                    className="inline-flex items-center gap-1 px-2 py-1 text-[0.6875rem] rounded-md transition-colors disabled:opacity-50"
+                    style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
                   >
-                    {addingName === t.name ? <Loader2 className="h-3 w-3 animate-spin" /> : <PackagePlus className="h-3 w-3" />}
+                    {addingName === t.name ? <Loader size={12} className="text-current" /> : <PackagePlus className="h-3 w-3" />}
                     {alreadyAdded ? 'Added' : 'Add to workspace'}
                   </button>
                   <button
@@ -207,7 +208,7 @@ export function TemplatesView({
                         type="button"
                         onClick={() => handleDelete(t.name)}
                         disabled={deleteMutation.isPending}
-                        className="px-2 py-1 text-[11px] rounded disabled:opacity-50"
+                        className="px-2 py-1 text-[0.6875rem] rounded disabled:opacity-50"
                         style={{ color: 'var(--color-loss)' }}
                       >
                         {deleteMutation.isPending ? 'Deleting…' : 'Confirm'}
@@ -215,7 +216,7 @@ export function TemplatesView({
                       <button
                         type="button"
                         onClick={() => setDeletingName(null)}
-                        className="px-2 py-1 text-[11px] rounded hover:bg-foreground/10"
+                        className="px-2 py-1 text-[0.6875rem] rounded hover:bg-foreground/10"
                         style={{ color: 'var(--color-text-tertiary)' }}
                       >
                         Cancel

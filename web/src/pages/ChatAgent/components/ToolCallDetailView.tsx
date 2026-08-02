@@ -2,7 +2,8 @@ import React, { useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { useIsMobile } from '@/hooks/useIsMobile';
-import { ArrowRight, ChevronRight, ExternalLink, FileText, Loader2 } from 'lucide-react';
+import { ArrowRight, ChevronRight, ExternalLink, FileText } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import { stripLineNumbers, parseTruncatedResult } from './toolDisplayConfig';
 import {
   StockPriceChart,
@@ -196,7 +197,10 @@ function TaskToolContent({ description, type, subagentId, subagentResult, subage
             className="flex items-center gap-2 px-3 py-3 rounded-lg"
             style={{ backgroundColor: 'var(--color-bg-surface)', border: '1px solid var(--color-border-muted)' }}
           >
-            <Loader2 className="h-4 w-4 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />
+            {/* Shared liveness glyph (nav tree, task cards): ascii spinner, amber. */}
+            <span aria-hidden="true" className="flex-shrink-0">
+              <Loader size={14} className="text-[color:var(--color-accent-primary)]" />
+            </span>
             <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
               {t('toolArtifact.subagentStillRunning')}
             </span>
@@ -216,8 +220,8 @@ function TaskToolContent({ description, type, subagentId, subagentResult, subage
           onClick={handleGoToSubagent}
           className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg transition-colors hover:brightness-110"
           style={{
-            backgroundColor: 'var(--color-accent-soft)',
-            border: '1px solid var(--color-accent-soft)',
+            backgroundColor: 'var(--color-bg-elevated)',
+            border: '1px solid var(--color-border-elevated)',
           }}
         >
           <img src={isRunning ? iconRoboSing : iconRobo} alt="Subagent" className="w-5 h-5 flex-shrink-0" />
@@ -482,8 +486,8 @@ function WebSearchCards({ data }: WebSearchCardsProps): React.ReactElement {
         <div
           className="rounded-lg px-4 py-3"
           style={{
-            backgroundColor: 'var(--color-accent-soft)',
-            border: '1px solid var(--color-accent-soft)',
+            backgroundColor: 'var(--color-bg-elevated)',
+            border: '1px solid var(--color-border-default)',
           }}
         >
           <p className="text-sm" style={{ color: 'var(--color-text-primary)', lineHeight: 1.6 }}>
@@ -515,7 +519,7 @@ function WebSearchCards({ data }: WebSearchCardsProps): React.ReactElement {
             transition: 'border-color 0.15s, background-color 0.15s',
           }}
           onMouseEnter={(e: React.MouseEvent<HTMLAnchorElement>) => {
-            e.currentTarget.style.borderColor = 'var(--color-accent-overlay)';
+            e.currentTarget.style.borderColor = 'var(--color-border-elevated)';
             e.currentTarget.style.backgroundColor = 'var(--color-bg-hover)';
           }}
           onMouseLeave={(e: React.MouseEvent<HTMLAnchorElement>) => {
@@ -586,8 +590,8 @@ function TruncatedResultMessage({ filePath, preview, onOpenFile }: TruncatedResu
       <div
         className="rounded-lg px-4 py-3"
         style={{
-          backgroundColor: 'var(--color-accent-soft)',
-          border: '1px solid var(--color-accent-overlay)',
+          backgroundColor: 'var(--color-bg-elevated)',
+          border: '1px solid var(--color-border-default)',
         }}
       >
         <div className="flex items-start gap-3">
@@ -604,8 +608,8 @@ function TruncatedResultMessage({ filePath, preview, onOpenFile }: TruncatedResu
                 onClick={() => onOpenFile(filePath)}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm transition-colors hover:bg-foreground/10"
                 style={{
-                  color: 'var(--color-accent-primary)',
-                  border: '1px solid var(--color-accent-overlay)',
+                  color: 'var(--color-text-primary)',
+                  border: '1px solid var(--color-border-elevated)',
                 }}
               >
                 <FileText className="h-3.5 w-3.5" />

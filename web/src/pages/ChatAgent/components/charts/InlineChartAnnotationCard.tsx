@@ -42,6 +42,7 @@ import { describeAnnotationVisual } from '@/pages/MarketView/utils/annotationGeo
 import { useWorkspaceId } from '../../contexts/WorkspaceContext';
 import { useChartSurface } from '../../contexts/ChartSurfaceContext';
 import { AnnotationPreviewChart } from './AnnotationPreviewChart';
+import { CARD_BG, CARD_BORDER } from './inlineCardsShared';
 
 // Lazy: the surface pulls in the whole MarketView chart stack (lightweight-charts,
 // html2canvas, TradingView). Keep it out of the chat bundle until a chart opens.
@@ -51,8 +52,6 @@ const MarketChartSurface = lazy(() =>
   })),
 );
 
-const CARD_BG = 'var(--color-bg-tool-card)';
-const CARD_BORDER = 'var(--color-border-muted)';
 const TEXT_COLOR = 'var(--color-text-tertiary)';
 const ACCENT = 'var(--color-accent-primary)';
 const ACCENT_SOFT = 'var(--color-accent-soft)';
@@ -187,7 +186,7 @@ export function InlineChartAnnotationCard({
           border: `1px solid ${accented ? ACCENT : CARD_BORDER}`,
           borderRadius: 999,
           padding: '6px 12px',
-          fontSize: 12,
+          fontSize: '0.75rem',
           color: TEXT_COLOR,
           cursor: 'pointer',
           transition: 'border-color 0.15s',
@@ -301,7 +300,7 @@ export function InlineChartAnnotationCard({
         <div style={{ position: 'relative', height: plotHeight }}>
           {barsLoading ? (
             <div style={CENTERED}>
-              <span style={{ fontSize: 12, color: TEXT_COLOR }}>
+              <span style={{ fontSize: '0.75rem', color: TEXT_COLOR }}>
                 {t('chat.chartAnnotationCard.loadingChart')}
               </span>
             </div>
@@ -324,7 +323,7 @@ export function InlineChartAnnotationCard({
                 }}
               >
                 <LineChart size={26} style={{ opacity: 0.5 }} />
-                <span style={{ fontSize: 12 }}>
+                <span style={{ fontSize: '0.75rem' }}>
                   {t('chat.chartAnnotationCard.previewUnavailable')}
                 </span>
               </span>
@@ -373,7 +372,7 @@ export function InlineChartAnnotationCard({
           >
             <span
               style={{
-                fontSize: 21,
+                fontSize: '1.3125rem',
                 fontWeight: 700,
                 color: 'var(--color-text-primary)',
                 letterSpacing: '-0.01em',
@@ -382,7 +381,7 @@ export function InlineChartAnnotationCard({
               {symbol}
             </span>
             {lastClose != null && (
-              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--color-text-primary)' }}>
+              <span style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--color-text-primary)' }}>
                 ${lastClose.toLocaleString('en-US', {
                   minimumFractionDigits: 2,
                   maximumFractionDigits: 2,
@@ -395,7 +394,7 @@ export function InlineChartAnnotationCard({
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: 3,
-                  fontSize: 13,
+                  fontSize: '0.8125rem',
                   fontWeight: 600,
                   color: trendColor,
                 }}
@@ -423,7 +422,7 @@ export function InlineChartAnnotationCard({
               position: 'absolute',
               top: 16,
               right: 16,
-              fontSize: 11,
+              fontSize: '0.6875rem',
               fontWeight: 700,
               letterSpacing: '0.03em',
               color: TEXT_COLOR,
@@ -467,7 +466,7 @@ export function InlineChartAnnotationCard({
                       display: 'inline-flex',
                       alignItems: 'center',
                       gap: 6,
-                      fontSize: 11.5,
+                      fontSize: '0.7188rem',
                       fontWeight: 600,
                       color: 'var(--color-text-secondary)',
                     }}
@@ -489,7 +488,7 @@ export function InlineChartAnnotationCard({
                 ))}
               </AnimatePresence>
               {extraCount > 0 && (
-                <span style={{ fontSize: 11.5, fontWeight: 600, color: TEXT_COLOR }}>+{extraCount}</span>
+                <span style={{ fontSize: '0.7188rem', fontWeight: 600, color: TEXT_COLOR }}>+{extraCount}</span>
               )}
             </div>
           )}
@@ -503,7 +502,7 @@ export function InlineChartAnnotationCard({
               display: 'inline-flex',
               alignItems: 'center',
               gap: 7,
-              fontSize: 13,
+              fontSize: '0.8125rem',
               fontWeight: 600,
               padding: '9px 15px',
               borderRadius: 11,
@@ -572,7 +571,7 @@ export function InlineChartAnnotationCard({
                   border: `1px solid ${CARD_BORDER}`,
                   background: ACCENT_SOFT,
                   color: ACCENT,
-                  fontSize: 12,
+                  fontSize: '0.75rem',
                   fontWeight: 600,
                   cursor: 'pointer',
                   whiteSpace: 'nowrap',
@@ -614,7 +613,7 @@ export function InlineChartAnnotationCard({
                         alignItems: 'center',
                         justifyContent: 'center',
                         height: '100%',
-                        fontSize: 13,
+                        fontSize: '0.8125rem',
                         color: TEXT_COLOR,
                       }}
                     >

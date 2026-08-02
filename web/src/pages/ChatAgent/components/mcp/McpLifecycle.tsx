@@ -87,7 +87,7 @@ export function McpLifecycle({ status, enabled, origin, checking, synced, sandbo
       data-phase={phase}
     >
       <LifecycleTrack steps={[{ key: 'saved', state: 'done' }, { key: 'verify', state: verifyState }, { key: 'ready', state: readyState }]} />
-      <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>{label}</span>
+      <span className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>{label}</span>
     </span>
   );
 }

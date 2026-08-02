@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { KeyRound, Plus, Loader2, Check } from 'lucide-react';
+import { KeyRound, Plus, Check } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import { createVaultSecret, formatApiErrorDetail } from '../../utils/api';
 
 /**
@@ -77,14 +78,14 @@ export function VaultSecretPicker({
   return (
     <div className="flex flex-col gap-1.5">
       {/* Mode toggle */}
-      <div className="flex gap-1 text-[11px]">
+      <div className="flex gap-1 text-[0.6875rem]">
         <button
           type="button"
           onClick={() => { setMode('vault'); if (refName(value) === null) onChange(''); }}
           className="px-2 py-0.5 rounded"
           style={{
-            color: mode === 'vault' ? 'var(--color-text-on-accent)' : 'var(--color-text-tertiary)',
-            backgroundColor: mode === 'vault' ? 'var(--color-accent-primary)' : 'var(--color-bg-card)',
+            color: mode === 'vault' ? 'var(--color-btn-primary-text)' : 'var(--color-text-tertiary)',
+            backgroundColor: mode === 'vault' ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-card)',
           }}
         >
           From vault
@@ -94,8 +95,8 @@ export function VaultSecretPicker({
           onClick={() => { setMode('literal'); if (refName(value) !== null) onChange(''); }}
           className="px-2 py-0.5 rounded"
           style={{
-            color: mode === 'literal' ? 'var(--color-text-on-accent)' : 'var(--color-text-tertiary)',
-            backgroundColor: mode === 'literal' ? 'var(--color-accent-primary)' : 'var(--color-bg-card)',
+            color: mode === 'literal' ? 'var(--color-btn-primary-text)' : 'var(--color-text-tertiary)',
+            backgroundColor: mode === 'literal' ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-card)',
           }}
         >
           Literal
@@ -113,10 +114,10 @@ export function VaultSecretPicker({
                     key={name}
                     type="button"
                     onClick={() => onChange(vaultRef(name))}
-                    className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-mono rounded"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-[0.6875rem] font-mono rounded"
                     style={{
-                      color: active ? 'var(--color-text-on-accent)' : 'var(--color-text-secondary)',
-                      backgroundColor: active ? 'var(--color-accent-primary)' : 'var(--color-bg-card)',
+                      color: active ? 'var(--color-btn-primary-text)' : 'var(--color-text-secondary)',
+                      backgroundColor: active ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-card)',
                       border: '1px solid var(--color-border-muted)',
                     }}
                   >
@@ -153,13 +154,13 @@ export function VaultSecretPicker({
                 maxLength={4096}
               />
               {createError && (
-                <div className="text-[11px]" style={{ color: 'var(--color-loss)' }}>{createError}</div>
+                <div className="text-[0.6875rem]" style={{ color: 'var(--color-loss)' }}>{createError}</div>
               )}
               <div className="flex justify-end gap-1.5">
                 <button
                   type="button"
                   onClick={() => { setCreating(false); setCreateError(null); }}
-                  className="px-2 py-0.5 text-[11px] rounded hover:bg-foreground/10"
+                  className="px-2 py-0.5 text-[0.6875rem] rounded hover:bg-foreground/10"
                   style={{ color: 'var(--color-text-tertiary)' }}
                 >
                   Cancel
@@ -168,10 +169,10 @@ export function VaultSecretPicker({
                   type="button"
                   onClick={handleCreate}
                   disabled={saving || !newName || !newValue}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] rounded disabled:opacity-50"
-                  style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[0.6875rem] rounded disabled:opacity-50"
+                  style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
                 >
-                  {saving && <Loader2 className="h-3 w-3 animate-spin" />}
+                  {saving && <Loader size={12} className="text-current" />}
                   Create &amp; use
                 </button>
               </div>
@@ -180,7 +181,7 @@ export function VaultSecretPicker({
             <button
               type="button"
               onClick={() => { setCreating(true); setCreateError(null); }}
-              className="inline-flex items-center gap-1 text-[11px] self-start"
+              className="inline-flex items-center gap-1 text-[0.6875rem] self-start"
               style={{ color: 'var(--color-accent-primary)' }}
             >
               <Plus className="h-3 w-3" />
