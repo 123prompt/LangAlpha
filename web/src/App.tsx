@@ -1,8 +1,11 @@
-import React, { Suspense, useEffect } from 'react';
+import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { MotionConfig } from 'framer-motion';
 import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
-import Sidebar from './components/Sidebar/Sidebar';
+import AppSidebar from './components/Sidebar/AppSidebar';
+import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth } from './components/Sidebar/sidebarWidth';
+import { useScrollMemory } from './lib/scrollMemory';
 import BottomTabBar from './components/BottomTabBar/BottomTabBar';
-import Main from './components/Main/Main';
+import Main, { preloadRouteChunk } from './components/Main/Main';
 import PageLoading from './components/PageLoading/PageLoading';
 import AuthConfirm from './pages/Login/AuthConfirm';
 import SharedChatView from './pages/SharedChat/SharedChatView';
@@ -13,6 +16,7 @@ import { useSetupGate } from './hooks/useSetupGate';
 import { isPlatformMode, APP_ENTRY_PATH } from './config/hostMode';
 import { AUTH_BROADCAST_CHANNEL, type AuthBroadcastMessage } from './lib/oauthPopup';
 import { OnboardingProvider, OnboardingHostGate } from './pages/Onboarding';
+import { ThreadLifecycleFeed } from './lib/threadLifecycle/ThreadLifecycleFeed';
 import './App.css';
 
 // Login carries the market-tape canvas subsystem (~2k lines that only a
@@ -100,11 +104,73 @@ function LegacyAppPathRedirect() {
  * Authenticated app shell — sidebar + main content.
  * Redirects to the setup wizard if the user hasn't configured API keys.
  */
+const SIDEBAR_COLLAPSED_KEY = 'app-sidebar-collapsed';
+const SIDEBAR_WIDTH_KEY = 'app-sidebar-width';
+
 function AuthenticatedShell() {
   const isMobile = useIsMobile();
   const location = useLocation();
   const hideTabBar = isMobile && location.pathname.startsWith('/chat/t/');
   const { isLoading, needsSetup } = useSetupGate();
+
+  // Warm the target route's chunk while /users/me resolves — the gate below
+  // otherwise serializes two network legs (profile fetch, then the lazy
+  // import only starts on first render of Main). import() is deduped, so
+  // this is free when the gate is already settled. Mount-only: later
+  // navigations mount their lazy component directly.
+  useEffect(() => {
+    preloadRouteChunk(window.location.pathname);
+  }, []);
+
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(next));
+      } catch {
+        // localStorage unavailable (private mode) — collapse still works for the session
+      }
+      return next;
+    });
+  }, []);
+
+  // Per-route scroll memory for the shared content scroller: leaving a tab and
+  // coming back restores where the user was (0 for first visits, so positions
+  // never bleed between routes that share this container).
+  const mainRef = useRef<HTMLElement>(null);
+  useScrollMemory(mainRef, `route:${location.pathname}`);
+
+  const layoutRef = useRef<HTMLDivElement>(null);
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
+      return Number.isFinite(stored) && stored > 0 ? clampSidebarWidth(stored) : SIDEBAR_DEFAULT_WIDTH;
+    } catch {
+      return SIDEBAR_DEFAULT_WIDTH;
+    }
+  });
+  // Live drag updates write --sidebar-width straight to the DOM (no re-render
+  // per pointermove — the whole route tree lives under this shell); React state
+  // and localStorage only sync on commit (drag end / double-click reset).
+  const handleSidebarWidthChange = useCallback((width: number, commit = false) => {
+    if (!commit) {
+      layoutRef.current?.style.setProperty('--sidebar-width', `${width}px`);
+      return;
+    }
+    setSidebarWidth(width);
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width));
+    } catch {
+      // localStorage unavailable — width still applies for the session
+    }
+  }, []);
 
   // While the user profile is loading, show the loading state to avoid
   // flashing protected content before the gate check completes.
@@ -118,10 +184,22 @@ function AuthenticatedShell() {
 
   return (
     <OnboardingProvider>
-      <div className="app-layout">
-        {!isMobile && <Sidebar />}
+      <ThreadLifecycleFeed />
+      <div
+        ref={layoutRef}
+        className="app-layout"
+        style={!isMobile ? ({ '--sidebar-width': sidebarCollapsed ? '80px' : `${sidebarWidth}px` } as React.CSSProperties) : undefined}
+      >
+        {!isMobile && (
+          <AppSidebar
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={toggleSidebar}
+            width={sidebarWidth}
+            onWidthChange={handleSidebarWidthChange}
+          />
+        )}
         {isMobile && !hideTabBar && <BottomTabBar />}
-        <main className={`app-main${hideTabBar ? ' app-main--no-tab' : ''}`}>
+        <main ref={mainRef} className={`app-main${hideTabBar ? ' app-main--no-tab' : ''}`}>
           <Main />
         </main>
       </div>
@@ -146,6 +224,10 @@ function App() {
   );
 
   return (
+    // reducedMotion="user": every framer-motion transform/layout animation
+    // app-wide collapses to instant for prefers-reduced-motion users (opacity
+    // still animates) — no per-component wiring.
+    <MotionConfig reducedMotion="user">
     <Routes>
       <Route path={APP_ENTRY_PATH} element={appEntryElement} />
       {isPlatformMode && APP_ENTRY_PATH === '/' && (
@@ -184,6 +266,7 @@ function App() {
         isLoggedIn ? <AuthenticatedShell /> : <Navigate to={APP_ENTRY_PATH} replace />
       } />
     </Routes>
+    </MotionConfig>
   );
 }
 

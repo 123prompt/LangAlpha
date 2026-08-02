@@ -23,7 +23,7 @@ const MAX_DEPTH = 3;
 const MAX_BREADTH = 50;
 
 const LABEL_STYLE: React.CSSProperties = {
-  fontSize: 11,
+  fontSize: '0.6875rem',
   color: 'var(--color-text-quaternary)',
   letterSpacing: '0.05em',
   textTransform: 'uppercase',

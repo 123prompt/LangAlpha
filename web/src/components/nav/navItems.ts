@@ -1,4 +1,4 @@
-import { ChartCandlestick, LayoutDashboard, MessageSquareText, Settings, Timer } from 'lucide-react';
+import { ChartCandlestick, LayoutDashboard, MessagesSquare, Settings, Timer } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
 export interface NavItem {
@@ -14,7 +14,7 @@ export interface NavItem {
 // Single source of truth for primary navigation (rail + mobile tab bar).
 export const NAV_ITEMS: NavItem[] = [
   { key: '/dashboard', icon: LayoutDashboard, labelKey: 'sidebar.dashboard', match: 'exact-or-sub' },
-  { key: '/chat', icon: MessageSquareText, labelKey: 'sidebar.chatAgent', match: 'prefix' },
+  { key: '/chat', icon: MessagesSquare, labelKey: 'sidebar.chatAgent', match: 'prefix' },
   { key: '/market', icon: ChartCandlestick, labelKey: 'sidebar.marketView', match: 'exact-or-sub' },
   { key: '/automations', icon: Timer, labelKey: 'sidebar.automations', match: 'exact-or-sub' },
 ];

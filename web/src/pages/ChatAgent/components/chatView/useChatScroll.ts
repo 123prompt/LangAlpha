@@ -1,5 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { isNearBottom } from '../../utils/scrollHelpers';
+import { scrollMemory } from '@/lib/scrollMemory';
 
 // Scroll/pin tuning. Distance from the bottom (px) still counted as "at bottom";
 // settle window the pin re-applies through as async media expands; fallback for
@@ -23,6 +24,13 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
 }) {
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const subagentScrollAreaRef = useRef<HTMLDivElement>(null);
+
+  // Resolved thread id for the cross-unmount scroll store (scrollMemory) — a
+  // ref so the scroll listener always stamps the current thread without
+  // re-binding. '__default__' (unresolved new thread) is never stored.
+  const memoryTidRef = useRef<string | null>(null);
+  const resolvedTid = currentThreadId || threadId;
+  memoryTidRef.current = resolvedTid && resolvedTid !== '__default__' ? resolvedTid : null;
 
   // --- Scroll position memory for tab switching ---
   // Stores scrollTop per agentId so switching tabs preserves position
@@ -84,8 +92,11 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
   const isNearBottomRef = useRef(true);
   const isSubagentNearBottomRef = useRef(true);
 
-  // Pin controller state.
-  type PinTarget = { mode: 'bottom' };
+  // Pin controller state. 'bottom' follows the growing transcript end;
+  // 'offset' converges on a remembered mid-thread scrollTop that async content
+  // (charts, markdown, images) hasn't made reachable yet — same settle
+  // machinery, different target.
+  type PinTarget = { mode: 'bottom' } | { mode: 'offset'; top: number };
   const pinTargetRef = useRef<PinTarget | null>(null);
   const programmaticScrollRef = useRef(false);
   const settleQuietTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -114,11 +125,6 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
         : next,
     );
   }, []);
-  const userMsgCount = useMemo(
-    () => (messages as Array<{ role?: string }>).filter((m) => m?.role === 'user').length,
-    [messages],
-  );
-
   // Wrap a programmatic scroll so the scroll listener doesn't mistake it for a
   // user scroll (which cancels the pin). Smooth scrolls clear on `scrollend`
   // (600ms fallback for engines without it); instant clears after the scroll
@@ -210,16 +216,20 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     [getScrollContainer, withProgrammaticScroll, armSettleTimers, setPillState],
   );
 
-  // Re-apply the bottom pin (rAF-coalesced); called by the ResizeObserver each
+  // Re-apply the pin target (rAF-coalesced); called by the ResizeObserver each
   // time content settles, so async media finishing layout can't strand the user
-  // mid-thread.
+  // mid-thread ('bottom') or clamp a remembered offset short ('offset').
   const reapplyPin = useCallback(() => {
     if (reapplyRafRef.current != null) return;
     reapplyRafRef.current = requestAnimationFrame(() => {
       reapplyRafRef.current = null;
       const c = getScrollContainer(scrollAreaRef);
-      if (!pinTargetRef.current || !c) return;
-      withProgrammaticScroll(() => c.scrollTo({ top: c.scrollHeight }), 'auto');
+      const target = pinTargetRef.current;
+      if (!target || !c) return;
+      withProgrammaticScroll(
+        () => c.scrollTo({ top: target.mode === 'bottom' ? c.scrollHeight : target.top }),
+        'auto',
+      );
       armSettleTimers();
     });
   }, [getScrollContainer, withProgrammaticScroll, armSettleTimers]);
@@ -242,6 +252,18 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
         NEAR_BOTTOM_PX,
       );
       if (!isMain) return;
+      // Record every settle (user scrolls AND pins/follows) so the cross-unmount
+      // store always reflects where the transcript actually is — a bottom pin
+      // after send must overwrite a stale mid-thread offset. 'bottom' is sticky:
+      // re-entry pins to the (possibly taller) new bottom. Offset sessions are
+      // the exception: their intermediate scrolls clamp against still-short
+      // content and would overwrite the very offset being restored.
+      if (memoryTidRef.current && pinTargetRef.current?.mode !== 'offset') {
+        scrollMemory.set(
+          `thread:${memoryTidRef.current}`,
+          nearBottomRef.current ? 'bottom' : c.scrollTop,
+        );
+      }
       if (programmaticScrollRef.current) return; // ignore our own scrolls
       // A genuine user scroll takes control away from the pin controller.
       pinTargetRef.current = null;
@@ -267,6 +289,11 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
       programmaticScrollRef.current = false;
       pinTargetRef.current = null;
       clearSettleTimers();
+      // Also cancel a pending entry-restore frame — the user has taken over.
+      if (entryRestoreRafRef.current != null) {
+        cancelAnimationFrame(entryRestoreRafRef.current);
+        entryRestoreRafRef.current = null;
+      }
     };
     c.addEventListener('wheel', handleUserIntent, { passive: true });
     c.addEventListener('touchstart', handleUserIntent, { passive: true });
@@ -296,6 +323,11 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
   // near the bottom and the pin controller isn't currently owning the scroll.
   useEffect(() => {
     if (pinTargetRef.current) return; // pin controller owns scroll during settle
+    // Hold all follows until the thread-entry decision (below) has landed —
+    // messages render while history is still hydrating, and a bottom-follow
+    // here would record 'bottom' over the very offset entry restore is about
+    // to read.
+    if (memoryTidRef.current && restoredForThreadRef.current !== memoryTidRef.current) return;
     if (!isNearBottomRef.current) {
       // User is reading earlier turns — surface "N new" instead of yanking them down.
       const delta = messagesLenRef.current - pillBaselineLenRef.current;
@@ -326,8 +358,10 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
   }, [messages, getScrollContainer, withProgrammaticScroll]);
 
   // Thread-entry restore — the core fix. Fires on the real "history is present"
-  // signal (isLoadingHistory flips false), not on an empty/partial list, then
-  // pins to bottom through the async settle window.
+  // signal (isLoadingHistory flips false), not on an empty/partial list. A
+  // remembered mid-thread offset (scrollMemory, survives route unmounts) wins
+  // over the default bottom pin, so tabbing away and back lands where the user
+  // left; 'bottom' / no memory pins to bottom through the async settle window.
   useEffect(() => {
     if (!isActive) return;
     const tid = currentThreadId || threadId;
@@ -335,19 +369,56 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     if (isLoadingHistory) return;
     if (restoredForThreadRef.current === tid) return;
     restoredForThreadRef.current = tid;
-    entryRestoreRafRef.current = requestAnimationFrame(() => {
-      entryRestoreRafRef.current = null;
-      // The instance may have gone inactive (cached/hidden) before this frame.
-      if (!isActiveRef.current) return;
-      pinToBottom('auto');
-    });
+    const saved = scrollMemory.get(`thread:${tid}`);
+    if (typeof saved === 'number') {
+      // Async content (charts, markdown, images) keeps growing the transcript
+      // after the history signal, so a one-shot scrollTop set clamps short.
+      // Run an offset pin session: the ResizeObserver re-applies the target on
+      // every growth until the settle window closes — the same machinery that
+      // makes land-at-bottom reliable. The claim is synchronous so a
+      // message-triggered bottom follow can't slip in before the deferred
+      // apply.
+      //
+      // A numeric save is by construction mid-thread (near-bottom saves record
+      // 'bottom'), so reflect that immediately: streaming follow / new-message
+      // autoscroll must not yank to the bottom, and the jump-to-latest
+      // affordance surfaces without waiting for a user scroll (handleScroll,
+      // its usual trigger, never fires here).
+      pinTargetRef.current = { mode: 'offset', top: saved };
+      isNearBottomRef.current = false;
+      pillBaselineLenRef.current = messagesLenRef.current;
+      setPillState({ visible: true, hasNew: false, newCount: 0 });
+      entryRestoreRafRef.current = requestAnimationFrame(() => {
+        entryRestoreRafRef.current = null;
+        // The instance may have gone inactive (cached/hidden) before this frame.
+        const c = isActiveRef.current ? getScrollContainer(scrollAreaRef) : null;
+        if (!c) {
+          // The apply never ran — release the claim so a stale pin can't
+          // block follows when the instance reactivates.
+          if (pinTargetRef.current?.mode === 'offset') pinTargetRef.current = null;
+          return;
+        }
+        withProgrammaticScroll(() => {
+          c.scrollTop = saved;
+        });
+        armSettleTimers();
+      });
+    } else {
+      entryRestoreRafRef.current = requestAnimationFrame(() => {
+        entryRestoreRafRef.current = null;
+        if (!isActiveRef.current) return;
+        pinToBottom('auto');
+      });
+    }
     return () => {
       if (entryRestoreRafRef.current != null) {
         cancelAnimationFrame(entryRestoreRafRef.current);
         entryRestoreRafRef.current = null;
+        // A cancelled frame leaves an offset claim unapplied — release it.
+        if (pinTargetRef.current?.mode === 'offset') pinTargetRef.current = null;
       }
     };
-  }, [isActive, isLoadingHistory, currentThreadId, threadId, pinToBottom, isActiveRef]);
+  }, [isActive, isLoadingHistory, currentThreadId, threadId, pinToBottom, isActiveRef, getScrollContainer, withProgrammaticScroll, armSettleTimers, setPillState]);
 
   // Cleanup pending scroll timers/rAF on unmount.
   useEffect(() => {
@@ -368,7 +439,6 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     pinToBottom,
     saveScrollPosition,
     jumpPill,
-    userMsgCount,
     scrollPositionsRef,
     skipSubagentAutoScrollRef,
     activeAgentIdRef,

@@ -1,8 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, FolderOpen, Loader2 } from 'lucide-react';
+import { ArrowLeft, FolderOpen } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { Loader } from '@/components/ui/loader';
 import MessageList from '../ChatAgent/components/MessageList';
+import {
+  MessageActionsProvider,
+  READ_ONLY_MESSAGE_ACTIONS,
+  type MessageActions,
+} from '../ChatAgent/components/messageList/MessageActionsContext';
 import FilePanel from '../ChatAgent/components/FilePanel';
 import { WorkspaceProvider } from '../ChatAgent/contexts/WorkspaceContext';
 import { useTheme } from '../../contexts/ThemeContext';
@@ -394,6 +400,15 @@ export default function SharedChatView() {
     }
   }, [canBrowseFiles, files.length, shareToken]);
 
+  // Read-only adapter for the transcript's action surface. The shared view has
+  // no turn to edit/regenerate/rate and no interrupt to approve. Subagent-task
+  // opening isn't declared here — MessageContentSegments strips it on readOnly
+  // surfaces, so a value would be dead weight pretending to be the gate.
+  const readOnlyActions = useMemo<MessageActions>(() => ({
+    ...READ_ONLY_MESSAGE_ACTIONS,
+    onOpenFile: handleOpenFile,
+  }), [handleOpenFile]);
+
   // Deep link: `?file=<path>` opens that report directly once metadata + file
   // permission are known. One-shot — the share-link target from §1.3b.
   const fileDeepLinkConsumedRef = useRef(false);
@@ -452,7 +467,7 @@ export default function SharedChatView() {
   if (!metadata) {
     return (
       <div className="flex items-center justify-center min-h-screen" style={{ backgroundColor: 'var(--color-bg-page)' }}>
-        <Loader2 className="h-6 w-6 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />
+        <Loader size={24} className="text-[color:var(--color-text-tertiary)]" />
       </div>
     );
   }
@@ -517,18 +532,20 @@ export default function SharedChatView() {
                   <div className="w-full max-w-3xl">
                     {loading && messages.length === 0 ? (
                       <div className="flex items-center justify-center py-20">
-                        <Loader2 className="h-5 w-5 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />
+                        <span aria-hidden="true" className="flex-shrink-0">
+                          <Loader size={20} className="text-[color:var(--color-text-tertiary)]" />
+                        </span>
                         <span className="ml-2 text-sm" style={{ color: 'var(--color-text-tertiary)' }}>Loading conversation...</span>
                       </div>
                     ) : (
                       <WorkspaceProvider workspaceId={null} downloadFile={imageDownloader}>
-                      <MessageList
-                        messages={messages}
-                        readOnly={true}
-                        allowFiles={canBrowseFiles}
-                        onOpenSubagentTask={() => {}}
-                        onOpenFile={handleOpenFile}
-                      />
+                      <MessageActionsProvider actions={readOnlyActions}>
+                        <MessageList
+                          messages={messages}
+                          readOnly={true}
+                          allowFiles={canBrowseFiles}
+                        />
+                      </MessageActionsProvider>
                       </WorkspaceProvider>
                     )}
                   </div>

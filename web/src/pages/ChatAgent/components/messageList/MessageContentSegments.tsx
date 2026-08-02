@@ -18,8 +18,9 @@ import { NotificationDivider } from './NotificationDivider';
 import { normalizeSubagentText } from './normalizeSubagentText';
 import StructuredResultBlock from './StructuredResultBlock';
 import { parseStructuredResult } from '../../utils/structuredResult';
+import { useMessageActions } from './MessageActionsContext';
 import { EMPTY_OBJ } from './types';
-import type { ContentSegmentRecord, SubagentInfo, ToolCallProcessRecord } from './types';
+import type { ContentSegmentRecord, ToolCallProcessRecord } from './types';
 import {
   buildRenderBlocks,
   groupSegments,
@@ -62,26 +63,8 @@ interface MessageContentSegmentsProps {
   isSubagentView?: boolean;
   readOnly?: boolean;
   allowFiles?: boolean;
-  onOpenSubagentTask?: (info: SubagentInfo) => void;
-  onOpenFile?: (filePath: string, workspaceId?: string) => void;
-  onOpenDir?: (dirPath: string) => void;
-  onToolCallDetailClick?: (proc: ToolCallProcessRecord) => void;
-  onApprovePlan?: () => void;
-  onRejectPlan?: () => void;
-  onPlanDetailClick?: (planData: Record<string, unknown>) => void;
-  onAnswerQuestion?: (answer: string, questionId: string, interruptId: string) => void;
-  onSkipQuestion?: (questionId: string, interruptId: string) => void;
-  onApproveCreateWorkspace?: (proposalData: Record<string, unknown>) => void;
-  onRejectCreateWorkspace?: (proposalData: Record<string, unknown>) => void;
-  onApproveStartQuestion?: (proposalData: Record<string, unknown>) => void;
-  onRejectStartQuestion?: (proposalData: Record<string, unknown>) => void;
-  onApprovePTCAgent?: (proposalData: Record<string, unknown>, overrides: { report_back?: boolean } | undefined, proposalId: string, interruptId: string) => void;
-  onRejectPTCAgent?: (proposalData: Record<string, unknown>, proposalId: string, interruptId: string) => void;
-  onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
-  onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   ptcAgentProposals?: Record<string, Record<string, unknown>>;
   secretaryActionProposals?: Record<string, Record<string, unknown>>;
-  onWidgetSendPrompt?: (text: string) => void;
   htmlWidgetProcesses?: Record<string, Record<string, unknown>>;
   textOnly?: boolean;
   flashContext?: { threadId: string; workspaceId: string } | null;
@@ -129,7 +112,18 @@ function TextBlock({ block, isFirst, isStreaming, hasError, structuredError, isS
   return isFirst && textContent ? <div className="-mt-1">{textEl}</div> : textEl;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, planApprovals = EMPTY_OBJ, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, hasError, structuredError, isAssistant = false, compactToolCalls = false, isSubagentView = false, readOnly = false, allowFiles = false, onOpenSubagentTask, onOpenFile, onOpenDir, onToolCallDetailClick, onApprovePlan, onRejectPlan, onPlanDetailClick, onAnswerQuestion, onSkipQuestion, onApproveCreateWorkspace, onRejectCreateWorkspace, onApproveStartQuestion, onRejectStartQuestion, onApprovePTCAgent, onRejectPTCAgent, onApproveSecretaryAction, onRejectSecretaryAction, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, onWidgetSendPrompt, htmlWidgetProcesses = EMPTY_OBJ, textOnly = false, flashContext }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, planApprovals = EMPTY_OBJ, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, hasError, structuredError, isAssistant = false, compactToolCalls = false, isSubagentView = false, readOnly = false, allowFiles = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, textOnly = false, flashContext }: MessageContentSegmentsProps): React.ReactElement {
+  const {
+    onOpenSubagentTask, onOpenFile, onOpenDir, onToolCallDetailClick,
+    onApprovePlan, onRejectPlan, onPlanDetailClick,
+    onAnswerQuestion, onSkipQuestion,
+    onApproveCreateWorkspace, onRejectCreateWorkspace,
+    onApproveStartQuestion, onRejectStartQuestion,
+    onApprovePTCAgent, onRejectPTCAgent,
+    onApproveSecretaryAction, onRejectSecretaryAction,
+    onWidgetSendPrompt,
+  } = useMessageActions();
+
   // Force re-render timer for recently-completed tool calls that need minimum exposure
   const [tick, setTick] = useState(0);
   const expiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
