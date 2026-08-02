@@ -1,12 +1,15 @@
-"""Cross-worker pub/sub for workspace lifecycle status changes.
+"""Cross-worker pub/sub: the shared subscribe primitive, plus workspace status.
 
 Replaces the loser-side DB poll loop with a push notification so a
 stopped→running transition wakes waiting workers in milliseconds rather
 than 0.5–2 s polling cycles. Also feeds the ``/workspaces/{id}/events``
 SSE channel so the frontend can drop interval-polling.
 
-Degrades silently when Redis is unavailable: ``subscribe_to_status``
-yields ``None`` and ``publish_status_change`` is a no-op, so callers
+``subscribe_to_channel`` owns the one long-lived subscription contract (the
+dedicated pool, the tri-state wait, cancellation-safe teardown); the per-domain
+``subscribe_to_*`` functions — here and in ``thread_lifecycle_feed`` — are
+channel wrappers over it. Degrades silently when Redis is unavailable: the
+subscribe yields ``None`` and ``publish_status_change`` is a no-op, so callers
 must keep their DB-poll path as a safety net.
 """
 
@@ -16,8 +19,9 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Awaitable, Callable, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional, Tuple
 
+import anyio
 import redis.asyncio as redis
 from redis.asyncio.connection import ConnectionPool
 
@@ -42,9 +46,6 @@ _pubsub_init_lock = asyncio.Lock()
 # broken URL doesn't cost a rebuild on every subscribe.
 _pubsub_retry_after = 0.0
 _POOL_RETRY_COOLDOWN_S = 30.0
-
-# Backoff after a broken-connection get_message so error paths don't busy-spin.
-_BROKEN_CONN_BACKOFF_S = 1.0
 
 
 async def _get_pubsub_client(cache: RedisCacheClient) -> Optional[redis.Redis]:
@@ -136,8 +137,13 @@ def status_channel(workspace_id: str) -> str:
     return f"ws:status:{workspace_id}"
 
 
-# Type of the `wait()` coroutine yielded by subscribe_to_status.
-WaitFn = Callable[[Optional[float]], Awaitable[Optional[dict]]]
+# ('message', payload) | ('timeout', None) | ('error', None)
+ChannelWaitFn = Callable[
+    [Optional[float]], Awaitable[Tuple[str, Optional[dict]]]
+]
+
+# Historical alias — subscribe_to_status yields the same tri-state wait fn.
+WaitFn = ChannelWaitFn
 
 
 async def publish_status_change(
@@ -167,17 +173,19 @@ async def publish_status_change(
 
 
 @asynccontextmanager
-async def subscribe_to_status(
-    workspace_id: str,
-) -> AsyncIterator[Optional[WaitFn]]:
-    """Subscribe to a workspace's status channel and yield a ``wait()`` coroutine.
+async def subscribe_to_channel(
+    channel: str,
+) -> AsyncIterator[Optional[ChannelWaitFn]]:
+    """Subscribe to *channel* on the dedicated pub/sub pool.
 
-    Yields ``None`` when Redis is disabled so callers fall back to DB
-    polling. When the channel is live, yields an async ``wait(timeout)``
-    that returns the next decoded payload dict (or ``None`` on timeout /
-    decode error). Subscribers MUST re-read the authoritative DB state
-    after subscribing — the channel may have published before our
-    SUBSCRIBE completed.
+    Yields ``None`` when Redis is disabled or the subscribe fails, so callers
+    fall back to their DB path. Otherwise yields ``wait(timeout)`` returning a
+    tri-state: ``('message', payload)``, ``('timeout', None)`` (quiet
+    interval — keepalive/reconcile tick), or ``('error', None)`` (broken
+    connection). ⚠️ ``('error', None)`` returns IMMEDIATELY, so a caller that
+    treats it as a timeout busy-spins: abandon the subscription and pace the
+    fallback. Subscribers MUST re-read the authoritative state after
+    subscribing — the channel may have published before SUBSCRIBE completed.
     """
     cache = get_cache_client()
     if not cache.enabled or not cache.client:
@@ -193,13 +201,11 @@ async def subscribe_to_status(
 
     pubsub = client.pubsub()
     try:
-        await pubsub.subscribe(status_channel(workspace_id))
+        await pubsub.subscribe(channel)
     except Exception as exc:
-        logger.debug(
-            "Failed to subscribe to status channel for %s: %s",
-            workspace_id,
-            exc,
-        )
+        # warning, not debug: this is where pool exhaustion surfaces, and it
+        # silently downgrades five subsystems to their DB-poll fallbacks.
+        logger.warning("Failed to subscribe to %s: %s", channel, exc)
         try:
             await pubsub.aclose()
         except Exception:
@@ -207,49 +213,61 @@ async def subscribe_to_status(
         yield None
         return
 
-    async def _wait(timeout: Optional[float] = None) -> Optional[dict]:
+    async def _wait(
+        timeout: Optional[float] = None,
+    ) -> Tuple[str, Optional[dict]]:
         try:
             msg = await pubsub.get_message(
                 ignore_subscribe_messages=True,
                 timeout=timeout,
             )
         except Exception as exc:
-            logger.debug("Pubsub get_message error for %s: %s", workspace_id, exc)
-            # On a broken connection get_message raises immediately instead of
-            # blocking for `timeout`; pace the error path so looping callers
-            # (the start-wait loop, the /events SSE handler) don't busy-spin
-            # DB reads until their deadline. Cap at the requested timeout so we
-            # never sleep longer than the caller asked to wait.
-            backoff = _BROKEN_CONN_BACKOFF_S if timeout is None else min(timeout, _BROKEN_CONN_BACKOFF_S)
-            await asyncio.sleep(backoff)
-            return None
+            logger.debug("Pubsub get_message error on %s: %s", channel, exc)
+            return ("error", None)
         if not msg or msg.get("type") != "message":
-            return None
+            return ("timeout", None)
         data = msg.get("data")
         if isinstance(data, bytes):
             try:
                 data = data.decode("utf-8")
             except UnicodeDecodeError:
-                return None
+                return ("timeout", None)
         try:
             payload = json.loads(data)
         except (json.JSONDecodeError, TypeError):
-            return None
-        return payload if isinstance(payload, dict) else None
+            return ("timeout", None)
+        if not isinstance(payload, dict):
+            return ("timeout", None)
+        return ("message", payload)
 
     try:
         yield _wait
     finally:
-        # Cancellation-safe teardown — unsubscribe then close, swallowing
-        # everything so a cancelled SSE generator doesn't leak warnings.
-        try:
-            await pubsub.unsubscribe(status_channel(workspace_id))
-        except Exception:
-            pass
-        try:
-            await pubsub.aclose()
-        except Exception:
-            pass
+        # Shielded teardown: this generator dies by CANCELLATION (client
+        # disconnect aborts the SSE task), and under an already-tripped anyio
+        # cancel scope every bare await re-raises CancelledError — which
+        # `except Exception` does NOT catch. aclose() is the only path that
+        # returns the connection to the pubsub pool, so an unshielded close
+        # leaks one pool slot per disconnect until MaxConnectionsError kills
+        # the pool for the process lifetime.
+        with anyio.CancelScope(shield=True):
+            try:
+                await pubsub.unsubscribe(channel)
+            except Exception:
+                pass
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
+
+
+@asynccontextmanager
+async def subscribe_to_status(
+    workspace_id: str,
+) -> AsyncIterator[Optional[ChannelWaitFn]]:
+    """Subscribe to a workspace's status channel (see subscribe_to_channel)."""
+    async with subscribe_to_channel(status_channel(workspace_id)) as wait:
+        yield wait
 
 
 async def wait_for_status_change(
@@ -259,11 +277,12 @@ async def wait_for_status_change(
 ) -> Optional[dict]:
     """Subscribe once and wait for a single status-change payload.
 
-    Returns the payload, or ``None`` if Redis is disabled or the
-    timeout elapses without a message. Convenience wrapper used by
-    callers that don't need a long-lived subscription.
+    Returns the payload, or ``None`` if Redis is disabled, the subscription
+    breaks, or the timeout elapses without a message. Convenience wrapper
+    used by callers that don't need a long-lived subscription.
     """
     async with subscribe_to_status(workspace_id) as wait:
         if wait is None:
             return None
-        return await wait(timeout)
+        _kind, payload = await wait(timeout)
+        return payload

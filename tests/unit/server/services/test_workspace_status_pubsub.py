@@ -2,7 +2,7 @@
 
 Focus on the contract callers depend on:
 - publish_status_change writes a JSON payload to the per-workspace channel
-- subscribe_to_status yields a wait() that returns decoded payloads
+- subscribe_to_channel/subscribe_to_status yield a tri-state wait()
 - Redis-disabled paths are no-ops / return None so callers fall back cleanly
 """
 
@@ -15,6 +15,7 @@ from src.server.services import workspace_status_pubsub
 from src.server.services.workspace_status_pubsub import (
     publish_status_change,
     status_channel,
+    subscribe_to_channel,
     subscribe_to_status,
     wait_for_status_change,
 )
@@ -215,8 +216,10 @@ async def test_subscribe_yields_wait_and_decodes_payload(monkeypatch):
 
     async with subscribe_to_status("ws-1") as wait:
         assert wait is not None
-        msg = await wait(0.1)
-        assert msg == {"workspace_id": "ws-1", "status": "running"}
+        assert await wait(0.1) == (
+            "message",
+            {"workspace_id": "ws-1", "status": "running"},
+        )
 
     # Cleanup happens in the contextmanager __aexit__.
     assert pubsub.subscribed == [status_channel("ws-1")]
@@ -234,11 +237,14 @@ async def test_subscribe_decodes_string_payload(monkeypatch):
     )
 
     async with subscribe_to_status("ws-1") as wait:
-        assert await wait(0.1) == {"workspace_id": "ws-1", "status": "error"}
+        assert await wait(0.1) == (
+            "message",
+            {"workspace_id": "ws-1", "status": "error"},
+        )
 
 
 @pytest.mark.asyncio
-async def test_subscribe_returns_none_for_non_message(monkeypatch):
+async def test_subscribe_returns_timeout_for_non_message(monkeypatch):
     pubsub = _FakePubsub([{"type": "subscribe", "data": 1}])
     _install_cache(
         monkeypatch,
@@ -246,11 +252,11 @@ async def test_subscribe_returns_none_for_non_message(monkeypatch):
     )
 
     async with subscribe_to_status("ws-1") as wait:
-        assert await wait(0.1) is None
+        assert await wait(0.1) == ("timeout", None)
 
 
 @pytest.mark.asyncio
-async def test_subscribe_returns_none_on_invalid_json(monkeypatch):
+async def test_subscribe_returns_timeout_on_invalid_json(monkeypatch):
     pubsub = _FakePubsub([{"type": "message", "data": "not-json"}])
     _install_cache(
         monkeypatch,
@@ -258,7 +264,7 @@ async def test_subscribe_returns_none_on_invalid_json(monkeypatch):
     )
 
     async with subscribe_to_status("ws-1") as wait:
-        assert await wait(0.1) is None
+        assert await wait(0.1) == ("timeout", None)
 
 
 @pytest.mark.asyncio
@@ -280,9 +286,12 @@ async def test_subscribe_yields_none_when_subscribe_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_wait_paces_on_get_message_error(monkeypatch):
-    """A broken pubsub connection (get_message raises) must return None AND
-    sleep, so looping callers don't busy-spin DB reads until their deadline."""
+async def test_wait_reports_error_without_pacing(monkeypatch):
+    """A broken pubsub connection (get_message raises) surfaces as ('error',
+    None) and returns immediately — the primitive does NOT sleep. Pacing is the
+    caller's job precisely because each one abandons differently: /events and
+    the feed resubscribe on their own cadence, the start-waiter degrades to its
+    backoff poll. A sleep here would silently double every caller's wait."""
 
     class _ErroringPubsub(_FakePubsub):
         async def get_message(self, ignore_subscribe_messages=True, timeout=None):
@@ -301,10 +310,28 @@ async def test_wait_paces_on_get_message_error(monkeypatch):
     monkeypatch.setattr(workspace_status_pubsub.asyncio, "sleep", _fake_sleep)
 
     async with subscribe_to_status("ws-1") as wait:
-        assert await wait(0.1) is None
+        assert await wait(0.1) == ("error", None)
 
-    # Floored at the caller's timeout (capped at 1.0s).
-    assert slept == [0.1]
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_subscribe_to_channel_is_the_shared_primitive(monkeypatch):
+    """Both domain wrappers ride one subscription contract, so a fix to the
+    tri-state / teardown can't land on only half the callers."""
+    payload = json.dumps({"hello": "world"})
+    pubsub = _FakePubsub([{"type": "message", "data": payload.encode()}])
+    _install_cache(
+        monkeypatch,
+        _FakeCache(enabled=True, client=_FakeRedisClient(pubsub_obj=pubsub)),
+    )
+
+    async with subscribe_to_channel("user:events:u-1") as wait:
+        assert await wait(0.1) == ("message", {"hello": "world"})
+
+    assert pubsub.subscribed == ["user:events:u-1"]
+    assert pubsub.unsubscribed == ["user:events:u-1"]
+    assert pubsub.closed is True
 
 
 @pytest.mark.asyncio

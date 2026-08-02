@@ -214,6 +214,19 @@ class ChatMessage(BaseModel):
 # =============================================================================
 
 
+class ThreadOrigin(BaseModel):
+    """Who initiated a thread — stored under the thread's metadata['origin'].
+
+    'agent' = spawned by another agent (id = dispatching flash thread id),
+    'automation' = scheduled/triggered run (id = automation id), 'system' =
+    reserved for platform-initiated threads. User-initiated threads carry no
+    origin at all rather than an explicit 'user' entry.
+    """
+
+    type: Literal["agent", "automation", "system"]
+    id: Optional[str] = Field(default=None, max_length=100)
+
+
 class ChatRequest(BaseModel):
     """Request model for streaming chat endpoint."""
 
@@ -399,9 +412,18 @@ class ChatRequest(BaseModel):
         default=None,
         pattern=r"^[a-z_]+(:[A-Z0-9][A-Z0-9.-]*)?$",
         max_length=50,
-        description="Origin/platform identifier. Examples: 'web', "
+        description="Surface the chat originated from. Examples: 'web', "
         "'market_view:AAPL', 'market_view:002851.SZ', 'telegram', 'slack', "
-        "'discord', 'feishu'.",
+        "'discord', 'feishu'. Absent for system-initiated threads (see origin).",
+    )
+    # Orthogonal to platform: platform = which user surface, origin = who
+    # initiated. Absent origin = user-initiated (the common case is never
+    # written). Only affects the caller's own thread labeling, so it is
+    # accepted from any client without gating.
+    origin: Optional["ThreadOrigin"] = Field(
+        default=None,
+        description="Thread initiator provenance, recorded at thread creation "
+        "(ignored for existing threads). Absent = user-initiated.",
     )
 
 

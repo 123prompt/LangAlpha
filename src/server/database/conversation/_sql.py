@@ -1,5 +1,17 @@
 """Shared SQL fragments for conversation_responses readers."""
 
+
+def sql_literals(statuses: tuple) -> str:
+    """Render a status vocabulary as a SQL IN-list.
+
+    The tuples come from ``contracts.status`` — every status IN-filter in this
+    package must build from those constants through here, never a hand-typed
+    list, so the SQL cannot drift from the Python classification. Nothing
+    user-supplied reaches this, and binding as parameters would cost the
+    planner the constant folding that keeps the branch filters index-friendly.
+    """
+    return ", ".join(f"'{s}'" for s in statuses)
+
 _RESPONSE_COLUMNS = (
     "conversation_response_id, conversation_thread_id, turn_index, status, "
     "interrupt_reason, metadata, warnings, errors, execution_time, created_at, "
