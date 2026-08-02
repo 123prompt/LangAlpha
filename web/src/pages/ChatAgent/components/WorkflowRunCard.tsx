@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useContext } from 'react';
 import { useTranslation } from 'react-i18next';
 import { compactNumber } from '@/lib/format';
 import {
@@ -7,7 +7,7 @@ import {
   workflowRunDisplayStatus,
   type WorkflowRunState,
 } from '../session/subagents/workflowRunState';
-import { useWorkflowRun } from './WorkflowRunContext';
+import { WorkflowRunContext } from './WorkflowRunContext';
 import TaskCardShell from './TaskCardShell';
 import { WorkflowChildRow, summarizeRun } from './workflowRunUi';
 
@@ -47,8 +47,15 @@ function WorkflowRunCard({
   workflowRun: workflowRunProp,
 }: WorkflowRunCardProps): React.ReactElement | null {
   const { t } = useTranslation();
-  const ctxRun = useWorkflowRun(subagentId);
+  // Raw context, not useWorkflowRun: the hook collapses "no provider mounted"
+  // and "run not (yet) hydrated" into one undefined, but the card must tell
+  // them apart — provider absence is a *surface* property (shared links mount
+  // no workflow state), while an authed view is merely pre-hydration and must
+  // not flash an unavailability note.
+  const resolver = useContext(WorkflowRunContext);
+  const ctxRun = resolver && subagentId ? resolver(subagentId) : undefined;
   const run = workflowRunProp ?? ctxRun;
+  const detailUnavailable = resolver === null && !workflowRunProp;
 
   if (!subagentId && !description && !run) return null;
 
@@ -94,10 +101,23 @@ function WorkflowRunCard({
       eyebrow={`${WORKFLOW_TASK_TYPE}${run?.name ? ` · ${run.name}` : ''}`}
       statusKind={kind}
       title={title}
-      hint={t(isRunning ? 'chat.workflowRun.openRunning' : 'chat.workflowRun.openDetails')}
-      onOpen={handleOpen}
+      hint={onOpen ? t(isRunning ? 'chat.workflowRun.openRunning' : 'chat.workflowRun.openDetails') : undefined}
+      onOpen={onOpen ? handleOpen : undefined}
       footer={metaParts.length > 0 ? <span data-testid="workflow-meta-band">{metaParts.join(' · ')}</span> : null}
     >
+      {detailUnavailable && (
+        <div
+          data-testid="workflow-detail-unavailable"
+          style={{
+            marginTop: 8,
+            fontSize: '0.6875rem',
+            color: 'var(--color-text-tertiary)',
+            letterSpacing: '0.02em',
+          }}
+        >
+          {t('chat.workflowRun.sharedUnavailable')}
+        </div>
+      )}
       {(run?.phases.length ?? 0) > 0 && (
         <div
           data-testid="workflow-phase-rail"
@@ -108,7 +128,7 @@ function WorkflowRunCard({
             columnGap: 8,
             rowGap: 2,
             marginTop: 8,
-            fontSize: 11,
+            fontSize: '0.6875rem',
             letterSpacing: '0.02em',
           }}
         >
@@ -143,7 +163,7 @@ function WorkflowRunCard({
       {children.length > 0 && (
         <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 4 }}>
           {hiddenCount > 0 && (
-            <div style={{ fontSize: 11, color: 'var(--color-text-quaternary)' }}>
+            <div style={{ fontSize: '0.6875rem', color: 'var(--color-text-quaternary)' }}>
               {t('chat.workflowRun.earlier', { count: hiddenCount })}
             </div>
           )}
@@ -158,7 +178,7 @@ function WorkflowRunCard({
           data-testid="workflow-latest-log"
           style={{
             marginTop: 8,
-            fontSize: 11,
+            fontSize: '0.6875rem',
             color: 'var(--color-text-tertiary)',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
@@ -173,8 +193,8 @@ function WorkflowRunCard({
         <div
           style={{
             marginTop: 8,
-            fontSize: 11,
-            color: 'var(--color-loss)',
+            fontSize: '0.6875rem',
+            color: 'var(--color-icon-danger)',
             display: '-webkit-box',
             WebkitLineClamp: 2,
             WebkitBoxOrient: 'vertical',

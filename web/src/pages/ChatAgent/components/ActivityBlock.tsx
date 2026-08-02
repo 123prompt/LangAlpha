@@ -324,7 +324,7 @@ const ActivityBlock = memo(function ActivityBlock({ items, preparingToolCall, is
               style={{
                 paddingTop: '5px',
                 paddingBottom: '5px',
-                fontSize: '13px',
+                fontSize: '0.8125rem',
                 color: 'var(--Labels-Tertiary)',
               }}
             >
@@ -419,13 +419,13 @@ const ActivityBlock = memo(function ActivityBlock({ items, preparingToolCall, is
                     >
                       <div
                         className="flex items-center gap-2 mb-1"
-                        style={{ fontSize: '13px', color: 'var(--Labels-Secondary)' }}
+                        style={{ fontSize: '0.8125rem', color: 'var(--Labels-Secondary)' }}
                       >
                         <Brain className="h-4 w-4 flex-shrink-0" />
                         {item._liveState === 'active' ? (
                           <TextShimmer
                             as="span"
-                            className="font-medium truncate text-[13px] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)]"
+                            className="font-medium truncate text-[0.8125rem] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)]"
                             duration={1.5}
                           >
                             {effectiveTitle || t('toolArtifact.reasoningPending')}
@@ -578,7 +578,7 @@ const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: ToolCal
       className={`nrow ${stateClass} flex items-center gap-2 pl-3 pr-3 py-1.5`}
       animate={{ opacity: isInProgress ? 1 : 0.7, y: isInProgress ? 0 : 1 }}
       transition={{ duration: 0.25, ease: 'easeOut' }}
-      style={{ fontSize: '13px', color: 'var(--Labels-Secondary)' }}
+      style={{ fontSize: '0.8125rem', color: 'var(--Labels-Secondary)' }}
     >
       <div className="relative flex-shrink-0 flex items-center justify-center h-5 w-5">
         <motion.span
@@ -606,7 +606,7 @@ const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: ToolCal
       {isInProgress ? (
         <TextShimmer
           as="span"
-          className="font-medium text-[13px] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)] truncate"
+          className="font-medium text-[0.8125rem] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)] truncate"
           duration={1.5}
         >
           {activeLabel || ''}
@@ -641,7 +641,7 @@ function PreparingToolCallRow({ tc }: PreparingToolCallRowProps): React.ReactEle
     <div
       className="nrow flex items-center gap-2 pl-3 pr-3"
       style={{
-        fontSize: '13px',
+        fontSize: '0.8125rem',
         color: 'var(--Labels-Secondary)',
         padding: '6px 12px',
         opacity: 0.85,
@@ -936,7 +936,7 @@ const EditToolRow = memo(function EditToolRow({ item, onOpenFile }: EditToolRowP
               transition={SPRING}
               style={{ overflow: 'hidden' }}
             >
-              <div className="mt-2 rounded overflow-hidden" style={{ fontSize: '12px', border: '1px solid var(--color-border-muted)' }}>
+              <div className="mt-2 rounded overflow-hidden" style={{ fontSize: '0.75rem', border: '1px solid var(--color-border-muted)' }}>
                 {oldStr && (
                   <div style={{ backgroundColor: 'var(--color-loss-soft)' }}>
                     {oldStr.split('\n').map((line, i) => (

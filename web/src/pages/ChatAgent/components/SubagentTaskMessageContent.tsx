@@ -120,14 +120,18 @@ function SubagentTaskMessageContent({
       statusKind={statusKind}
       rawStatus={status}
       title={summarize(description) || t('chat.subagentCard.titleFallback')}
-      hint={t(
-        action === 'update' ? 'chat.subagentCard.openUpdated'
-        : action === 'resume' ? 'chat.subagentCard.openResumed'
-        : isRunning ? 'chat.subagentCard.openRunning'
-        : 'chat.subagentCard.openDetails'
-      )}
-      onOpen={handleOpen}
-      affordance={hasResult ? (
+      hint={
+        onOpen
+          ? t(
+              action === 'update' ? 'chat.subagentCard.openUpdated'
+              : action === 'resume' ? 'chat.subagentCard.openResumed'
+              : isRunning ? 'chat.subagentCard.openRunning'
+              : 'chat.subagentCard.openDetails'
+            )
+          : undefined
+      }
+      onOpen={onOpen ? handleOpen : undefined}
+      affordance={hasResult && onDetailOpen ? (
         <button
           type="button"
           aria-label={t('chat.subagentCard.viewOutput')}
@@ -154,7 +158,7 @@ function SubagentTaskMessageContent({
             display: 'flex',
             gap: 8,
             marginTop: 8,
-            fontSize: 11,
+            fontSize: '0.6875rem',
             color: 'var(--color-text-tertiary)',
             fontFamily: MONO_STACK,
             letterSpacing: '0.02em',

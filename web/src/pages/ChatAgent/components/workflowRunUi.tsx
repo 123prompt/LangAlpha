@@ -1,15 +1,16 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  AlertCircle, Check, ChevronRight, Loader2, StopCircle, type LucideIcon,
+  AlertCircle, Check, ChevronRight, StopCircle, type LucideIcon,
 } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import type {
   WorkflowChild, WorkflowChildStatus, WorkflowRunState,
 } from '../session/subagents/workflowRunState';
 
 /** The uppercase hairline label above every band in the run detail. */
 export const SECTION_LABEL_STYLE: React.CSSProperties = {
-  fontSize: 11,
+  fontSize: '0.6875rem',
   color: 'var(--color-text-quaternary)',
   letterSpacing: '0.05em',
   textTransform: 'uppercase',
@@ -36,13 +37,12 @@ export function formatRunDuration(seconds: number | null | undefined): string | 
  */
 const WORKFLOW_CHILD_UI: Record<
   WorkflowChildStatus,
-  { labelKey: string; color: string; Icon: LucideIcon; spin?: boolean }
+  { labelKey: string; color: string; Icon?: LucideIcon; live?: boolean }
 > = {
   running: {
     labelKey: 'chat.workflowRun.childRunning',
     color: 'var(--color-warning)',
-    Icon: Loader2,
-    spin: true,
+    live: true,
   },
   ok: { labelKey: 'chat.workflowRun.childDone', color: 'var(--color-success)', Icon: Check },
   invalid_schema: {
@@ -57,10 +57,10 @@ const WORKFLOW_CHILD_UI: Record<
   },
   timeout: {
     labelKey: 'chat.workflowRun.childTimedOut',
-    color: 'var(--color-loss)',
+    color: 'var(--color-icon-danger)',
     Icon: AlertCircle,
   },
-  error: { labelKey: 'chat.workflowRun.childFailed', color: 'var(--color-loss)', Icon: AlertCircle },
+  error: { labelKey: 'chat.workflowRun.childFailed', color: 'var(--color-icon-danger)', Icon: AlertCircle },
 };
 
 /** i18n key for a child's status word — the row label and the icon's name. */
@@ -86,6 +86,16 @@ export function WorkflowChildStatusIcon({
   const { t } = useTranslation();
   const ui = WORKFLOW_CHILD_UI[status] ?? WORKFLOW_CHILD_UI.error;
   const { Icon } = ui;
+  if (ui.live || !Icon) {
+    // Shared liveness glyph (nav tree, task cards): ascii spinner, amber.
+    return (
+      <Loader
+        size={size}
+        label={t(workflowChildLabelKey(status))}
+        style={{ color: ui.color, flexShrink: 0 }}
+      />
+    );
+  }
   return (
     <Icon
       aria-label={t(workflowChildLabelKey(status))}
@@ -94,7 +104,6 @@ export function WorkflowChildStatusIcon({
         height: size,
         flexShrink: 0,
         color: ui.color,
-        animation: ui.spin ? 'spin 1s linear infinite' : undefined,
       }}
     />
   );
@@ -127,7 +136,7 @@ interface ChildRowSurfaceUi {
   iconSize: number;
   labelColor: string;
   /** Set only where a cell's size differs from the row's own. */
-  cellFontSize?: number;
+  cellFontSize?: string;
   durationMinWidth: number;
   /** The inline card drops an unknown dispatch type; the detail keeps the
    *  column so every row's trailing cells stay on the same rails. */
@@ -143,7 +152,7 @@ interface ChildRowSurfaceUi {
 const CHILD_ROW_UI: Record<WorkflowChildRowSurface, ChildRowSurfaceUi> = {
   card: {
     testId: 'workflow-child-row',
-    row: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, minWidth: 0 },
+    row: { display: 'flex', alignItems: 'center', gap: 8, fontSize: '0.6875rem', minWidth: 0 },
     iconSize: 11,
     labelColor: 'var(--color-text-secondary)',
     durationMinWidth: 42,
@@ -159,13 +168,13 @@ const CHILD_ROW_UI: Record<WorkflowChildRowSurface, ChildRowSurfaceUi> = {
       padding: '6px 8px',
       margin: '0 -8px',
       borderRadius: 6,
-      fontSize: 12,
+      fontSize: '0.75rem',
       minWidth: 0,
       cursor: 'default',
     },
     iconSize: 12,
     labelColor: 'var(--color-text-primary)',
-    cellFontSize: 11,
+    cellFontSize: '0.6875rem',
     durationMinWidth: 64,
     alwaysShowType: true,
     namesStatusWhenUnfinished: true,
