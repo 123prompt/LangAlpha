@@ -202,6 +202,7 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onUpgr
     >
       <div
         className="relative group h-full"
+        data-testid="workspace-card"
         onMouseEnter={!isMobile ? () => prefetchThreads?.(workspace.workspace_id) : undefined}
       >
         <div

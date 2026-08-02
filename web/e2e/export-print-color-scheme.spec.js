@@ -107,10 +107,10 @@ test.describe('PDF export — print color-scheme', () => {
   });
 
   test('scheme and background travel together, or the fallback is unreadable', async ({ page }) => {
-    // index.html's `html { background: #000 }` is on the un-failable inlined
+    // index.html's `html { background: #191919 }` is on the un-failable inlined
     // path, so if only the scheme ships here a missing chunk yields the dark
-    // background with light-scheme black text — black on black. Shipping the
-    // white background alongside it keeps the failure legible.
+    // background with light-scheme black text — black on near-black. Shipping
+    // the white background alongside it keeps the failure legible.
     const { colorScheme, background } = await rootStylesInPrint(
       page,
       printDocument({ pageStyle: PRINT_PAGE_STYLE }),
@@ -131,9 +131,9 @@ test.describe('PDF export — print color-scheme', () => {
       printDocument({ pageStyle: schemeOnly }),
     );
     expect(colorScheme).toBe('light');
-    // index.html's black survives on the un-failable inlined path, and a light
-    // scheme paints the UA's default text black on top of it.
-    expect(background).toBe('rgb(0, 0, 0)');
+    // index.html's dark charcoal (#191919) survives on the un-failable inlined
+    // path, and a light scheme paints the UA's default text black on top of it.
+    expect(background).toBe('rgb(25, 25, 25)');
   });
 
   test('the page stays legible when only the lazy chunk is missing', async ({ page }) => {
@@ -230,6 +230,7 @@ test.describe('PDF export — print color-scheme', () => {
     const SAFE_UNPINNED = {
       '--color-accent-primary': 'dark value #4161A4 — mid blue, legible on white',
       '--color-accent-overlay': 'rgba(75,107,174,.5) — blockquote rule, visible on white',
+      '--color-border-elevated': 'dark value #34363A — dark grey border/rule (luminance ~54 vs 255), visible on white',
     };
     const used = new Set(
       [...read('src/pages/ChatAgent/components/Markdown.tsx').matchAll(/var\((--color-[a-z0-9-]+)\)/g)]
