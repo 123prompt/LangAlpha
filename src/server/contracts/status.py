@@ -12,18 +12,18 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+# The public vocabulary is a PARTITION, not a list: every status is live
+# (still owed to the user), terminal (settled), or one of the two singletons —
+# `interrupted` (awaits input) and `idle` (the no-run placeholder).
+# PUBLIC_STATUSES derives from the families below, so adding a status forces
+# choosing its family. The frontend mirrors these two sets by hand in
+# web/src/lib/threadLifecycle/store.ts (LIVE_STATUSES / TERMINAL_FAMILY) —
+# change here first, then the mirror.
+LIVE_PUBLIC_STATUSES = ("queued", "running", "stopping", "recovering")
+TERMINAL_PUBLIC_STATUSES = ("completed", "failed", "cancelled")
+
 PUBLIC_STATUSES = frozenset(
-    {
-        "idle",
-        "queued",
-        "running",
-        "stopping",
-        "recovering",
-        "completed",
-        "interrupted",
-        "failed",
-        "cancelled",
-    }
+    {"idle", "interrupted", *LIVE_PUBLIC_STATUSES, *TERMINAL_PUBLIC_STATUSES}
 )
 
 # The one internal terminal set — both run ledgers (runs/lifecycle,
@@ -42,6 +42,15 @@ TERMINAL_STATUSES = ("completed", "interrupted", "error", "cancelled")
 # admits any terminal status, because reporting a stop to the agent is a
 # delivery too (it is what keeps the sweep from re-announcing the task).
 REPORT_BACK_STATUSES = ("completed", "error")
+
+# Run-row spellings, for SQL that must classify without calling `to_public`.
+# ⚠️ Run rows persist `error`; `failed` exists only downstream of `to_public`
+# (migration CHECK, 001_initial_schema.py:341), so a NOT-IN filter over the
+# public vocabulary would leave every errored run classified live forever.
+# `interrupted` is live-LIKE here — it awaits the user, so the feed's live
+# branch owns it and the terminal branch must not.
+RAW_LIVE_STATUSES = ("in_progress", "interrupted")
+RAW_TERMINAL_SNAPSHOT_STATUSES = ("completed", "error", "cancelled")
 
 # Live-run internal spellings, refined by durable intent/liveness below.
 _LIVE = ("in_progress", "active")
