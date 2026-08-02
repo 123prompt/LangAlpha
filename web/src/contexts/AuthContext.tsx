@@ -6,7 +6,8 @@ import { queryKeys } from '../lib/queryKeys';
 import { AUTH_BROADCAST_CHANNEL, OAUTH_POPUP_WINDOW_NAME, OAUTH_POPUP_FEATURES } from '../lib/oauthPopup';
 import { clearFlashWorkspaceCache } from '@/pages/MarketView/utils/flashWorkspace';
 import { resetNavPanelExpansion } from '@/pages/ChatAgent/components/navExpansionStore';
-import { resetStableNavOrder, resetSharedWorkspaceThreads } from '@/pages/ChatAgent/hooks/useNavigationData';
+import { resetStableNavOrder } from '@/pages/ChatAgent/hooks/useNavigationData';
+import { resetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { runAuthResets } from '../lib/authResets';
 
 import type {

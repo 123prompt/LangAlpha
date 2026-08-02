@@ -41,6 +41,11 @@ export const queryKeys = {
   threads: {
     all:         ['threads'],
     byWorkspace: (wsId: string) => [...queryKeys.threads.all, 'workspace', wsId],
+    // ThreadGallery's infinite list. Deliberately UNDER the byWorkspace prefix
+    // so the lifecycle feed's prefix invalidation and the gallery's own
+    // self-invalidations keep reaching it; the suffix keeps it distinct from
+    // the sidebar's finite page entries, which cannot hold InfiniteData.
+    gallery:     (wsId: string, archived: boolean) => [...queryKeys.threads.byWorkspace(wsId), { view: 'gallery', archived }],
     detail:      (threadId: string) => [...queryKeys.threads.all, 'detail', threadId],
     recent:      (limit: number) => [...queryKeys.threads.all, 'recent', limit],
     status:      (threadId: string) => [...queryKeys.threads.all, 'status', threadId],
