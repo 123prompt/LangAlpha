@@ -223,7 +223,7 @@ async def update_thread_external_id(
                     UPDATE conversation_threads
                     SET platform = %s, external_id = %s, updated_at = NOW()
                     WHERE conversation_thread_id = %s
-                    RETURNING conversation_thread_id, workspace_id, current_status, msg_type, thread_index, title, platform, metadata, is_pinned, archived_at, created_at, updated_at
+                    RETURNING conversation_thread_id, workspace_id, current_status, msg_type, thread_index, title, platform, metadata, is_shared, is_pinned, archived_at, created_at, updated_at
                 """,
                     (platform, external_id, thread_id),
                 )
@@ -664,7 +664,7 @@ async def update_thread_fields(
                     UPDATE conversation_threads
                     SET {", ".join(sets)}
                     WHERE conversation_thread_id = %s
-                    RETURNING conversation_thread_id, workspace_id, current_status, msg_type, thread_index, title, platform, metadata, is_pinned, archived_at, last_seen_run_seq, created_at, updated_at
+                    RETURNING conversation_thread_id, workspace_id, current_status, msg_type, thread_index, title, platform, metadata, is_shared, is_pinned, archived_at, last_seen_run_seq, created_at, updated_at
                 """,
                     (*params, conversation_thread_id),
                 )

@@ -126,7 +126,7 @@ function scheduleInvalidate(workspaceId?: string | null): void {
     for (const ws of workspaces) {
       void qc.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(ws) });
     }
-    void qc.invalidateQueries({ queryKey: [...queryKeys.threads.all, 'recent'] });
+    void qc.invalidateQueries({ queryKey: queryKeys.threads.recentAll() });
   }, INVALIDATE_DEBOUNCE_MS);
 }
 
@@ -163,6 +163,7 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     workspace_id?: string | null;
     run_id?: string | null;
     title?: string | null;
+    updated_at?: string | null;
   };
   switch (evt.type) {
     case 'run_started':
@@ -184,7 +185,9 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     case 'thread_title': {
       const qc = getLifecycleQueryClient();
       if (qc && evt.thread_id && evt.title) {
-        patchThreadTitle(qc, evt.thread_id, evt.title);
+        // updated_at versions the event: a delayed generated-title event must
+        // not overwrite a manual rename that already landed in the cache.
+        patchThreadTitle(qc, evt.thread_id, evt.title, evt.updated_at ?? undefined);
       }
       return;
     }

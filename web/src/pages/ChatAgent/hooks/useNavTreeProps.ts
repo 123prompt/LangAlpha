@@ -84,25 +84,30 @@ export function useNavTreeProps({
   // Archiving the thread being viewed must not strand ChatView on a row that
   // just left the nav: mount the adjacent thread in the tree's visible order
   // (the row after, else the one before), or the workspace home when it was
-  // the workspace's last one.
-  const onArchiveThread = useCallback((wsId: string, threadId: string) => {
-    if (threadId === currentThreadId) {
+  // the workspace's last one. The target is computed BEFORE the await (the
+  // optimistic patch removes the row) and navigation waits for the server —
+  // a failed archive rolls back and must leave the user where they are.
+  const onArchiveThread = useCallback(async (wsId: string, threadId: string) => {
+    const isCurrent = threadId === currentThreadId;
+    let next;
+    if (isCurrent) {
       const rows = workspaceThreads[wsId]?.threads || [];
       const idx = rows.findIndex((th) => th.thread_id === threadId);
-      const next = idx >= 0 ? rows[idx + 1] ?? rows[idx - 1] : undefined;
-      if (next) {
-        onNavigateThread(wsId, next.thread_id);
-      } else {
-        const ws = findWorkspace(wsId);
-        navigate(`/chat/${wsId}`, {
-          state: {
-            workspaceName: ws?.name || fallbackWorkspaceName || '',
-            workspaceStatus: ws?.status || null,
-          },
-        });
-      }
+      next = idx >= 0 ? rows[idx + 1] ?? rows[idx - 1] : undefined;
     }
-    return archiveThread(wsId, threadId);
+    const ok = await archiveThread(wsId, threadId);
+    if (!ok || !isCurrent) return;
+    if (next) {
+      onNavigateThread(wsId, next.thread_id);
+    } else {
+      const ws = findWorkspace(wsId);
+      navigate(`/chat/${wsId}`, {
+        state: {
+          workspaceName: ws?.name || fallbackWorkspaceName || '',
+          workspaceStatus: ws?.status || null,
+        },
+      });
+    }
   }, [currentThreadId, workspaceThreads, onNavigateThread, findWorkspace, navigate, fallbackWorkspaceName, archiveThread]);
 
   return useMemo(() => ({

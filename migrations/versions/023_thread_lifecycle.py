@@ -85,9 +85,15 @@ def upgrade() -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS uq_responses_run_seq
         ON conversation_responses (run_seq)
     """)
+    # Covering index: the latest-attempt LATERAL (list rows + the feed
+    # snapshot's owned CTE) reads exactly these five payload columns for the
+    # top-run_seq row per thread; INCLUDE lets that read stay index-only
+    # instead of one heap fetch per owned thread per snapshot.
     op.execute("""
         CREATE INDEX IF NOT EXISTS ix_responses_thread_run_seq
         ON conversation_responses (conversation_thread_id, run_seq DESC)
+        INCLUDE (conversation_response_id, status, cancel_requested_at,
+                 interrupt_reason, created_at)
     """)
     # (thread_id, run_seq DESC) serves every predicate the 001 single-column
     # index served — keeping both just taxes the hottest write path.

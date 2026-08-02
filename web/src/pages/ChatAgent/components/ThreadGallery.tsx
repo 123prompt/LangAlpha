@@ -174,7 +174,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   }, []);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  useScrollMemory(scrollContainerRef, `threads:${workspaceId}`);
+  // Keyed per view: the active and archived lists have unrelated heights, so
+  // a saved offset from one must not restore into the other.
+  useScrollMemory(scrollContainerRef, `threads:${workspaceId}:${showArchived ? 'archived' : 'active'}`);
   // Sentinel below the last card: intersecting it (within rootMargin) pulls the
   // next page. Also covers the short-list case a scroll listener can't — with
   // no overflow the sentinel is simply already on screen.
@@ -410,8 +412,14 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
       const updatedThread = await updateThreadTitle(threadId, newTitle) as ThreadRecord;
 
       // Same writer the lifecycle feed uses for generated titles — every cached
-      // list holding the row, plus its detail entry.
-      patchThreadTitle(queryClient, threadId, (updatedThread.title as string | undefined) ?? newTitle);
+      // list holding the row, plus its detail entry. The response's updated_at
+      // versions the patch so a slower generated-title event can't undo it.
+      patchThreadTitle(
+        queryClient,
+        threadId,
+        (updatedThread.title as string | undefined) ?? newTitle,
+        updatedThread.updated_at as string | undefined,
+      );
       queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(workspaceId) });
 
       // Close modal
@@ -763,13 +771,18 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                         }}
                         style={{ overflow: 'hidden' }}
                       >
+                        {/* Archive affordances derive from the ROW, not the
+                            view toggle: while isPlaceholderData shows the
+                            previous view's rows the toggle has already
+                            flipped, so the view flag would offer Archive on
+                            an archived row. */}
                         <ThreadCard
                           thread={thread}
                           onClick={handleThreadClick}
                           onDelete={handleDeleteClick}
                           onRename={handleRenameClick}
-                          onArchive={!showArchived ? handleArchive : undefined}
-                          onUnarchive={showArchived ? handleUnarchive : undefined}
+                          onArchive={!thread.archived_at ? handleArchive : undefined}
+                          onUnarchive={thread.archived_at ? handleUnarchive : undefined}
                         />
                       </motion.div>
                     ))}

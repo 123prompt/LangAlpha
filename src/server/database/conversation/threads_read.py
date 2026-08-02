@@ -455,9 +455,9 @@ async def get_thread_by_id(conversation_thread_id: str) -> Optional[Dict[str, An
                 await cur.execute(
                     """
                     SELECT conversation_thread_id, workspace_id, current_status,
-                           msg_type, thread_index, title, metadata,
+                           msg_type, thread_index, title, platform, metadata,
                            share_token, is_shared, share_permissions, shared_at,
-                           created_at, updated_at
+                           is_pinned, archived_at, created_at, updated_at
                     FROM conversation_threads
                     WHERE conversation_thread_id = %s
                 """,

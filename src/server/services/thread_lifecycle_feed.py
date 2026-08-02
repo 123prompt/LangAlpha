@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, AsyncIterator, Dict, Optional
 
 from src.server.services.thread_lifecycle import interrupt_reason_for
@@ -43,6 +44,7 @@ def build_lifecycle_event(
     status: Optional[str] = None,
     interrupt_reason: Optional[str] = None,
     title: Optional[str] = None,
+    updated_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The one wire shape (plan v6 §2.2). ``status`` is PUBLIC vocabulary."""
     event: Dict[str, Any] = {
@@ -57,6 +59,8 @@ def build_lifecycle_event(
     }
     if title is not None:
         event["title"] = title
+    if updated_at is not None:
+        event["updated_at"] = updated_at
     return event
 
 
@@ -117,7 +121,13 @@ async def publish_thread_title(
     thread_id: str,
     workspace_id: Optional[str],
     title: str,
+    updated_at: Optional[datetime | str] = None,
 ) -> None:
+    """``updated_at`` is the title write's row timestamp — the event's version.
+
+    Clients drop a title event not newer than their cached row, so a delayed
+    generated-title event can't overwrite a manual rename that beat it.
+    """
     await publish_user_event(
         user_id,
         build_lifecycle_event(
@@ -125,6 +135,11 @@ async def publish_thread_title(
             thread_id=thread_id,
             workspace_id=workspace_id,
             title=title,
+            updated_at=(
+                updated_at.isoformat()
+                if isinstance(updated_at, datetime)
+                else updated_at
+            ),
         ),
     )
 
@@ -200,6 +215,14 @@ async def _exec_user_feed(job: Dict[str, Any]) -> None:
     user_id = payload.get("user_id")
     thread_id = payload.get("thread_id") or job.get("conversation_thread_id")
     if not user_id or not thread_id:
+        # Malformed payload: ack (retrying can't repair it) — but leave a
+        # trace, or enqueue-site bugs surface only as silently missing events.
+        logger.warning(
+            "user_feed outbox job missing user_id/thread_id — dropping "
+            "(job=%s run_id=%s)",
+            job.get("hook_outbox_id"),
+            payload.get("run_id") or job.get("run_id"),
+        )
         return
     await publish_user_event_strict(
         user_id,

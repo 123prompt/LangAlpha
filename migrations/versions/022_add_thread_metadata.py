@@ -32,6 +32,14 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Fail fast instead of queueing the cluster: the DROP TRIGGER below takes
+    # the FIRST ACCESS EXCLUSIVE lock of the 022→024 batch (alembic runs them
+    # in one transaction, so this session-level SET covers all three; 023
+    # repeats it for standalone re-runs from a stamped DB). Without it, one
+    # long reader parks this lock request and every later query queues behind
+    # it for the full batch duration.
+    op.execute("SET lock_timeout = '5s'")
+
     # Must precede every backfill UPDATE in 022/023: the BEFORE UPDATE trigger
     # would overwrite NEW.updated_at after any SET clause, so preserving the
     # column in the UPDATE itself is not possible.

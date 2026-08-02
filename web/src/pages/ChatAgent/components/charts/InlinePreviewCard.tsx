@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import { relativeTime } from '@/lib/format';
 import { Globe, ExternalLink } from 'lucide-react';
 import { useWorkspaceId } from '../../contexts/WorkspaceContext';
@@ -29,6 +30,7 @@ interface InlinePreviewCardProps {
 
 
 export function InlinePreviewCard({ artifact, onClick }: InlinePreviewCardProps): React.ReactElement | null {
+  useTranslation(); // relativeTime is locale-keyed — re-render on locale switch
   const workspaceId = useWorkspaceId();
   const [health, setHealth] = useState<{ reachable: boolean; checkedAt: number; sandboxStopped?: boolean } | null>(null);
   const [, setTick] = useState(0); // force re-render for "X min ago" updates

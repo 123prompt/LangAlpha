@@ -25,6 +25,9 @@ export interface EnsureThreadIdArgs {
   /** Re-checked after the round-trip — a stop during pre-create already
    *  finalized the UI, so starting the run would resurrect it. */
   wasStoppedRef: { current: boolean };
+  /** The send's abort signal — stopWorkflow aborts it, so it catches a stop
+   *  even when a subsequent send has already reset wasStoppedRef. */
+  signal: AbortSignal;
 }
 
 export interface EnsureThreadIdResult {
@@ -43,6 +46,7 @@ export async function ensureThreadId({
   threadIdRef,
   setThreadId,
   wasStoppedRef,
+  signal,
 }: EnsureThreadIdArgs): Promise<EnsureThreadIdResult> {
   if (threadId && threadId !== '__default__') return { threadId, aborted: false };
 
@@ -57,7 +61,7 @@ export async function ensureThreadId({
     // Stop landed during the round-trip: adopting the id now (navigate,
     // optimistic row, nav bump) would resurrect the UI the stop finalized.
     // The durable row is harmless — it surfaces on the next list refetch.
-    if (wasStoppedRef.current) return { threadId, aborted: true };
+    if (signal.aborted || wasStoppedRef.current) return { threadId, aborted: true };
     effectiveThreadId = created.thread_id;
     threadIdRef.current = created.thread_id;
     // Same flip the first SSE frame performs on the legacy path — drives
@@ -79,5 +83,5 @@ export async function ensureThreadId({
   } catch (e) {
     console.warn('[Send] thread pre-create failed; using legacy new-thread flow', e);
   }
-  return { threadId: effectiveThreadId, aborted: wasStoppedRef.current };
+  return { threadId: effectiveThreadId, aborted: signal.aborted || wasStoppedRef.current };
 }

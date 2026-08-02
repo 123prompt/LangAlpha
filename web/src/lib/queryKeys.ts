@@ -47,7 +47,9 @@ export const queryKeys = {
     // the sidebar's finite page entries, which cannot hold InfiniteData.
     gallery:     (wsId: string, archived: boolean) => [...queryKeys.threads.byWorkspace(wsId), { view: 'gallery', archived }],
     detail:      (threadId: string) => [...queryKeys.threads.all, 'detail', threadId],
-    recent:      (limit: number) => [...queryKeys.threads.all, 'recent', limit],
+    // Base for every recent-list variant — invalidation targets this prefix.
+    recentAll:   () => [...queryKeys.threads.all, 'recent'],
+    recent:      (limit: number) => [...queryKeys.threads.recentAll(), limit],
     status:      (threadId: string) => [...queryKeys.threads.all, 'status', threadId],
     // Batched dispatch-liveness read for a turn's PTC cards. The base key
     // targets every id-set variant for invalidation; the concrete key is stable

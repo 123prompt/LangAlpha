@@ -238,12 +238,18 @@ function recompute(): void {
     changed = true;
   }
   // effStatus consumers read individual (primitive) values; refresh the map
-  // whenever entries changed shape.
-  if (
-    changed ||
-    effStatus.size !== state.effStatus.size ||
-    [...effStatus].some(([k, v]) => state.effStatus.get(k) !== v)
-  ) {
+  // whenever entries changed shape. Compared entry-wise without materializing
+  // an array — this runs on every feed event/snapshot.
+  let effChanged = changed || effStatus.size !== state.effStatus.size;
+  if (!effChanged) {
+    for (const [tid, status] of effStatus) {
+      if (state.effStatus.get(tid) !== status) {
+        effChanged = true;
+        break;
+      }
+    }
+  }
+  if (effChanged) {
     state.effStatus = effStatus;
     changed = true;
   }
@@ -364,17 +370,25 @@ export function applySnapshot(frame: SnapshotFrame): void {
     // allocated by nextval() and committed later, so a run can commit BELOW
     // an earlier snapshot's as_of watermark. Without this release the
     // watermark suppresses that run forever (suppression only ever raises).
+    //
+    // Releasing on presence is safe because a present entry is always the
+    // thread's LATEST run — three invariants carry that: the snapshot SQL's
+    // per-thread LATERAL LIMIT 1, frames delivered sequentially per
+    // connection, and forks truncating the run chain atomically. The
+    // newest-known guard makes it robust anyway: an entry older than what
+    // this store has already observed must not lower watermarks it didn't
+    // earn (post-merge, feed.runSeq is the max — equality means this entry
+    // IS the newest).
     if (
       typeof entry.run_seq === 'number' &&
-      e.seenSuppressedBelowSeq >= entry.run_seq
+      entry.run_seq >= (e.feed?.runSeq ?? 0)
     ) {
-      e.seenSuppressedBelowSeq = entry.run_seq - 1;
-    }
-    if (
-      typeof entry.run_seq === 'number' &&
-      e.liveSuppressedBelowSeq >= entry.run_seq
-    ) {
-      e.liveSuppressedBelowSeq = entry.run_seq - 1;
+      if (e.seenSuppressedBelowSeq >= entry.run_seq) {
+        e.seenSuppressedBelowSeq = entry.run_seq - 1;
+      }
+      if (e.liveSuppressedBelowSeq >= entry.run_seq) {
+        e.liveSuppressedBelowSeq = entry.run_seq - 1;
+      }
     }
   }
 

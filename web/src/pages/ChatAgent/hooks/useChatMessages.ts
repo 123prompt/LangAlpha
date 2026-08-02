@@ -1606,6 +1606,7 @@ export function useChatMessages(
       threadIdRef,
       setThreadId,
       wasStoppedRef,
+      signal: abortController.signal,
     });
     // Stopped during the pre-create round-trip: stopWorkflow already finalized
     // the UI — starting the run now would resurrect it.

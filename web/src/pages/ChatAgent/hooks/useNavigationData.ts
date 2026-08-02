@@ -451,7 +451,9 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     } catch (e) {
       rollbackThreadRows(queryClient, previousRows);
       console.warn('[useNavigationData] Failed to update thread:', e);
-      return;
+      // Surface failure to callers (archive gates navigation on it) without
+      // rejecting — pin/archive buttons call this fire-and-forget.
+      return false;
     }
     // Past this point the server has applied the change: a failure in the
     // refresh below must NOT roll back the optimistic patch (it matches the
@@ -484,6 +486,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     } else {
       queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(wsId) });
     }
+    return true;
   }, [queryClient, threadPageSize]);
 
   // Pin/unpin a thread. The pinned-first partition in orderThreads repositions

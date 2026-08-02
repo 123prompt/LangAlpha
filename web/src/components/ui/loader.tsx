@@ -2,7 +2,7 @@
 // The curated pre-cleanup set lives in git history: blob 3feea2e434deede55dd8040572d7b957c83f767a
 // (was loader.reference.tsx).
 
-import { useSyncExternalStore, type CSSProperties } from "react";
+import { useCallback, useSyncExternalStore, type CSSProperties } from "react";
 import { cn } from "@/lib/utils";
 
 // Terminal-style frame set — the loader CLI AI agents cycle through.
@@ -56,7 +56,9 @@ function subscribeFrame(stepMs: number, cb: () => void): () => void {
     t.listeners.delete(cb);
     if (t.listeners.size === 0) {
       clearInterval(t.id);
-      tickers.delete(stepMs);
+      // A later generation may already own this cadence slot (React runs all
+      // destroys before creates in a commit) — only remove our own entry.
+      if (tickers.get(stepMs) === t) tickers.delete(stepMs);
     }
   };
 }
@@ -104,8 +106,16 @@ export function Loader({
     () => false,
   );
   const stepMs = ((reduce ? speed * 2.5 : speed) / ASCII_FRAMES.length) * 1000;
+  // Stable subscribe identity: an inline closure is a NEW function every
+  // render, and useSyncExternalStore resubscribes whenever it changes — each
+  // frame tick would tear the interval down and rebuild it at frame 0,
+  // freezing the glyph while churning timers.
+  const subscribe = useCallback(
+    (cb: () => void) => subscribeFrame(stepMs, cb),
+    [stepMs],
+  );
   const frame = useSyncExternalStore(
-    (cb) => subscribeFrame(stepMs, cb),
+    subscribe,
     () => tickers.get(stepMs)?.frame ?? 0,
     () => 0,
   );

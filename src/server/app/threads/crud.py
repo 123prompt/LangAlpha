@@ -164,17 +164,7 @@ async def get_thread(thread_id: str, x_user_id: CurrentUserId):
     thread = await get_thread_by_id(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    return WorkspaceThreadListItem(
-        thread_id=str(thread["conversation_thread_id"]),
-        workspace_id=str(thread["workspace_id"]),
-        thread_index=thread["thread_index"],
-        current_status=thread["current_status"],
-        msg_type=thread.get("msg_type"),
-        title=thread.get("title"),
-        metadata=thread.get("metadata") or {},
-        created_at=thread["created_at"],
-        updated_at=thread["updated_at"],
-    )
+    return _thread_list_item(thread)
 
 
 class ThreadSeenRequest(BaseModel):
@@ -304,7 +294,7 @@ async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
 
 
 def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
-    """Build the list-item response from an updated thread row."""
+    """Build the list-item response from a detail/updated thread row."""
     return WorkspaceThreadListItem(
         thread_id=str(row["conversation_thread_id"]),
         workspace_id=str(row["workspace_id"]),
@@ -314,6 +304,7 @@ def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
         title=row.get("title"),
         platform=row.get("platform"),
         metadata=row.get("metadata") or {},
+        is_shared=bool(row.get("is_shared", False)),
         is_pinned=bool(row.get("is_pinned", False)),
         archived_at=row.get("archived_at"),
         created_at=row["created_at"],
@@ -334,7 +325,9 @@ async def update_thread_endpoint(
         await auth_api.require_thread_owner(thread_id, x_user_id)
         provided = request.model_fields_set
         updates: dict = {}
-        if "title" in provided and request.title is not None:
+        if "title" in provided:
+            # An explicit null clears the title (list rows fall back to the
+            # first-query preview) — only absence from the body skips it.
             updates["title"] = request.title
         if "is_pinned" in provided and request.is_pinned is not None:
             updates["is_pinned"] = request.is_pinned
@@ -355,6 +348,7 @@ async def update_thread_endpoint(
                 thread_id=thread_id,
                 workspace_id=str(updated_thread["workspace_id"]),
                 title=updated_thread.get("title") or "",
+                updated_at=updated_thread.get("updated_at"),
             )
         if "archived" in updates:
             # Post-commit only: the archive statement already stamped the

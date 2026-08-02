@@ -1,5 +1,6 @@
 import { useLayoutEffect } from 'react';
 import type React from 'react';
+import { registerAuthReset } from '@/lib/authResets';
 
 /**
  * Session-scoped scroll positions keyed by a stable id (route path, thread id).
@@ -32,7 +33,13 @@ export const scrollMemory = {
   forget(key: string): void {
     positions.delete(key);
   },
+  clear(): void {
+    positions.clear();
+  },
 };
+
+// Thread/route keys are per-account state — wipe on sign-out/account switch.
+registerAuthReset(() => scrollMemory.clear());
 
 // Restore retries: content below the fold often lands a few frames after the
 // route swap (lazy pages, query cache hydration). ~10 frames covers that

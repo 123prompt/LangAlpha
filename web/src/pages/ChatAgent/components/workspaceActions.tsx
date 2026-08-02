@@ -266,7 +266,8 @@ export function useWorkspaceActions({
       forgetNavPanelExpansion(wsId);
       forgetStableNavOrder(wsId);
       forgetSharedWorkspaceThreads(wsId);
-      scrollMemory.forget(`threads:${wsId}`);
+      scrollMemory.forget(`threads:${wsId}:active`);
+      scrollMemory.forget(`threads:${wsId}:archived`);
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
       onAfterDelete?.(wsId);
       if (currentWorkspaceId === wsId) {

@@ -39,16 +39,35 @@ export function insertOptimisticThread(queryClient: QueryClient, thread: Thread)
  * the row, plus the detail entry. List entries without the row are skipped —
  * this never invents rows, only rewrites titles in place, so list order and
  * pagination are untouched.
+ *
+ * `updatedAt` is the title write's row timestamp (every server title write
+ * bumps updated_at): a patch not newer than the cached row is dropped, so a
+ * delayed generated-title feed event can't overwrite a manual rename that
+ * already refreshed the cache. Without it the patch applies unconditionally
+ * (local rename flows that already won the server race).
  */
-export function patchThreadTitle(queryClient: QueryClient, threadId: string, title: string): void {
+export function patchThreadTitle(
+  queryClient: QueryClient,
+  threadId: string,
+  title: string,
+  updatedAt?: string,
+): void {
+  const eventTs = updatedAt ? Date.parse(updatedAt) : NaN;
+  const isStale = (row: Thread): boolean => {
+    if (Number.isNaN(eventTs) || !row.updated_at) return false;
+    const rowTs = Date.parse(row.updated_at);
+    return !Number.isNaN(rowTs) && eventTs <= rowTs;
+  };
+  const apply = <T extends Thread>(row: T): T =>
+    isStale(row) ? row : { ...row, title, ...(updatedAt ? { updated_at: updatedAt } : {}) };
   patchThreadRows(queryClient, queryKeys.threads.all, (rows) =>
     rows.some((t) => t.thread_id === threadId)
-      ? rows.map((t) => (t.thread_id === threadId ? { ...t, title } : t))
+      ? rows.map((t) => (t.thread_id === threadId ? apply(t) : t))
       : rows,
   );
   queryClient.setQueryData(
     queryKeys.threads.detail(threadId),
-    (old: Thread | undefined) => (old ? { ...old, title } : old),
+    (old: Thread | undefined) => (old ? apply(old) : old),
   );
 }
 

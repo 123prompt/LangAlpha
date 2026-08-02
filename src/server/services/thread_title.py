@@ -173,6 +173,7 @@ async def generate_thread_title(
         thread_id=thread_id,
         workspace_id=str(updated["workspace_id"]),
         title=title,
+        updated_at=updated.get("updated_at"),
     )
 
     return title, True

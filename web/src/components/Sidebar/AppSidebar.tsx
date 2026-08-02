@@ -1,4 +1,4 @@
-import React, { useCallback, useRef } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { LayoutGrid, PanelLeftClose, PanelLeftOpen, SquarePen } from 'lucide-react';
@@ -44,6 +44,12 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
   const widthRef = useRef(width);
   widthRef.current = width;
 
+  // Armed for the duration of a resize drag; unmount mid-drag (rail collapse,
+  // route swap) would otherwise strand the app-wide sidebar-resizing body
+  // class (col-resize cursor + no text selection everywhere).
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
+
   // Edge-drag resize. Pointer capture keeps move/up events routed to the handle
   // even when the cursor outruns it; a body class pins the col-resize cursor,
   // blocks text selection, and drops the width transitions for 1:1 tracking.
@@ -63,16 +69,22 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
     const onMove = (ev: PointerEvent) => {
       onWidthChange(clampSidebarWidth(startWidth + (ev.clientX - startX)));
     };
-    const onEnd = (ev: PointerEvent) => {
+    // Hoisted declarations: teardown and onEnd reference each other.
+    function teardown() {
+      dragCleanupRef.current = null;
       document.body.classList.remove('sidebar-resizing');
       handle.removeEventListener('pointermove', onMove);
       handle.removeEventListener('pointerup', onEnd);
       handle.removeEventListener('pointercancel', onEnd);
+    }
+    function onEnd(ev: PointerEvent) {
+      teardown();
       onWidthChange(clampSidebarWidth(startWidth + (ev.clientX - startX)), true);
-    };
+    }
     handle.addEventListener('pointermove', onMove);
     handle.addEventListener('pointerup', onEnd);
     handle.addEventListener('pointercancel', onEnd);
+    dragCleanupRef.current = teardown;
   }, [onWidthChange]);
 
   const handleResizeReset = useCallback(() => {

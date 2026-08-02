@@ -1,4 +1,5 @@
 import React, { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { relativeTime } from '@/lib/format';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
@@ -75,6 +76,7 @@ export default function AutomationDetailOverlay({
   onTrigger,
   mutationsLoading,
 }: AutomationDetailOverlayProps) {
+  useTranslation(); // relativeTime is locale-keyed — re-render on locale switch
   const navigate = useNavigate();
   const { executions, loading: execLoading } = useExecutions(automation.automation_id as string);
   const isCron = automation.trigger_type === 'cron';
