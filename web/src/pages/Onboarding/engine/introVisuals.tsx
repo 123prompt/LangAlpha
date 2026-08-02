@@ -42,7 +42,7 @@ function Ln({ w, h = 3, c }: { w: string; h?: number; c?: string }) {
 function Tag({ children, color = 'var(--iv-blue)' }: { children: ReactNode; color?: string }) {
   return (
     <span
-      className="w-fit shrink-0 rounded px-1 py-0.5 font-mono text-[8px] leading-none"
+      className="w-fit shrink-0 rounded px-1 py-0.5 font-mono text-[0.5rem] leading-none"
       style={{ background: `color-mix(in srgb, ${color} 18%, transparent)`, color }}
     >
       {children}
@@ -115,7 +115,7 @@ function InputDock({ hot = false, delay, chip }: { hot?: boolean; delay?: number
       <Ln w="46%" c="var(--iv-line-3)" />
       <div className="flex items-center gap-1.5">
         <Plus className="h-2.5 w-2.5 shrink-0" style={{ color: 'var(--iv-text-3)' }} />
-        <span className="font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+        <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
           plan
         </span>
         <span className="ml-auto">
@@ -175,7 +175,7 @@ function TwoModes() {
         <Region hot delay={0.12} className="flex flex-1 flex-col gap-1.5 p-2">
           <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-blue)' }}>
             <Zap className="h-2.5 w-2.5" />
-            <span className="font-mono text-[8px]">Flash</span>
+            <span className="font-mono text-[0.5rem]">Flash</span>
           </div>
           <OrchRow
             icon={<Folder className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
@@ -191,7 +191,7 @@ function TwoModes() {
             <Ln w="90%" h={2} c="var(--iv-line-3)" />
             <Ln w="74%" h={2} c="var(--iv-line-3)" />
           </div>
-          <span className="mt-auto font-mono text-[7px]" style={{ color: 'var(--iv-text-3)' }}>
+          <span className="mt-auto font-mono text-[0.4375rem]" style={{ color: 'var(--iv-text-3)' }}>
             coordination · quick answers
           </span>
         </Region>
@@ -207,12 +207,12 @@ function TwoModes() {
             <FileText className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-teal)' }} />
             <Ln w="48%" h={2} c="var(--iv-line-3)" />
           </div>
-          <span className="mt-auto font-mono text-[7px]" style={{ color: 'var(--iv-text-3)' }}>
+          <span className="mt-auto font-mono text-[0.4375rem]" style={{ color: 'var(--iv-text-3)' }}>
             deep analysis &amp; deliverables
           </span>
         </Region>
       </div>
-      <div className="mt-2.5 flex items-center gap-1.5 font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+      <div className="mt-2.5 flex items-center gap-1.5 font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
         <span className="intro-pulse" style={{ width: 5, height: 5 }} />
         one agent · two modes
       </div>
@@ -251,7 +251,7 @@ function WorkspaceGrid() {
           <WsCard delay={0.48} />
         </div>
       </div>
-      <div className="mt-2.5 flex items-center gap-1.5 font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+      <div className="mt-2.5 flex items-center gap-1.5 font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
         <span className="intro-pulse" style={{ width: 5, height: 5 }} />
         one desk per company, sector, or strategy
       </div>
@@ -278,20 +278,20 @@ function QuoteCard({
   return (
     <Region delay={delay} className="flex flex-col gap-1 p-1.5">
       <div className="flex items-center gap-1">
-        <span className="font-mono text-[8px] leading-none" style={{ color: 'var(--iv-text)' }}>
+        <span className="font-mono text-[0.5rem] leading-none" style={{ color: 'var(--iv-text)' }}>
           {ticker}
         </span>
         <Ln w="26%" h={2} c="var(--iv-line-3)" />
       </div>
       <div className="flex items-baseline gap-1">
         <span
-          className="font-mono text-[9px] font-semibold leading-none"
+          className="font-mono text-[0.5625rem] font-semibold leading-none"
           style={{ color: 'var(--iv-text)' }}
         >
           {price}
         </span>
         <span
-          className="font-mono text-[7px] leading-none"
+          className="font-mono text-[0.4375rem] leading-none"
           style={{ color: up ? 'var(--iv-teal)' : 'var(--iv-red)' }}
         >
           {change}
@@ -321,10 +321,10 @@ function OrchRow({
   return (
     <div className="intro-rv flex items-center gap-1.5" style={rv(delay)}>
       {icon}
-      <span className="font-mono text-[8px] leading-none" style={{ color: 'var(--iv-text-2)' }}>
+      <span className="font-mono text-[0.5rem] leading-none" style={{ color: 'var(--iv-text-2)' }}>
         {label}
       </span>
-      <span className="ml-auto font-mono text-[7px] leading-none" style={{ color: 'var(--iv-teal)' }}>
+      <span className="ml-auto font-mono text-[0.4375rem] leading-none" style={{ color: 'var(--iv-teal)' }}>
         ✓
       </span>
     </div>
@@ -345,7 +345,7 @@ function FlashAnswer() {
             style={{ background: 'rgba(90,130,216,0.22)' }}
           >
             <span
-              className="block font-mono text-[8px] leading-none"
+              className="block font-mono text-[0.5rem] leading-none"
               style={{ color: 'var(--iv-text)' }}
             >
               Set up a deep dive on NVDA earnings
@@ -355,7 +355,7 @@ function FlashAnswer() {
         <Region hot delay={0.2} className="flex flex-col gap-1.5 p-2">
           <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-blue)' }}>
             <Zap className="h-2.5 w-2.5" />
-            <span className="font-mono text-[8px]">flash · orchestrating</span>
+            <span className="font-mono text-[0.5rem]">flash · orchestrating</span>
           </div>
           <OrchRow
             icon={<Folder className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
@@ -380,7 +380,7 @@ function FlashAnswer() {
             style={{ background: 'rgba(90,130,216,0.22)' }}
           >
             <span
-              className="block font-mono text-[8px] leading-none"
+              className="block font-mono text-[0.5rem] leading-none"
               style={{ color: 'var(--iv-text)' }}
             >
               NVDA price?
@@ -390,7 +390,7 @@ function FlashAnswer() {
         <Region delay={0.62} className="flex flex-col gap-1.5 p-2">
           <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-blue)' }}>
             <Zap className="h-2.5 w-2.5" />
-            <span className="font-mono text-[8px]">flash · 0.9s</span>
+            <span className="font-mono text-[0.5rem]">flash · 0.9s</span>
           </div>
           <div className="grid grid-cols-2 gap-1.5">
             <QuoteCard ticker="NVDA" price="$142.10" change="+1.8%" up delay={0.7} />
@@ -410,18 +410,18 @@ function SubagentCard({ name, tools, delay }: { name: string; tools: string; del
   return (
     <Region delay={delay} className="flex flex-col gap-1 p-1.5">
       <div className="flex items-center">
-        <span className="font-mono text-[8px] leading-none" style={{ color: 'var(--iv-text-2)' }}>
+        <span className="font-mono text-[0.5rem] leading-none" style={{ color: 'var(--iv-text-2)' }}>
           {name}
         </span>
         <span
-          className="ml-auto font-mono text-[7px] leading-none"
+          className="ml-auto font-mono text-[0.4375rem] leading-none"
           style={{ color: 'var(--iv-teal)' }}
         >
           ✓ completed
         </span>
       </div>
       <Ln w="72%" h={2} c="var(--iv-line-3)" />
-      <span className="font-mono text-[7px] leading-none" style={{ color: 'var(--iv-text-3)' }}>
+      <span className="font-mono text-[0.4375rem] leading-none" style={{ color: 'var(--iv-text-3)' }}>
         {tools}
       </span>
     </Region>
@@ -465,14 +465,14 @@ function PtcSandbox() {
           <div className="intro-rv flex flex-wrap items-center gap-1.5" style={rv(0.52)}>
             <Region className="flex items-center gap-1 px-1.5 py-1">
               <FileText className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-text-3)' }} />
-              <span className="font-mono text-[7px] leading-none" style={{ color: 'var(--iv-text-2)' }}>
+              <span className="font-mono text-[0.4375rem] leading-none" style={{ color: 'var(--iv-text-2)' }}>
                 comps.xlsx
               </span>
               <Tag color="var(--iv-teal)">✓</Tag>
             </Region>
             <Region className="flex items-center gap-1 px-1.5 py-1">
               <FileText className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-text-3)' }} />
-              <span className="font-mono text-[7px] leading-none" style={{ color: 'var(--iv-text-2)' }}>
+              <span className="font-mono text-[0.4375rem] leading-none" style={{ color: 'var(--iv-text-2)' }}>
                 report.pdf
               </span>
               <Tag color="var(--iv-teal)">✓</Tag>
@@ -484,7 +484,7 @@ function PtcSandbox() {
         <Region delay={0.44} className="flex flex-1 flex-col gap-1.5 p-1.5">
           <div className="flex items-center gap-1">
             <FileText className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-text-3)' }} />
-            <span className="font-mono text-[7px] leading-none" style={{ color: 'var(--iv-text-2)' }}>
+            <span className="font-mono text-[0.4375rem] leading-none" style={{ color: 'var(--iv-text-2)' }}>
               comps.xlsx
             </span>
           </div>
@@ -569,28 +569,28 @@ function CreateWorkspace() {
       <div className="absolute left-1/2 top-1/2 w-[72%] -translate-x-1/2 -translate-y-1/2">
         <div className="intro-mk intro-mk--accent intro-pop p-2.5" style={rv(0.95)}>
           <div className="flex items-center justify-between">
-            <span className="font-mono text-[9px]">New workspace</span>
+            <span className="font-mono text-[0.5625rem]">New workspace</span>
             <X className="h-2.5 w-2.5" style={{ color: 'var(--iv-text-3)' }} />
           </div>
           <div className="mt-2 flex flex-col gap-1.5">
             {/* name field */}
-            <span className="font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+            <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
               name
             </span>
             <Region className="flex items-center px-1.5 py-1" style={{ borderRadius: 5 }}>
-              <span className="font-mono text-[8px] leading-none" style={{ color: 'var(--iv-text)' }}>
+              <span className="font-mono text-[0.5rem] leading-none" style={{ color: 'var(--iv-text)' }}>
                 NVDA earnings deep-dive
               </span>
             </Region>
             {/* description */}
-            <span className="font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+            <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
               description
             </span>
-            <span className="font-mono text-[8px]" style={{ color: 'var(--iv-text-2)' }}>
+            <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-2)' }}>
               Q1 print vs. guidance, data-center demand…
             </span>
             {/* files queued for the new workspace */}
-            <span className="font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+            <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
               files
             </span>
             <Region dashed className="flex items-center justify-center gap-1.5 p-1.5">
@@ -612,14 +612,14 @@ function CreateWorkspace() {
               </span>
             </div>
             <div className="flex items-center justify-end gap-2">
-              <span className="font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+              <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
                 cancel
               </span>
               <span
                 className="flex items-center px-2 py-1"
                 style={{ background: 'var(--iv-blue-deep)', borderRadius: 5 }}
               >
-                <span className="font-mono text-[8px] leading-none text-white">create</span>
+                <span className="font-mono text-[0.5rem] leading-none text-white">create</span>
               </span>
             </div>
           </div>
@@ -638,7 +638,7 @@ function PanelTabs({ active }: { active: 'files' | 'memory' | 'memos' }) {
       {tabs.map((t) => (
         <span
           key={t}
-          className="rounded px-1.5 py-0.5 font-mono text-[8px] leading-none"
+          className="rounded px-1.5 py-0.5 font-mono text-[0.5rem] leading-none"
           style={
             t === active
               ? { background: 'var(--iv-blue-deep)', color: '#fff' }
@@ -762,7 +762,7 @@ function Memory() {
       bubble={
         <div className="intro-rv flex justify-end" style={rv(0.1)}>
           <div className="rounded-md rounded-br-sm px-1.5 py-1" style={{ background: 'rgba(90,130,216,0.22)' }}>
-            <span className="block font-mono text-[8px] leading-none" style={{ color: 'var(--iv-text-2)' }}>
+            <span className="block font-mono text-[0.5rem] leading-none" style={{ color: 'var(--iv-text-2)' }}>
               remember this…
             </span>
           </div>
@@ -899,10 +899,10 @@ function DashboardCustomize() {
         <>
           <Ln w="22%" />
           <span className="ml-auto flex items-center gap-1 rounded p-0.5" style={{ background: 'var(--iv-line-3)' }}>
-            <span className="rounded px-1.5 py-0.5 font-mono text-[8px]" style={{ color: 'var(--iv-text-3)' }}>
+            <span className="rounded px-1.5 py-0.5 font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
               Classic
             </span>
-            <span className="rounded px-1.5 py-0.5 font-mono text-[8px] text-white" style={{ background: 'var(--iv-blue-deep)' }}>
+            <span className="rounded px-1.5 py-0.5 font-mono text-[0.5rem] text-white" style={{ background: 'var(--iv-blue-deep)' }}>
               Custom
             </span>
           </span>
@@ -973,7 +973,7 @@ function DashboardAttach() {
             /* right-aligned: this scene bleeds off the left edge */
             <span className="ml-auto flex w-fit items-center gap-1 rounded px-1.5 py-0.5" style={{ background: 'rgba(90,130,216,0.2)' }}>
               <Paperclip className="h-2 w-2" style={{ color: 'var(--iv-blue)' }} />
-              <span className="font-mono text-[8px]" style={{ color: 'var(--iv-blue)' }}>
+              <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-blue)' }}>
                 attached
               </span>
             </span>

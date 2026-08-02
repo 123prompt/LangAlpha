@@ -140,10 +140,10 @@ export function PreferencesTab() {
           <button
             type="button"
             onClick={handleStartOnboarding}
-            className="shrink-0 flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium"
+            className="shrink-0 flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
             style={{
-              backgroundColor: 'var(--color-accent-primary)',
-              color: 'var(--color-text-on-accent)',
+              backgroundColor: 'var(--color-btn-primary-bg)',
+              color: 'var(--color-btn-primary-text)',
             }}
           >
             {t('settings.startOnboarding')}
@@ -303,10 +303,10 @@ export function PreferencesTab() {
           <button
             type="button"
             onClick={handleModifyPreferences}
-            className="flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium"
+            className="flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
             style={{
-              backgroundColor: 'var(--color-accent-primary)',
-              color: 'var(--color-text-on-accent)',
+              backgroundColor: 'var(--color-btn-primary-bg)',
+              color: 'var(--color-btn-primary-text)',
             }}
           >
             <MessageSquareText className="h-4 w-4" /> {t('settings.modifyWithAgent')}

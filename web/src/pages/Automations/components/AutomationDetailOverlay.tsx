@@ -1,4 +1,5 @@
 import React, { useMemo } from 'react';
+import { relativeTime } from '@/lib/format';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -22,7 +23,7 @@ import ExecutionHistoryTable from './ExecutionHistoryTable';
 import { useExecutions } from '../hooks/useExecutions';
 import { cronToHuman } from '../utils/cron';
 import { formatPriceTrigger, formatRetriggerMode } from '../utils/price';
-import { formatRelativeTime, formatDateTime } from '../utils/time';
+import { formatDateTime } from '../utils/time';
 import type { Automation } from '@/types/automation';
 
 interface StatCardProps {
@@ -40,12 +41,12 @@ function StatCard({ label, value, sub }: StatCardProps) {
         borderColor: 'var(--color-border-default)',
       }}
     >
-      <p className="text-[10px] uppercase tracking-wider mb-1" style={{ color: 'var(--color-text-secondary)' }}>
+      <p className="text-[0.625rem] uppercase tracking-wider mb-1" style={{ color: 'var(--color-text-secondary)' }}>
         {label}
       </p>
       <p className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{value}</p>
       {sub && (
-        <p className="text-[11px] mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
+        <p className="text-[0.6875rem] mt-0.5" style={{ color: 'var(--color-text-secondary)' }}>
           {sub}
         </p>
       )}
@@ -194,7 +195,7 @@ export default function AutomationDetailOverlay({
           />
           <StatCard
             label="Last Run"
-            value={automation.last_run_at ? formatRelativeTime(automation.last_run_at) : '\u2014'}
+            value={automation.last_run_at ? relativeTime(automation.last_run_at) : '\u2014'}
             sub={automation.last_run_at ? formatDateTime(automation.last_run_at) : null}
           />
         </div>
@@ -207,12 +208,12 @@ export default function AutomationDetailOverlay({
           />
           <StatCard
             label="Next Run"
-            value={automation.next_run_at ? formatRelativeTime(automation.next_run_at as string) : '\u2014'}
+            value={automation.next_run_at ? relativeTime(automation.next_run_at as string) : '\u2014'}
             sub={automation.next_run_at ? formatDateTime(automation.next_run_at as string) : null}
           />
           <StatCard
             label="Last Run"
-            value={automation.last_run_at ? formatRelativeTime(automation.last_run_at) : '\u2014'}
+            value={automation.last_run_at ? relativeTime(automation.last_run_at) : '\u2014'}
             sub={automation.last_run_at ? formatDateTime(automation.last_run_at) : null}
           />
         </div>
@@ -220,7 +221,7 @@ export default function AutomationDetailOverlay({
 
       {/* Instruction */}
       <div>
-        <p className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
+        <p className="text-[0.625rem] uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
           Instruction
         </p>
         <div
@@ -236,7 +237,7 @@ export default function AutomationDetailOverlay({
 
       {/* Configuration */}
       <div>
-        <p className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
+        <p className="text-[0.625rem] uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
           Configuration
         </p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1.5 text-sm">
@@ -271,7 +272,7 @@ export default function AutomationDetailOverlay({
 
       {/* Execution History */}
       <div>
-        <p className="text-[10px] uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
+        <p className="text-[0.625rem] uppercase tracking-wider mb-1.5" style={{ color: 'var(--color-text-secondary)' }}>
           Execution History
         </p>
         <ExecutionHistoryTable executions={executions} loading={execLoading} workspaceId={automation.workspace_id} />

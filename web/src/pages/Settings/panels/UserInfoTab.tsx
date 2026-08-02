@@ -11,6 +11,7 @@ import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useTheme } from '@/contexts/ThemeContext';
+import { FONT_SCALES, getFontScale, setFontScale } from '@/lib/fontScale';
 import { useTranslation } from 'react-i18next';
 import { useToast } from '@/components/ui/use-toast';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
@@ -40,6 +41,7 @@ export function UserInfoTab() {
   const updatePrefsMutation = useUpdatePreferences();
   const queryClient = useQueryClient();
   const { theme: _theme, preference, setTheme: setThemePref } = useTheme();
+  const [fontScale, setFontScaleState] = useState(getFontScale);
   const { t, i18n } = useTranslation();
 
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
@@ -212,8 +214,8 @@ export function UserInfoTab() {
         </div>
         <div>
           <button type="button" onClick={() => fileInputRef.current?.click()} disabled={isUploadingAvatar}
-            className="px-3 py-1.5 rounded-md text-sm font-medium"
-            style={{ backgroundColor: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)' }}
+            className="px-3 py-1.5 rounded-md text-sm font-medium border transition-opacity hover:opacity-90"
+            style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-elevated)', color: 'var(--color-text-primary)' }}
           >
             {isUploadingAvatar ? t('settings.uploading') : t('settings.changeAvatar')}
           </button>
@@ -339,6 +341,29 @@ export function UserInfoTab() {
             <Monitor className="h-3.5 w-3.5" />
             {t('settings.auto', 'Auto')}
           </button>
+        </div>
+      </div>
+
+      {/* Font size — multiplies the browser's own font-size preference */}
+      <div className="flex items-center justify-between p-3 rounded-lg" style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}>
+        <div className="space-y-0.5">
+          <label className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.fontSize', 'Font size')}</label>
+        </div>
+        <div className="inline-flex rounded-lg overflow-hidden" style={{ border: '1px solid var(--color-border-muted)' }}>
+          {FONT_SCALES.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => { setFontScale(s); setFontScaleState(s); }}
+              className="px-2.5 py-1.5 text-sm font-medium transition-colors"
+              style={{
+                backgroundColor: fontScale === s ? 'var(--color-accent-soft)' : 'transparent',
+                color: fontScale === s ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
+              }}
+            >
+              {Math.round(s * 100)}%
+            </button>
+          ))}
         </div>
       </div>
 

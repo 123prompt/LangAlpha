@@ -1,8 +1,9 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Loader2, Check } from 'lucide-react';
+import { Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Loader } from '@/components/ui/loader';
 import { Input } from '@/components/ui/input';
 import { ApiKeyInput } from '@/components/model/ApiKeyInput';
 import { useUpdateApiKeys } from '@/hooks/useApiKeys';
@@ -322,15 +323,15 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
               autoComplete="off"
             />
           </div>
-          <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+          <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
             {t('setup.modelIdHint')}
           </p>
           <div className="flex items-center gap-1.5 pt-1">
-            <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
+            <span className="text-[0.625rem] uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
               {t('setup.capabilities', { defaultValue: 'Capabilities' })}:
             </span>
             <span
-              className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium"
+              className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium"
               style={{ background: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)', opacity: 0.6 }}
             >
               Text
@@ -342,7 +343,7 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
                   key={mod}
                   type="button"
                   onClick={() => toggleManualModality(mod)}
-                  className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors"
+                  className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-colors"
                   style={{
                     background: active ? 'var(--color-accent-soft)' : 'transparent',
                     color: active ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
@@ -374,16 +375,16 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
                   <button
                     type="button"
                     onClick={selectAllParentModels}
-                    className="text-[11px] font-medium transition-colors"
+                    className="text-[0.6875rem] font-medium transition-colors"
                     style={{ color: 'var(--color-accent-primary)' }}
                   >
                     {t('setup.selectAll', { defaultValue: 'All' })}
                   </button>
-                  <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>·</span>
+                  <span className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>·</span>
                   <button
                     type="button"
                     onClick={selectNoParentModels}
-                    className="text-[11px] font-medium transition-colors"
+                    className="text-[0.6875rem] font-medium transition-colors"
                     style={{ color: 'var(--color-text-secondary)' }}
                   >
                     {t('setup.selectNone', { defaultValue: 'None' })}
@@ -391,14 +392,16 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
                 </div>
               )}
             </div>
-            <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+            <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
               {t('setup.importParentModelsDesc', {
                 defaultValue: 'Models from the parent catalog, routed through your endpoint and key. Uncheck any you don\'t need.',
               })}
             </p>
             {parentModelsLoading && (
               <div className="flex items-center gap-2 py-2">
-                <Loader2 className="h-4 w-4 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />
+                <span aria-hidden="true" className="flex-shrink-0">
+                  <Loader size={16} className="text-[color:var(--color-text-tertiary)]" />
+                </span>
                 <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
                   {t('setup.fetchingModels', { defaultValue: 'Fetching models...' })}
                 </span>
@@ -465,7 +468,9 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
           >
             {saving ? (
               <>
-                <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
+                <span aria-hidden="true" className="mr-1.5 flex-shrink-0">
+                  <Loader size={16} className="text-current" />
+                </span>
                 {t('setup.saving')}
               </>
             ) : (

@@ -569,7 +569,8 @@ export default function AutomationInlineForm({
           <Button
             type="submit"
             disabled={loading}
-            style={{ backgroundColor: 'var(--color-accent-primary)', color: 'var(--color-text-on-accent)' }}
+            className="transition-opacity hover:opacity-90"
+            style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
           >
             {loading ? t('common.saving') : isEdit ? t('automation.saveChanges') : t('common.create')}
           </Button>

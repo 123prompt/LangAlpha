@@ -17,7 +17,7 @@
      Single source of truth — MarketScanlines and EdgeGrain read this variable
      at runtime (via derivePalette in loginPaper), so the canvases and the CSS
      never drift. */
-  --login-ember: rgb(255, 168, 92);
+  --login-ember: rgb(233, 149, 74);
   /* Opaque composition: the muted/loss tokens are translucent, so compose each
      over the page color — the dune's stray dots (see EdgeGrain) never print
      through a field, button, or error box. Referenced by the input, buttons,
@@ -38,11 +38,11 @@
   overflow: hidden;
   /* Pinned here so the login renders the same face in every host app —
      without it, text inherits whatever body font the app's tokens set. */
-  font-family: 'Golos Text', 'Inter', system-ui, sans-serif;
+  font-family: 'Sora', 'Geist', 'Noto Sans SC', -apple-system, system-ui, sans-serif;
 }
 
 [data-theme='light'] .login-page {
-  --login-ember: rgb(178, 82, 38);
+  --login-ember: rgb(208, 125, 51);
 }
 
 .login-page__card {
@@ -60,7 +60,7 @@
     0 0 20px rgba(255, 255, 255, 0.04),
     0 0 40px rgba(255, 255, 255, 0.02),
     0 4px 24px rgba(0, 0, 0, 0.15);
-  font-family: 'Golos Text', 'Inter', system-ui, sans-serif;
+  font-family: 'Sora', 'Geist', 'Noto Sans SC', -apple-system, system-ui, sans-serif;
 }
 
 .login-page__card-header {
@@ -79,7 +79,7 @@
 }
 
 .login-page__title {
-  font-family: 'Golos Text', 'Inter', system-ui, sans-serif;
+  font-family: 'Sora', 'Geist', 'Noto Sans SC', -apple-system, system-ui, sans-serif;
   font-size: 1.5rem;
   font-weight: 600;
   letter-spacing: -0.03em;
@@ -402,7 +402,7 @@
   height: 12px;
   border: 1px solid var(--color-text-tertiary);
   border-radius: 3px;
-  font-size: 9px;
+  font-size: 0.5625rem;
   line-height: 1;
   color: transparent;
   transition: color 0.2s ease, border-color 0.2s ease;
@@ -725,7 +725,7 @@
 
 .login-page__visual-title {
   margin: 0;
-  font-family: 'Golos Text', 'Inter', system-ui, sans-serif;
+  font-family: 'Sora', 'Geist', 'Noto Sans SC', -apple-system, system-ui, sans-serif;
   font-size: clamp(1.625rem, 2.2vw, 2.5rem);
   font-weight: 600;
   letter-spacing: -0.02em;

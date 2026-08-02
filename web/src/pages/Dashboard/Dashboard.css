@@ -11,7 +11,7 @@
   flex-direction: row;
   box-sizing: border-box;
   overflow: hidden;
-  background-color: var(--color-bg-page);
+  background-color: var(--color-bg-canvas);
 }
 
 /* Dashboard-specific scrollbar styling */
@@ -69,7 +69,7 @@
   height: 24px;
   border-radius: 6px;
   font-family: 'JetBrains Mono', monospace;
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-weight: 600;
   line-height: 1;
   flex-shrink: 0;
@@ -152,7 +152,7 @@
   border: 1px solid var(--color-border-muted);
   background: var(--color-bg-elevated);
   color: var(--color-text-secondary);
-  font-size: 12px;
+  font-size: 0.75rem;
   cursor: pointer;
   opacity: 0;
   transform: translateY(6px);
@@ -181,13 +181,13 @@
   backdrop-filter: blur(48px);
   border: 1px solid var(--color-border-muted);
   border-radius: 9999px;
-  box-shadow: 0 0 30px var(--color-accent-soft);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
   transition: all 0.3s;
 }
+/* Focus earns a low-alpha accent edge — no glow, resting stays neutral. */
 .dashboard-floating-chat:focus-within {
   border-color: var(--color-accent-overlay);
   border-radius: 1rem;
-  box-shadow: 0 0 30px var(--color-accent-soft);
 }
 
 @media (max-width: 767px) {

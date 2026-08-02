@@ -26,7 +26,7 @@
 }
 
 .market-chat-messages-header h3 {
-  font-size: 16px;
+  font-size: 1rem;
   font-weight: 600;
   color: var(--color-text-primary);
   margin: 0;
@@ -52,13 +52,13 @@
 .market-chat-empty-icon {
   width: 48px;
   height: 48px;
-  color: var(--color-accent-primary);
+  color: var(--color-icon-muted);
   opacity: 0.5;
   margin-bottom: 16px;
 }
 
 .market-chat-empty-text {
-  font-size: 14px;
+  font-size: 0.875rem;
   color: var(--color-text-secondary);
   margin: 0;
 }
@@ -76,12 +76,12 @@
   gap: 8px;
   padding: 12px;
   border-radius: 8px;
-  font-size: 14px;
+  font-size: 0.875rem;
 }
 
 .market-chat-loading {
   color: var(--color-text-secondary);
-  background-color: var(--color-accent-soft);
+  background-color: var(--color-bg-surface);
 }
 
 .market-chat-loading-icon {
@@ -120,7 +120,7 @@
   width: 32px;
   height: 32px;
   border-radius: 50%;
-  background-color: var(--color-accent-soft);
+  background-color: var(--color-bg-surface);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -143,8 +143,8 @@
 }
 
 .market-message-user .market-message-content {
-  background-color: var(--color-accent-primary);
-  border: none;
+  background-color: var(--color-bg-surface);
+  border: 1px solid var(--color-border-muted);
 }
 
 .market-message-error {
@@ -154,7 +154,7 @@
 
 .market-message-error-text {
   color: var(--color-loss);
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.5;
   margin: 0;
 }
@@ -165,7 +165,7 @@
 }
 
 .market-message-text {
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.5;
   margin: 0;
   white-space: pre-wrap;

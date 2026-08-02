@@ -22,6 +22,7 @@ import { useDashboardPrefs } from './widgets/framework/useDashboardPrefs';
 import type { DashboardPrefs, WidgetInstance } from './widgets/types';
 import type { PresetId } from './widgets/presets';
 import './widgets/index';
+import { useScrollMemory } from '@/lib/scrollMemory';
 import './Dashboard.css';
 
 interface DashboardCustomProps {
@@ -38,6 +39,7 @@ function CustomInner({ mode, onModeChange }: DashboardCustomProps) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [settingsFor, setSettingsFor] = useState<string | null>(null);
   const mainRef = useRef<HTMLElement>(null);
+  useScrollMemory(mainRef, 'page:dashboard-custom');
 
   const ctx = useDashboardContext();
   const {
@@ -150,8 +152,8 @@ function CustomInner({ mode, onModeChange }: DashboardCustomProps) {
             onClick={() => setAddOpen(true)}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full transition-colors"
             style={{
-              backgroundColor: 'var(--color-accent-primary)',
-              color: 'var(--color-text-on-accent)',
+              backgroundColor: 'var(--color-btn-primary-bg)',
+              color: 'var(--color-btn-primary-text)',
             }}
           >
             <Plus size={12} /> {t('dashboard.widgets.shell.addWidget')}
@@ -362,7 +364,7 @@ function CustomInner({ mode, onModeChange }: DashboardCustomProps) {
               type="button"
               onClick={portfolio.handleUpdate}
               className="px-3 py-1.5 rounded text-sm font-medium hover:opacity-90"
-              style={{ backgroundColor: 'var(--color-accent-primary)', color: 'var(--color-text-on-accent)' }}
+              style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
             >
               {t('dashboard.widgets.shell.save')}
             </button>
