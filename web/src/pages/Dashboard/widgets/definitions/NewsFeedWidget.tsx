@@ -372,7 +372,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
             placeholder={t('dashboard.widgets.newsFeed.tickerPlaceholder')}
             value={tickerFilter}
             onChange={(e) => setTickerFilter(e.target.value)}
-            className="flex-1 text-[0.6875rem] bg-transparent border-none outline-none min-w-0"
+            className="flex-1 text-[0.6875rem] bg-transparent border-none outline-none focus-visible:ring-1 focus-visible:ring-ring min-w-0"
             style={{ color: 'var(--color-text-primary)' }}
           />
           {tickerFilter ? (
@@ -417,7 +417,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
             value={sourceFilter}
             onChange={(e) => setSourceFilter(e.target.value)}
             aria-label={t('dashboard.widgets.newsFeed.sourceLabel')}
-            className="h-7 px-2 rounded-md border text-[0.6875rem] outline-none cursor-pointer max-w-[140px]"
+            className="h-7 px-2 rounded-md border text-[0.6875rem] outline-none focus-visible:ring-1 focus-visible:ring-ring cursor-pointer max-w-[140px]"
             style={{
               backgroundColor: 'var(--color-bg-subtle)',
               borderColor: 'var(--color-border-muted)',

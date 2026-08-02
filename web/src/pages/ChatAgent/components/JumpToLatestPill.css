@@ -50,8 +50,9 @@
 }
 
 .jump-to-latest-pill__count {
-  /* Text-primary (not accent): the blue accent fails AA contrast on the dark
-     near-black pill; bold tabular text-primary is legible in both themes. */
+  /* Text-primary (not accent): the amber accent fails AA contrast on the
+     light theme's white pill; bold tabular text-primary is legible in both
+     themes. */
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--color-text-primary);

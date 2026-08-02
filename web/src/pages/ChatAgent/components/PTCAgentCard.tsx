@@ -31,7 +31,7 @@ interface PTCAgentCardProps {
 // Message-flow card → the chat artifact fill (tinted on the light chat page),
 // not --color-bg-card (white; the dashboard-on-canvas pairing).
 const PANEL_BG = 'var(--color-bg-tool-card)';
-const MONO = "'JetBrains Mono', 'Menlo', monospace";
+const MONO = 'var(--font-mono)';
 
 /**
  * Single source of truth for the dispatch card's per-status presentation.

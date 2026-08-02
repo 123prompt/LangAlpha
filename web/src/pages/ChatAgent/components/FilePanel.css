@@ -445,7 +445,9 @@
      the fill is the amber accent and the label stays readable. */
   .file-panel-memo-banner-stale .file-panel-memo-banner-action-primary {
     background-color: var(--color-status-modified);
-    color: #fff;
+    /* Ink, not white — the fill is 0.7-alpha amber, and white composites to
+       ~3.1:1 against it in both themes (fails AA); ink reads at ~5.3+. */
+    color: var(--color-text-on-accent);
     border-color: var(--color-status-modified);
   }
   .file-panel-memo-banner-stale .file-panel-memo-banner-action-primary:hover:not(:disabled) {

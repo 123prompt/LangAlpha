@@ -16,7 +16,7 @@
   background-color: var(--color-accent-soft);
   color: var(--color-text-primary);
   font-size: 0.75rem;
-  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-family: var(--font-mono);
   line-height: 1.4;
   max-width: 200px;
 }

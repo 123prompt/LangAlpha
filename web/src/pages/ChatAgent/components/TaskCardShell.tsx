@@ -2,7 +2,7 @@ import React from 'react';
 import { ChevronRight } from 'lucide-react';
 import { TaskStatusChip, type TaskCardStatusKind } from './taskStatusUi';
 
-export const MONO_STACK = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+export const MONO_STACK = 'var(--font-mono)';
 
 interface TaskCardShellProps {
   /** Lowercase type token on the left of the header rule. */

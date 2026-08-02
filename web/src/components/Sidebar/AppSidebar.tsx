@@ -128,9 +128,14 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
     return (
       <aside className="sidebar">
         <React.Fragment key="rail">
-        <div className="sidebar-logo" onClick={() => navigate('/dashboard')} style={{ cursor: 'pointer' }}>
-          <img src={logo} alt="Logo" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />
-        </div>
+        <button
+          type="button"
+          className="sidebar-logo"
+          onClick={() => navigate('/dashboard')}
+          aria-label={t('sidebar.dashboard')}
+        >
+          <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />
+        </button>
         <button
           className="sidebar-rail-toggle"
           onClick={onToggleCollapse}
@@ -177,10 +182,15 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
     <aside className="sidebar sidebar--panel">
       <React.Fragment key="panel">
       <div className="sidebar-panel-header">
-        <div className="sidebar-brand" onClick={() => navigate('/dashboard')}>
-          <img src={logo} alt="Logo" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />
+        <button
+          type="button"
+          className="sidebar-brand"
+          onClick={() => navigate('/dashboard')}
+          aria-label={t('sidebar.dashboard')}
+        >
+          <img src={logo} alt="" style={{ width: '28px', height: '28px', objectFit: 'contain' }} />
           <span className="sidebar-wordmark title-font">LangAlpha</span>
-        </div>
+        </button>
         <button
           className="sidebar-collapse-btn"
           onClick={onToggleCollapse}

@@ -66,8 +66,8 @@
   bottom: 0;
 }
 
-/* Dragging is an intentional-action moment, so the handle earns a low-alpha
-   accent edge — a hairline, never a fill. */
+/* Dragging is an intentional-action moment, so the handle earns the
+   high-alpha accent edge — a hairline, never a fill. */
 .market-resize-handle:hover,
 .market-resize-handle:active {
   background: var(--color-accent-overlay);

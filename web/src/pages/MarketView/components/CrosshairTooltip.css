@@ -2,20 +2,14 @@
   position: absolute;
   pointer-events: none;
   z-index: 20;
-  background: var(--color-bg-overlay-strong);
+  background: var(--color-bg-elevated);
   border: 1px solid var(--color-border-elevated);
   border-radius: 6px;
   padding: 8px 10px;
   font-size: 0.6875rem;
-  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-family: var(--font-mono);
   color: var(--color-text-primary);
   min-width: 140px;
-  backdrop-filter: blur(8px);
-}
-
-[data-theme="light"] .crosshair-tooltip {
-  background: rgba(255, 255, 255, 0.92);
-  border-color: var(--color-border-default);
 }
 
 .crosshair-tooltip-date {

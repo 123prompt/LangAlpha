@@ -112,6 +112,11 @@ body.sidebar-resizing .app-main {
   gap: 10px;
   min-width: 0;
   flex: 1;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
+  text-align: left;
   cursor: pointer;
 }
 
@@ -335,14 +340,9 @@ body.sidebar-resizing .app-main {
   align-items: center;
   padding: 16px 0;
   margin-bottom: 8px;
-}
-
-.sidebar-logo-gradient {
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, hsl(var(--primary)), hsl(var(--primary) / 0.7));
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  border: none;
+  background: transparent;
+  cursor: pointer;
 }
 
 .sidebar-nav {
