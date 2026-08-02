@@ -223,6 +223,11 @@ async def astream_flash_workflow(
         query_metadata = {"msg_type": "flash"}
         if effective_model:
             query_metadata["llm_model"] = effective_model
+        if request.origin:
+            # Per-turn initiator, mirroring the thread-level metadata['origin']
+            # (threads go mixed: a pinned automation thread also takes manual
+            # user follow-ups, which carry no origin).
+            query_metadata["origin"] = request.origin.model_dump(exclude_none=True)
         widget_ctxs = parse_widget_contexts(request.additional_context)
         chart_selections = parse_chart_selection_contexts(request.additional_context)
         if request.additional_context:

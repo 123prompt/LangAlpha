@@ -583,6 +583,7 @@ class TestEnsureThread:
         request = MagicMock()
         request.external_thread_id = None
         request.platform = None
+        request.origin = None
 
         with patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock) as mock_db:
             await ensure_thread(
@@ -605,6 +606,7 @@ class TestEnsureThread:
         request = MagicMock()
         request.external_thread_id = "ext-123"
         request.platform = "slack"
+        request.origin = None
 
         with patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock) as mock_db:
             await ensure_thread(
@@ -622,12 +624,109 @@ class TestEnsureThread:
         request = MagicMock()
         request.external_thread_id = None
         request.platform = None
+        request.origin = None
 
         with patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock) as mock_db:
             await ensure_thread(request, "t-1", "ws-1", "u-1", msg_type="flash")
 
         call_kwargs = mock_db.call_args.kwargs
         assert call_kwargs["initial_query"] == ""
+
+    @pytest.mark.asyncio
+    async def test_origin_passed_as_metadata(self):
+        """request.origin lands in thread metadata under the 'origin' key."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+        from src.server.models.chat import ThreadOrigin
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = ThreadOrigin(type="agent", id="flash-t-1")
+
+        with patch(
+            f"{PREP}.qr_db.ensure_thread_exists",
+            new_callable=AsyncMock,
+            return_value=False,
+        ) as mock_db:
+            await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query="hi"
+            )
+
+        assert mock_db.call_args.kwargs["metadata"] == {
+            "origin": {"type": "agent", "id": "flash-t-1"}
+        }
+
+    @pytest.mark.asyncio
+    async def test_title_generation_on_create(self):
+        """A newly created thread with a first query spawns title generation."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+
+        with (
+            patch(
+                f"{PREP}.qr_db.ensure_thread_exists",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "src.server.services.thread_title.schedule_title_generation"
+            ) as mock_schedule,
+        ):
+            await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query="hello"
+            )
+
+        mock_schedule.assert_called_once()
+        assert mock_schedule.call_args.kwargs["thread_id"] == "t-1"
+        assert mock_schedule.call_args.kwargs["expected_title"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_no_title_generation_on_existing_thread(self):
+        """created=False (pre-created or follow-up turn) must not re-title."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+
+        with (
+            patch(
+                f"{PREP}.qr_db.ensure_thread_exists",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "src.server.services.thread_title.schedule_title_generation"
+            ) as mock_schedule,
+        ):
+            await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query="hello"
+            )
+
+        mock_schedule.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_title_generation_without_llm_service(self):
+        """The scheduler owns llm_service resolution, so neither creation door
+        carries a `getattr(setup, ...)` locator that could drift."""
+        from src.server.services.thread_title import schedule_title_generation
+
+        with patch("src.server.app.setup") as mock_setup:
+            mock_setup.llm_service = None
+            assert (
+                schedule_title_generation(
+                    thread_id="t-1",
+                    user_id="u-1",
+                    first_query="hello",
+                    expected_title="hello",
+                )
+                is None
+            )
 
 
 # ---------------------------------------------------------------------------

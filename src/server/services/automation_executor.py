@@ -18,7 +18,7 @@ from src.server.database.api_keys import is_byok_active
 from src.server.database.oauth_tokens import has_any_oauth_token
 from src.server.database.workspace import get_or_create_flash_workspace
 from src.server.dependencies.usage_limits import enforce_credit_limit
-from src.server.models.chat import ChatMessage, ChatRequest
+from src.server.models.chat import ChatMessage, ChatRequest, ThreadOrigin
 from src.server.services.webhook_client import WebhookClient
 from src.observability import automation_executions, safe_add
 from src.observability.tracing import hash_id as _obs_hash_id, tracer as _otel_tracer
@@ -36,6 +36,50 @@ class AutomationExecutor:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    async def _precreate_titled_thread(
+        self,
+        automation: Dict[str, Any],
+        thread_id: str,
+        workspace_id: str,
+        agent_mode: str,
+    ) -> None:
+        """Pre-create the run's thread titled "<automation name> — <date>".
+
+        Automation runs bypass POST /threads, so without this the thread would be
+        born inside ensure_thread_exists with the raw instruction as title (then
+        LLM-retitled). A stable name+date reads better for recurring runs. Never
+        raises — on failure the run proceeds and the ensure path creates the row.
+        """
+        name = (automation.get("name") or "").strip()
+        if not name:
+            return  # no name to stamp — let the ensure path LLM-title it
+        try:
+            from zoneinfo import ZoneInfo
+
+            from src.server.database.conversation import create_thread
+
+            try:
+                tz = ZoneInfo(automation.get("timezone") or "UTC")
+            except Exception:
+                tz = timezone.utc
+            run_date = datetime.now(tz).strftime("%Y-%m-%d")
+            await create_thread(
+                conversation_thread_id=thread_id,
+                workspace_id=workspace_id,
+                current_status="completed",
+                msg_type=agent_mode,
+                thread_index=None,
+                title=f"{name} — {run_date}"[:255],
+                metadata={
+                    "origin": {
+                        "type": "automation",
+                        "id": str(automation["automation_id"]),
+                    }
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[AUTOMATION_EXEC] Thread pre-create failed: {e}")
 
     async def _fire_webhook(
         self,
@@ -144,6 +188,9 @@ class AutomationExecutor:
                         automation_id, user_id,
                         conversation_thread_id=thread_id,
                     )
+                await self._precreate_titled_thread(
+                    automation, thread_id, workspace_id, agent_mode
+                )
 
             # ─── Build ChatRequest ─────────────────────────────────
             additional_context = automation.get("additional_context")
@@ -156,6 +203,7 @@ class AutomationExecutor:
                 ],
                 llm_model=automation.get("llm_model"),
                 additional_context=additional_context,
+                origin=ThreadOrigin(type="automation", id=str(automation_id)),
             )
 
             # ─── Invoke agent workflow ─────────────────────────────

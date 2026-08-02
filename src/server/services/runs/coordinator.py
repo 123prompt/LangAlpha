@@ -163,6 +163,16 @@ class RunCoordinator:
         from src.server.services import writer_guard as wg
 
         metadata = {"msg_type": msg_type, **(run_metadata or {})}
+        # START-stamp identity onto the durable row: finalize/recovery paths
+        # build the user-feed event from row metadata alone, with no in-process
+        # context surviving a crash (user_id names the channel, workspace_id
+        # scopes the client-side list invalidation). Unconditional: the
+        # authenticated principal must never lose to a caller-supplied
+        # run_metadata key — that value names the publish channel.
+        if user_id:
+            metadata["user_id"] = user_id
+        if workspace_id:
+            metadata["workspace_id"] = workspace_id
 
         guard = None
         if wg.guard_enabled():
@@ -202,6 +212,21 @@ class RunCoordinator:
             )
 
             await announce_run_started(thread_id, run_id)
+
+            # Best-effort user-feed hint: a miss degrades to a late spinner via
+            # the feed's DB reconcile, never a stuck state (unlike run_settled,
+            # which rides the outbox).
+            from src.server.services.thread_lifecycle_feed import (
+                publish_run_started,
+            )
+
+            await publish_run_started(
+                user_id=metadata.get("user_id"),
+                thread_id=thread_id,
+                workspace_id=metadata.get("workspace_id"),
+                run_id=run_id,
+                run_seq=row.get("run_seq"),
+            )
         except BaseException:
             # Covers post-commit failures too (incl. CancelledError from the
             # announce await): releasing the guard here is what lets the

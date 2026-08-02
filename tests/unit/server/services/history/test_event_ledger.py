@@ -72,6 +72,12 @@ LIVE_ONLY = {
     # recomputed from ledger+Redis on every load, never replayed from a store
     "market_watch_update",  # transient stamp notice, accumulate=False; the
     # durable watchlist re-seeds the chip via GET /{thread}/market-watch on replay
+    "thread_created",  # legacy creation SSE branch (POST /threads with
+    # Accept: text/event-stream), never on the run wire; the row itself is the
+    # durable truth (GET /threads/{id}). ⚠️ Deletes together with that branch.
+    "thread_title",  # legacy creation SSE branch: auto-title result; durable
+    # title re-read on every thread list/detail fetch, so never replayed.
+    # ⚠️ Deletes together with that branch (see create.py's shim note).
     "chan_open",  # mux channel lifecycle (thread_stream_mux)
     "chan_close",  # mux channel lifecycle (thread_stream_mux)
     "transport_error",  # mux whole-socket retryable close
@@ -97,6 +103,8 @@ _CATEGORIES = {
 _EMIT_PATTERNS = (
     # _format_sse_event("type", ...) — possibly line-wrapped
     re.compile(r'_format_sse_event\(\s*"([a-z_]+)"'),
+    # _sse("type", ...) — the per-module frame helpers
+    re.compile(r'_sse\(\s*"([a-z_]+)"'),
     # yield f"event: type\n..." and plain "event: type"
     re.compile(r'"(?:id: [^"]*?\\n)?event: ([a-z_]+)'),
     # replay item dicts: {"event": "type", ...}

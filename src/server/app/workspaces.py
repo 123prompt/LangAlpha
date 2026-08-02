@@ -314,78 +314,103 @@ async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
         if last_status in _EVENTS_TERMINAL:
             return
 
-        async with subscribe_to_status(workspace_id) as wait_for_notify:
-            # Always re-read after subscribing — the publish for the current
-            # status could have fired between the initial DB read above and
-            # the SUBSCRIBE below.
-            event, close = await reconcile()
-            if event:
-                yield event
-            if close:
-                return
-
-            while time.monotonic() - started < _EVENTS_MAX_DURATION_S:
+        while time.monotonic() - started < _EVENTS_MAX_DURATION_S:
+            subscription_broke = False
+            async with subscribe_to_status(workspace_id) as wait_for_notify:
                 if wait_for_notify is not None:
-                    payload = await wait_for_notify(_EVENTS_KEEPALIVE_S)
-                    if payload is None:
-                        # Keepalive tick or a missed message — re-read to be
-                        # safe, then send keepalive.
+                    # Always re-read after subscribing — the publish for the
+                    # current status could have fired between the initial DB
+                    # read above and the SUBSCRIBE.
+                    event, close = await reconcile()
+                    if event:
+                        yield event
+                    if close:
+                        return
+
+                    while time.monotonic() - started < _EVENTS_MAX_DURATION_S:
+                        kind, payload = await wait_for_notify(
+                            _EVENTS_KEEPALIVE_S
+                        )
+                        if kind == "error":
+                            # Broken pub/sub connection: abandon it — a broken
+                            # wait returns immediately, so looping on it would
+                            # busy-spin DB reads. The paced cycle below owns
+                            # liveness until the resubscribe.
+                            subscription_broke = True
+                            break
+                        if payload is None:
+                            # Keepalive tick or a missed message — re-read to
+                            # be safe, then send keepalive.
+                            event, close = await reconcile()
+                            if event:
+                                yield event
+                            if close:
+                                return
+                            yield ": ping\n\n"
+                            continue
+                        # Forward a sandbox sub-state refinement (e.g.
+                        # 'archived') immediately. It's a non-terminal hint
+                        # during the 'starting' phase — it can't close the
+                        # stream and isn't persisted in the DB, so it's emitted
+                        # directly without a DB re-read. Lets the FE escalate to
+                        # the slow-restore spinner even when a background warm
+                        # (not this client's chat) owns the start.
+                        sandbox_state = payload.get("sandbox_state")
+                        hinted = payload.get("status")
+                        # Pair the refinement with the payload's own status, not
+                        # the cached last_status. A publish can carry
+                        # {status:'starting', sandbox_state:'archived'} while
+                        # reconcile() still has last_status on 'stopped' (the
+                        # 'starting' publish raced ahead of its commit).
+                        # Emitting 'stopped' here makes the FE drop the archived
+                        # hint, and the follow-up plain 'starting' (from
+                        # reconcile) carries no refinement — the spinner is lost.
+                        event_status = (
+                            hinted if isinstance(hinted, str) else last_status
+                        )
+                        if (
+                            sandbox_state
+                            and sandbox_state != last_sandbox_state
+                            and event_status not in _EVENTS_TERMINAL
+                        ):
+                            # Guard on event_status (what we emit), not
+                            # last_status — this is a non-terminal hint, so it
+                            # must never carry a terminal status. reconcile()
+                            # owns terminal transitions.
+                            last_sandbox_state = sandbox_state
+                            yield _sse_status_event(
+                                workspace_id,
+                                event_status,
+                                sandbox_state=sandbox_state,
+                            )
+                        # Treat the status hint as advisory only. A publish can
+                        # race ahead of its transaction commit (or be spurious),
+                        # and a terminal status closes the stream — so confirm
+                        # against the authoritative DB row (via reconcile)
+                        # before trusting it.
+                        if not hinted or hinted == last_status:
+                            continue
                         event, close = await reconcile()
                         if event:
                             yield event
                         if close:
                             return
-                        yield ": ping\n\n"
-                        continue
-                    # Forward a sandbox sub-state refinement (e.g. 'archived')
-                    # immediately. It's a non-terminal hint during the
-                    # 'starting' phase — it can't close the stream and isn't
-                    # persisted in the DB, so it's emitted directly without a
-                    # DB re-read. Lets the FE escalate to the slow-restore
-                    # spinner even when a background warm (not this client's
-                    # chat) owns the start.
-                    sandbox_state = payload.get("sandbox_state")
-                    hinted = payload.get("status")
-                    # Pair the refinement with the payload's own status, not the
-                    # cached last_status. A publish can carry {status:'starting',
-                    # sandbox_state:'archived'} while reconcile() still has
-                    # last_status on 'stopped' (the 'starting' publish raced ahead
-                    # of its commit). Emitting 'stopped' here makes the FE drop
-                    # the archived hint, and the follow-up plain 'starting' (from
-                    # reconcile) carries no refinement — the spinner is lost.
-                    event_status = hinted if isinstance(hinted, str) else last_status
-                    if (
-                        sandbox_state
-                        and sandbox_state != last_sandbox_state
-                        and event_status not in _EVENTS_TERMINAL
-                    ):
-                        # Guard on event_status (what we emit), not last_status —
-                        # this is a non-terminal hint, so it must never carry a
-                        # terminal status. reconcile() owns terminal transitions.
-                        last_sandbox_state = sandbox_state
-                        yield _sse_status_event(
-                            workspace_id, event_status, sandbox_state=sandbox_state
-                        )
-                    # Treat the status hint as advisory only. A publish can race
-                    # ahead of its transaction commit (or be spurious), and a
-                    # terminal status closes the stream — so confirm against the
-                    # authoritative DB row (via reconcile) before trusting it.
-                    if not hinted or hinted == last_status:
-                        continue
-                    event, close = await reconcile()
-                    if event:
-                        yield event
-                    if close:
-                        return
-                else:
-                    # Redis-disabled fallback: server-side keepalive-paced poll.
-                    await asyncio.sleep(_EVENTS_KEEPALIVE_S)
-                    event, close = await reconcile()
-                    if event:
-                        yield event
-                    if close:
-                        return
-                    yield ": ping\n\n"
+                    if not subscription_broke:
+                        break  # duration cap reached while subscribed
+
+            # No subscription (Redis disabled / subscribe failed / broke): one
+            # keepalive-paced DB cycle, then retry the subscribe — attempts are
+            # thereby paced at the keepalive interval, never a tight loop.
+            remaining = _EVENTS_MAX_DURATION_S - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_EVENTS_KEEPALIVE_S, remaining))
+            event, close = await reconcile()
+            if event:
+                yield event
+            if close:
+                return
+            yield ": ping\n\n"
 
         yield "event: timeout\ndata: {}\n\n"
 

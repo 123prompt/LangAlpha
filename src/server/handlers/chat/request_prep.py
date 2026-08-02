@@ -342,7 +342,25 @@ async def ensure_thread(
         ensure_kwargs["platform"] = request.platform
     if request.external_thread_id:
         ensure_kwargs["external_id"] = request.external_thread_id
-    await qr_db.ensure_thread_exists(**ensure_kwargs)
+    if request.origin:
+        ensure_kwargs["metadata"] = {
+            "origin": request.origin.model_dump(exclude_none=True)
+        }
+    created = await qr_db.ensure_thread_exists(**ensure_kwargs)
+
+    # Threads born here (automations, channel gateways, legacy clients) never
+    # pass through POST /threads, so this is their only shot at an LLM title.
+    # Web create-first threads pre-exist → created=False → no double generation.
+    if created and initial_query:
+        from src.server.services.thread_title import schedule_title_generation
+
+        schedule_title_generation(
+            thread_id=thread_id,
+            user_id=user_id,
+            first_query=initial_query,
+            expected_title=initial_query[:255],
+            timezone=request.timezone,
+        )
 
 
 def _slash_text_target(content: Any) -> tuple[str, dict | None]:
