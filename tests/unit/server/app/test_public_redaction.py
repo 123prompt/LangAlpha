@@ -357,7 +357,9 @@ class TestServeSharedFile:
         # Keep the sandbox AND cap egress (connect-src 'none'); assert shape, not
         # the exact string, so directive ordering can change freely.
         csp = resp.headers["content-security-policy"]
-        assert csp.startswith("sandbox allow-scripts;")
+        assert csp.startswith(
+            "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox;"
+        )
         assert "default-src 'none'" in csp
         assert "connect-src 'none'" in csp
         assert "https://fonts.googleapis.com" in csp  # CJK web-font path

@@ -25,6 +25,9 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Covered by 022's session-level SET when the batch runs together; repeated
+    # here so a standalone 023→024 upgrade from a stamped DB gets the same cap.
+    op.execute("SET lock_timeout = '5s'")
     op.execute(
         "ALTER TABLE conversation_threads "
         "ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN NOT NULL DEFAULT FALSE"

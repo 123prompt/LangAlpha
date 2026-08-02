@@ -26,6 +26,7 @@ LIFECYCLE_TYPES = {
     "run_started",
     "run_settled",
     "thread_title",
+    "thread_pinned",
     "thread_deleted",
     "thread_archived",
     "thread_unarchived",

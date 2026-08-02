@@ -3,8 +3,11 @@
 One Redis channel per user (``user:events:{user_id}``) carries every thread's
 lifecycle transitions to that user's open tabs. The channel is TRANSPORT, not
 truth: ``run_settled`` rides the hook outbox (at-least-once, enqueued inside
-the finalize transaction) and everything else is best-effort — the durable
-list fields and the feed endpoint's DB reconcile are the correctness backstop.
+the finalize transaction), and the feed endpoint's 30s DB reconcile backs it
+up — every settle status is representable in the snapshot. The thread events
+(title, pinned, deleted, archived, unarchived) are NOT: they have no snapshot
+representation, so a dropped publish for those is repaired only by the
+client's stream-cap reconnect, never by the reconcile.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ def build_lifecycle_event(
     status: Optional[str] = None,
     interrupt_reason: Optional[str] = None,
     title: Optional[str] = None,
+    pinned: Optional[bool] = None,
     updated_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The one wire shape (plan v6 §2.2). ``status`` is PUBLIC vocabulary."""
@@ -59,6 +63,8 @@ def build_lifecycle_event(
     }
     if title is not None:
         event["title"] = title
+    if pinned is not None:
+        event["pinned"] = pinned
     if updated_at is not None:
         event["updated_at"] = updated_at
     return event
@@ -140,6 +146,27 @@ async def publish_thread_title(
                 if isinstance(updated_at, datetime)
                 else updated_at
             ),
+        ),
+    )
+
+
+async def publish_thread_pinned(
+    *,
+    user_id: Optional[str],
+    thread_id: str,
+    workspace_id: Optional[str],
+    pinned: bool,
+) -> None:
+    """Pin hint: pin state lives only in list rows (the snapshot frame carries
+    no ``is_pinned``, and unchanged frames are suppressed), so without an event
+    other tabs never learn of a pin until an unrelated refetch."""
+    await publish_user_event(
+        user_id,
+        build_lifecycle_event(
+            type="thread_pinned",
+            thread_id=thread_id,
+            workspace_id=workspace_id,
+            pinned=pinned,
         ),
     )
 

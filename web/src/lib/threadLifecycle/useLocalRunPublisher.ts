@@ -26,11 +26,14 @@ export function useLocalRunPublisher(
   isLoading: boolean,
   runIdRef: { current: string | null },
 ): void {
-  const wasRunningRef = useRef(false);
+  // Holds WHICH thread this tab observed running (not a bare boolean), so a
+  // threadId swap without an unmount can never settle the new thread on the
+  // strength of the old thread's run.
+  const runningThreadRef = useRef<string | null>(null);
   useEffect(() => {
     const running = !!threadId && threadId !== '__default__' && isLoading;
-    const wasRunning = wasRunningRef.current;
-    wasRunningRef.current = running;
+    const wasRunningThisThread = runningThreadRef.current === threadId;
+    runningThreadRef.current = running ? threadId : null;
     if (running) {
       publishLocalRunning(threadId, runIdRef.current ?? undefined);
       // The effect fires on the isLoading flip, BEFORE the response-header
@@ -54,11 +57,19 @@ export function useLocalRunPublisher(
         clearLocalObservation(threadId);
       };
     }
-    if (wasRunning && threadId && threadId !== '__default__') {
+    if (wasRunningThisThread && threadId && threadId !== '__default__') {
       const runId = runIdRef.current ?? undefined;
-      publishLocalSettled(threadId, runId);
-      if (runId && getActiveThreadId() === threadId) {
-        markThreadSeen(threadId, runId);
+      if (runId === undefined) {
+        // The send ended before response headers delivered a run id (network
+        // or admission failure), so no run row was committed — a seq-less
+        // terminal observation could never be reconciled away by snapshots or
+        // list seeding and would sit as a permanent phantom dot. Drop it.
+        clearLocalObservation(threadId);
+      } else {
+        publishLocalSettled(threadId, runId);
+        if (getActiveThreadId() === threadId) {
+          markThreadSeen(threadId, runId);
+        }
       }
     }
     // runIdRef is a stable ref container — read at effect time, never a dep.

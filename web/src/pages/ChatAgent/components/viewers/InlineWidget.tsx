@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { registerAuthReset } from '@/lib/authResets';
 import { Loader } from '@/components/ui/loader';
 import { buildHtmlSrcDoc } from './html/buildHtmlSrcDoc';
 import { useHtmlSandbox } from './html/useHtmlSandbox';
@@ -22,10 +23,12 @@ interface InlineWidgetProps {
  */
 const lastKnownHeights = new Map<string, number>();
 
-/** Test-only: the cache outlives unmounts by design, so tests must clear it. */
+/** The cache outlives unmounts by design; wiped on sign-out/account switch
+ * (module singletons outlive React — web/AGENTS.md). Exported for tests. */
 export function resetInlineWidgetHeightCache() {
   lastKnownHeights.clear();
 }
+registerAuthReset(resetInlineWidgetHeightCache);
 
 function widgetHeightKey(html: string, data?: Record<string, string>): string {
   let h = 5381;
@@ -76,10 +79,14 @@ export default function InlineWidget({ html, title, onSendPrompt, data }: Inline
   // than a tall widget pushing chat down.
   return (
     <div className="inline-widget-container">
+      {/* Popup tokens: links the agent embeds must open as REAL tabs — a
+          sandbox-inheriting tab has no cookie access, so external sites' bot
+          checks break. buildHtmlSrcDoc's click handler forces noopener, and a
+          noopener'd tab is the reach a chat markdown link already has. */}
       <iframe
         ref={iframeRef}
         srcDoc={srcDoc}
-        sandbox="allow-scripts allow-popups"
+        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
         title={title || 'Widget'}
         className="inline-widget-frame"
         style={{

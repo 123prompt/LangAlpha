@@ -83,6 +83,9 @@ export function buildHtmlSrcDoc(
   // Injected before any widget code runs:
   // 1. Patch JSON.parse to handle NaN/Infinity from Python's json.dumps (not valid JSON).
   // 2. Catch uncaught errors and unhandled rejections, display an inline error overlay.
+  // 3. Route link clicks to window.open(..., 'noopener'): a plain <a href>
+  //    navigates the IFRAME itself, rendering the target inside the sandbox
+  //    where it has no cookie access (real sites' bot checks break).
   const earlyScripts = `<script>
 (function(){
   var _p=JSON.parse;
@@ -121,6 +124,17 @@ export function buildHtmlSrcDoc(
   }
   window.onerror=function(_,__,___,____,e){showError(e&&e.message||String(_));};
   window.addEventListener('unhandledrejection',function(e){showError(e.reason&&e.reason.message||String(e.reason));});
+  document.addEventListener('click',function(e){
+    if(e.defaultPrevented)return;
+    var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;
+    if(!a)return;
+    var href=a.getAttribute('href')||'';
+    if(href.charAt(0)==='#')return;
+    if(!/^https?:/i.test(a.href)){e.preventDefault();return;}
+    if(a.host===location.host)return;
+    e.preventDefault();
+    window.open(a.href,'_blank','noopener,noreferrer');
+  });
 })();
 </script>\n`;
 

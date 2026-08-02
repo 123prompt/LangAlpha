@@ -3,7 +3,7 @@
  * (stop → start) must leave EXACTLY one loop connected, and a dying loop must
  * never abort or release the live loop's connection.
  */
-import { QueryClient } from '@tanstack/react-query';
+import { QueryClient, QueryObserver } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const transport = vi.hoisted(() => ({
@@ -293,6 +293,121 @@ describe('threadLifecycleFeed — thread_archived', () => {
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: queryKeys.threads.byWorkspace('w1'),
     });
+  });
+});
+
+describe('threadLifecycleFeed — thread_title', () => {
+  it('propagates a title clear (empty string) instead of dropping it', async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    const finiteKey = [...queryKeys.threads.byWorkspace('w1'), 10, 0];
+    queryClient.setQueryData(finiteKey, {
+      threads: [{ thread_id: 't1', title: 'Old', updated_at: '2026-01-01T00:00:00Z' }],
+      total: 1,
+    });
+
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_title',
+      thread_id: 't1',
+      workspace_id: 'w1',
+      title: '',
+      updated_at: '2026-01-02T00:00:00Z',
+    });
+    await flush(400);
+
+    const finite = queryClient.getQueryData(finiteKey) as { threads: Array<{ title?: string }> };
+    expect(finite.threads[0].title).toBe('');
+  });
+});
+
+describe('threadLifecycleFeed — thread_pinned', () => {
+  it('patches the flag in cached lists and refetches for ordering', async () => {
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    const finiteKey = [...queryKeys.threads.byWorkspace('w1'), 10, 0];
+    queryClient.setQueryData(finiteKey, {
+      threads: [{ thread_id: 't1', is_pinned: false }, { thread_id: 't2', is_pinned: false }],
+      total: 2,
+    });
+
+    invalidate.mockClear();
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'thread_pinned',
+      thread_id: 't1',
+      workspace_id: 'w1',
+      pinned: true,
+    });
+    await flush(400);
+
+    const finite = queryClient.getQueryData(finiteKey) as { threads: Array<{ thread_id: string; is_pinned?: boolean }> };
+    expect(finite.threads.find((t) => t.thread_id === 't1')?.is_pinned).toBe(true);
+    expect(finite.threads.find((t) => t.thread_id === 't2')?.is_pinned).toBe(false);
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: queryKeys.threads.byWorkspace('w1'),
+    });
+  });
+});
+
+describe('threadLifecycleFeed — cache-only list refetch', () => {
+  it('explicitly fetches an invalidated list whose only observers are disabled', async () => {
+    // The nav tree's page-0 queries observe with `enabled: false`, which
+    // invalidateQueries (refetchType 'active') marks stale but never refetches
+    // — a thread started in the background would stay missing until the user
+    // navigates into the workspace.
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    const finiteKey = [...queryKeys.threads.byWorkspace('w1'), 10, 0];
+    queryClient.setQueryData(finiteKey, { threads: [], total: 0 });
+    const queryFn = vi.fn().mockResolvedValue({ threads: [{ thread_id: 't-new' }], total: 1 });
+    const observer = new QueryObserver(queryClient, { queryKey: finiteKey, queryFn, enabled: false });
+    const unsubscribe = observer.subscribe(() => {});
+
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'run_started',
+      thread_id: 't-new',
+      workspace_id: 'w1',
+      run_id: 'r1',
+      run_seq: 1,
+      status: 'running',
+    });
+    await flush(400);
+
+    expect(queryFn).toHaveBeenCalledTimes(1);
+    const finite = queryClient.getQueryData(finiteKey) as { threads: Array<{ thread_id: string }> };
+    expect(finite.threads.map((t) => t.thread_id)).toEqual(['t-new']);
+    unsubscribe();
+  });
+
+  it('leaves observer-less queries lazy', async () => {
+    // An unmounted gallery's cache entry has zero observers — invalidation
+    // alone is right there (it refetches on next mount); eager-fetching every
+    // stale entry would refetch views nobody is rendering.
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    const finiteKey = [...queryKeys.threads.byWorkspace('w1'), 10, 0];
+    queryClient.setQueryData(finiteKey, { threads: [], total: 0 });
+
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'run_started',
+      thread_id: 't-new',
+      workspace_id: 'w1',
+      run_id: 'r1',
+      run_seq: 1,
+      status: 'running',
+    });
+    await flush(400);
+
+    const finite = queryClient.getQueryData(finiteKey) as { threads: Array<{ thread_id: string }> };
+    expect(finite.threads).toEqual([]);
   });
 });
 

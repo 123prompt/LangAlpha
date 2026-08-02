@@ -11,6 +11,7 @@ from src.server.services.thread_lifecycle import project_lifecycle
 from src.server.services.thread_lifecycle_feed import (
     publish_thread_archived,
     publish_thread_deleted,
+    publish_thread_pinned,
     publish_thread_title,
     publish_thread_unarchived,
 )
@@ -349,6 +350,13 @@ async def update_thread_endpoint(
                 workspace_id=str(updated_thread["workspace_id"]),
                 title=updated_thread.get("title") or "",
                 updated_at=updated_thread.get("updated_at"),
+            )
+        if "is_pinned" in updates:
+            await publish_thread_pinned(
+                user_id=x_user_id,
+                thread_id=thread_id,
+                workspace_id=str(updated_thread["workspace_id"]),
+                pinned=bool(updated_thread.get("is_pinned", False)),
             )
         if "archived" in updates:
             # Post-commit only: the archive statement already stamped the

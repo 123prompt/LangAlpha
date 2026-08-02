@@ -843,8 +843,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // useStableHandler pins each identity while always invoking the freshest
   // closure, which is exactly what edit/regenerate need: their turn-index
   // math must read the current messages array, never a memoized snapshot.
-  // Feedback handlers are NOT wrapped — useChatFeedback keeps them stable
-  // itself, and the ratings reach bubbles as data (feedbackByTurn).
   const stableOpenFile = useStableHandler(handleOpenFileFromChat);
   const stableOpenSources = useStableHandler(handleOpenSourcesFromChat);
   const stableOpenDir = useStableHandler(handleOpenDirFromChat);

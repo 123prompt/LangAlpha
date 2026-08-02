@@ -105,6 +105,23 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** invalidateQueries only refetches enabled observers, and the nav tree's
+ * page-0 lists observe cache-only (`enabled: false`) — a stale marking alone
+ * leaves them frozen until the user navigates into the workspace. Explicitly
+ * fetch every invalidated query whose observers are ALL disabled; queries
+ * with no observers at all (unmounted galleries) stay lazy. */
+function refetchCacheOnlyLists(qc: QueryClient, queryKey: readonly unknown[]): void {
+  for (const query of qc.getQueryCache().findAll({ queryKey })) {
+    // state.isInvalidated, not the `stale` filter: the filter reads observer
+    // results, which recompute in a batched notification AFTER this runs.
+    if (!query.state.isInvalidated) continue;
+    const observers = query.observers;
+    if (observers.length > 0 && observers.every((o) => o.options.enabled === false)) {
+      void query.fetch().catch(() => {});
+    }
+  }
+}
+
 /** Debounced list invalidation: a settle burst (parallel dispatched runs)
  * coalesces into one refetch per touched workspace + the recent lists. */
 function scheduleInvalidate(workspaceId?: string | null): void {
@@ -121,10 +138,12 @@ function scheduleInvalidate(workspaceId?: string | null): void {
     if (full) {
       // Reconnect resync: one prefix-wide invalidate subsumes the scoped ones.
       void qc.invalidateQueries({ queryKey: queryKeys.threads.all });
+      refetchCacheOnlyLists(qc, queryKeys.threads.all);
       return;
     }
     for (const ws of workspaces) {
       void qc.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(ws) });
+      refetchCacheOnlyLists(qc, queryKeys.threads.byWorkspace(ws));
     }
     void qc.invalidateQueries({ queryKey: queryKeys.threads.recentAll() });
   }, INVALIDATE_DEBOUNCE_MS);
@@ -163,6 +182,7 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     workspace_id?: string | null;
     run_id?: string | null;
     title?: string | null;
+    pinned?: boolean | null;
     updated_at?: string | null;
   };
   switch (evt.type) {
@@ -184,11 +204,33 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     }
     case 'thread_title': {
       const qc = getLifecycleQueryClient();
-      if (qc && evt.thread_id && evt.title) {
+      // An empty title is a real payload — clearing a title publishes "" —
+      // so gate on presence, not truthiness.
+      if (qc && evt.thread_id && evt.title != null) {
         // updated_at versions the event: a delayed generated-title event must
         // not overwrite a manual rename that already landed in the cache.
         patchThreadTitle(qc, evt.thread_id, evt.title, evt.updated_at ?? undefined);
       }
+      return;
+    }
+    // Pin hint: pin state lives only in list rows (the snapshot frame has no
+    // is_pinned), so without this a pin in another tab never reaches the
+    // sidebar. Patch the flag in place for the cache-only lists, then refetch
+    // for the server's pinned-first ordering.
+    case 'thread_pinned': {
+      const qc = getLifecycleQueryClient();
+      if (qc && evt.thread_id && typeof evt.pinned === 'boolean') {
+        const tid = evt.thread_id;
+        const pinned = evt.pinned;
+        patchThreadRows<Thread>(
+          qc,
+          evt.workspace_id ? queryKeys.threads.byWorkspace(evt.workspace_id) : queryKeys.threads.all,
+          (rows) => (rows.some((t) => t.thread_id === tid)
+            ? rows.map((t) => (t.thread_id === tid ? { ...t, is_pinned: pinned } : t))
+            : rows),
+        );
+      }
+      scheduleInvalidate(evt.workspace_id);
       return;
     }
     // Archive is a prune too: an archived row leaves the snapshot exactly like

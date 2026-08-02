@@ -295,10 +295,14 @@ async def get_threads_for_user(
 
 # Feed snapshot in one statement (v6 §2.2). `owned` is the pre-filter set —
 # every latest attempt the user owns — so `watermark` advances even when both
-# branches come back empty. Branch `live` is UNCAPPED (absence there is proof
-# a run isn't live); branch `unseen` is capped by the caller, newest first, so
-# Python only has to notice the overflow row. Archived threads are absent from
-# both: archiving stamps the attempt seen, so their absence is not truncation.
+# branches come back empty. Branch `live` is UNCAPPED, so absence there proves
+# a run isn't live — for UNARCHIVED threads only: archiving is allowed on a
+# live run (the run survives, the row just leaves the lists), so an archived
+# thread can be absent here while still running. Branch `unseen` is capped by
+# the caller, newest first, so Python only has to notice the overflow row.
+# Archived threads are absent from both; the archive stamps the latest TERMINAL
+# attempt seen (GREATEST no-ops on a live one), so their absence is not
+# truncation.
 _LIFECYCLE_SNAPSHOT_SQL = f"""
     WITH owned AS (
         SELECT ct.conversation_thread_id, ct.workspace_id, ct.archived_at,

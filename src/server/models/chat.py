@@ -219,8 +219,10 @@ class ThreadOrigin(BaseModel):
 
     'agent' = spawned by another agent (id = dispatching flash thread id),
     'automation' = scheduled/triggered run (id = automation id), 'system' =
-    reserved for platform-initiated threads. User-initiated threads carry no
-    origin at all rather than an explicit 'user' entry.
+    set aside for platform-initiated threads. The label is advisory —
+    client-supplied, not authenticated, and nothing branches on it.
+    User-initiated threads carry no origin at all rather than an explicit
+    'user' entry.
     """
 
     type: Literal["agent", "automation", "system"]

@@ -60,9 +60,15 @@ wsfiles_router = APIRouter(prefix="/api/v1", tags=["Workspace File Serving"])
 _WSFILES_CACHE_CONTROL = "private, max-age=60"
 
 # Content-Security-Policy for served reports. Two jobs:
-#   1. `sandbox allow-scripts` forces an opaque origin even though the iframe
+#   1. The `sandbox` directive forces an opaque origin even though the iframe
 #      loads via `src=`, so agent/prompt-injected HTML can never reach app
-#      cookies/localStorage.
+#      cookies/localStorage. The popup tokens exist for embedded links: the
+#      viewer-injected click handler (below) opens external links via
+#      window.open(..., 'noopener'), and without the escape token the new tab
+#      would inherit the sandbox — opaque origin, no cookies, so real sites'
+#      bot checks break. A noopener'd external tab is the same reach a chat
+#      markdown link already has. (The header intersects with the iframe's
+#      sandbox attribute; both carry the tokens.)
 #   2. The source directives cap egress to the html-report skill's CDN
 #      allowlist. `connect-src 'none'` is the load-bearing block: no
 #      fetch/XHR/beacon/websocket, so a prompt-injected report cannot exfiltrate
@@ -72,7 +78,7 @@ _WSFILES_CACHE_CONTROL = "private, max-age=60"
 # server splices an inline theme-sync script for `?inject=theme`. Google Fonts
 # stays allowed for the CJK web-font path (Noto Sans SC/JP/KR -> tofu without it).
 _WSFILES_CSP = (
-    "sandbox allow-scripts; "
+    "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; "
     "default-src 'none'; "
     "script-src 'self' 'unsafe-inline' "
     "https://cdnjs.cloudflare.com https://cdn.jsdelivr.net "
@@ -87,11 +93,14 @@ _WSFILES_CSP = (
     "form-action 'none'"
 )
 
-# Theme-sync script spliced after <head> when `?inject=theme` is set. Listens
-# for `widget:themeUpdate` postMessages and applies the `--color-*` custom
-# properties to :root via a dedicated style element. The payload field (`css`,
-# a `--color-x: value;` block) and message type match the inline-widget theme
-# protocol the parent already speaks (useHtmlSandbox.pushTheme).
+# Viewer-embed script spliced after <head> when `?inject=theme` is set. Two
+# jobs: (1) theme sync — listens for `widget:themeUpdate` postMessages and
+# applies the `--color-*` custom properties to :root via a dedicated style
+# element (payload matches the inline-widget protocol the parent speaks,
+# useHtmlSandbox.pushTheme); (2) link routing — a plain <a href> would
+# navigate the sandboxed IFRAME itself (where the target has no cookies and
+# bot checks break), so external links open via window.open(..., 'noopener')
+# while same-host links keep in-frame navigation (multi-file reports).
 _THEME_INJECTION = (
     '<meta name="color-scheme" content="light dark">'
     "<script>(function(){"
@@ -103,7 +112,18 @@ _THEME_INJECTION = (
     "window.addEventListener('message',function(e){"
     "var d=e&&e.data;"
     "if(!d||d.type!=='widget:themeUpdate'||!d.css)return;"
-    "apply(d.css);});})();</script>"
+    "apply(d.css);});"
+    "document.addEventListener('click',function(e){"
+    "if(e.defaultPrevented)return;"
+    "var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;"
+    "if(!a)return;"
+    "var href=a.getAttribute('href')||'';"
+    "if(href.charAt(0)==='#')return;"
+    "if(!/^https?:/i.test(a.href)){e.preventDefault();return;}"
+    "if(a.host===location.host)return;"
+    "e.preventDefault();"
+    "window.open(a.href,'_blank','noopener,noreferrer');});"
+    "})();</script>"
 )
 
 

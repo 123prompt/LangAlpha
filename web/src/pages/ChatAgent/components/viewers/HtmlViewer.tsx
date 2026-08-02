@@ -97,10 +97,13 @@ export default function HtmlViewer({
         />
       </div>
       {mode === 'preview' ? (
+        // src= loads: the served response's CSP `sandbox` header intersects
+        // with this attribute — serve.py owns the effective policy and the
+        // link-click rationale (both must carry the popup tokens).
         <iframe
           ref={iframeRef}
           src={servedUrl}
-          sandbox="allow-scripts allow-popups"
+          sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
           className="html-viewer-frame"
           title={fileName || 'HTML Preview'}
           onLoad={pushTheme}

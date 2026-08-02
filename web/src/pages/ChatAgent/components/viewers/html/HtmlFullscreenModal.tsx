@@ -75,19 +75,25 @@ export default function HtmlFullscreenModal(props: HtmlFullscreenModalProps) {
             />
           </div>
           {props.variant === 'file' ? (
+            // src= loads: the served response's CSP `sandbox` header
+            // intersects with this attribute — serve.py owns the policy and
+            // the link-click rationale (both must carry the popup tokens).
             <iframe
               ref={iframeRef}
               src={servedUrl!}
-              sandbox="allow-scripts allow-popups"
+              sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
               className="html-fullscreen-frame"
               title={title || t('filePanel.fullscreen')}
               onLoad={pushTheme}
             />
           ) : (
+            // Popup tokens: agent-embedded links must open as REAL tabs (a
+            // sandbox-inheriting tab has no cookies — bot checks break);
+            // buildHtmlSrcDoc's click handler forces noopener.
             <iframe
               ref={iframeRef}
               srcDoc={props.srcDoc}
-              sandbox="allow-scripts allow-popups"
+              sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
               className="html-fullscreen-frame"
               title={title || t('filePanel.fullscreen')}
             />

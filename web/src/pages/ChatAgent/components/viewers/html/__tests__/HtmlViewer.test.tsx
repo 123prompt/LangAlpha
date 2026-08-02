@@ -81,7 +81,7 @@ describe('HtmlViewer', () => {
   it('sandboxes the preview iframe without allow-same-origin', () => {
     renderViewer(<HtmlViewer {...defaultProps} />);
     expect(getPreviewIframe().getAttribute('sandbox')).toBe(
-      'allow-scripts allow-popups',
+      'allow-scripts allow-popups allow-popups-to-escape-sandbox',
     );
   });
 
