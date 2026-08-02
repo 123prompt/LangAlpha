@@ -216,7 +216,7 @@ function WorkspaceCard({ workspace, onSelect, onTogglePin, onRenameStart, onUpgr
               : 'var(--color-bg-card-gradient, linear-gradient(to bottom, var(--color-border-muted), var(--color-border-muted)))',
             border: isFlash
               ? '1px solid var(--color-border-default)'
-              : '0.5px solid var(--color-bg-card-border, var(--color-border-muted))',
+              : '1px solid var(--color-bg-card-border, var(--color-border-muted))',
             backdropFilter: 'blur(8px)',
             WebkitBackdropFilter: 'blur(8px)',
           }}

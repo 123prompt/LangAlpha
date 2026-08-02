@@ -295,8 +295,10 @@ html {
 
   --color-dot-grid: rgba(31, 31, 30, 0.05);
 
-  --color-bg-card-gradient: rgba(255, 255, 255, 0.75);
-  --color-bg-card-border: rgba(31, 31, 30, 0.07);
+  /* Solid white tile + crisp system hairline — the 75%-white wash the dark
+     theme uses for glass is invisible against the white page. */
+  --color-bg-card-gradient: #ffffff;
+  --color-bg-card-border: #e8e8e6;
 
   /* Tailwind/shadcn HSL — white page, white bordered cards, burnished amber */
   --background: 0 0% 100%;
