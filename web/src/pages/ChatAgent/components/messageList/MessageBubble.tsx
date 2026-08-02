@@ -77,6 +77,10 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
 
   // Copy state
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+  }, []);
 
   // Feedback state
   const [feedbackRating, setFeedbackRating] = useState<string | null>(null);
@@ -171,9 +175,14 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
       ?.filter((s) => s.type === 'text')
       .map((s) => s.content)
       .join('') || (message.content as string) || '';
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    // Confirm only after the write lands (it can reject when the document
+    // loses focus); rapid re-copies reset the shared timer instead of
+    // stacking timers that would cut the newer indicator short.
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
   };
 
   return (

@@ -66,10 +66,11 @@ export function useNarrowContainer(
 
     update(el.getBoundingClientRect().width);
 
-    const ro = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        update(entry.contentRect.width);
-      }
+    const ro = new ResizeObserver(() => {
+      // Border box, same as the initial read — `entry.contentRect` is the
+      // CONTENT box, which disagrees on padded/scrollbar-bearing elements
+      // and would flip `narrow` on the first no-op resize.
+      update(el.getBoundingClientRect().width);
     });
     ro.observe(el);
     return () => ro.disconnect();

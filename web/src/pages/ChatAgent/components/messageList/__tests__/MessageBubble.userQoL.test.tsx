@@ -61,12 +61,13 @@ function stubScrollHeight(px: number): () => void {
 }
 
 describe('MessageBubble — user copy action', () => {
-  it('copies the user message content and flips to the copied state', () => {
+  it('copies the user message content and flips to the copied state', async () => {
     renderBubble(makeMessage());
     const copyButton = screen.getByTitle('Copy message');
     fireEvent.click(copyButton);
     expect(writeText).toHaveBeenCalledWith('What does the Q3 report say about margins?');
-    expect(screen.getByTitle('Copied!')).toBeInTheDocument();
+    // Copied state confirms only after the clipboard write resolves.
+    expect(await screen.findByTitle('Copied!')).toBeInTheDocument();
   });
 
   it('keeps the edit pencil alongside copy', () => {

@@ -76,6 +76,10 @@ export default function SharedChatView() {
   const [filePanelTargetFile, setFilePanelTargetFile] = useState<string | null>(null);
   const [rightPanelWidth, setRightPanelWidth] = useState(750);
   const isDraggingRef = useRef(false);
+  // Armed for the duration of a divider drag; unmount mid-drag would otherwise
+  // strand document listeners and app-wide col-resize/no-select body styles.
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
 
   const scrollAreaRef = useRef<HTMLDivElement>(null);
 
@@ -434,7 +438,10 @@ export default function SharedChatView() {
       setRightPanelWidth(newWidth);
     };
 
-    const onMouseUp = () => {
+    const onMouseUp = () => teardown();
+    // Doubles as the unmount cleanup — unhooks listeners and restores body styles.
+    const teardown = () => {
+      dragCleanupRef.current = null;
       isDraggingRef.current = false;
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mouseup', onMouseUp);
@@ -446,6 +453,7 @@ export default function SharedChatView() {
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
+    dragCleanupRef.current = teardown;
   }, [rightPanelWidth]);
 
   // Error state

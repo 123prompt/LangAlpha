@@ -161,6 +161,10 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   const [files, setFiles] = useState<string[]>([]);
   const isDraggingRef = useRef(false);
   const [isDragging, setIsDragging] = useState(false);
+  // Armed for the duration of a divider drag; unmount mid-drag would otherwise
+  // strand document listeners and app-wide col-resize/no-select body styles.
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => dragCleanupRef.current?.(), []);
   const containerRef = useRef<HTMLDivElement>(null);
   const containerWidthRef = useRef<number>(0);
   const DIVIDER_WIDTH = 4; // px -- matches w-[4px] divider
@@ -519,19 +523,26 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
       setFilePanelWidth(clampPanelWidthUtil(startWidth + delta, containerW));
     };
 
-    const onMouseUp = () => {
+    // Hoisted declarations: teardown and onMouseUp reference each other.
+    function teardown() {
+      dragCleanupRef.current = null;
       isDraggingRef.current = false;
-      setIsDragging(false);
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mouseup', onMouseUp);
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
-    };
+    }
+
+    function onMouseUp() {
+      setIsDragging(false);
+      teardown();
+    }
 
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
+    dragCleanupRef.current = teardown;
   }, [filePanelWidth]);
 
   if (isLoading) {
