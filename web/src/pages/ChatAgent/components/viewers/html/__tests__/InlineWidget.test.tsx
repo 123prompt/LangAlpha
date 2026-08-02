@@ -2,7 +2,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 
-import InlineWidget from '../../InlineWidget';
+import InlineWidget, { resetInlineWidgetHeightCache } from '../../InlineWidget';
+
+// The height cache outlives unmounts by design — isolate every test from it.
+beforeEach(() => {
+  resetInlineWidgetHeightCache();
+});
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -32,11 +37,45 @@ describe('InlineWidget — sandbox bridge regressions', () => {
   it('grows the iframe height on widget:resize', () => {
     const { container } = render(<InlineWidget html="<div>hi</div>" />);
     const iframe = container.querySelector('iframe.inline-widget-frame') as HTMLIFrameElement;
-    // Before any resize, height is the 150px placeholder and opacity 0.
+    // Before any resize, height is the 150px placeholder and opacity 0,
+    // with the loading glyph shown in the reserved box.
     expect(iframe.style.height).toBe('150px');
+    expect(container.querySelector('.inline-widget-loading')).toBeTruthy();
     postFromIframe(iframe, { type: 'widget:resize', height: 420 });
     expect(iframe.style.height).toBe('420px');
     expect(iframe.style.opacity).toBe('1');
+    expect(container.querySelector('.inline-widget-loading')).toBeNull();
+  });
+
+  it('reserves the last known height when the same widget remounts', () => {
+    const first = render(<InlineWidget html="<div>hi</div>" />);
+    const iframe = first.container.querySelector('iframe.inline-widget-frame') as HTMLIFrameElement;
+    postFromIframe(iframe, { type: 'widget:resize', height: 420 });
+    first.unmount();
+
+    // Re-open (e.g. thread revisit): box is reserved at the cached height and
+    // visible immediately, but the loading glyph stays until the new document
+    // actually reports.
+    const second = render(<InlineWidget html="<div>hi</div>" />);
+    const iframe2 = second.container.querySelector('iframe.inline-widget-frame') as HTMLIFrameElement;
+    expect(iframe2.style.height).toBe('420px');
+    expect(iframe2.style.opacity).toBe('1');
+    expect(second.container.querySelector('.inline-widget-loading')).toBeTruthy();
+    postFromIframe(iframe2, { type: 'widget:resize', height: 430 });
+    expect(iframe2.style.height).toBe('430px');
+    expect(second.container.querySelector('.inline-widget-loading')).toBeNull();
+  });
+
+  it('does not share cached heights across different widget content', () => {
+    const first = render(<InlineWidget html="<div>hi</div>" />);
+    const iframe = first.container.querySelector('iframe.inline-widget-frame') as HTMLIFrameElement;
+    postFromIframe(iframe, { type: 'widget:resize', height: 420 });
+    first.unmount();
+
+    const other = render(<InlineWidget html="<div>other content</div>" />);
+    const iframe2 = other.container.querySelector('iframe.inline-widget-frame') as HTMLIFrameElement;
+    expect(iframe2.style.height).toBe('150px');
+    expect(iframe2.style.opacity).toBe('0');
   });
 
   it('calls onSendPrompt on widget:sendPrompt', () => {

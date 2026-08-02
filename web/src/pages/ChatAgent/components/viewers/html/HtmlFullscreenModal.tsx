@@ -78,7 +78,7 @@ export default function HtmlFullscreenModal(props: HtmlFullscreenModalProps) {
             <iframe
               ref={iframeRef}
               src={servedUrl!}
-              sandbox="allow-scripts"
+              sandbox="allow-scripts allow-popups"
               className="html-fullscreen-frame"
               title={title || t('filePanel.fullscreen')}
               onLoad={pushTheme}
@@ -87,7 +87,7 @@ export default function HtmlFullscreenModal(props: HtmlFullscreenModalProps) {
             <iframe
               ref={iframeRef}
               srcDoc={props.srcDoc}
-              sandbox="allow-scripts"
+              sandbox="allow-scripts allow-popups"
               className="html-fullscreen-frame"
               title={title || t('filePanel.fullscreen')}
             />

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 
 import { buildHtmlSrcDoc } from '../buildHtmlSrcDoc';
 // Byte-exact srcDoc captured from the pre-refactor InlineWidget under jsdom
@@ -59,5 +59,24 @@ describe('buildHtmlSrcDoc — widget-fullscreen variant', () => {
     expect(fullscreen).toContain("e.data.type === 'widget:themeUpdate'");
     // Data script still injected for the fullscreen variant.
     expect(fullscreen).toContain('window.__WIDGET_DATA__ =');
+  });
+});
+
+describe('buildHtmlSrcDoc — host color-scheme mirroring', () => {
+  afterEach(() => {
+    document.documentElement.style.removeProperty('color-scheme');
+  });
+
+  // A widget document whose used color-scheme differs from the host's loses
+  // transparent compositing (the browser paints the iframe canvas opaque
+  // white), so the host's declared scheme must ride along in the :root block.
+  it('mirrors a declared host color-scheme into the injected :root block', () => {
+    document.documentElement.style.setProperty('color-scheme', 'dark');
+    expect(buildHtmlSrcDoc('widget-inline', NO_DATA)).toContain(':root {\n  color-scheme: dark;');
+  });
+
+  it('omits color-scheme when the host resolves to normal', () => {
+    document.documentElement.style.setProperty('color-scheme', 'normal');
+    expect(buildHtmlSrcDoc('widget-inline', NO_DATA)).toBe(widgetInlineNodataFixture);
   });
 });

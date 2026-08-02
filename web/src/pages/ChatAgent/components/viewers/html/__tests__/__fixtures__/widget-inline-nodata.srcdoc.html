@@ -80,10 +80,16 @@ window.sendPrompt = function(text) {
   document.addEventListener('DOMContentLoaded', function() {
     var mo = new MutationObserver(debouncedReport);
     mo.observe(document.body, { childList: true, subtree: true });
+    if (typeof ResizeObserver === 'function') {
+      new ResizeObserver(debouncedReport).observe(document.body);
+    }
     reportHeight();
   });
   var checks = [100, 300, 800, 2000, 5000];
   checks.forEach(function(ms) { setTimeout(reportHeight, ms); });
+  // A container width change is a pure reflow — no DOM mutation — so the
+  // observers above never see it; track the viewport and body box directly.
+  window.addEventListener('resize', debouncedReport);
   window.addEventListener('message', function(e) {
     if (e.data && e.data.type === 'widget:themeUpdate' && e.data.css) {
       var style = document.querySelector('style');

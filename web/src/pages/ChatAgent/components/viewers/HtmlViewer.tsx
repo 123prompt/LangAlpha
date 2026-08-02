@@ -100,7 +100,7 @@ export default function HtmlViewer({
         <iframe
           ref={iframeRef}
           src={servedUrl}
-          sandbox="allow-scripts"
+          sandbox="allow-scripts allow-popups"
           className="html-viewer-frame"
           title={fileName || 'HTML Preview'}
           onLoad={pushTheme}
@@ -110,7 +110,7 @@ export default function HtmlViewer({
           <SyntaxHighlighter
             language="markup"
             style={isLight ? oneLight : oneDark}
-            customStyle={{ margin: 0, padding: 0, backgroundColor: 'transparent', fontSize: '12px', lineHeight: '1.6' }}
+            customStyle={{ margin: 0, padding: 0, backgroundColor: 'transparent', fontSize: '0.75rem', lineHeight: '1.6' }}
             codeTagProps={{ style: { backgroundColor: 'transparent' } }}
             wrapLongLines
           >

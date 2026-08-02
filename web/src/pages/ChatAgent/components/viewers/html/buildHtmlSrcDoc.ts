@@ -55,12 +55,20 @@ body > :first-child {
 
 export function resolveThemeVars(): string {
   const style = getComputedStyle(document.documentElement);
-  return THEME_VARS.map((v) => {
+  const vars = THEME_VARS.map((v) => {
     const val = style.getPropertyValue(v).trim();
     return val ? `${v}: ${val};` : '';
   })
     .filter(Boolean)
     .join('\n  ');
+  // The host <html> declares color-scheme (index.html); an embedded document
+  // whose used color-scheme differs from its embedder's loses transparent
+  // compositing — the browser paints the iframe canvas opaque white, which in
+  // dark mode puts a white sheet behind the widget's transparent body. Mirror
+  // the host's scheme into the injected :root block (themeUpdate pushes ride
+  // along, since the iframe splices this string into that same block).
+  const scheme = style.colorScheme;
+  return scheme && scheme !== 'normal' ? `color-scheme: ${scheme};\n  ${vars}` : vars;
 }
 
 export function buildHtmlSrcDoc(
@@ -158,10 +166,16 @@ window.sendPrompt = function(text) {
   document.addEventListener('DOMContentLoaded', function() {
     var mo = new MutationObserver(debouncedReport);
     mo.observe(document.body, { childList: true, subtree: true });
+    if (typeof ResizeObserver === 'function') {
+      new ResizeObserver(debouncedReport).observe(document.body);
+    }
     reportHeight();
   });
   var checks = [100, 300, 800, 2000, 5000];
   checks.forEach(function(ms) { setTimeout(reportHeight, ms); });
+  // A container width change is a pure reflow — no DOM mutation — so the
+  // observers above never see it; track the viewport and body box directly.
+  window.addEventListener('resize', debouncedReport);
   window.addEventListener('message', function(e) {
     if (e.data && e.data.type === 'widget:themeUpdate' && e.data.css) {
       var style = document.querySelector('style');
