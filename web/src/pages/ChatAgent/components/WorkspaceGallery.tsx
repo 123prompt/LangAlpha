@@ -681,15 +681,27 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
   const visibleWorkspaces = filteredAndSortedWorkspaces;
 
   // Sorted list for reorder mode (pinned block first — Flash counts as
-  // always-pinned — then sort_order, then recency)
-  const reorderSortedList = [...allWorkspaces].sort((a, b) => {
-    const aPinned = isEffectivelyPinned(a) ? 1 : 0;
-    const bPinned = isEffectivelyPinned(b) ? 1 : 0;
-    if (aPinned !== bPinned) return bPinned - aPinned;
-    if ((a.sort_order ?? 0) !== (b.sort_order ?? 0)) return (a.sort_order ?? 0) - (b.sort_order ?? 0);
-    return new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime();
-  });
+  // always-pinned — then sort_order, then recency). Sort keys are computed
+  // once per item, not per comparison, and the whole sort re-runs only when
+  // the list changes — not on every drag-position render.
+  const reorderSortedList = useMemo(() => {
+    const keyed = allWorkspaces.map((ws) => ({
+      ws,
+      pinned: isEffectivelyPinned(ws) ? 1 : 0,
+      order: ws.sort_order ?? 0,
+      updated: new Date(ws.updated_at || 0).getTime(),
+    }));
+    keyed.sort((a, b) => {
+      if (a.pinned !== b.pinned) return b.pinned - a.pinned;
+      if (a.order !== b.order) return a.order - b.order;
+      return b.updated - a.updated;
+    });
+    return keyed.map((k) => k.ws);
+  }, [allWorkspaces]);
   const reorderSortedIds = reorderSortedList.map((ws) => ws.workspace_id);
+  const reorderActiveWs = reorderActiveId
+    ? reorderSortedList.find((w) => w.workspace_id === reorderActiveId) ?? null
+    : null;
 
   if (isWsLoading) {
     return (
@@ -975,11 +987,8 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               >
                 <SortableContext items={reorderSortedIds} strategy={verticalListSortingStrategy}>
                   {reorderSortedList.map((ws) => {
-                    const activeWs = reorderActiveId
-                      ? reorderSortedList.find((w) => w.workspace_id === reorderActiveId)
-                      : null;
-                    const crossBlock = !!activeWs && ws.workspace_id !== reorderActiveId &&
-                      isEffectivelyPinned(ws) !== isEffectivelyPinned(activeWs);
+                    const crossBlock = !!reorderActiveWs && ws.workspace_id !== reorderActiveId &&
+                      isEffectivelyPinned(ws) !== isEffectivelyPinned(reorderActiveWs);
                     return (
                       <SortableReorderRow
                         key={ws.workspace_id}

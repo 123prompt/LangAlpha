@@ -18,11 +18,7 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../../componen
 import { createDateFormatter, relativeTime } from '@/lib/format';
 import { Loader } from '@/components/ui/loader';
 import { useTitleFade } from '@/hooks/useTitleFade';
-import {
-  useThreadRunning,
-  useThreadUnseen,
-  useThreadNeedsInput,
-} from '@/lib/threadLifecycle/store';
+import { useThreadFlags } from '@/lib/threadLifecycle/store';
 import type { SidebarAgentRow } from '../session/subagents/subagentStatus';
 import { SubagentStatusIcon } from './taskStatusUi';
 import type { NavWorkspace } from '../hooks/useNavigationData';
@@ -116,9 +112,7 @@ function ThreadRowTitle({ title, active }: { title: string; active: boolean }) {
    event re-renders just this gutter span, never the panel tree. */
 function ThreadRowGlyph({ tid, isCurrentThread }: { tid: string; isCurrentThread: boolean }) {
   const { t } = useTranslation();
-  const isRunning = useThreadRunning(tid);
-  const needsInput = useThreadNeedsInput(tid);
-  const isUnseen = useThreadUnseen(tid);
+  const { isRunning, needsInput, isUnseen } = useThreadFlags(tid);
   if (!isRunning && !needsInput && !(isUnseen && !isCurrentThread)) return null;
   return (
     <span className="absolute left-2 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center">
