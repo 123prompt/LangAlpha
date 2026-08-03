@@ -1,5 +1,6 @@
 import React, { useCallback, useDeferredValue, useMemo, useState } from 'react';
-import { X, Plus, Trash2, Loader2, Zap, ClipboardPaste } from 'lucide-react';
+import { X, Plus, Trash2, Zap, ClipboardPaste } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import { VaultSecretPicker } from './VaultSecretPicker';
 import { McpDiscoverResult } from './McpDiscoverResult';
 import { parseMcpServersJson } from './mcpImport';
@@ -268,7 +269,7 @@ export function McpServerModal({
                 <button
                   type="button"
                   onClick={() => { setPasteOpen(true); setPasteNote(null); }}
-                  className="inline-flex items-center gap-1.5 text-[11px] self-start"
+                  className="inline-flex items-center gap-1.5 text-[0.6875rem] self-start"
                   style={{ color: 'var(--color-accent-primary)' }}
                 >
                   <ClipboardPaste className="h-3.5 w-3.5" />
@@ -282,7 +283,7 @@ export function McpServerModal({
                     placeholder={'{ "mcpServers": { "my-server": { "command": "npx", "args": ["-y", "pkg"] } } }'}
                     rows={4}
                     spellCheck={false}
-                    className="w-full px-2 py-1.5 text-[11px] rounded bg-transparent outline-none font-mono resize-none"
+                    className="w-full px-2 py-1.5 text-[0.6875rem] rounded bg-transparent outline-none font-mono resize-none"
                     style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
                   />
                   <div className="flex items-center gap-2">
@@ -290,15 +291,15 @@ export function McpServerModal({
                       type="button"
                       onClick={applyPaste}
                       disabled={!pasteText.trim()}
-                      className="px-2.5 py-1 text-[11px] rounded transition-colors disabled:opacity-50"
-                      style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+                      className="px-2.5 py-1 text-[0.6875rem] rounded transition-colors disabled:opacity-50"
+                      style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
                     >
                       Fill form
                     </button>
                     <button
                       type="button"
                       onClick={() => { setPasteOpen(false); setPasteText(''); setPasteNote(null); }}
-                      className="px-2.5 py-1 text-[11px] rounded transition-colors hover:bg-foreground/10"
+                      className="px-2.5 py-1 text-[0.6875rem] rounded transition-colors hover:bg-foreground/10"
                       style={{ color: 'var(--color-text-tertiary)' }}
                     >
                       Cancel
@@ -307,7 +308,7 @@ export function McpServerModal({
                 </>
               )}
               {pasteNote && (
-                <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>{pasteNote}</p>
+                <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>{pasteNote}</p>
               )}
             </div>
           )}
@@ -337,8 +338,8 @@ export function McpServerModal({
                   onClick={() => setTransport(t)}
                   className="px-3 py-1.5 text-xs rounded-md uppercase"
                   style={{
-                    color: transport === t ? 'var(--color-text-on-accent)' : 'var(--color-text-tertiary)',
-                    backgroundColor: transport === t ? 'var(--color-accent-primary)' : 'var(--color-bg-card)',
+                    color: transport === t ? 'var(--color-btn-primary-text)' : 'var(--color-text-tertiary)',
+                    backgroundColor: transport === t ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-card)',
                   }}
                 >
                   {t}
@@ -455,8 +456,8 @@ export function McpServerModal({
                   onClick={() => setExposure(m)}
                   className="px-3 py-1.5 text-xs rounded-md capitalize"
                   style={{
-                    color: exposure === m ? 'var(--color-text-on-accent)' : 'var(--color-text-tertiary)',
-                    backgroundColor: exposure === m ? 'var(--color-accent-primary)' : 'var(--color-bg-card)',
+                    color: exposure === m ? 'var(--color-btn-primary-text)' : 'var(--color-text-tertiary)',
+                    backgroundColor: exposure === m ? 'var(--color-btn-primary-bg)' : 'var(--color-bg-card)',
                   }}
                 >
                   {m}
@@ -518,7 +519,7 @@ export function McpServerModal({
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
               style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
             >
-              {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+              {testing ? <Loader size={14} className="text-current" /> : <Zap className="h-3.5 w-3.5" />}
               Test saved config
             </button>
           ) : <span />}
@@ -537,9 +538,9 @@ export function McpServerModal({
               onClick={handleSubmit}
               disabled={saving || !validation.ok}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-              style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+              style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
             >
-              {saving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {saving && <Loader size={14} className="text-current" />}
               {isEdit ? 'Save' : 'Add'}
             </button>
           </div>
@@ -577,14 +578,14 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
     <div className="flex flex-col gap-1">
       <label className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>{label}</label>
       {children}
-      {hint && <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>{hint}</p>}
+      {hint && <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>{hint}</p>}
     </div>
   );
 }
 
 function FieldError({ error }: { error?: { message: string } }) {
   if (!error) return null;
-  return <p className="text-[11px]" style={{ color: 'var(--color-loss)' }}>{error.message}</p>;
+  return <p className="text-[0.6875rem]" style={{ color: 'var(--color-loss)' }}>{error.message}</p>;
 }
 
 function ArgsEditor({ args, onChange }: { args: string[]; onChange: (a: string[]) => void }) {
@@ -614,7 +615,7 @@ function ArgsEditor({ args, onChange }: { args: string[]; onChange: (a: string[]
       <button
         type="button"
         onClick={() => onChange([...args, ''])}
-        className="inline-flex items-center gap-1 text-[11px] self-start"
+        className="inline-flex items-center gap-1 text-[0.6875rem] self-start"
         style={{ color: 'var(--color-accent-primary)' }}
       >
         <Plus className="h-3 w-3" />
@@ -673,7 +674,7 @@ function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreat
       <button
         type="button"
         onClick={() => onChange([...kvs, { id: nextKvId(), key: '', value: '' }])}
-        className="inline-flex items-center gap-1 text-[11px] self-start"
+        className="inline-flex items-center gap-1 text-[0.6875rem] self-start"
         style={{ color: 'var(--color-accent-primary)' }}
       >
         <Plus className="h-3 w-3" />

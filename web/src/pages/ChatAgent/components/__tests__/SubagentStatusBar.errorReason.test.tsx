@@ -59,7 +59,10 @@ describe('SubagentStatusBar — failure reason banner', () => {
     );
     expect(screen.getByText('Failed')).toBeInTheDocument();
     expect(screen.queryByText('Running: WebFetch')).toBeNull();
+    // Neither spinner form may appear: the legacy animate-spin arc nor the
+    // shared ascii Loader (role="status") that Running renders now.
     expect(container.querySelector('.animate-spin')).toBeNull();
+    expect(container.querySelector('[role="status"]')).toBeNull();
     expect(screen.getByText('This agent stopped with an error')).toBeInTheDocument();
   });
 });

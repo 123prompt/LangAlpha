@@ -55,12 +55,20 @@ body > :first-child {
 
 export function resolveThemeVars(): string {
   const style = getComputedStyle(document.documentElement);
-  return THEME_VARS.map((v) => {
+  const vars = THEME_VARS.map((v) => {
     const val = style.getPropertyValue(v).trim();
     return val ? `${v}: ${val};` : '';
   })
     .filter(Boolean)
     .join('\n  ');
+  // The host <html> declares color-scheme (index.html); an embedded document
+  // whose used color-scheme differs from its embedder's loses transparent
+  // compositing — the browser paints the iframe canvas opaque white, which in
+  // dark mode puts a white sheet behind the widget's transparent body. Mirror
+  // the host's scheme into the injected :root block (themeUpdate pushes ride
+  // along, since the iframe splices this string into that same block).
+  const scheme = style.colorScheme;
+  return scheme && scheme !== 'normal' ? `color-scheme: ${scheme};\n  ${vars}` : vars;
 }
 
 export function buildHtmlSrcDoc(
@@ -75,6 +83,9 @@ export function buildHtmlSrcDoc(
   // Injected before any widget code runs:
   // 1. Patch JSON.parse to handle NaN/Infinity from Python's json.dumps (not valid JSON).
   // 2. Catch uncaught errors and unhandled rejections, display an inline error overlay.
+  // 3. Route link clicks to window.open(..., 'noopener'): a plain <a href>
+  //    navigates the IFRAME itself, rendering the target inside the sandbox
+  //    where it has no cookie access (real sites' bot checks break).
   const earlyScripts = `<script>
 (function(){
   var _p=JSON.parse;
@@ -113,6 +124,17 @@ export function buildHtmlSrcDoc(
   }
   window.onerror=function(_,__,___,____,e){showError(e&&e.message||String(_));};
   window.addEventListener('unhandledrejection',function(e){showError(e.reason&&e.reason.message||String(e.reason));});
+  document.addEventListener('click',function(e){
+    if(e.defaultPrevented)return;
+    var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;
+    if(!a)return;
+    var href=a.getAttribute('href')||'';
+    if(href.charAt(0)==='#')return;
+    if(!/^https?:/i.test(a.href)){e.preventDefault();return;}
+    if(a.host===location.host)return;
+    e.preventDefault();
+    window.open(a.href,'_blank','noopener,noreferrer');
+  });
 })();
 </script>\n`;
 
@@ -158,10 +180,16 @@ window.sendPrompt = function(text) {
   document.addEventListener('DOMContentLoaded', function() {
     var mo = new MutationObserver(debouncedReport);
     mo.observe(document.body, { childList: true, subtree: true });
+    if (typeof ResizeObserver === 'function') {
+      new ResizeObserver(debouncedReport).observe(document.body);
+    }
     reportHeight();
   });
   var checks = [100, 300, 800, 2000, 5000];
   checks.forEach(function(ms) { setTimeout(reportHeight, ms); });
+  // A container width change is a pure reflow — no DOM mutation — so the
+  // observers above never see it; track the viewport and body box directly.
+  window.addEventListener('resize', debouncedReport);
   window.addEventListener('message', function(e) {
     if (e.data && e.data.type === 'widget:themeUpdate' && e.data.css) {
       var style = document.querySelector('style');

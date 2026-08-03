@@ -1,5 +1,7 @@
 {
   "common": {
+    "copy": "Copy",
+    "submit": "Submit",
     "save": "Save",
     "saving": "Saving...",
     "cancel": "Cancel",
@@ -101,7 +103,13 @@
     "marketView": "Market View",
     "automations": "Automations",
     "settings": "Settings",
-    "account": "Usage & Plan"
+    "account": "Usage & Plan",
+    "newChat": "New chat",
+    "workspaces": "Workspaces",
+    "workspaceGallery": "Workspace gallery",
+    "collapse": "Collapse sidebar",
+    "expand": "Expand sidebar",
+    "resize": "Resize sidebar"
   },
   "account": {
     "menuLabel": "Account menu"
@@ -117,10 +125,27 @@
     "threadsPerWorkspace": "Threads per workspace",
     "all": "All",
     "showMore": "Show more",
-    "loadAll": "Load all"
+    "loadAll": "Load all",
+    "pinThread": "Pin",
+    "unpinThread": "Unpin",
+    "archiveThread": "Archive",
+    "threadUpdated": "Updated",
+    "threadCreated": "Created",
+    "threadTurns": "Turns",
+    "threadNeedsInput": "Waiting for your input",
+    "threadUnseen": "Finished, not yet viewed",
+    "untitledThread": "Untitled",
+    "noConversations": "No conversations yet",
+    "workspaceFallback": "Workspace",
+    "collapseAgents": "Collapse agents",
+    "expandAgents": "Expand agents",
+    "removeAgent": "Remove agent"
   },
   "settings": {
     "title": "User Settings",
+    "connected": "Connected",
+    "manageProviders": "Manage providers",
+    "fontSize": "Font size",
     "userInfo": "User Info",
     "preferences": "Preferences",
     "model": "Model",
@@ -1182,7 +1207,12 @@
     "failedDeleteThread": "Failed to delete thread. Please try again.",
     "failedRenameThread": "Failed to rename thread. Please try again.",
     "viewAll": "View all",
-    "shared": "Shared"
+    "shared": "Shared",
+    "archive": "Archive",
+    "unarchive": "Unarchive",
+    "archived": "Archived",
+    "archivedTasks": "Archived tasks",
+    "noArchivedThreads": "No archived threads"
   },
   "share": {
     "shareConversation": "Share conversation",
@@ -1194,12 +1224,20 @@
     "anyoneWithLink": "Anyone with this link can view the conversation."
   },
   "chat": {
+    "backToWorkflow": "Back to workflow",
+    "backToMain": "Back to main",
+    "backToFlash": "Back to Flash",
+    "reconnecting": "Reconnecting…",
+    "jumpToLatest": {
+      "aria": "Scroll to latest message"
+    },
     "pills": {
       "plan": "Plan",
       "planTitle": "Plan mode — agent creates a plan for approval before executing",
       "watch": "Watch",
       "watchTitle": "Market watch — live prices for tickers the agent tracks"
     },
+    "moreTools": "More tools",
     "widgetContext": {
       "inContext_one": "{{count}} in context",
       "inContext_other": "{{count}} in context",
@@ -1244,6 +1282,17 @@
     "expandResult": "Show all",
     "collapseResult": "Show less",
     "resultMoreItems": "+{{n}} more",
+    "actions": {
+      "copyMessage": "Copy message",
+      "copied": "Copied!",
+      "editMessage": "Edit message",
+      "goodResponse": "Good response",
+      "removeRating": "Remove rating",
+      "reportIssue": "Report issue",
+      "feedbackSubmitted": "Feedback submitted",
+      "regenerate": "Regenerate response",
+      "retry": "Retry"
+    },
     "modelTroubleSuggestion": "{{from}} is having trouble — this answer came from {{to}}",
     "switchToModel": "Switch to {{model}}",
     "modelSwitched": "Default model set to {{model}}",
@@ -1270,10 +1319,21 @@
       "toolUnit_other": "tools",
       "tokenUnit": "tokens"
     },
+    "subagentBar": {
+      "completedWithTools_one": "Completed ({{count}} tool call)",
+      "completedWithTools_other": "Completed ({{count}} tool calls)",
+      "runningWithTool": "Running: {{tool}}",
+      "initializing": "Initializing",
+      "instruct": "Instruct",
+      "errorHeading": "This agent stopped with an error",
+      "inputPlaceholder": "Add instruction for this agent...",
+      "avatarAlt": "Agent"
+    },
     "workflowRun": {
       "titleFallback": "Workflow run",
       "openRunning": "Click to view running workflow",
       "openDetails": "Click to view workflow details",
+      "sharedUnavailable": "Run details aren't available in shared view",
       "agents_one": "{{count}} agent",
       "agents_other": "{{count}} agents",
       "done": "{{count}} done",
@@ -1313,7 +1373,7 @@
       "statusFailed": "Failed",
       "statusStopped": "Stopped",
       "hintProvisioning": "Provisioning sandbox…",
-      "hintWorking": "Working through the analysis…",
+      "hintWorking": "Running in the background",
       "hintFailed": "Run stopped before finishing",
       "hintStopped": "Run was stopped",
       "ctaOpenThread": "Open thread",
@@ -1351,6 +1411,11 @@
     "workspaceStateArchivedTitle": "Restoring from cold storage",
     "workspaceStateArchivedBody": "Sandboxes that sit idle for 7 days are archived to free compute. Bringing one back involves downloading the snapshot and rebooting the container, which usually takes 60 to 90 seconds.",
     "workspaceStateArchivedFootnote": "Your files, tools, and conversation state are intact — you'll be able to chat as soon as the sandbox is ready.",
+    "archiveConfirm": {
+      "title": "Archive a running thread?",
+      "body": "This thread has a run in progress. Archiving hides it from your lists while the run keeps going — you'll find it under Archived, with its results waiting.",
+      "confirm": "Archive"
+    },
     "compacting": "Compacting conversation...",
     "offloading": "Offloading context...",
     "compactionStopped": "Compaction stopped",
@@ -1503,6 +1568,9 @@
     "addNLinesToContext": "Add {{count}} lines to context",
     "openFile": "Open file",
     "fromAgentResponse": "From agent response",
+    "pastedText": "Pasted text",
+    "pastedLines_one": "Pasted text · {{count}} line",
+    "pastedLines_other": "Pasted text · {{count}} lines",
     "addToMemo": "Add to memo",
     "syncWithMemo": "Sync with memo",
     "memoAdding": "Adding \"{{name}}\" to memo",
@@ -1821,6 +1889,7 @@
   },
   "toolArtifact": {
     "open": "Open",
+    "floatPct": "Float %",
     "prevClose": "Prev Close",
     "dayRange": "Day Range",
     "52wRange": "52W Range",
@@ -1833,8 +1902,14 @@
     "vol": "Vol",
     "liveQuotes": "Live Quotes",
     "extendedHours": {
-      "preMarket": { "long": "Pre-Mkt", "short": "Pre" },
-      "afterHours": { "long": "After-Hrs", "short": "AH" }
+      "preMarket": {
+        "long": "Pre-Mkt",
+        "short": "Pre"
+      },
+      "afterHours": {
+        "long": "After-Hrs",
+        "short": "AH"
+      }
     },
     "marketStatus": {
       "early_trading": "Pre-Market",
@@ -2147,6 +2222,14 @@
     }
   },
   "setup": {
+    "capabilities": "Capabilities",
+    "importParentModels": "Also add these models",
+    "importParentModelsDesc": "Models from the parent catalog, routed through your endpoint and key. Uncheck any you don't need.",
+    "selectNone": "None",
+    "fetchingModels": "Fetching models...",
+    "selectModelsDesc": "Select models available on your server.",
+    "availableModels": "Available models",
+    "noModelsFound": "No models found. Make sure your server is running and has models loaded.",
     "brandedHeader": "Configure your LLM providers",
     "securityNote": "Your API keys are encrypted and never shared",
     "methodTitle": "How would you like to connect?",

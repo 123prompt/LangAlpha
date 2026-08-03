@@ -328,8 +328,8 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
             onClick={() => setView(key)}
             className="px-3 py-1.5 text-xs font-medium rounded"
             style={{
-              color: view === key ? 'var(--color-text-on-accent)' : 'var(--color-text-tertiary)',
-              backgroundColor: view === key ? 'var(--color-accent-primary)' : 'transparent',
+              color: view === key ? 'var(--color-btn-primary-text)' : 'var(--color-text-tertiary)',
+              backgroundColor: view === key ? 'var(--color-btn-primary-bg)' : 'transparent',
             }}
           >
             {label}
@@ -367,7 +367,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
                 disabled={atCap}
                 title={atCap ? `At ${maxServers}/${maxServers} — remove one first` : undefined}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-                style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+                style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
               >
                 <Plus className="h-3 w-3" />
                 Add server
@@ -376,20 +376,20 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
           </div>
 
           {!sandboxRunning && sandboxWarming && (
-            <div className="text-[11px] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
+            <div className="text-[0.6875rem] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
               Starting workspace — your servers are checked automatically as soon as it&apos;s up.
             </div>
           )}
 
           {!sandboxRunning && !sandboxWarming && (
-            <div className="text-[11px] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
+            <div className="text-[0.6875rem] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
               Workspace is stopped — saving a server starts it back up and checks the server automatically.
             </div>
           )}
 
           {promoteConfirm && (
             <div
-              className="flex items-center justify-between gap-3 text-[11px] p-2 rounded"
+              className="flex items-center justify-between gap-3 text-[0.6875rem] p-2 rounded"
               style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
             >
               <span className="min-w-0">
@@ -405,7 +405,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
                   }}
                   disabled={promoteMutation.isPending}
                   className="px-2 py-1 rounded disabled:opacity-50"
-                  style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+                  style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
                 >
                   Overwrite
                 </button>

@@ -45,6 +45,35 @@ function renderWithChild(status: WorkflowChildStatus): void {
   );
 }
 
+function renderWithRunOutcome(status: WorkflowRunState['status'], error: string): void {
+  const run: WorkflowRunState = {
+    ...createWorkflowRunState(),
+    status,
+    error,
+    children: [],
+  };
+  render(
+    <WorkflowRunContext.Provider value={() => run}>
+      <WorkflowRunDetail agent={AGENT} />
+    </WorkflowRunContext.Provider>,
+  );
+}
+
+describe('WorkflowRunDetail run-level error box', () => {
+  // The wire deliberately carries `error` on cancelled runs ("Workflow
+  // cancelled"). A stop is not a failure — the header chip says Stopped in
+  // neutral grey, and a danger box under it would contradict the same screen.
+  it('suppresses the danger box for a user-stopped run', () => {
+    renderWithRunOutcome('cancelled', 'Workflow cancelled');
+    expect(screen.queryByText('Workflow cancelled')).not.toBeInTheDocument();
+  });
+
+  it('keeps the danger box for a genuine failure', () => {
+    renderWithRunOutcome('failed', 'child 3 exploded');
+    expect(screen.getByText('child 3 exploded')).toBeInTheDocument();
+  });
+});
+
 describe('WorkflowRunDetail child error colour', () => {
   it('tints a schema miss amber, matching its own row', () => {
     renderWithChild('invalid_schema');
@@ -53,10 +82,10 @@ describe('WorkflowRunDetail child error colour', () => {
     });
   });
 
-  it('still tints a genuine failure as loss', () => {
+  it('still tints a genuine failure with the danger token', () => {
     renderWithChild('error');
     expect(screen.getByTestId('workflow-detail-child-error')).toHaveStyle({
-      color: 'var(--color-loss)',
+      color: 'var(--color-icon-danger)',
     });
   });
 });

@@ -311,7 +311,7 @@ export function ModelTab() {
                   const displayName = providerData?.display_name || provider.charAt(0).toUpperCase() + provider.slice(1);
                   return (
                     <div key={provider} className="mb-1">
-                      <div className="px-2 py-1 text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
+                      <div className="px-2 py-1 text-[0.625rem] font-semibold uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
                         {displayName}
                       </div>
                       {filtered.map((m) => {

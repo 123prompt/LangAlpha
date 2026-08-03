@@ -2,9 +2,10 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   X, Cpu, MemoryStick, HardDrive, MonitorCog, Play, Square,
   Package, Search, RefreshCw, ChevronDown, ChevronRight,
-  Server, Loader2, BookOpen, Archive, KeyRound,
+  Server, BookOpen, Archive, KeyRound,
   Plus, Trash2, Pencil, Eye, EyeOff, ExternalLink, Sparkles,
 } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import {
   getSandboxStats, installSandboxPackages, refreshWorkspace,
   getVaultSecrets, createVaultSecret, updateVaultSecret, deleteVaultSecret, revealVaultSecret,
@@ -395,7 +396,7 @@ function ErrorState({ message, onRetry }: ErrorStateProps) {
       <button
         onClick={onRetry}
         className="px-4 py-2 text-sm rounded-md transition-colors hover:bg-foreground/10"
-        style={{ color: 'var(--color-accent-primary)', border: '1px solid var(--color-accent-primary)' }}
+        style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-elevated)' }}
       >
         Retry
       </button>
@@ -516,11 +517,9 @@ function OverviewTab({ stats, isRunning, actionLoading, refreshing, onStartStop,
       >
         <div className="flex items-center gap-3" role="status" aria-live="polite">
           {isTransitioning ? (
-            <Loader2
-              aria-hidden="true"
-              className="h-3.5 w-3.5 animate-spin flex-shrink-0"
-              style={{ color: 'var(--color-text-tertiary)' }}
-            />
+            <span aria-hidden="true" className="flex-shrink-0">
+              <Loader size={14} className="text-[color:var(--color-text-tertiary)]" />
+            </span>
           ) : (
             <div
               aria-hidden="true"
@@ -560,7 +559,11 @@ function OverviewTab({ stats, isRunning, actionLoading, refreshing, onStartStop,
             style={{ color: 'var(--color-text-tertiary)', border: '1px solid var(--color-border-muted)' }}
           >
             {refreshing
-              ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+              ? (
+                <span aria-hidden="true" className="flex-shrink-0">
+                  <Loader size={12} className="text-current" />
+                </span>
+              )
               : <RefreshCw className="h-3 w-3" aria-hidden="true" />}
           </button>
           {!isRunning && stats.state === 'stopped' && (
@@ -760,7 +763,7 @@ function PackagesTab({
                   </span>
                   {isDefault && (
                     <span
-                      className="text-[10px] px-1.5 py-0.5 rounded"
+                      className="text-[0.625rem] px-1.5 py-0.5 rounded"
                       style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-card)' }}
                     >
                       default
@@ -799,11 +802,11 @@ function PackagesTab({
             disabled={installing || !installInput.trim()}
             className="flex items-center gap-1.5 px-4 py-2 text-sm rounded-md transition-colors disabled:opacity-50"
             style={{
-              color: 'var(--color-text-on-accent)',
-              backgroundColor: 'var(--color-accent-primary)',
+              color: 'var(--color-btn-primary-text)',
+              backgroundColor: 'var(--color-btn-primary-bg)',
             }}
           >
-            {installing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Package className="h-3.5 w-3.5" />}
+            {installing ? <Loader size={14} className="text-current" /> : <Package className="h-3.5 w-3.5" />}
             Install
           </button>
         </div>
@@ -912,7 +915,7 @@ function ToolsTab({ stats, refreshing, refreshResult, onRefresh }: ToolsTabProps
             backgroundColor: 'var(--color-bg-card)',
           }}
         >
-          {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+          {refreshing ? <Loader size={16} className="text-current" /> : <RefreshCw className="h-4 w-4" />}
           Sync Tools & Skills
         </button>
 
@@ -1201,8 +1204,8 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
             onClick={() => { setShowAdd(!showAdd); setError(null); }}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors"
             style={{
-              color: 'var(--color-text-on-accent)',
-              backgroundColor: 'var(--color-accent-primary)',
+              color: 'var(--color-btn-primary-text)',
+              backgroundColor: 'var(--color-btn-primary-bg)',
             }}
           >
             <Plus className="h-3 w-3" />
@@ -1244,7 +1247,7 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
                     <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
                       {bp.label}
                     </span>
-                    <span className="text-xs font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-default)' }}>
+                    <span className="text-xs font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-tag)' }}>
                       {bp.name}
                     </span>
                   </div>
@@ -1345,9 +1348,9 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
               onClick={handleCreate}
               disabled={saving || !newName || !newValue}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-              style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+              style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
             >
-              {saving && <Loader2 className="h-3 w-3 animate-spin" />}
+              {saving && <Loader size={12} className="text-current" />}
               Save
             </button>
           </div>
@@ -1367,7 +1370,7 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
                 /* Edit form */
                 <div
                   className="flex flex-col gap-2 p-3 rounded-lg"
-                  style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-accent-primary)' }}
+                  style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-elevated)' }}
                 >
                   <div className="text-sm font-mono font-medium" style={{ color: 'var(--color-text-primary)' }}>
                     {secret.name}
@@ -1413,9 +1416,9 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
                       onClick={() => handleUpdate(secret.name)}
                       disabled={editSaving}
                       className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-                      style={{ color: 'var(--color-text-on-accent)', backgroundColor: 'var(--color-accent-primary)' }}
+                      style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
                     >
-                      {editSaving && <Loader2 className="h-3 w-3 animate-spin" />}
+                      {editSaving && <Loader size={12} className="text-current" />}
                       Update
                     </button>
                   </div>
@@ -1450,7 +1453,7 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
                       title={revealedSecrets[secret.name] !== undefined ? 'Hide value' : 'Reveal value'}
                     >
                       {revealingName === secret.name ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <Loader size={14} className="text-current" />
                       ) : revealedSecrets[secret.name] !== undefined ? (
                         <EyeOff className="h-3.5 w-3.5" />
                       ) : (

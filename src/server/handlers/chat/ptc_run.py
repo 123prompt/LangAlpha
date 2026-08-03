@@ -258,6 +258,11 @@ async def astream_ptc_workflow(
         }
         if effective_model:
             query_metadata["llm_model"] = effective_model
+        if request.origin:
+            # Per-turn initiator, mirroring the thread-level metadata['origin']
+            # (threads go mixed: a pinned automation thread also takes manual
+            # user follow-ups, which carry no origin).
+            query_metadata["origin"] = request.origin.model_dump(exclude_none=True)
 
         # Extract attachment and context metadata for display in history
         # (PTC skips this block for HITL resumes — contrast with Flash)

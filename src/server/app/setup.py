@@ -474,13 +474,19 @@ async def lifespan(app: FastAPI):
     # immediately. Executor registration must precede start(): the outbox
     # never imports handlers, and an unregistered type's jobs nack toward
     # dead.
-    try:
-        from src.server.services.report_back import subagent
-        from src.server.services.report_back.flash import core as flash_core
-        from src.server.services.hook_outbox import HookOutboxDrainer
+    # Imports + registration OUTSIDE the guard: a failure there is a code bug
+    # that must crash the worker loudly — swallowed, it leaves the drainer
+    # permanently off behind one WARN line (report-backs undelivered, burst
+    # slots leaking).
+    from src.server.services.report_back import subagent
+    from src.server.services.report_back.flash import core as flash_core
+    from src.server.services import thread_lifecycle_feed
+    from src.server.services.hook_outbox import HookOutboxDrainer
 
-        flash_core.register_outbox_executors()
-        subagent.register_outbox_executors()
+    flash_core.register_outbox_executors()
+    subagent.register_outbox_executors()
+    thread_lifecycle_feed.register_outbox_executors()
+    try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
     except Exception as e:
@@ -986,6 +992,7 @@ from src.server.app.chart_annotations import router as chart_annotations_router
 from src.server.app.workspace_sandbox import preview_redirect_router
 from src.server.app.market_data import router as market_data_router
 from src.server.app.bars import router as bars_router
+from src.server.app.user_events import router as user_events_router
 from src.server.app.users import router as users_router
 from src.server.app.features import router as features_router
 from src.server.app.watchlist import router as watchlist_router
@@ -1045,6 +1052,9 @@ app.include_router(
     bars_router
 )  # /api/v1/market-data/bars/* - Protocol-native progressive bars
 app.include_router(users_router)  # /api/v1/users/* - User management
+app.include_router(
+    user_events_router
+)  # /api/v1/users/me/thread-events - Thread lifecycle SSE feed
 app.include_router(features_router)  # /api/v1/features/* - Feature flags (per-user resolved)
 app.include_router(
     watchlist_router

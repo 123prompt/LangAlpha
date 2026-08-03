@@ -2275,7 +2275,13 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 if wait_for_notify is not None:
                     # Pub/sub fast path. Cap at 30 s so a dropped publish
                     # still triggers a periodic DB re-read.
-                    await wait_for_notify(min(remaining, 30.0))
+                    kind, _payload = await wait_for_notify(min(remaining, 30.0))
+                    if kind == "error":
+                        # A broken connection returns immediately instead of
+                        # blocking, so keeping this path would busy-spin DB
+                        # reads until the deadline. Abandon pub/sub and let the
+                        # backoff poll below pace the rest of the wait.
+                        wait_for_notify = None
                 else:
                     await asyncio.sleep(min(interval, remaining))
                     interval = min(interval * 2, max_interval)

@@ -14,7 +14,13 @@ import {
 } from '@/components/ui/dropdown-menu';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 
-const AccountMenu: React.FC = () => {
+interface AccountMenuProps {
+  /** 'rail' = avatar-only trigger (collapsed sidebar); 'row' = full-width
+   *  avatar + name row for the expanded panel's bottom slot. */
+  variant?: 'rail' | 'row';
+}
+
+const AccountMenu: React.FC<AccountMenuProps> = ({ variant = 'rail' }) => {
   const navigate = useNavigate();
   const location = useLocation();
   const { logout } = useAuth();
@@ -67,37 +73,69 @@ const AccountMenu: React.FC = () => {
     <>
       <DropdownMenu open={open} onOpenChange={setOpen} modal={false}>
         <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            aria-label={t('account.menuLabel', 'Account menu')}
-            title={t('account.menuLabel', 'Account menu')}
-            className="sidebar-account-trigger"
-            data-active={isTriggerActive ? 'true' : undefined}
-          >
-            {avatarUrl && !avatarError ? (
-              <img
-                src={avatarUrl}
-                alt=""
-                className="sidebar-account-avatar-img"
-                onError={() => setAvatarError(true)}
-              />
-            ) : initials ? (
-              <span className="sidebar-account-initials">{initials}</span>
-            ) : (
-              <User className="sidebar-account-icon" />
-            )}
-            {planDisplayName && (
-              <span className="sidebar-account-plan-flair" aria-hidden="true">
-                {planDisplayName}
+          {variant === 'row' ? (
+            <button
+              type="button"
+              aria-label={t('account.menuLabel', 'Account menu')}
+              className="sidebar-account-row"
+              data-active={isTriggerActive ? 'true' : undefined}
+            >
+              <span className="sidebar-account-row-avatar">
+                {avatarUrl && !avatarError ? (
+                  <img
+                    src={avatarUrl}
+                    alt=""
+                    className="sidebar-account-avatar-img"
+                    onError={() => setAvatarError(true)}
+                  />
+                ) : initials ? (
+                  <span className="sidebar-account-initials">{initials}</span>
+                ) : (
+                  <User className="sidebar-account-icon" />
+                )}
               </span>
-            )}
-          </button>
+              <span className="sidebar-account-row-name">
+                {displayName || email || t('account.menuLabel', 'Account menu')}
+              </span>
+              {planDisplayName && (
+                <span className="sidebar-account-row-plan" aria-hidden="true">
+                  {planDisplayName}
+                </span>
+              )}
+            </button>
+          ) : (
+            <button
+              type="button"
+              aria-label={t('account.menuLabel', 'Account menu')}
+              title={t('account.menuLabel', 'Account menu')}
+              className="sidebar-account-trigger"
+              data-active={isTriggerActive ? 'true' : undefined}
+            >
+              {avatarUrl && !avatarError ? (
+                <img
+                  src={avatarUrl}
+                  alt=""
+                  className="sidebar-account-avatar-img"
+                  onError={() => setAvatarError(true)}
+                />
+              ) : initials ? (
+                <span className="sidebar-account-initials">{initials}</span>
+              ) : (
+                <User className="sidebar-account-icon" />
+              )}
+              {planDisplayName && (
+                <span className="sidebar-account-plan-flair" aria-hidden="true">
+                  {planDisplayName}
+                </span>
+              )}
+            </button>
+          )}
         </DropdownMenuTrigger>
 
         <DropdownMenuContent
-          side="right"
-          align="end"
-          sideOffset={12}
+          side={variant === 'row' ? 'top' : 'right'}
+          align={variant === 'row' ? 'start' : 'end'}
+          sideOffset={variant === 'row' ? 8 : 12}
           className="w-64"
         >
           {(displayName || email) && (
@@ -131,7 +169,7 @@ const AccountMenu: React.FC = () => {
                       </span>
                       {planDisplayName && (
                         <span
-                          className="text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full flex-shrink-0"
+                          className="text-[0.625rem] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full flex-shrink-0"
                           style={{
                             backgroundColor: 'var(--color-accent-soft)',
                             color: 'var(--color-accent-light)',

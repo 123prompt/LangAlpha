@@ -176,10 +176,10 @@ describe('McpServerRow — in-flight affordances', () => {
     const { container, rerender } = render(
       <McpServerRow server={makeServer()} toggling {...handlers()} />,
     );
-    expect(container.querySelector('.animate-spin')).toBeNull();
+    expect(container.querySelector('[role="status"]')).toBeNull();
 
     rerender(<McpServerRow server={makeServer()} deleting {...handlers()} />);
-    expect(container.querySelector('.animate-spin')).not.toBeNull();
+    expect(container.querySelector('[role="status"]')).not.toBeNull();
   });
 });
 

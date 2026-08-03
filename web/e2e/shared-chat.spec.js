@@ -112,8 +112,9 @@ test.describe('SharedChat page', () => {
 
     await page.goto(`/s/${TOKEN}`);
 
-    // Spinner should be visible while waiting for metadata
-    const spinner = page.locator('.animate-spin');
+    // The glyph loader should be visible while waiting for metadata
+    // (Loader renders role="status" with aria-label "Loading")
+    const spinner = page.getByRole('status', { name: 'Loading' });
     await expect(spinner).toBeVisible({ timeout: 3000 });
   });
 

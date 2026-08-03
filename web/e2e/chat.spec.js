@@ -70,6 +70,15 @@ function chatViewOverrides() {
   };
 }
 
+/**
+ * Gallery card for a workspace, scoped by test id: the sidebar renders the
+ * same workspace names, so a bare getByText(name) is ambiguous and races the
+ * gallery's lazy chunk (matching the nav row instead of the card).
+ */
+function workspaceCard(page, name) {
+  return page.getByTestId('workspace-card').filter({ has: page.getByText(name, { exact: true }) });
+}
+
 /** Configure replay SSE to return replay_done immediately (empty history). */
 async function configureEmptyReplay() {
   await configureSSE({
@@ -162,15 +171,14 @@ test.describe('Workspace Gallery', () => {
     await page.goto('/chat');
 
     // Wait for card to appear
-    const researchCard = page.getByText('Research', { exact: true });
+    const researchCard = workspaceCard(page, 'Research');
     await expect(researchCard).toBeVisible({ timeout: 10000 });
 
     // Hover on the workspace card to reveal the 3-dot menu
-    const cardContainer = researchCard.locator('xpath=ancestor::div[contains(@class, "group")]').first();
-    await cardContainer.hover();
+    await researchCard.hover();
 
-    // Click the 3-dot menu button (MoreHorizontal icon)
-    await cardContainer.locator('button:has(svg)').first().click();
+    // Click the 3-dot menu button (MoreHorizontal icon, the card's only button)
+    await researchCard.locator('button:has(svg)').first().click();
 
     // Click Delete in the dropdown (Radix renders menu items as role="menuitem")
     await page.getByRole('menuitem', { name: 'Delete' }).click();
@@ -180,7 +188,7 @@ test.describe('Workspace Gallery', () => {
     await page.getByRole('button', { name: 'Delete' }).click();
 
     // The Research card should disappear (refetch returns without a0000001-0000-4000-8000-000000000001)
-    await expect(page.getByText('Research', { exact: true })).not.toBeVisible({ timeout: 10000 });
+    await expect(researchCard).not.toBeVisible({ timeout: 10000 });
   });
 
   test('click workspace navigates to thread gallery', async ({ page }) => {
@@ -190,7 +198,7 @@ test.describe('Workspace Gallery', () => {
     await page.goto('/chat');
 
     // Wait for Research card
-    const researchCard = page.getByText('Research', { exact: true });
+    const researchCard = workspaceCard(page, 'Research');
     await expect(researchCard).toBeVisible({ timeout: 10000 });
 
     // Click the workspace card
@@ -243,9 +251,20 @@ test.describe('Thread Gallery', () => {
   });
 
   test('delete thread removes from list', async ({ page }) => {
+    // Dynamic mock: the gallery refetches the list after a delete, so the mock
+    // must stop returning the deleted thread once DELETE has been called.
+    let thDeleted = false;
     await mockAPI(page, {
       ...threadOverrides(),
-      'DELETE /threads/b0000001-0000-4000-8000-000000000001': { success: true },
+      'GET /threads': (route) => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(thDeleted ? { threads: [th2], total: 1 } : { threads: [th1, th2], total: 2 }),
+      }),
+      'DELETE /threads/b0000001-0000-4000-8000-000000000001': (route) => {
+        thDeleted = true;
+        return route.fulfill({ status: 200, contentType: 'application/json', body: '{"success": true}' });
+      },
       'GET /workspaces/a0000001-0000-4000-8000-000000000001/files': { files: [] },
     });
 

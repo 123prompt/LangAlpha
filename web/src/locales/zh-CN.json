@@ -1,5 +1,7 @@
 {
   "common": {
+    "copy": "复制",
+    "submit": "提交",
     "save": "保存",
     "saving": "保存中...",
     "cancel": "取消",
@@ -101,7 +103,13 @@
     "marketView": "行情中心",
     "automations": "自动化",
     "settings": "设置",
-    "account": "用量与套餐"
+    "account": "用量与套餐",
+    "newChat": "新对话",
+    "workspaces": "工作区",
+    "workspaceGallery": "工作区总览",
+    "collapse": "收起侧边栏",
+    "expand": "展开侧边栏",
+    "resize": "调整侧边栏宽度"
   },
   "account": {
     "menuLabel": "账号菜单"
@@ -117,10 +125,27 @@
     "threadsPerWorkspace": "每个工作区显示的对话数",
     "all": "全部",
     "showMore": "显示更多",
-    "loadAll": "加载全部"
+    "loadAll": "加载全部",
+    "pinThread": "置顶",
+    "unpinThread": "取消置顶",
+    "archiveThread": "归档",
+    "threadUpdated": "更新于",
+    "threadCreated": "创建于",
+    "threadTurns": "轮次",
+    "threadNeedsInput": "等待您的输入",
+    "threadUnseen": "已完成，尚未查看",
+    "untitledThread": "未命名",
+    "noConversations": "暂无会话",
+    "workspaceFallback": "工作区",
+    "collapseAgents": "收起智能体",
+    "expandAgents": "展开智能体",
+    "removeAgent": "移除智能体"
   },
   "settings": {
     "title": "用户设置",
+    "connected": "已连接",
+    "manageProviders": "管理提供商",
+    "fontSize": "字体大小",
     "userInfo": "用户信息",
     "preferences": "偏好设置",
     "model": "模型",
@@ -1182,7 +1207,12 @@
     "failedDeleteThread": "删除对话失败，请重试。",
     "failedRenameThread": "重命名对话失败，请重试。",
     "viewAll": "查看全部",
-    "shared": "已分享"
+    "shared": "已分享",
+    "archive": "归档",
+    "unarchive": "取消归档",
+    "archived": "已归档",
+    "archivedTasks": "已归档任务",
+    "noArchivedThreads": "暂无已归档的对话"
   },
   "share": {
     "shareConversation": "分享对话",
@@ -1194,12 +1224,20 @@
     "anyoneWithLink": "任何拥有此链接的人都可以查看对话。"
   },
   "chat": {
+    "backToWorkflow": "返回工作流",
+    "backToMain": "返回主对话",
+    "backToFlash": "返回 Flash",
+    "reconnecting": "重新连接中…",
+    "jumpToLatest": {
+      "aria": "滚动到最新消息"
+    },
     "pills": {
       "plan": "计划",
       "planTitle": "计划模式 — 智能体先生成计划，经确认后再执行",
       "watch": "盯盘",
       "watchTitle": "盯盘模式 — 实时跟踪智能体关注的股票价格"
     },
+    "moreTools": "更多工具",
     "widgetContext": {
       "inContext_one": "{{count}} 项上下文",
       "inContext_other": "{{count}} 项上下文",
@@ -1243,6 +1281,17 @@
     "expandResult": "显示全部",
     "collapseResult": "收起",
     "resultMoreItems": "另有 {{n}} 项",
+    "actions": {
+      "copyMessage": "复制消息",
+      "copied": "已复制！",
+      "editMessage": "编辑消息",
+      "goodResponse": "点赞回复",
+      "removeRating": "取消评价",
+      "reportIssue": "反馈问题",
+      "feedbackSubmitted": "已提交反馈",
+      "regenerate": "重新生成回复",
+      "retry": "重试"
+    },
     "modelTroubleSuggestion": "{{from}} 出现问题 — 本次回答由 {{to}} 完成",
     "switchToModel": "切换到 {{model}}",
     "modelSwitched": "默认模型已设为 {{model}}",
@@ -1269,10 +1318,21 @@
       "toolUnit_other": "次工具调用",
       "tokenUnit": "tokens"
     },
+    "subagentBar": {
+      "completedWithTools_one": "已完成（{{count}} 次工具调用）",
+      "completedWithTools_other": "已完成（{{count}} 次工具调用）",
+      "runningWithTool": "运行中：{{tool}}",
+      "initializing": "初始化中",
+      "instruct": "指示",
+      "errorHeading": "该智能体因错误而停止",
+      "inputPlaceholder": "为该智能体添加指令…",
+      "avatarAlt": "智能体"
+    },
     "workflowRun": {
       "titleFallback": "工作流运行",
       "openRunning": "点击查看运行中的工作流",
       "openDetails": "点击查看工作流详情",
+      "sharedUnavailable": "分享视图中不提供运行详情",
       "agents_one": "{{count}} 个智能体",
       "agents_other": "{{count}} 个智能体",
       "done": "已完成 {{count}} 个",
@@ -1312,7 +1372,7 @@
       "statusFailed": "已失败",
       "statusStopped": "已停止",
       "hintProvisioning": "正在配置沙盒…",
-      "hintWorking": "正在进行分析…",
+      "hintWorking": "正在后台运行",
       "hintFailed": "运行未完成便已停止",
       "hintStopped": "运行已停止",
       "ctaOpenThread": "打开对话",
@@ -1350,6 +1410,11 @@
     "workspaceStateArchivedTitle": "正在从冷存储中恢复",
     "workspaceStateArchivedBody": "闲置超过 7 天的沙盒会被归档以释放算力。唤回时需要下载快照并重启容器，通常需要 60 至 90 秒。",
     "workspaceStateArchivedFootnote": "您的文件、工具和对话状态都完好无损——沙盒就绪后即可继续对话。",
+    "archiveConfirm": {
+      "title": "该对话仍在运行，确定归档？",
+      "body": "此对话还有任务正在运行。归档只是把它从列表中隐藏，任务会继续跑完——之后可在“已归档”中找到它和运行结果。",
+      "confirm": "归档"
+    },
     "compacting": "正在压缩对话...",
     "offloading": "正在转存上下文...",
     "compactionStopped": "压缩已停止",
@@ -1502,6 +1567,9 @@
     "addNLinesToContext": "添加 {{count}} 行到上下文",
     "openFile": "打开文件",
     "fromAgentResponse": "来自 Agent 回复",
+    "pastedText": "粘贴的文本",
+    "pastedLines_one": "粘贴的文本 · {{count}} 行",
+    "pastedLines_other": "粘贴的文本 · {{count}} 行",
     "addToMemo": "添加到备忘录",
     "syncWithMemo": "同步到备忘录",
     "memoAdding": "正在将 \"{{name}}\" 添加到备忘录",
@@ -1818,6 +1886,7 @@
   },
   "toolArtifact": {
     "open": "开盘",
+    "floatPct": "流通比例",
     "prevClose": "前收",
     "dayRange": "日内区间",
     "52wRange": "52周区间",
@@ -1830,8 +1899,14 @@
     "vol": "量",
     "liveQuotes": "实时报价",
     "extendedHours": {
-      "preMarket": { "long": "盘前", "short": "盘前" },
-      "afterHours": { "long": "盘后", "short": "盘后" }
+      "preMarket": {
+        "long": "盘前",
+        "short": "盘前"
+      },
+      "afterHours": {
+        "long": "盘后",
+        "short": "盘后"
+      }
     },
     "marketStatus": {
       "early_trading": "盘前",
@@ -2126,6 +2201,14 @@
     }
   },
   "setup": {
+    "capabilities": "能力",
+    "importParentModels": "同时添加这些模型",
+    "importParentModelsDesc": "来自父级目录的模型，通过您的端点和密钥路由。取消勾选不需要的模型。",
+    "selectNone": "全不选",
+    "fetchingModels": "正在获取模型…",
+    "selectModelsDesc": "选择您服务器上可用的模型。",
+    "availableModels": "可用模型",
+    "noModelsFound": "未找到模型。请确认您的服务器正在运行且已加载模型。",
     "brandedHeader": "配置您的 LLM 提供商",
     "securityNote": "您的 API 密钥已加密且不会被共享",
     "methodTitle": "您想如何连接？",

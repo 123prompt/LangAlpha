@@ -1,6 +1,7 @@
 import React, { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Loader2, StopCircle } from 'lucide-react';
+import { StopCircle } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import { compactNumber } from '@/lib/format';
 import {
   WORKFLOW_TASK_TYPE,
@@ -11,7 +12,7 @@ import {
 } from '../session/subagents/workflowRunState';
 import type { SubagentTelemetry } from '../session/subagents/resolveSubagentTelemetry';
 import { useWorkflowRun } from './WorkflowRunContext';
-import { MONO_STACK, INTER_STACK } from './TaskCardShell';
+import { MONO_STACK } from './TaskCardShell';
 import { TaskStatusChip, type TaskCardStatusKind } from './taskStatusUi';
 import {
   SECTION_LABEL_STYLE,
@@ -53,7 +54,7 @@ function Stat({ label, value }: { label: string; value: string }): React.ReactEl
   return (
     <div style={{ minWidth: 0 }}>
       <div style={{ ...SECTION_LABEL_STYLE, marginBottom: 2 }}>{label}</div>
-      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>
+      <div style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--color-text-primary)' }}>
         {value}
       </div>
     </div>
@@ -95,7 +96,7 @@ function RunHeader({
       <div style={{ minWidth: 0, flex: 1 }}>
         <div
           style={{
-            fontSize: 11,
+            fontSize: '0.6875rem',
             color: 'var(--color-text-tertiary)',
             letterSpacing: '0.04em',
             textTransform: 'lowercase',
@@ -105,8 +106,8 @@ function RunHeader({
         </div>
         <div
           style={{
-            fontFamily: INTER_STACK,
-            fontSize: 16,
+            fontFamily: 'var(--font-ui)',
+            fontSize: '1rem',
             fontWeight: 600,
             color: 'var(--color-text-primary)',
             marginTop: 2,
@@ -128,7 +129,7 @@ function RunHeader({
             gap: 5,
             padding: '3px 9px',
             marginTop: 0,
-            fontSize: 11,
+            fontSize: '0.6875rem',
             fontFamily: MONO_STACK,
             letterSpacing: '0.04em',
             color: 'var(--color-text-secondary)',
@@ -178,7 +179,8 @@ function PhaseGroup({
           }}
         >
           {active && (
-            <Loader2 style={{ width: 10, height: 10, animation: 'spin 1s linear infinite' }} />
+            // Shared liveness glyph — inherits the phase label's warning amber.
+            <Loader size={10} label={t('chat.taskCard.statusRunning')} style={{ color: 'inherit' }} />
           )}
           {phase}
           <span style={{ color: 'var(--color-text-quaternary)', letterSpacing: 0 }}>
@@ -215,7 +217,7 @@ function PhaseGroup({
                   data-testid="workflow-detail-child-error"
                   style={{
                     margin: '0 0 4px 22px',
-                    fontSize: 11,
+                    fontSize: '0.6875rem',
                     color: workflowChildStatusColor(child.status),
                     whiteSpace: 'pre-wrap',
                     wordBreak: 'break-word',
@@ -328,7 +330,10 @@ function WorkflowRunDetail({
   }, [run?.resultPreview]);
 
   const { children, doneCount, agentCount, duration } = summarizeRun(run);
-  const error = run?.error ?? agent.error;
+  // The wire carries `error` on cancelled runs too ("Workflow cancelled") — a
+  // stop is not a failure, so only a genuinely failed run gets the danger box.
+  // Same gate as the inline card's error line.
+  const error = kind === 'error' ? (run?.error ?? agent.error) : null;
   const groups = groupChildrenByPhase(children);
 
   return (
@@ -346,8 +351,8 @@ function WorkflowRunDetail({
           style={{
             marginTop: 10,
             padding: '8px 10px',
-            fontSize: 12,
-            color: 'var(--color-loss)',
+            fontSize: '0.75rem',
+            color: 'var(--color-icon-danger)',
             border: '1px solid var(--color-border-muted)',
             borderRadius: 8,
             whiteSpace: 'pre-wrap',
@@ -412,7 +417,7 @@ function WorkflowRunDetail({
                 border: '1px solid var(--color-border-subtle)',
                 borderRadius: 8,
                 padding: '8px 10px',
-                fontSize: 11,
+                fontSize: '0.6875rem',
                 fontFamily: MONO_STACK,
                 color: 'var(--color-text-secondary)',
                 whiteSpace: 'pre-wrap',
@@ -435,7 +440,7 @@ function WorkflowRunDetail({
               border: '1px solid var(--color-border-subtle)',
               borderRadius: 8,
               padding: '8px 10px',
-              fontSize: 11,
+              fontSize: '0.6875rem',
               color: 'var(--color-text-secondary)',
               display: 'flex',
               flexDirection: 'column',
@@ -454,7 +459,7 @@ function WorkflowRunDetail({
       )}
 
       {!run && (
-        <div style={{ marginTop: 14, fontSize: 12, color: 'var(--color-text-tertiary)' }}>
+        <div style={{ marginTop: 14, fontSize: '0.75rem', color: 'var(--color-text-tertiary)' }}>
           {t(isRunning ? 'chat.workflowRun.starting' : 'chat.workflowRun.noProgress')}
         </div>
       )}

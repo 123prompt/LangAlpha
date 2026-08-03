@@ -98,7 +98,7 @@ export function PageIntroModal({ intro, onClose }: { intro: PageIntroDef; onClos
                     {t(step.titleKey)}
                   </DialogTitle>
                   <DialogDescription
-                    className="text-sm leading-relaxed sm:text-[15px]"
+                    className="text-sm leading-relaxed sm:text-[0.9375rem]"
                     style={{ color: 'var(--color-text-secondary)' }}
                   >
                     {t(step.bodyKey)}

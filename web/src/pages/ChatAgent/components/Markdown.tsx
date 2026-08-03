@@ -246,8 +246,8 @@ const chatPre = ({ node: _node, children, ..._props }: MarkdownComponentProps) =
 };
 const chatBlockquote = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <blockquote
-    className="border-l-4 pl-4 my-2 italic"
-    style={{ borderColor: 'var(--color-accent-primary)', color: 'var(--color-text-primary)', opacity: 0.8 }}
+    className="border-l-2 pl-4 my-2 italic"
+    style={{ borderColor: 'var(--color-border-elevated)', color: 'var(--color-text-primary)', opacity: 0.8 }}
     {...props}
   />
 );
@@ -338,7 +338,7 @@ const panelA = ({ node: _node, ...props }: MarkdownComponentProps) => (
 const panelBlockquote = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <blockquote
     className="pl-3 my-2"
-    style={{ borderLeft: '3px solid var(--color-accent-overlay)', color: 'var(--color-text-primary)' }}
+    style={{ borderLeft: '2px solid var(--color-border-elevated)', color: 'var(--color-text-primary)' }}
     {...props}
   />
 );
@@ -710,9 +710,11 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
     return { ...result, a: fileAwareA };
   }, [onOpenFile, variant, config.components, codeTheme]);
 
+  // Rendered markdown is always long-form reading content — every call site
+  // (transcript, detail panels, memos, plans) gets the content face here.
   return (
     <div
-      className={`${config.className} ${className}`.trim()}
+      className={`font-content ${config.className} ${className}`.trim()}
       style={{ ...config.style, ...style }}
     >
       <ReactMarkdown key={lineKey} remarkPlugins={[[remarkGfm, { singleTilde: false }], remarkCjkFriendly, remarkMath]} rehypePlugins={[[rehypeKatex, { strict: false }], rehypeRaw, [rehypeSanitize, sanitizeSchema]]} components={components}>

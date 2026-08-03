@@ -105,7 +105,7 @@ describe('SubagentTaskMessageContent — telemetry row', () => {
 });
 
 describe('SubagentTaskMessageContent — status discriminator', () => {
-  it('renders Running label with spin animation for action=init + status=running', () => {
+  it('renders Running label with the ascii liveness glyph for action=init + status=running', () => {
     render(
       <SubagentTaskMessageContent
         subagentId="tc-r"
@@ -115,7 +115,10 @@ describe('SubagentTaskMessageContent — status discriminator', () => {
         action="init"
       />,
     );
-    expect(screen.getByText('Running')).toBeInTheDocument();
+    // Two "Running" nodes by design: the visible label + the ascii Loader's
+    // aria-label (role="status") — assert both halves explicitly.
+    expect(screen.getAllByText('Running').length).toBeGreaterThan(0);
+    expect(screen.getByRole('status', { name: 'Running' })).toBeInTheDocument();
   });
 
   it('renders Completed label for action=init + status=completed', () => {
@@ -216,13 +219,14 @@ describe('SubagentTaskMessageContent — telemetry context fallback', () => {
 });
 
 describe('SubagentTaskMessageContent — accessibility', () => {
-  it('exposes the card as a keyboard-focusable button', () => {
+  it('exposes the card as a keyboard-focusable button when it can open', () => {
     render(
       <SubagentTaskMessageContent
         subagentId="tc-a11y"
         description="Click me"
         type="research"
         status="completed"
+        onOpen={() => {}}
       />,
     );
     // Without a hasResult body, the card root is the only role=button.
@@ -230,6 +234,37 @@ describe('SubagentTaskMessageContent — accessibility', () => {
     const card = screen.getByRole('button');
     expect(card).toHaveAttribute('tabIndex', '0');
     expect(card).toHaveAttribute('title');
+  });
+
+  it('renders inert on read-only surfaces — no button role, focus stop, or tooltip', () => {
+    // Shared links strip onOpen (MessageContentSegments passes undefined on
+    // readOnly). The card must not keep the click costume without the click.
+    render(
+      <SubagentTaskMessageContent
+        subagentId="tc-inert"
+        description="Click me"
+        type="research"
+        status="completed"
+      />,
+    );
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(document.querySelector('[tabindex]')).toBeNull();
+    expect(document.querySelector('[title]')).toBeNull();
+  });
+
+  it('omits the view-output affordance when onDetailOpen is absent', () => {
+    // A result with no handler (read-only surface) must not render the arrow
+    // button — it would swallow clicks and open nothing.
+    render(
+      <SubagentTaskMessageContent
+        subagentId="tc-dead-affordance"
+        description="Done"
+        type="research"
+        status="completed"
+        toolCallProcess={{ toolCallResult: { content: 'output text' } }}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: 'View subagent output' })).toBeNull();
   });
 
   it('opens the secondary view-output action via an accessible button', () => {

@@ -85,15 +85,15 @@ describe('WorkflowChildStatusIcon', () => {
     },
   );
 
-  it('animates only while the child is running', () => {
+  it('renders the ascii liveness glyph only while the child is running', () => {
+    // Liveness is the shared ascii Loader (role="status"), not a spinning
+    // lucide icon — the same glyph as the nav tree and the task cards.
     const { unmount } = render(<WorkflowChildStatusIcon status="running" />);
-    expect(screen.getByLabelText('Running')).toHaveStyle({
-      animation: 'spin 1s linear infinite',
-    });
+    expect(screen.getByRole('status', { name: 'Running' })).toBeInTheDocument();
     unmount();
 
     render(<WorkflowChildStatusIcon status="ok" />);
-    expect(screen.getByLabelText('Done').style.animation).toBe('');
+    expect(screen.queryByRole('status')).toBeNull();
   });
 
   it('defaults to the inline-card size and honours the panel override', () => {
@@ -147,13 +147,15 @@ describe('WorkflowChildRow', () => {
   });
 
   it('leaves an unfinished duration blank on the card and names the state on the detail', () => {
+    // Ignore the liveness glyph's screen-reader label — this pin is about the
+    // visible duration cell, which stays blank on the card surface.
     const live = child({ status: 'running', durationS: null });
     const { unmount } = render(<WorkflowChildRow child={live} surface="card" />);
-    expect(screen.queryByText('Running')).not.toBeInTheDocument();
+    expect(screen.queryByText('Running', { ignore: '.sr-only' })).not.toBeInTheDocument();
     unmount();
 
     render(<WorkflowChildRow child={live} surface="detail" />);
-    expect(screen.getByText('Running')).toBeInTheDocument();
+    expect(screen.getByText('Running', { ignore: '.sr-only' })).toBeInTheDocument();
   });
 
   it('renders the telemetry cell only when the caller supplies one', () => {
@@ -219,7 +221,7 @@ describe('workflowChildStatusColor', () => {
     // hardcoded loss colour there made one child read calm amber and alarming
     // red at once, for a child that ran fine and only mismatched its schema.
     expect(workflowChildStatusColor('invalid_schema')).toBe('var(--color-warning)');
-    expect(workflowChildStatusColor('error')).toBe('var(--color-loss)');
+    expect(workflowChildStatusColor('error')).toBe('var(--color-icon-danger)');
     expect(workflowChildStatusColor('invalid_schema')).not.toBe(
       workflowChildStatusColor('error'),
     );

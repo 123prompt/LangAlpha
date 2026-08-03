@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { Loader2, Check, AlertTriangle } from 'lucide-react';
+import { Check, AlertTriangle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Loader } from '@/components/ui/loader';
 import { Input } from '@/components/ui/input';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
@@ -176,7 +177,9 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
             </label>
             {loadingModels && (
               <div className="flex items-center gap-2 py-4 justify-center">
-                <Loader2 className="h-4 w-4 animate-spin" style={{ color: 'var(--color-text-tertiary)' }} />
+                <span aria-hidden="true" className="flex-shrink-0">
+                  <Loader size={16} className="text-[color:var(--color-text-tertiary)]" />
+                </span>
                 <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
                   {t('setup.fetchingModels', { defaultValue: 'Fetching models...' })}
                 </span>
@@ -233,11 +236,11 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
                     </button>
                     {selectedModelIds.has(m.id) && (
                       <div className="flex items-center gap-1.5 pl-10 py-1">
-                        <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
+                        <span className="text-[0.625rem] uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
                           {t('setup.capabilities', { defaultValue: 'Capabilities' })}:
                         </span>
                         <span
-                          className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium"
+                          className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium"
                           style={{ background: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)', opacity: 0.6 }}
                         >
                           Text
@@ -249,7 +252,7 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
                               key={mod}
                               type="button"
                               onClick={(e) => { e.stopPropagation(); toggleDiscoveredModality(m.id, mod); }}
-                              className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors"
+                              className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-colors"
                               style={{
                                 background: active ? 'var(--color-accent-soft)' : 'transparent',
                                 color: active ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
@@ -297,15 +300,15 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
               className="font-mono text-xs"
               autoComplete="off"
             />
-            <p className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+            <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
               {t('setup.modelIdHint')}
             </p>
             <div className="flex items-center gap-1.5 pt-1">
-              <span className="text-[10px] uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
+              <span className="text-[0.625rem] uppercase tracking-wider" style={{ color: 'var(--color-text-tertiary)' }}>
                 {t('setup.capabilities', { defaultValue: 'Capabilities' })}:
               </span>
               <span
-                className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium"
+                className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium"
                 style={{ background: 'var(--color-accent-soft)', color: 'var(--color-accent-primary)', opacity: 0.6 }}
               >
                 Text
@@ -317,7 +320,7 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
                     key={mod}
                     type="button"
                     onClick={() => toggleManualModality(mod)}
-                    className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors"
+                    className="inline-flex items-center rounded-full px-2 py-0.5 text-[0.625rem] font-medium transition-colors"
                     style={{
                       background: active ? 'var(--color-accent-soft)' : 'transparent',
                       color: active ? 'var(--color-accent-primary)' : 'var(--color-text-tertiary)',
@@ -350,7 +353,9 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
           >
             {saving ? (
               <>
-                <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
+                <span aria-hidden="true" className="mr-1.5 flex-shrink-0">
+                  <Loader size={16} className="text-current" />
+                </span>
                 {t('setup.saving')}
               </>
             ) : (

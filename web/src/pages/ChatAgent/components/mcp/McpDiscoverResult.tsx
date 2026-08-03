@@ -63,7 +63,7 @@ export function McpDiscoverResult({ result }: McpDiscoverResultProps) {
               <div className="min-w-0">
                 <span className="font-mono" style={{ color: 'var(--color-text-primary)' }}>{t.name}</span>
                 {t.description && (
-                  <p className="text-[11px] mt-0.5 line-clamp-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                  <p className="text-[0.6875rem] mt-0.5 line-clamp-2" style={{ color: 'var(--color-text-tertiary)' }}>
                     {t.description}
                   </p>
                 )}

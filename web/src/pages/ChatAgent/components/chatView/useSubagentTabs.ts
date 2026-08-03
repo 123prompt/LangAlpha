@@ -2,8 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import { useStableHandler } from '@/hooks/useStableHandler';
+import { useStableArray } from '@/hooks/useStableArray';
 import { countToolCalls } from '../../session/subagents/subagentMetrics';
-import { deriveSubagentStatus, isTerminalStatus, normalizeWireStatus } from '../../session/subagents/subagentStatus';
+import {
+  deriveSubagentStatus,
+  isTerminalStatus,
+  normalizeWireStatus,
+  sidebarAgentRowsEqual,
+  toSidebarAgentRow,
+} from '../../session/subagents/subagentStatus';
 import { type SubagentTokenUsage, ZERO_USAGE } from '../../utils/tokenUsage';
 import {
   resolveSubagentTelemetry as resolveSubagentTelemetryPure,
@@ -198,6 +206,16 @@ export function useSubagentTabs({
   // Combine: main agent first, then visible subagents (limited to 11)
   const agents = useMemo((): AgentInfo[] => [MAIN_AGENT, ...subagentAgents], [subagentAgents]);
 
+  // Nav-tree row projection. `agents` takes a fresh identity on every cards
+  // update (i.e. every streamed subagent chunk), but the tree renders only the
+  // row fields — keep the previous array identity whenever none of them
+  // changed so the sidebar bridge publish and the panels stay quiet while a
+  // subagent streams.
+  const sidebarAgentRows = useStableArray(
+    useMemo(() => agents.map(toSidebarAgentRow), [agents]),
+    sidebarAgentRowsEqual,
+  );
+
   // Find the active agent object for subagent view. Falls back to the
   // unfiltered card list so sidebar-hidden agents (workflow children,
   // auto-hidden excess) can still be opened in the detail view.
@@ -374,14 +392,18 @@ export function useSubagentTabs({
     [hydrateTaskTranscript, getSubagentHistory, refreshSubagentCard],
   );
 
-  // Handle sidebar agent selection — refresh card data, then switch tab
-  const handleSelectAgent = useCallback((agentId: string) => {
+  // Handle sidebar agent selection — refresh card data, then switch tab.
+  // useStableHandler (not useCallback): this crosses the sidebar bridge, and
+  // hydrateTaskStatusIfStale's deps include `cards` — a useCallback here would
+  // take a fresh identity on every streamed card update and re-publish the
+  // bridge slice, re-rendering the whole AppSidebar per chunk.
+  const handleSelectAgent = useStableHandler((agentId: string) => {
     if (agentId !== 'main') {
       refreshSubagentCard(agentId);
       void hydrateTaskStatusIfStale(agentId);
     }
     switchAgent(agentId);
-  }, [refreshSubagentCard, hydrateTaskStatusIfStale, switchAgent]);
+  });
 
   // Open subagent task (navigate to subagent tab) - shared between MessageList and DetailPanel
   const handleOpenSubagentTask = useCallback((subagentInfo: SubagentInfo) => {
@@ -406,8 +428,9 @@ export function useSubagentTabs({
     switchAgent(agentId, { push: isDrillDown });
   }, [resolveSubagentIdToAgentId, updateSubagentCard, refreshSubagentCard, hydrateTaskStatusIfStale, hydrateTranscriptThenRefresh, switchAgent, activeAgentIdRef]);
 
-  // Handle removing an agent from sidebar (just hide from display, don't affect state)
-  const handleRemoveAgent = useCallback((agentId: string) => {
+  // Handle removing an agent from sidebar (just hide from display, don't
+  // affect state). Stable for the same bridge reason as handleSelectAgent.
+  const handleRemoveAgent = useStableHandler((agentId: string) => {
     // Add to hidden set
     setHiddenAgentIds((prev) => {
       const newSet = new Set(prev);
@@ -419,7 +442,7 @@ export function useSubagentTabs({
     if (activeAgentIdRef.current === agentId) {
       switchAgent('main');
     }
-  }, [switchAgent, activeAgentIdRef]);
+  });
 
   // Sync activeAgentId with URL-derived initialTaskId (browser back/forward)
   useEffect(() => {
@@ -453,8 +476,9 @@ export function useSubagentTabs({
   }, [initialTaskId, isLoadingHistory, refreshSubagentCard, hydrateTaskStatusIfStale, hydrateTranscriptThenRefresh]);
 
   return {
-    agents,
+    sidebarAgentRows,
     activeAgent,
+    switchAgent,
     handleSelectAgent,
     handleOpenSubagentTask,
     handleRemoveAgent,

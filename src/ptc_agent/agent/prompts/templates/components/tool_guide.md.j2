@@ -27,7 +27,7 @@ Renders an HTML widget inline in the chat — charts, dashboards, data tables, o
 
 Quick reference:
 - **Outer element must be transparent** — no background, border, or border-radius on the outermost div
-- **Inner cards** use `var(--color-bg-card)`, `0.5px solid var(--color-border-muted)`, `border-radius: 8px`
+- **Inner cards** use `var(--color-bg-card, #ffffff)`, `0.5px solid var(--color-border-muted, #e4e1dc)`, `border-radius: 8px` — always the fallback form, never a bare `var()` or raw hex
 - **Charts**: wrap `<canvas>` in a div with explicit height; use `responsive: true, maintainAspectRatio: false`
 - **CDN**: `cdnjs.cloudflare.com`, `cdn.jsdelivr.net`, `unpkg.com`, `esm.sh`
 - **No network to non-CDN origins**: `fetch()`/`XMLHttpRequest` to arbitrary URLs blocked by CSP — only CDN domains allowed. Use `data_files` for workspace files, or embed small data directly in HTML

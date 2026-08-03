@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { MoreVertical, Pencil, Zap, Trash2, Server, KeyRound, Loader2, BookmarkPlus } from 'lucide-react';
+import { MoreVertical, Pencil, Zap, Trash2, Server, KeyRound, BookmarkPlus } from 'lucide-react';
+import { Loader } from '@/components/ui/loader';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -107,10 +108,10 @@ function McpServerRowImpl({
             {server.name}
           </span>
           <span
-            className="text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide"
+            className="text-[0.625rem] px-1.5 py-0.5 rounded uppercase tracking-wide"
             style={{
               color: 'var(--color-text-tertiary)',
-              backgroundColor: 'var(--color-bg-default)',
+              backgroundColor: 'var(--color-bg-tag)',
               border: '1px solid var(--color-border-muted)',
             }}
           >
@@ -130,7 +131,7 @@ function McpServerRowImpl({
             sandboxWarming={sandboxWarming}
           />
           {server.enabled && server.status === 'connected' && server.tool_count > 0 && (
-            <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+            <span className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
               {server.tool_count} tool{server.tool_count === 1 ? '' : 's'}
             </span>
           )}
@@ -138,7 +139,7 @@ function McpServerRowImpl({
 
         {/* Error text */}
         {server.enabled && server.status === 'error' && server.error && (
-          <p className="text-[11px] break-words" style={{ color: 'var(--color-loss)' }}>
+          <p className="text-[0.6875rem] break-words" style={{ color: 'var(--color-loss)' }}>
             {server.error}
           </p>
         )}
@@ -151,10 +152,10 @@ function McpServerRowImpl({
                 key={name}
                 type="button"
                 onClick={() => onSetupSecret(name)}
-                className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded"
+                className="inline-flex items-center gap-1 text-[0.6875rem] px-2 py-0.5 rounded"
                 style={{
                   color: 'var(--color-warning, #d97706)',
-                  backgroundColor: 'var(--color-bg-default)',
+                  backgroundColor: 'var(--color-bg-tag)',
                   border: '1px dashed var(--color-border-default)',
                 }}
               >
@@ -196,7 +197,7 @@ function McpServerRowImpl({
               style={{ color: 'var(--color-text-tertiary)' }}
               aria-label={`Actions for ${server.name}`}
             >
-              {deleting ? <Loader2 className="h-4 w-4 animate-spin" /> : <MoreVertical className="h-4 w-4" />}
+              {deleting ? <Loader size={16} className="text-current" /> : <MoreVertical className="h-4 w-4" />}
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">

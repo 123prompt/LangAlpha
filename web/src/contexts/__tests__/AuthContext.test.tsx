@@ -54,6 +54,9 @@ vi.mock('@/pages/ChatAgent/components/navExpansionStore', () => ({
 }));
 vi.mock('@/pages/ChatAgent/hooks/useNavigationData', () => ({
   resetStableNavOrder: () => mockResetStableNavOrder(),
+}));
+vi.mock('@/lib/navThreadsStore', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/navThreadsStore')>()),
   resetSharedWorkspaceThreads: () => mockResetSharedWorkspaceThreads(),
 }));
 

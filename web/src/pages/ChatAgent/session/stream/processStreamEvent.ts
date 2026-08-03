@@ -315,8 +315,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         return [...prev, ...newUserMessages];
       });
 
-      // 3. Create new assistant message placeholder (steering continuation — not a new backend turn)
-      const newAssistantId = `assistant-${Date.now()}`;
+      // 3. Create new assistant message placeholder (steering continuation — not a new backend turn).
+      //    Random suffix: the turn's first bubble uses the same Date.now() scheme,
+      //    and two ids minted in the same millisecond would collide.
+      const newAssistantId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       const newAssistant = { ...createAssistantMessage(newAssistantId), isSteering: true };
       rt.setMessages((prev) => appendMessage(prev,newAssistant));
 

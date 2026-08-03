@@ -44,7 +44,9 @@ def _assert_report_csp(csp: str) -> None:
 
     Checks shape, not the exact string, so directive ordering can change freely.
     """
-    assert csp.startswith("sandbox allow-scripts;")
+    assert csp.startswith(
+        "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox;"
+    )
     assert "default-src 'none'" in csp
     assert "connect-src 'none'" in csp  # the load-bearing exfiltration block
     # Google Fonts stays allowed for the CJK web-font path.

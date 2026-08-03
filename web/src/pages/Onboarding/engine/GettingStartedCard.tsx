@@ -64,12 +64,12 @@ export function GettingStartedCard() {
       </div>
 
       <div
-        className="mt-2.5 h-1.5 w-full overflow-hidden rounded-full"
+        className="mt-2.5 h-1 w-full overflow-hidden rounded-full"
         role="progressbar"
         aria-valuemin={0}
         aria-valuemax={tasks.length}
         aria-valuenow={doneCount}
-        style={{ backgroundColor: 'var(--color-bg-subtle)' }}
+        style={{ backgroundColor: 'var(--color-bg-elevated)' }}
       >
         <div
           className="h-full rounded-full transition-all duration-300"
@@ -187,8 +187,8 @@ export function GettingStartedCard() {
               }}
               className="rounded-lg px-4 py-2 text-sm font-semibold transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)] focus-visible:ring-offset-2"
               style={{
-                background: 'var(--color-accent-primary)',
-                color: 'var(--color-text-on-accent)',
+                background: 'var(--color-btn-primary-bg)',
+                color: 'var(--color-btn-primary-text)',
               }}
             >
               {t('onboarding.gettingStarted.interview.confirm', 'Start the chat')}

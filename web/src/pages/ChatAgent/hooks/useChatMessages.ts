@@ -11,6 +11,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { useUser } from '@/hooks/useUser';
 import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
+import { useLocalRunPublisher } from '@/lib/threadLifecycle/useLocalRunPublisher';
 import { peekThreadMux } from '../session/stream/threadStreamMux';
 import type { WorkflowStatusResponse } from '../utils/api';
 // Imported from the dependency-free signal module (not `../utils/api`) so this
@@ -23,7 +24,9 @@ import { buildRateLimitError, type StructuredError } from '@/utils/rateLimitErro
 import { getStoredThreadId, setStoredThreadId } from './utils/threadStorage';
 import { type SubagentTokenUsage, ZERO_USAGE } from '../utils/tokenUsage';
 import { computeSteeringBoundary } from '../session/stream/steeringRollback';
+import { isSteeringContinuation, isSteeringUserMessage } from '../components/messageList/messagePredicates';
 import { bumpThreadNavOrder } from './useNavigationData';
+import { ensureThreadId } from '../session/threadCreation';
 export { removeStoredThreadId } from './utils/threadStorage';
 import { createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, type AttachmentMeta } from './utils/messageHelpers';
 import type { AssistantMessage, UserMessage } from '@/types/chat';
@@ -101,6 +104,7 @@ export function useChatMessages(
   const [isLoadingHistory, setIsLoadingHistory] = useState(
     () => !!(initialThreadId && initialThreadId !== '__default__')
   );
+
   const [hasActiveSubagents, setHasActiveSubagents] = useState(false);  // Subagent streams open after main agent finished
   // false | 'starting' (generic cold start) | 'archived' (slow ~90s restore from cold storage).
   // Widen this union when backend adds a new sandbox_state discriminator.
@@ -258,7 +262,7 @@ export function useChatMessages(
 
   const releaseStreamOwnership = () => releaseOwnership(runtime);
 
-  const { handleThumbUp, handleThumbDown, getFeedbackForMessage, loadFeedback } = useChatFeedback(threadId, messages);
+  const { handleThumbUp, handleThumbDown, feedbackByTurn, loadFeedback } = useChatFeedback(threadId);
 
   // Track if history replay found an unresolved interrupt (skip reconnection in that case)
   const historyHasUnresolvedInterruptRef = useRef(false);
@@ -292,6 +296,9 @@ export function useChatMessages(
   // steering handler can detect when a POST was routed as a new turn
   // (race: status flipped terminal between isLoading check and POST land).
   const currentRunIdRef = useRef<string | null>(null);
+  // Local-layer run-liveness publish (declared here so it sits below the
+  // run-id ref it reads).
+  useLocalRunPublisher(threadId, isLoading, currentRunIdRef);
   // Highest turn_index this view has RENDERED, compared against
   // /status.latest_turn_index by the reactivation staleness check (a run that
   // finished while this cached view was hidden is terminal — can_reconnect is
@@ -1589,10 +1596,27 @@ export function useChatMessages(
     });
     currentMessageRef.current = assistantMessageId;
 
+    const created = await ensureThreadId({
+      threadId,
+      workspaceId,
+      message,
+      agentMode,
+      platform,
+      queryClient,
+      threadIdRef,
+      setThreadId,
+      wasStoppedRef,
+      signal: abortController.signal,
+    });
+    // Stopped during the pre-create round-trip: stopWorkflow already finalized
+    // the UI — starting the run now would resurrect it.
+    if (created.aborted) return;
+    const effectiveThreadId = created.threadId;
+
     // One request_key per logical send, reused if this exact send is
     // retransmitted after a lost response (fingerprint match) — see
     // createRequestKeyTracker.
-    const requestKey = requestKeyRef.current.take(`send|${threadId}|${message}`);
+    const requestKey = requestKeyRef.current.take(`send|${effectiveThreadId}|${message}`);
     let wasDisconnected = false;
     const wasInterruptedRef = { current: false };
     try {
@@ -1605,7 +1629,7 @@ export function useChatMessages(
       const result = await sendChatMessageStream(
         message,
         workspaceId,
-        threadId,
+        effectiveThreadId,
         [],
         planMode,
         processEvent,
@@ -2405,9 +2429,19 @@ export function useChatMessages(
     const msgIndex = messages.findIndex((m) => m.id === messageId);
     if (msgIndex === -1) return;
 
+    // Steering bubbles are mid-turn injections with no boundary in /turns —
+    // an edit fork would land on the NEXT turn and leave the original
+    // steering text in the agent's context. The UI hides the pencil for
+    // them; this guards every other caller.
+    const editTarget = messages[msgIndex];
+    if (isSteeringUserMessage(editTarget)) {
+      setMessageError("Steering messages can't be edited");
+      return;
+    }
+
     // Count non-steering assistant messages before this user message to get turn_index.
     // Excludes steering assistant messages (mid-turn continuations) which don't map to backend turns.
-    const turnIndex = messages.slice(0, msgIndex).filter((m) => m.role === 'assistant' && !m.isSteering).length;
+    const turnIndex = messages.slice(0, msgIndex).filter((m) => m.role === 'assistant' && !isSteeringContinuation(m)).length;
 
     // Immediate visual feedback: truncate, show edited message + loading placeholder.
     // Save snapshot so we can restore on failure.
@@ -2451,7 +2485,24 @@ export function useChatMessages(
 
     // Count non-steering assistant messages up to and including this one to get turn_index.
     // Excludes steering assistant messages (mid-turn continuations) which don't map to backend turns.
-    const turnIndex = messages.slice(0, msgIndex + 1).filter((m) => m.role === 'assistant' && !m.isSteering).length - 1;
+    const turnIndex = messages.slice(0, msgIndex + 1).filter((m) => m.role === 'assistant' && !isSteeringContinuation(m)).length - 1;
+
+    // A steered turn renders as several bubbles (pre-steering half + isSteering
+    // continuations) but has only one regenerate: the whole turn re-runs from
+    // its input checkpoint, without the mid-run steering. Normalize truncation
+    // back to the turn's first bubble so the stale halves and the steering
+    // bubbles leave the transcript together with the re-run.
+    let truncateIndex = msgIndex;
+    const regenTarget = messages[msgIndex];
+    if (isSteeringContinuation(regenTarget)) {
+      for (let i = msgIndex - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role === 'assistant' && !isSteeringContinuation(m)) {
+          truncateIndex = i;
+          break;
+        }
+      }
+    }
 
     // Immediate visual feedback: truncate at the assistant message, show loading placeholder.
     // Save snapshot so we can restore on failure.
@@ -2460,7 +2511,7 @@ export function useChatMessages(
     setMessageError(null);
     setFallbackSuggestion(null);
     setMessages((prev) => [
-      ...prev.slice(0, msgIndex),
+      ...prev.slice(0, truncateIndex),
       createAssistantMessage(`assistant-pending-${Date.now()}`),
     ]);
 
@@ -2473,8 +2524,8 @@ export function useChatMessages(
     }
 
     const checkpointId = turnsData.turns[turnIndex].regenerate_checkpoint_id;
-    // Truncate at the assistant message (keep everything before it, including user msg)
-    await streamFromCheckpoint(null, checkpointId, msgIndex, turnIndex, modelOptions);
+    // Truncate at the turn's first assistant bubble (keep everything before it, including user msg)
+    await streamFromCheckpoint(null, checkpointId, truncateIndex, turnIndex, modelOptions);
   }, [messages, getTurnCheckpoints, streamFromCheckpoint]);
 
   /**
@@ -2567,7 +2618,7 @@ export function useChatMessages(
     handleRetry,
     handleThumbUp,
     handleThumbDown,
-    getFeedbackForMessage,
+    feedbackByTurn,
     // Resolve subagentId (e.g. toolCallId from segment) to stable agent_id for card operations.
     resolveSubagentIdToAgentId: (subagentId: string) =>
       toolCallIdToTaskIdMapRef.current.get(subagentId) || subagentId,

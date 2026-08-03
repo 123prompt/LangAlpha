@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { useScrollMemory } from '@/lib/scrollMemory';
 import { useUser } from '@/hooks/useUser';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useTranslation } from 'react-i18next';
@@ -17,6 +18,8 @@ function Settings() {
 
   const tabParam = searchParams.get('tab') || 'userInfo';
   const [activeTab, setActiveTab] = useState(tabParam);
+  const pageRef = useRef<HTMLDivElement>(null);
+  useScrollMemory(pageRef, 'page:settings');
   const isLoading = isUserLoading || isPrefsLoading;
 
   // Sync tab with URL search params
@@ -35,7 +38,7 @@ function Settings() {
   }, [searchParams]);
 
   return (
-    <div className="settings-page">
+    <div ref={pageRef} className="settings-page">
       <div className="settings-container">
         <h2 className="text-xl font-semibold mb-6" style={{ color: 'var(--color-text-primary)' }}>{t('settings.title')}</h2>
         <div className="flex gap-2 mb-6 border-b overflow-x-auto settings-tab-bar" style={{ borderColor: 'var(--color-border-muted)' }}>
