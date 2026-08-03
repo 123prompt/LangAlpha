@@ -53,16 +53,16 @@ class NamespaceUnfenced(TaskRunRefused):
     settle_reason = "namespace fence unavailable"
 
 
-class DispatchSpawnError(RuntimeError):
+class SpawnError(RuntimeError):
     """A writer could not be spawned; the task was settled before this was
     raised. Callers that need the two causes apart catch the subclasses."""
 
 
-class SpawnSetupError(DispatchSpawnError):
+class SpawnSetupError(SpawnError):
     """Setup raised before the writer was published."""
 
 
-class SpawnStoppedError(DispatchSpawnError):
+class SpawnStoppedError(SpawnError):
     """A stop stamped the task mid-setup, so the publish fence refused it."""
 
 

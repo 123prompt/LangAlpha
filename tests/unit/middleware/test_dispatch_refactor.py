@@ -348,14 +348,14 @@ async def test_dispatch_stamps_ledger_run_id_when_admitted():
 
 @pytest.mark.asyncio
 async def test_dispatch_admission_rejection_aborts_before_spawn():
-    """A refused admission raises DispatchSpawnError carrying the refusal
+    """A refused admission raises SpawnError carrying the refusal
     reason and settles the task never-started: no writer, no opener, nothing
     for a collector to claim."""
     mw = FakeMiddleware()
     mw.admission_refusal = spawn_mod.TaskRunRefused("slot busy")
     graphs = {"research": _RecordingGraph()}
 
-    with pytest.raises(spawn_mod.DispatchSpawnError) as exc_info:
+    with pytest.raises(spawn_mod.SpawnError) as exc_info:
         await dispatch_background_subagent(
             mw,
             graphs,
@@ -388,7 +388,7 @@ async def test_a_refused_dispatch_leaves_nothing_behind_in_the_registry():
     graphs = {"research": _RecordingGraph()}
 
     for _ in range(3):
-        with pytest.raises(spawn_mod.DispatchSpawnError):
+        with pytest.raises(spawn_mod.SpawnError):
             await dispatch_background_subagent(
                 mw,
                 graphs,
@@ -433,7 +433,7 @@ async def test_dispatch_reports_a_fence_refusal_in_its_own_words():
     mw.admission_refusal = spawn_mod.NamespaceUnfenced("unused here")
     graphs = {"research": _RecordingGraph()}
 
-    with pytest.raises(spawn_mod.DispatchSpawnError) as exc_info:
+    with pytest.raises(spawn_mod.SpawnError) as exc_info:
         await dispatch_background_subagent(
             mw,
             graphs,

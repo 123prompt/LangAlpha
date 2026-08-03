@@ -26,8 +26,8 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTask,
 )
 from ptc_agent.agent.middleware.background_subagent.spawn import (
-    DispatchSpawnError,
     NamespaceUnfenced,
+    SpawnError,
     TaskRunRefused,
     spawn_task_writer,
 )
@@ -157,7 +157,7 @@ async def dispatch_background_subagent(
     stamps); ``owner_task_id`` marks the child as workflow-owned so
     agent-facing aggregation (wait-all, notifications, TaskOutput's
     all-tasks view) skips it. Raises ``ValueError`` on an unknown
-    ``subagent_type`` and ``DispatchSpawnError`` when admission was rejected
+    ``subagent_type`` and ``SpawnError`` when admission was rejected
     or the writer could not be spawned.
     """
     if subagent_type not in subagent_graphs:
@@ -196,12 +196,12 @@ async def dispatch_background_subagent(
             )
         except NamespaceUnfenced as refusal:
             task.mark_never_started(refusal.settle_reason)
-            raise DispatchSpawnError(
+            raise SpawnError(
                 f"could not fence checkpoint namespace for {task.display_id}"
             ) from refusal
         except TaskRunRefused as refusal:
             task.mark_never_started(refusal.settle_reason)
-            raise DispatchSpawnError(
+            raise SpawnError(
                 f"Error: could not start {task.display_id} — {refusal.reason}."
             ) from refusal
         task.task_run_id = admitted or None
