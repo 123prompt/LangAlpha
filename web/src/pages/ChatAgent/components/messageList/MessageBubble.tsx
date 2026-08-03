@@ -9,7 +9,7 @@ import LissajousLoading from '@/components/ui/lissajous-loading';
 import { useUser } from '@/hooks/useUser';
 import { CitationMetadataProvider } from '../CitationMetadataContext';
 import TextMessageContent from '../TextMessageContent';
-import { countDedupedSources, type ProvenanceRecord } from '@/types/chat';
+import { countDedupedSources, type ProvenanceRecord, type SubagentTaskRecord } from '@/types/chat';
 import { TextShimmer } from '@/components/ui/text-shimmer';
 import type { SelectionPreviewShape } from '../SelectionContextPreview';
 import { AttachmentCard, InlineSelectionCards, InlineWidgetDeck } from './attachments';
@@ -304,7 +304,7 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
               reasoningProcesses={(message.reasoningProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
               toolCallProcesses={(message.toolCallProcesses as Record<string, ToolCallProcessRecord>) || EMPTY_OBJ}
               todoListProcesses={(message.todoListProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
-              subagentTasks={(message.subagentTasks as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
+              subagentTasks={(message.subagentTasks as Record<string, SubagentTaskRecord>) || EMPTY_OBJ}
               planApprovals={(message.planApprovals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
               userQuestions={(message.userQuestions as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
               workspaceProposals={(message.workspaceProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}

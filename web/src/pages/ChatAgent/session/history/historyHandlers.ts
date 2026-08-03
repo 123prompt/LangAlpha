@@ -5,7 +5,8 @@
 
 import { isToolResultFailure } from '../subagents/subagentStatus';
 import { isTaskAgentId } from '../../utils/agentId';
-import { deriveTaskSegment, applyTaskSegment } from '../subagents/taskSegmentBuilder';
+import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
+import type { SubagentTaskRecord } from '@/types/chat';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 
 let _steeringIdCounter = 0;
@@ -392,7 +393,7 @@ export function handleHistoryToolCalls({ assistantMessageId, toolCalls, pairStat
 
           const toolCallProcesses = { ...((msg.toolCallProcesses as Record<string, Record<string, unknown>>) || {}) };
           const contentSegments = [...((msg.contentSegments as Record<string, unknown>[]) || [])];
-          const subagentTasks = { ...((msg.subagentTasks as Record<string, Record<string, unknown>>) || {}) };
+          const subagentTasks = { ...((msg.subagentTasks as Record<string, SubagentTaskRecord>) || {}) };
 
           // Standard tool_call segment/process
           if (!toolCallProcesses[toolCallId]) {
@@ -456,7 +457,7 @@ export function handleHistoryToolCallResult({ assistantMessageId, toolCallId, re
       if (msg.id !== assistantMessageId) return msg;
 
       const toolCallProcesses = { ...((msg.toolCallProcesses as Record<string, Record<string, unknown>>) || {}) };
-      const subagentTasks = { ...((msg.subagentTasks as Record<string, Record<string, unknown>>) || {}) };
+      const subagentTasks = { ...((msg.subagentTasks as Record<string, SubagentTaskRecord>) || {}) };
 
       const isFailed = isToolResultFailure(result);
 
@@ -479,19 +480,8 @@ export function handleHistoryToolCallResult({ assistantMessageId, toolCallId, re
         return msg;
       }
 
-      // If this toolCallId is associated with a subagent task, store the result.
       if (subagentTasks[toolCallId]) {
-        // Don't set status: 'completed' here — the Task tool returns immediately
-        // after spawning, so its tool_call_result doesn't mean the subagent finished.
-        // Terminal status arrives per task: the replayed artifact stamp (ledger
-        // truth) or a live chan_close via onTaskRunClosed. EXCEPT a failed spawn
-        // (bare "Error: …" result): it has no run, no artifact to stamp and no
-        // channel to close, so this result is its only settle signal.
-        subagentTasks[toolCallId] = {
-          ...subagentTasks[toolCallId],
-          result: result.content,
-          ...(isFailed ? { status: 'error' } : {}),
-        };
+        subagentTasks[toolCallId] = applyLaunchReply(subagentTasks[toolCallId], result);
       }
 
       return {
@@ -614,7 +604,7 @@ export function handleHistoryTaskArtifactStatus({ toolCallId, taskId, status, se
 
   setMessages((prev: MessageRecord[]) =>
     prev.map((msg: MessageRecord) => {
-      const subagentTasks = msg.subagentTasks as Record<string, Record<string, unknown>> | undefined;
+      const subagentTasks = msg.subagentTasks as Record<string, SubagentTaskRecord> | undefined;
       if (!subagentTasks) return msg;
 
       // Primary: exact match on the card's own Task tool_call_id.

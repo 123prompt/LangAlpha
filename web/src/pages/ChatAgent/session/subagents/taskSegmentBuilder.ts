@@ -5,6 +5,7 @@
  * turn did — the two used to carry copy-pasted branches that drifted silently.
  */
 import type { SubagentTaskRecord, SubagentTaskSegment } from '@/types/chat';
+import { isToolResultFailure } from './subagentStatus';
 import { normalizeAction } from '../../hooks/utils/eventUtils';
 import { WORKFLOW_TASK_TYPE } from './workflowRunState';
 
@@ -93,16 +94,37 @@ export function deriveTaskSegment(
 }
 
 /**
+ * Stamp a launch card with the reply its `Task` / `RunWorkflow` call returned.
+ *
+ * The reply is never the task's outcome — both tools return the moment the
+ * launch is dispatched, and terminal status arrives later per task (a replayed
+ * artifact, or a live `chan_close`). The exception is a launch that was
+ * *refused*: it opens no run, produces no artifact and no channel, so nothing
+ * else will ever settle its card and the reply's own "Error" prefix has to.
+ *
+ * Live streaming and history replay both stamp through here — they used to
+ * carry a copy each, which is how they came to disagree on the field's name.
+ */
+export function applyLaunchReply(
+  record: SubagentTaskRecord,
+  result: { content?: unknown; artifact?: unknown },
+): SubagentTaskRecord {
+  return {
+    ...record,
+    ...(typeof result.content === 'string' ? { result: result.content } : {}),
+    ...(isToolResultFailure(result) ? { status: 'error' } : {}),
+  };
+}
+
+/**
  * Apply a derivation in place onto a message's segment list + task map, honoring
- * the stack-vs-merge rule. The two collections are the loose message bags the
- * stream handlers thread around, so this is the one place the typed derivation
- * is widened back into them.
+ * the stack-vs-merge rule.
  */
 export function applyTaskSegment(
   derived: TaskSegmentDerivation,
   toolCallId: string,
   contentSegments: Record<string, unknown>[],
-  subagentTasks: Record<string, Record<string, unknown>>,
+  subagentTasks: Record<string, SubagentTaskRecord>,
 ): void {
   const exists = contentSegments.some(
     (s) => s.type === 'subagent_task' && s.subagentId === toolCallId

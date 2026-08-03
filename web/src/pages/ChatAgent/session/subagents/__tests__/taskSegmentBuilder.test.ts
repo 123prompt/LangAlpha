@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { applyTaskSegment, deriveTaskSegment } from '../taskSegmentBuilder';
+import type { SubagentTaskRecord } from '@/types/chat';
 import { WORKFLOW_TASK_TYPE } from '../workflowRunState';
 
 type Segment = Record<string, unknown>;
-type TaskMap = Record<string, Record<string, unknown>>;
+type TaskMap = Record<string, SubagentTaskRecord>;
 
 function apply(
   calls: { toolCall: Parameters<typeof deriveTaskSegment>[0]; id: string }[]

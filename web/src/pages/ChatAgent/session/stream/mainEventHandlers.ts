@@ -5,10 +5,10 @@
  */
 
 import { isToolResultFailure } from '../subagents/subagentStatus';
-import { deriveTaskSegment, applyTaskSegment } from '../subagents/taskSegmentBuilder';
+import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { ProvenanceEvent } from '@/types/sse';
-import type { ProvenanceRecord } from '@/types/chat';
+import type { ProvenanceRecord, SubagentTaskRecord } from '@/types/chat';
 import { provenanceEventToRecord, provenanceRecordKey } from './provenance';
 import { extractLastReasoningTitle } from '../streamRefs';
 import type { StreamRefs, ToolCallChunkRecord } from '../streamRefs';
@@ -308,7 +308,7 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
 
           // Task spawns / resumes and RunWorkflow launches also render an
           // inline card — same derivation history replay uses.
-          const subagentTasks = { ...((msg.subagentTasks as Record<string, Record<string, unknown>>) || {}) };
+          const subagentTasks = { ...((msg.subagentTasks as Record<string, SubagentTaskRecord>) || {}) };
           const derived = deriveTaskSegment(toolCall, toolCallId, currentOrder);
           if (derived) {
             applyTaskSegment(derived, toolCallId, contentSegments, subagentTasks);
@@ -361,7 +361,7 @@ export function handleToolCallResult({ assistantMessageId, toolCallId, result, r
       const isFailed = isToolResultFailure(result);
 
       // Track subagent task status updates
-      const subagentTasks = { ...((msg.subagentTasks as Record<string, Record<string, unknown>>) || {}) };
+      const subagentTasks = { ...((msg.subagentTasks as Record<string, SubagentTaskRecord>) || {}) };
 
       if (toolCallProcesses[toolCallId]) {
         toolCallProcesses[toolCallId] = {
@@ -382,18 +382,8 @@ export function handleToolCallResult({ assistantMessageId, toolCallId, result, r
         return msg;
       }
 
-      // If this toolCallId is associated with a subagent task, store the tool call result.
-      // A SUCCESSFUL Task returns immediately ("Task-N started in background") while the
-      // subagent keeps running, so its result is NOT terminal — real completion comes via
-      // the per-task SSE stream closing. But a FAILED spawn (admission/setup error — a bare
-      // "Error: …" result) never produces a task artifact or a channel, so no chan_close
-      // will ever arrive to settle it; stamp it 'error' here or the placeholder spins forever.
       if (subagentTasks[toolCallId]) {
-        subagentTasks[toolCallId] = {
-          ...subagentTasks[toolCallId],
-          toolCallResult: result.content,
-          ...(isFailed ? { status: 'error' } : {}),
-        };
+        subagentTasks[toolCallId] = applyLaunchReply(subagentTasks[toolCallId], result);
       }
 
       return { ...msg, toolCallProcesses, subagentTasks };

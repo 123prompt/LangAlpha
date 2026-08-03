@@ -5,9 +5,13 @@
  * and never via a sweep over siblings.
  */
 
-import type { AssistantMessage, SubagentTask } from '@/types/chat';
+import type { AssistantMessage } from '@/types/chat';
 import { getThreadMux, type ThreadMuxSink } from '../stream/threadStreamMux';
-import { isTerminalStatus, normalizeWireStatus } from './subagentStatus';
+import {
+  isTerminalStatus,
+  normalizeWireStatus,
+  type SubagentTerminalStatus,
+} from './subagentStatus';
 import { settleWorkflowRunFromClosure } from './liveEventHandlers';
 import { isTaskAgentId, taskIdFromAgentId } from '../../utils/agentId';
 import type { SSEEvent } from '../types';
@@ -55,7 +59,7 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
    * keeps an earlier cancelled/error stamp from being painted over. */
   const setInlineSubagentTaskStatus = (
     agentId: string,
-    status: SubagentTask['status'],
+    status: SubagentTerminalStatus,
   ) => {
     rt.setMessages((prev) => {
       let anyChanged = false;
