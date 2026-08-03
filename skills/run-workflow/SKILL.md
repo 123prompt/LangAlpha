@@ -15,7 +15,7 @@ You write JavaScript (ES2020). It executes server-side: the script itself cannot
 export const meta = { name: 'ticker-briefs', description: 'Fan out research, synthesize' }
 ```
 
-`name` (letters, digits, `-`, `_`) and `description` are required; no variables or function calls inside the literal. The rest of the body is free-form async JS — top-level `await` and `return` both work, and the `return` value (JSON-serializable) becomes the run result.
+`name` (letters, digits, `-`, `_`) and `description` are required; no variables or function calls inside the literal. The rest of the body is free-form async JS — top-level `await` and `return` both work, and the `return` value (JSON-serializable) becomes the run result. Return a synthesis rather than the raw children: a large result is clipped for display, and a clipped object is unparseable.
 
 ## Built-ins
 
@@ -32,7 +32,9 @@ Failure semantics:
 
 Limits (defaults): 64 dispatches per run, 8 running at once — extra `agent()` calls queue, so fan out freely — and 30 minutes per child.
 
-## Example
+## Examples
+
+Single fan-out — one dispatch per item, synthesized in JS:
 
 ```js
 export const meta = { name: 'ticker-briefs', description: 'Research each ticker, then synthesize' }
@@ -53,6 +55,26 @@ results.forEach((r, i) => { if (r) briefs[args.tickers[i]] = r; else failed.push
 log(`${Object.keys(briefs).length} briefs, ${failed.length} failed`)
 return { briefs, failed }
 ```
+
+Two stages per item, no barrier — a slow filing never holds up the others:
+
+```js
+export const meta = { name: 'filing-risk-sweep', description: 'Summarize each filing, then stress-test it' }
+
+const reviewed = await pipeline(
+  args.tickers,
+  (ticker) => agent(`Summarize ${ticker}'s latest 10-Q: segment results, guidance changes, new risk language.`,
+    { agentType: 'research', label: ticker, phase: 'Read' }),
+  (summary, ticker) => summary && agent(
+    `Challenge this ${ticker} summary — what does it overstate, omit, or take on trust?\n\n${summary}`,
+    { agentType: 'equity-analyst', label: `${ticker} review`, phase: 'Challenge' }),
+)
+
+log(`${reviewed.filter(Boolean).length}/${args.tickers.length} reviewed`)
+return Object.fromEntries(args.tickers.map((t, i) => [t, reviewed[i]]))
+```
+
+Set `phase` per dispatch rather than calling `phase()` inside a stage: items run concurrently, so a global marker set mid-pipeline reflects whichever item reached it last. Guard each stage on its input — `summary && agent(...)` skips the second dispatch for an item whose first stage returned `null`.
 
 ## Saved workflows
 
