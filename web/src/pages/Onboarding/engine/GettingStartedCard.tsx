@@ -35,7 +35,7 @@ export function GettingStartedCard() {
 
   return (
     <aside
-      className="fixed bottom-4 z-40 hidden w-80 rounded-2xl border p-4 shadow-lg md:block"
+      className="sidebar-tracking fixed bottom-4 z-40 hidden w-80 rounded-2xl border p-4 shadow-lg md:block"
       style={{
         left: 'calc(var(--sidebar-width) + 1rem)',
         backgroundColor: 'var(--color-bg-card)',

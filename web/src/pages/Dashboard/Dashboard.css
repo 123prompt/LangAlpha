@@ -54,6 +54,9 @@
 /* === Suggestion bubbles above chat input === */
 .dashboard-suggestion-bubbles {
   display: flex;
+  /* Chips are nowrap and the row is capped by the content column, so without
+     wrapping they spill past the composer at narrower widths. */
+  flex-wrap: wrap;
   justify-content: center;
   gap: 8px;
   padding-bottom: 12px;
