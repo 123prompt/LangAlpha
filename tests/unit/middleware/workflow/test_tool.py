@@ -512,8 +512,9 @@ async def test_run_cap_ledger_read_failure_refuses_instead_of_counting_locally()
 
 
 def _reads_as_a_launch_failure(reply: Any) -> bool:
-    """The client's rule, verbatim — ``isToolResultFailure`` in
-    ``web/src/pages/ChatAgent/session/subagents/subagentStatus.ts``."""
+    """The client's rule for a reply carrying no artifact — ``isToolResultFailure``
+    in ``web/src/pages/ChatAgent/session/subagents/subagentStatus.ts``, whose
+    ``!artifact`` conjunct every refusal satisfies by answering bare text."""
     return isinstance(reply, str) and reply.strip()[:5].lower() == "error"
 
 
