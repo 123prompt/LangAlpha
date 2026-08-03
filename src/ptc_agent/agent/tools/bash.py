@@ -6,6 +6,7 @@ import structlog
 from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
+from ptc_agent.core.paths import MEMO_USER_DIR, MEMORY_USER_DIR, MEMORY_WORKSPACE_DIR
 
 logger = structlog.get_logger(__name__)
 
@@ -14,14 +15,14 @@ logger = structlog.get_logger(__name__)
 # dropping writes on the sandbox (which would also let the agent fabricate
 # fake memos invisible to the UI).
 _MEMORY_PATH_MARKERS: tuple[str, ...] = (
-    ".agents/user/memory/",
-    ".agents/workspace/memory/",
-    ".agents/user/memo/",
+    f"{MEMORY_USER_DIR}/",
+    f"{MEMORY_WORKSPACE_DIR}/",
+    f"{MEMO_USER_DIR}/",
 )
 
 _MEMORY_ROUTE_ERROR = (
-    "ERROR: Store-backed paths (.agents/user/memory/**, .agents/workspace/memory/**, "
-    ".agents/user/memo/**) are managed by the long-term memory/memo system and "
+    f"ERROR: Store-backed paths ({MEMORY_USER_DIR}/**, {MEMORY_WORKSPACE_DIR}/**, "
+    f"{MEMO_USER_DIR}/**) are managed by the long-term memory/memo system and "
     "are NOT on the workspace filesystem. Use the Write, Edit, Read, Glob, or "
     "Grep file tools for these paths so they route to the store. Memo paths are "
     "additionally read-only to the agent — ask the user to upload via the memo "
