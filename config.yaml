@@ -234,7 +234,7 @@ workflow:
   run_timeout: 16200             # Whole-run wall clock (seconds) — 64 dispatches at 8 wide is 8 waves, so this clears 8x child_timeout with margin
   max_runs_per_thread: 2         # Concurrent runs per thread
   max_result_bytes: 1048576      # Per-child result dump cap (bytes) — what the script sees in JS
-  max_summary_bytes: 65536       # Run summary handed to the model + archived for TaskOutput (bytes); result.json keeps the rest
+  max_summary_bytes: 98304       # Run summary handed to the model + archived for TaskOutput (bytes); result.json keeps the rest. A clipped JSON result is unparseable, so overflow costs a re-read of the file on top of the clipped copy — sized to absorb ordinary overflow, not merely to bound it
   max_prompt_chars: 400000       # Per-dispatch prompt length cap (~100K tokens)
   max_script_bytes: 204800       # Workflow script size cap (bytes)
 

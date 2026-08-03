@@ -366,7 +366,7 @@ class WorkflowOrchestrationConfig(BaseModel):
         ),
     )
     max_summary_bytes: int = Field(
-        default=64 * 1024,
+        default=96 * 1024,
         ge=1024,
         le=1024 * 1024,
         description=(
