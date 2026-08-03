@@ -25,6 +25,7 @@ from ptc_agent.agent.middleware.background_subagent.workflow.emitter import (
 )
 from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
     WorkflowHostError,
+    WorkflowUsageError,
     WorkflowLimits,
     WorkflowMeta,
     WorkflowOutcome,
@@ -391,7 +392,11 @@ class WorkflowDriver:
                 caps=self.spec.caps,
             )
         except DispatchValidationError as error:
-            raise WorkflowHostError(str(error)) from error
+            # Misuse, not misfortune: this call fails identically on every
+            # retry, so the prelude gets to treat it as a script bug. The cap
+            # above and the retry-prompt cap below stay plain host errors —
+            # both depend on how the run unfolded, not on the call's shape.
+            raise WorkflowUsageError(str(error)) from error
 
         self._dispatched += 1
         seq = self._next_seq()
