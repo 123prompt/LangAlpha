@@ -1,4 +1,4 @@
-import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { MotionConfig } from 'framer-motion';
 import { Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
 import AppSidebar from './components/Sidebar/AppSidebar';
@@ -147,7 +147,6 @@ function AuthenticatedShell() {
   const mainRef = useRef<HTMLElement>(null);
   useScrollMemory(mainRef, `route:${location.pathname}`);
 
-  const layoutRef = useRef<HTMLDivElement>(null);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     try {
       const stored = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY));
@@ -160,10 +159,11 @@ function AuthenticatedShell() {
   // per pointermove — the whole route tree lives under this shell); React state
   // and localStorage only sync on commit (drag end / double-click reset).
   const handleSidebarWidthChange = useCallback((width: number, commit = false) => {
-    if (!commit) {
-      layoutRef.current?.style.setProperty('--sidebar-width', `${width}px`);
-      return;
-    }
+    // Written on every call, commit or not: when the committed width equals the
+    // current state React bails out of the render, so the effect below never
+    // re-runs and the DOM would keep whatever the last pointermove left behind.
+    document.documentElement.style.setProperty('--sidebar-width', `${width}px`);
+    if (!commit) return;
     setSidebarWidth(width);
     try {
       localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width));
@@ -171,6 +171,20 @@ function AuthenticatedShell() {
       // localStorage unavailable — width still applies for the session
     }
   }, []);
+  // Published on the document root, not on .app-layout: custom properties only
+  // inherit downward, and every fixed overlay that has to dodge the sidebar
+  // (the getting-started card, the dashboard's floating chat and edit toolbar)
+  // is viewport-anchored — some of them portalled clean out of the layout
+  // subtree. Off the root they'd read the collapsed default from tokens.css and
+  // sit under the sidebar. 0 on mobile, where no sidebar renders at all.
+  const sidebarWidthVar = isMobile ? '0px' : sidebarCollapsed ? '80px' : `${sidebarWidth}px`;
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.style.setProperty('--sidebar-width', sidebarWidthVar);
+    return () => {
+      root.style.removeProperty('--sidebar-width');
+    };
+  }, [sidebarWidthVar]);
 
   // While the user profile is loading, show the loading state to avoid
   // flashing protected content before the gate check completes.
@@ -185,11 +199,7 @@ function AuthenticatedShell() {
   return (
     <OnboardingProvider>
       <ThreadLifecycleFeed />
-      <div
-        ref={layoutRef}
-        className="app-layout"
-        style={!isMobile ? ({ '--sidebar-width': sidebarCollapsed ? '80px' : `${sidebarWidth}px` } as React.CSSProperties) : undefined}
-      >
+      <div className="app-layout">
         {!isMobile && (
           <AppSidebar
             collapsed={sidebarCollapsed}

@@ -140,8 +140,13 @@ function CustomInner({ mode, onModeChange }: DashboardCustomProps) {
       {/* Floating edit-mode toolbar */}
       {editMode && (
         <div
-          className="fixed left-1/2 -translate-x-1/2 z-40 flex items-center gap-1 rounded-full border shadow-lg px-2 py-1.5"
+          className="fixed left-1/2 sidebar-tracking z-40 flex items-center gap-1 rounded-full border shadow-lg px-2 py-1.5"
           style={{
+            // Centered on the content column rather than the viewport, whose
+            // midpoint sits half a sidebar left of the grid below. Shifted by
+            // transform, not by `left`: this box is width:auto, so moving `left`
+            // would also shrink the space it can grow into and crush the row.
+            transform: 'translateX(calc(-50% + var(--sidebar-width) / 2))',
             bottom: '1.5rem',
             backgroundColor: 'var(--color-bg-elevated)',
             borderColor: 'var(--color-border-elevated)',

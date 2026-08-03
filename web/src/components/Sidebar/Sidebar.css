@@ -94,7 +94,8 @@ body.sidebar-resizing {
 }
 
 body.sidebar-resizing .sidebar,
-body.sidebar-resizing .app-main {
+body.sidebar-resizing .app-main,
+body.sidebar-resizing .sidebar-tracking {
   transition: none !important;
 }
 
