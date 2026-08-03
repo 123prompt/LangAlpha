@@ -25,10 +25,10 @@ def _cancel_outcome(
     """The one shape a cancel answers in — one user-facing action, one envelope.
 
     ``state`` is the machine-readable reason a cancel did nothing, so it is
-    absent exactly when one was dispatched. The two subject keys are separate
-    rather than a generic id because the tokens name different objects: a run
-    that isn't there is ``run_not_found``, a task that isn't is
-    ``task_not_found``, and collapsing them would tell a client less.
+    absent exactly when one was dispatched. ``thread_id`` and ``task_id`` stay
+    separate keys rather than one generic subject id because the two endpoints
+    cancel different objects, and a client reading the answer has to know which
+    of them it got back.
     """
     outcome: dict = {"cancelled": cancelled}
     if thread_id is not None:
@@ -168,31 +168,38 @@ async def cancel_workflow(thread_id: str, run_id: Optional[str] = None) -> dict:
                 state="already_finished",
                 message="Run already finished; nothing to cancel.",
             )
-        if intent_state == "not_found" and not cancel_success:
-            # A caller-supplied run_id that matches neither a ledger row nor
-            # a local task (wrong id, or another thread's run). Distinct from
-            # the pre-START dispatched window, where the placeholder cancel
-            # succeeds (cancel_success=True) despite the row not existing yet.
+        if not cancel_success and intent_state in (None, "not_found"):
+            # This cancel stopped nothing (a `not_found` that DID signal is the
+            # pre-START window, where the placeholder cancel took). Which
+            # nothing decides whether the caller should care: an idle thread
+            # had nothing to stop, while a live run means the stop the user
+            # asked for never happened. Reporting that is the whole job —
+            # cancelling the live run instead is the cross-turn hazard that
+            # run_id targeting exists to prevent.
+            if await tl_db.get_active_run(thread_id) is None:
+                return _cancel_outcome(
+                    cancelled=False,
+                    thread_id=thread_id,
+                    state="no_active_run",
+                    message="No active run to cancel.",
+                )
             return _cancel_outcome(
                 cancelled=False,
                 thread_id=thread_id,
-                state="run_not_found",
-                message="No such run on this thread; nothing to cancel.",
-            )
-        if target_run_id is None and not cancel_success:
-            # No durable run, no local task, no compaction — an honest no-op
-            # instead of pretending a signal was sent.
-            return _cancel_outcome(
-                cancelled=False,
-                thread_id=thread_id,
-                state="no_active_run",
-                message="No active run to cancel.",
+                state="another_run_active",
+                message=(
+                    "A run is active on this thread but the one to stop is "
+                    "gone; nothing was cancelled."
+                ),
             )
 
+        # Reaching here means intent was stamped or a task was signalled: every
+        # way of stopping nothing is answered above, with the state token that
+        # says which. Keep it that way — a `cancelled: False` with no state
+        # would tell a caller a stop failed without telling it what to do.
         logger.info(f"Workflow cancel requested: {thread_id}")
         return _cancel_outcome(
-            cancelled=bool(intent_state in ("requested", "already_requested"))
-            or cancel_success,
+            cancelled=True,
             thread_id=thread_id,
             message="Cancellation signal sent. Workflow will stop shortly.",
         )
@@ -273,8 +280,8 @@ async def cancel_subagent_task(thread_id: str, task_id: str) -> dict:
             # was stopped — and the run row moved or vanished between the
             # liveness read and the stamp, so nothing was recorded either.
             # Nudging and answering "cancelled" would claim a stop that never
-            # happened. ``cancel_workflow`` answers this same state the same
-            # way; the task exists here, only its run is gone.
+            # happened. The task itself still exists — only its run is gone,
+            # which is why this is not ``task_not_found``.
             return _cancel_outcome(
                 cancelled=False,
                 thread_id=thread_id,

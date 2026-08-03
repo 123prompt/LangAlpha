@@ -4,6 +4,7 @@
  */
 import { api } from '@/api/client';
 import type { WorkflowRunStatus } from '@/types/api';
+import type { CancelOutcome } from '../cancelOutcome';
 import { baseURL, getAuthHeaders, streamFetch, postSSEStream } from './transport';
 
 export async function replayThreadHistory(threadId: string, onEvent: (event: Record<string, unknown>) => void = () => {}) {
@@ -93,6 +94,9 @@ export async function sendRetryStream(
   return await postSSEStream(`/api/v1/threads/${threadId}/retry`, body, { onEvent, onRunIdResolved, signal });
 }
 
+export { isNoOpCancellation } from '../cancelOutcome';
+export type { CancelNoOpState, CancelOutcome } from '../cancelOutcome';
+
 /**
  * Hard-cancel the workflow for a thread (stops the main agent AND kills all
  * subagents immediately, flushing the checkpoint so the next message resumes
@@ -103,11 +107,16 @@ export async function sendRetryStream(
  * turn already tore down and the user started a new one, would hard-cancel that
  * *new* turn. The stop flow captures the run id at stop entry to avoid this.
  *
+ * Resolving is not proof of a stop — read {@link CancelOutcome.state} before
+ * treating the turn as cancelled.
+ *
  * @param {string} threadId - The thread ID to cancel
  * @param {string|null} runId - The specific run to cancel; null = latest active
- * @returns {Promise<Object>} Response data
  */
-export async function cancelWorkflow(threadId: string, runId: string | null = null) {
+export async function cancelWorkflow(
+  threadId: string,
+  runId: string | null = null,
+): Promise<CancelOutcome> {
   if (!threadId) throw new Error('Thread ID is required');
   // Bound the request: the shared axios instance sets no global timeout, so a
   // network-level hang (not a 4xx) would block each stopWorkflow retry until the
@@ -507,14 +516,11 @@ export async function getSubagentTaskHistory(
   return data;
 }
 
-/**
- * Stop one background task (e.g. a workflow run) without cancelling the turn.
- * @returns { cancelled, task_id, state?, message }
- */
+/** Stop one background task (e.g. a workflow run) without cancelling the turn. */
 export async function cancelSubagentTask(
   threadId: string,
   taskId: string,
-): Promise<{ cancelled: boolean; task_id: string; state?: string; message: string }> {
+): Promise<CancelOutcome> {
   const { data } = await api.post(
     `/api/v1/threads/${threadId}/tasks/${taskId}/cancel`,
   );

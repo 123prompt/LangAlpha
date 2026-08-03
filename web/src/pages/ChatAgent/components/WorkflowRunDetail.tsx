@@ -21,6 +21,9 @@ import {
   workflowChildStatusColor,
 } from './workflowRunUi';
 import StructuredResultBlock from './messageList/StructuredResultBlock';
+// Dependency-free module, not `../utils/api`: the predicate must survive the
+// tests that mock the api barrel wholesale.
+import { isNoOpCancellation } from '../utils/cancelOutcome';
 import { parseResultPreview } from '../utils/structuredResult';
 import type { AgentInfo, SubagentInfo } from './chatView/types';
 
@@ -235,21 +238,6 @@ function PhaseGroup({
         })}
       </div>
     </div>
-  );
-}
-
-/**
- * Whether a cancel request stopped nothing.
- *
- * The endpoint answers HTTP 200 with `cancelled: false` when there was nothing
- * to stop (`already_finished`, `task_not_found`), so a resolved promise is not
- * proof that a stop is on its way.
- */
-export function isNoOpCancellation(outcome: unknown): boolean {
-  return (
-    typeof outcome === 'object' &&
-    outcome !== null &&
-    (outcome as { cancelled?: unknown }).cancelled === false
   );
 }
 
