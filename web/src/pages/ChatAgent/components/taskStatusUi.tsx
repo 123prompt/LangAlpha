@@ -86,6 +86,26 @@ export const STATUS_UI: Record<TaskCardStatusKind, TaskCardStatusUi> = {
 };
 
 /**
+ * The card status a task's own wire status maps onto, before a card's action
+ * verb (`updated`/`resumed`) overrides it. Anything the vocabulary doesn't
+ * name falls to `unknown`, which renders the wire value verbatim rather than
+ * guessing an outcome.
+ */
+export function taskCardStatusKind(
+  status: string | null | undefined,
+): TaskCardStatusKind {
+  switch (status) {
+    case 'running':
+    case 'completed':
+    case 'cancelled':
+    case 'error':
+      return status;
+    default:
+      return 'unknown';
+  }
+}
+
+/**
  * The status word every task surface shows: icon, accent and label from one
  * `STATUS_UI` row. The inline card header and the workflow-run detail header
  * render this, so the chip cannot drift between them.

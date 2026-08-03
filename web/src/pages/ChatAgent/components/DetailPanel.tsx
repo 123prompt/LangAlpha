@@ -7,6 +7,7 @@ import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
 import { useTranslation } from 'react-i18next';
 import ToolCallDetailView, { type ToolCallProcessRecord, type SubagentInfo } from './ToolCallDetailView';
+import { taskCardStatusKind } from './taskStatusUi';
 
 interface PlanData {
   description?: string;
@@ -78,7 +79,11 @@ function DetailPanel({ toolCallProcess, planData, onClose, onOpenFile, onOpenSub
   const artifact = toolCallProcess.toolCallResult?.artifact;
   const content = toolCallProcess.toolCallResult?.content;
   const subagentType = isTaskTool ? ((toolCallProcess.toolCall?.args?.subagent_type as string) || 'general-purpose') : '';
-  const isSubagentCompleted = isTaskTool && (toolCallProcess._subagentStatus === 'completed' || !!content);
+  // Status only — a Task's reply exists from the moment it is dispatched, so
+  // `content` marked every running task "completed" and contradicted the
+  // status chip the panel body renders.
+  const isSubagentCompleted =
+    isTaskTool && taskCardStatusKind(toolCallProcess._subagentStatus) === 'completed';
 
   return (
     <div

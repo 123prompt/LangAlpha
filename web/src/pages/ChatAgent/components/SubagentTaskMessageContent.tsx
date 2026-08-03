@@ -5,7 +5,7 @@ import { compactNumber } from '@/lib/format';
 import { type SubagentTokenUsage } from '../utils/tokenUsage';
 import { useSubagentTelemetry } from './SubagentTelemetryContext';
 import TaskCardShell, { MONO_STACK } from './TaskCardShell';
-import type { TaskCardStatusKind } from './taskStatusUi';
+import { taskCardStatusKind, type TaskCardStatusKind } from './taskStatusUi';
 
 /**
  * Extract a short one-line summary from a full task description.
@@ -89,7 +89,6 @@ function SubagentTaskMessageContent({
   // A cancelled subagent is terminal like completed (workflow stopped) — it may
   // still have captured partial output worth viewing.
   const isCancelled = status === 'cancelled';
-  const isError = status === 'error';
   const hasResult = (isCompleted || isCancelled) && toolCallProcess?.toolCallResult?.content;
   const hasTelemetry = toolCalls > 0 || (tokenUsage?.total ?? 0) > 0;
 
@@ -97,10 +96,7 @@ function SubagentTaskMessageContent({
   const statusKind: TaskCardStatusKind =
     action === 'update' ? 'updated'
     : action === 'resume' ? 'resumed'
-    : action === 'init' && isRunning ? 'running'
-    : action === 'init' && isCompleted ? 'completed'
-    : action === 'init' && isCancelled ? 'cancelled'
-    : action === 'init' && isError ? 'error'
+    : action === 'init' ? taskCardStatusKind(status)
     : 'unknown';
 
   const handleOpen = (): void => {
