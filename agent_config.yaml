@@ -256,7 +256,6 @@ logging:
   file: "logs/ptc.log"
 
 agent:
-  enable_view_image: true
   background_auto_wait: false
 
 # Subagent configuration

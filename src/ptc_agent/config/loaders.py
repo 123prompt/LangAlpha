@@ -287,7 +287,6 @@ def load_from_dict(
     # Load Agent configuration (optional section)
     # Note: YAML sections with only comments parse as None, not {}
     agent_data = config_data.get("agent") or {}
-    enable_view_image = agent_data.get("enable_view_image", True)
     background_auto_wait = agent_data.get("background_auto_wait", False)
 
     # Load Subagent configuration (optional section)
@@ -353,7 +352,6 @@ def load_from_dict(
         filesystem=filesystem_config,
         skills=skills_config,
         flash=flash_config,
-        enable_view_image=enable_view_image,
         subagents=subagents_config,
         compaction=compaction_config,
         search_api=search_api,
@@ -439,7 +437,6 @@ filesystem:
 # Agent Settings (optional)
 # -------------------------
 agent:
-  enable_view_image: true
   background_auto_wait: false  # true to wait for background tasks before returning to CLI
 
 # Subagents (optional)
