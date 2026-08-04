@@ -2,6 +2,7 @@ import io
 import types
 
 import httpx
+import pypdf
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
@@ -14,6 +15,17 @@ from ptc_agent.agent.middleware.file_operations.multimodal import (
     _strip_unsupported_content_blocks,
 )
 from src.llms.llm import LLM, get_input_modalities
+
+
+def _pdf_bytes(pages: int = 1) -> bytes:
+    """A structurally valid PDF. Generated rather than committed as a blob so the
+    page count is a parameter — that is what the provider ceiling is measured in."""
+    writer = pypdf.PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=72, height=72)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
 
 
 def _png_bytes() -> bytes:
@@ -524,7 +536,7 @@ class TestContentIsTypedByItsBytes:
 
     @pytest.mark.asyncio
     async def test_a_sandbox_pdf_named_png_is_read_as_a_pdf(self):
-        mw = MultimodalMiddleware(sandbox=_Sandbox(b"%PDF-1.4 body"))
+        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes()))
 
         result = await mw._handle_sandbox_content(
             "report.png", AIMessage(content="ok"), "call-1"
@@ -544,7 +556,7 @@ class TestContentIsTypedByItsBytes:
             multimodal,
             "GuardedAsyncTransport",
             lambda: httpx.MockTransport(
-                lambda request: httpx.Response(200, content=b"%PDF-1.4 body")
+                lambda request: httpx.Response(200, content=_pdf_bytes())
             ),
         )
 
@@ -575,4 +587,76 @@ class TestContentIsTypedByItsBytes:
             "https://example.com/a.bmp", AIMessage(content="ok"), "call-1"
         )
         assert isinstance(result, ToolMessage)
-        assert "not a readable image or PDF" in result.content
+        assert not isinstance(result, Command)
+        assert "BMP" in result.content
+
+
+class TestPDFsAreVerifiedNotSniffed:
+    """A `%PDF` prefix is four bytes of claim. Everything past it — the xref, the
+    page tree, the page count — is what a provider actually validates, and the
+    Command that carries the block is written to the checkpoint before any
+    provider sees it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_header_only_pdf_never_reaches_graph_state(self):
+        """The bytes that pass a prefix check and nothing else."""
+        mw = MultimodalMiddleware(sandbox=_Sandbox(b"%PDF-1.4 body"))
+
+        result = await mw._handle_sandbox_content(
+            "report.pdf", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, ToolMessage)
+        assert not isinstance(result, Command)
+        assert "not a readable PDF" in result.content
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_pdf_is_refused(self):
+        """The realistic shape: an interrupted download or a half-written report,
+        whose head is a genuine PDF."""
+        whole = _pdf_bytes()
+        mw = MultimodalMiddleware(sandbox=_Sandbox(whole[: len(whole) * 6 // 10]))
+
+        result = await mw._handle_sandbox_content(
+            "report.pdf", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, ToolMessage)
+        assert "not a readable PDF" in result.content
+
+    @pytest.mark.asyncio
+    async def test_a_pdf_over_the_page_ceiling_is_refused_with_its_count(self):
+        """Page count is the ceiling that binds: this fixture is a few KB, so no
+        byte cap would catch it. The message names the count so the agent can
+        split the document rather than retry the same read."""
+        mw = MultimodalMiddleware(
+            sandbox=_Sandbox(_pdf_bytes(multimodal.MAX_PDF_PAGES + 1))
+        )
+
+        result = await mw._handle_sandbox_content(
+            "long.pdf", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, ToolMessage)
+        assert not isinstance(result, Command)
+        assert f"{multimodal.MAX_PDF_PAGES + 1}-page" in result.content
+
+    @pytest.mark.asyncio
+    async def test_a_pdf_at_the_page_ceiling_is_accepted(self):
+        """The limit is inclusive — off-by-one here silently rejects a legal doc."""
+        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(multimodal.MAX_PDF_PAGES)))
+
+        result = await mw._handle_sandbox_content(
+            "long.pdf", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, Command)
+
+    @pytest.mark.asyncio
+    async def test_trailing_bytes_do_not_condemn_an_otherwise_readable_pdf(self):
+        """Verification has to reject damage, not tidiness. Real PDFs routinely
+        carry junk after the final %%EOF, and providers accept them."""
+        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes() + b"\n<!-- appended -->"))
+
+        result = await mw._handle_sandbox_content(
+            "report.pdf", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, Command)
+        assert result.update["messages"][-1].content[-1]["mime_type"] == "application/pdf"

@@ -45,7 +45,7 @@ DOCUMENT_EXTENSIONS = frozenset({".pdf"})
 VISUAL_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS
 
 # PIL reports a format name; providers speak MIME. A format outside this map is
-# one no provider accepts, so it resolves to None rather than a near-miss guess.
+# one no provider accepts, so it is refused rather than given a near-miss guess.
 _PIL_FORMAT_TO_MIME = {
     "PNG": "image/png",
     "JPEG": "image/jpeg",
@@ -53,23 +53,48 @@ _PIL_FORMAT_TO_MIME = {
     "WEBP": "image/webp",
 }
 
+# The tightest published per-request page ceiling (Anthropic's, below a 1M-token
+# context). Page count is what binds for PDFs — a 300-page report can sit well
+# under MAX_CONTENT_BYTES and still be rejected on arrival.
+MAX_PDF_PAGES = 100
 
-def _detect_mime_type(content: bytes) -> str | None:
-    """MIME type read off the bytes, or None if they are neither PDF nor image.
+
+class _UnusableContent(Exception):
+    """Why bytes can't be injected. The text reaches the agent, so it reads as a
+    predicate ("not a readable PDF") that slots into the caller's message."""
+
+
+def _detect_mime_type(content: bytes) -> str:
+    """MIME type read off the bytes, raising `_UnusableContent` if nothing accepts them.
 
     The name can't decide this: a URL may carry no extension at all, and a
     sandbox path is only as accurate as whatever wrote the file. Both callers
-    checkpoint what they inject, so a mislabeled or truncated file would replay
-    its provider 400 on every later turn rather than failing once.
+    checkpoint what they inject, so anything a provider would reject has to be
+    caught here — otherwise it replays its 400 on every later turn instead of
+    failing once. Hence structural verification, not just a magic-byte peek.
     """
     if content.startswith(b"%PDF"):
+        import pypdf
+
+        try:
+            pages = len(pypdf.PdfReader(io.BytesIO(content)).pages)
+        except Exception:
+            raise _UnusableContent("not a readable PDF") from None
+        if pages > MAX_PDF_PAGES:
+            raise _UnusableContent(
+                f"a {pages}-page PDF, over the {MAX_PDF_PAGES}-page limit"
+            )
         return "application/pdf"
+
     try:
         img = Image.open(io.BytesIO(content))
         img.verify()
     except Exception:
-        return None
-    return _PIL_FORMAT_TO_MIME.get(img.format or "")
+        raise _UnusableContent("not a readable image or PDF") from None
+    mime_type = _PIL_FORMAT_TO_MIME.get(img.format or "")
+    if mime_type is None:
+        raise _UnusableContent(f"in {img.format} format, which no provider accepts")
+    return mime_type
 
 
 def _strip_unsupported_content_blocks(
@@ -232,10 +257,11 @@ class MultimodalMiddleware(AgentMiddleware):
     # injection half into dead code rather than failing anywhere visible.
     TOOL_NAME = "Read"
 
-    # Anthropic caps a single image at 5MB, which binds well before any
-    # per-request ceiling. Both injection paths return a Command that writes the
-    # block into graph state, so an oversized block is not a one-turn error: it
-    # is checkpointed and replayed on every later turn, and the modality strip
+    # Raw bytes, deliberately below every provider's published ceiling: those are
+    # quoted on the base64 string, which is 4/3 larger, so 5 MiB here is ~6.7 MiB
+    # on the wire. Both injection paths return a Command that writes the block
+    # into graph state, so an oversized block is not a one-turn error: it is
+    # checkpointed and replayed on every later turn, and the modality strip
     # cannot save a target that legitimately has the image modality. Refuse
     # before encoding rather than brick the thread.
     MAX_CONTENT_BYTES = 5 * 1024 * 1024
@@ -516,11 +542,12 @@ class MultimodalMiddleware(AgentMiddleware):
             # Typed from the bytes, not the URL: a signed or redirected URL can
             # end without an extension, and branching on that would send a PDF
             # down the image path and reject it as corrupt.
-            mime_type = _detect_mime_type(content_bytes)
-            if mime_type is None:
-                logger.warning(f"[MULTIMODAL] Unreadable content from URL: {url}")
+            try:
+                mime_type = _detect_mime_type(content_bytes)
+            except _UnusableContent as exc:
+                logger.warning(f"[MULTIMODAL] Refusing content from URL ({exc}): {url}")
                 return ToolMessage(
-                    content=f"ERROR: Content is not a readable image or PDF: {url}",
+                    content=f"ERROR: Content is {exc}: {url}",
                     tool_call_id=tool_call_id,
                 )
 
@@ -625,11 +652,12 @@ class MultimodalMiddleware(AgentMiddleware):
             # Typed from the bytes for the same reason the URL path is: the
             # extension is whatever wrote the file claimed, and a truncated
             # chart named .png is checkpointed before any provider sees it.
-            mime_type = _detect_mime_type(file_bytes)
-            if mime_type is None:
-                logger.warning(f"[MULTIMODAL] Unreadable content in file: {file_path}")
+            try:
+                mime_type = _detect_mime_type(file_bytes)
+            except _UnusableContent as exc:
+                logger.warning(f"[MULTIMODAL] Refusing file ({exc}): {file_path}")
                 return ToolMessage(
-                    content=f"ERROR: File is not a readable image or PDF: {file_path}",
+                    content=f"ERROR: File is {exc}: {file_path}",
                     tool_call_id=tool_call_id,
                 )
 
