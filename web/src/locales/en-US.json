@@ -1472,7 +1472,6 @@
       "effortMedium": "Medium",
       "effortHigh": "High",
       "effortXhigh": "X-High",
-      "incompatibleSdk": "Cannot switch to this model in the current session (different provider)",
       "fastMode": "Fast",
       "fastModeDesc": "Priority routing for faster responses",
       "fastModeHelpLine1": "Equivalent to /fast in Codex",
