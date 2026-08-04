@@ -1309,7 +1309,7 @@
     },
     "subagentCard": {
       "titleFallback": "子智能体任务",
-      "viewOutput": "查看子智能体输出",
+      "viewDetails": "查看任务详情",
       "openUpdated": "点击查看已更新的子智能体",
       "openResumed": "点击查看已恢复的子智能体",
       "openRunning": "点击查看运行中的子智能体",

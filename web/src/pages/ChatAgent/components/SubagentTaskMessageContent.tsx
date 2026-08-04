@@ -89,7 +89,10 @@ function SubagentTaskMessageContent({
   // A cancelled subagent is terminal like completed (workflow stopped) — it may
   // still have captured partial output worth viewing.
   const isCancelled = status === 'cancelled';
-  const hasResult = (isCompleted || isCancelled) && toolCallProcess?.toolCallResult?.content;
+  // The panel this opens shows the task's instructions and status, never its
+  // output — the reply it used to key on is dispatch boilerplate that exists
+  // from the moment the task starts, so it promised a result no panel had.
+  const hasDetails = (isCompleted || isCancelled) && !!toolCallProcess;
   const hasTelemetry = toolCalls > 0 || (tokenUsage?.total ?? 0) > 0;
 
   // Status discriminator — drives icon, label, and accent color via STATUS_UI.
@@ -103,7 +106,7 @@ function SubagentTaskMessageContent({
     onOpen?.({ subagentId: resumeTargetId || subagentId || '', description: description || '', type, status });
   };
 
-  const handleViewOutput = (e: React.MouseEvent<HTMLButtonElement>): void => {
+  const handleViewDetails = (e: React.MouseEvent<HTMLButtonElement>): void => {
     e.stopPropagation();
     if (onDetailOpen && toolCallProcess) {
       onDetailOpen(toolCallProcess);
@@ -127,11 +130,11 @@ function SubagentTaskMessageContent({
           : undefined
       }
       onOpen={onOpen ? handleOpen : undefined}
-      affordance={hasResult && onDetailOpen ? (
+      affordance={hasDetails && onDetailOpen ? (
         <button
           type="button"
-          aria-label={t('chat.subagentCard.viewOutput')}
-          onClick={handleViewOutput}
+          aria-label={t('chat.subagentCard.viewDetails')}
+          onClick={handleViewDetails}
           style={{
             background: 'transparent',
             border: 'none',

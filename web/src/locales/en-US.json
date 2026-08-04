@@ -1310,7 +1310,7 @@
     },
     "subagentCard": {
       "titleFallback": "Subagent Task",
-      "viewOutput": "View subagent output",
+      "viewDetails": "View task details",
       "openUpdated": "Click to view updated subagent",
       "openResumed": "Click to view resumed subagent",
       "openRunning": "Click to view running subagent",
