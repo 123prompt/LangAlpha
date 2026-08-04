@@ -1,9 +1,17 @@
-import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+import types
 
+import httpx
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.types import Command
+
+from ptc_agent.agent.middleware.file_operations import multimodal
 from ptc_agent.agent.middleware.file_operations.multimodal import (
+    MultimodalMiddleware,
+    _is_visual_request,
     _strip_unsupported_content_blocks,
 )
+from src.llms.llm import LLM, get_input_modalities
 
 
 class TestStripUnsupportedContentBlocks:
@@ -44,6 +52,68 @@ class TestStripUnsupportedContentBlocks:
         content = result[0].content
         assert content[0]["type"] == "text"
         assert "PDF" in content[0]["text"]
+
+    def test_text_only_strips_anthropic_native_image_blocks(self):
+        """Regression: an Anthropic-lineage turn leaves ``type: image`` blocks,
+        not ``image_url``. Missing that shape let the most common vision→text-only
+        switch replay raw blocks and 400."""
+        msgs = [
+            HumanMessage(content=[
+                {"type": "text", "text": "Look at this"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "abc",
+                }},
+            ]),
+        ]
+        result = _strip_unsupported_content_blocks(msgs, has_image=False, has_pdf=False)
+        assert result is not msgs
+        content = result[0].content
+        assert content[0] == {"type": "text", "text": "Look at this"}
+        assert content[1]["type"] == "text"
+        assert "not visible" in content[1]["text"]
+        # The checkpoint keeps the original block — the strip is read-side only.
+        assert msgs[0].content[1]["type"] == "image"
+
+    def test_text_only_strips_langchain_v1_image_blocks(self):
+        """The v1 shape keys the payload on `base64` instead of `source`; matching
+        on the block type alone keeps either from slipping through."""
+        msgs = [
+            HumanMessage(content=[
+                {"type": "image", "base64": "abc", "mime_type": "image/png"},
+            ]),
+        ]
+        result = _strip_unsupported_content_blocks(msgs, has_image=False, has_pdf=False)
+        assert result is not msgs
+        assert result[0].content[0]["type"] == "text"
+
+    @pytest.mark.parametrize(
+        "block",
+        [
+            {"type": "file", "base64": "abc", "mime_type": None},
+            {"type": "file", "base64": "abc"},
+            {"type": "file", "base64": "abc", "mime_type": "image/png"},
+        ],
+        ids=["null-mime", "no-mime-key", "non-pdf-mime"],
+    )
+    def test_unclassifiable_file_blocks_fail_closed(self, block):
+        """`pdf` is the only file-modality flag we have, so a file block we can't
+        classify is one a model without it cannot accept. Matching on mime left
+        these through — and on a null mime the old `.startswith` raised outright."""
+        msgs = [HumanMessage(content=[block])]
+        result = _strip_unsupported_content_blocks(msgs, has_image=False, has_pdf=False)
+        assert result is not msgs
+        assert result[0].content[0]["type"] == "text"
+
+    def test_vision_model_keeps_anthropic_native_image_blocks(self):
+        msgs = [
+            HumanMessage(content=[
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": "abc",
+                }},
+            ]),
+        ]
+        result = _strip_unsupported_content_blocks(msgs, has_image=True, has_pdf=False)
+        assert result is msgs
 
     def test_mixed_content_preserves_text_blocks(self):
         msgs = [
@@ -96,3 +166,296 @@ class TestStripUnsupportedContentBlocks:
         ]
         result = _strip_unsupported_content_blocks(msgs, has_image=False, has_pdf=False)
         assert result is msgs
+
+
+def _request(manifest_model):
+    """A model-call request carrying only what _resolve_modalities reads."""
+    metadata = {"manifest_model": manifest_model} if manifest_model else {}
+    return types.SimpleNamespace(model=types.SimpleNamespace(metadata=metadata))
+
+
+class TestResolveModalities:
+    """The middleware runs inside ModelResilienceMiddleware, so the client on the
+    request is the one that will actually be called — including after a fallback.
+    """
+
+    def test_reads_the_stamped_model_not_the_configured_one(self):
+        mw = MultimodalMiddleware(model_name="gpt-5.5")
+        # Configured for a vision model, but resilience substituted a text-only
+        # client; judging on the configured name would replay image blocks at it.
+        assert mw._resolve_modalities(_request("deepseek-v4-pro")) == ["text"]
+
+    def test_custom_modalities_apply_only_to_the_configured_model(self):
+        mw = MultimodalMiddleware(model_name="my-custom-vlm", custom_modalities=["text", "image"])
+        assert mw._resolve_modalities(_request("my-custom-vlm")) == ["text", "image"]
+        # A fallback is a different model — the override must not follow it over.
+        assert mw._resolve_modalities(_request("deepseek-v4-pro")) == ["text"]
+
+    def test_an_unstamped_client_is_text_only_even_under_a_vision_parent(self):
+        """Regression: a bare-string subagent resolves via ``init_chat_model`` and
+        carries no stamp. Lending it the configured model's modalities let a
+        vision parent replay image blocks into a text-only subagent — the exact
+        400 this strip exists to prevent."""
+        mw = MultimodalMiddleware(model_name="claude-sonnet-4-6")
+        assert "image" in get_input_modalities("claude-sonnet-4-6")  # parent sees images
+        assert mw._resolve_modalities(_request(None)) == ["text"]
+
+    def test_a_client_with_no_metadata_at_all_is_text_only(self):
+        mw = MultimodalMiddleware(model_name="claude-sonnet-4-6")
+        no_metadata = types.SimpleNamespace(model=types.SimpleNamespace())
+        assert mw._resolve_modalities(no_metadata) == ["text"]
+
+    def test_no_model_name_at_all_is_text_only(self):
+        """Fail closed: over-stripping costs a placeholder, under-stripping a 400."""
+        mw = MultimodalMiddleware()
+        assert mw._resolve_modalities(_request(None)) == ["text"]
+
+    def test_a_custom_modalities_override_does_not_survive_an_unstamped_client(self):
+        """The override describes the configured model; an unattributable client
+        is not that model."""
+        mw = MultimodalMiddleware(model_name="my-custom-vlm", custom_modalities=["text", "image"])
+        assert mw._resolve_modalities(_request(None)) == ["text"]
+
+
+class _ModelCallRequest:
+    """Minimal stand-in for the model-call request: a stamped client, a history,
+    and the ``override`` the middleware must go through to replace messages."""
+
+    def __init__(self, manifest_model, messages):
+        self.model = types.SimpleNamespace(metadata={"manifest_model": manifest_model})
+        self.messages = messages
+
+    def override(self, **kwargs):
+        clone = _ModelCallRequest.__new__(_ModelCallRequest)
+        clone.model = self.model
+        clone.messages = kwargs.get("messages", self.messages)
+        return clone
+
+
+class TestAwrapModelCall:
+    """The seam itself: capability resolution and the strip are covered above,
+    but nothing exercised the method that joins them and calls ``override``."""
+
+    @staticmethod
+    def _image_history():
+        return [
+            HumanMessage(content=[
+                {"type": "text", "text": "Look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_vision_target_is_handed_the_request_untouched(self):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        request = _ModelCallRequest("claude-sonnet-4-6", self._image_history())
+        assert await MultimodalMiddleware().awrap_model_call(request, handler) == "ok"
+        assert seen["request"] is request, "vision target must not be cloned or stripped"
+
+    @pytest.mark.asyncio
+    async def test_a_text_only_target_is_handed_stripped_messages(self):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        history = self._image_history()
+        request = _ModelCallRequest("deepseek-v4-pro", history)
+        await MultimodalMiddleware().awrap_model_call(request, handler)
+
+        forwarded = seen["request"]
+        assert forwarded is not request, "must forward an override, not the original"
+        assert forwarded.messages[0].content[1]["type"] == "text"
+        # Read-side only: the checkpoint's copy still holds the real block.
+        assert history[0].content[1]["type"] == "image_url"
+
+    @pytest.mark.asyncio
+    async def test_a_text_only_target_with_nothing_to_strip_is_not_cloned(self):
+        """No visual blocks means no override — the request passes through as-is."""
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        request = _ModelCallRequest("deepseek-v4-pro", [HumanMessage(content="plain text")])
+        await MultimodalMiddleware().awrap_model_call(request, handler)
+        assert seen["request"] is request
+
+
+class TestManifestModelStampRoundTrip:
+    """Producer and consumer of ``manifest_model`` live in different modules and
+    agree only by string. Both sides are asserted against one real client so a
+    rename on either cannot pass."""
+
+    def test_the_key_the_producer_writes_is_the_key_the_middleware_reads(self):
+        client = LLM("claude-sonnet-4-6", api_key="unused-offline").get_llm()
+        assert client.metadata["manifest_model"] == "claude-sonnet-4-6"
+
+        # Configured for a text-only model, handed a vision client: the stamp is
+        # what must win, which only works if both sides name the same key.
+        mw = MultimodalMiddleware(model_name="deepseek-v4-pro")
+        modalities = mw._resolve_modalities(types.SimpleNamespace(model=client))
+        assert "image" in modalities
+
+    def test_the_stamp_is_the_manifest_key_not_the_provider_model_id(self):
+        """``get_input_modalities`` looks up models.json keys; the API model id
+        would silently resolve to text-only for every renamed model."""
+        client = LLM("claude-sonnet-4-6", api_key="unused-offline").get_llm()
+        stamped = client.metadata["manifest_model"]
+        assert get_input_modalities(stamped) != ["text"]
+
+
+class TestVisualRequestRouting:
+    def test_memo_pdf_is_not_intercepted(self):
+        """Read serves memo PDFs as extracted text; they have no sandbox-FS copy,
+        so intercepting would swap real content for a not-found error."""
+        assert not _is_visual_request(".agents/user/memo/report.pdf")
+        assert not _is_visual_request("/.agents/user/memo/report.pdf")
+        assert not _is_visual_request("./.agents/user/memo/report.pdf")
+
+    def test_workspace_pdf_is_intercepted(self):
+        assert _is_visual_request("results/report.pdf")
+
+    def test_tool_name_matches_the_registered_read_tool(self):
+        """A drift here silently disables the whole injection half — it fails by
+        matching nothing, not by raising, which is how it went unnoticed before."""
+        from ptc_agent.agent.tools.file_ops import create_filesystem_tools
+
+        # The factory only closes over the backend; nothing touches it until a
+        # tool is actually invoked, so a bare stub is enough to read the names.
+        names = {t.name for t in create_filesystem_tools(types.SimpleNamespace())}
+        assert MultimodalMiddleware.TOOL_NAME in names
+
+
+class TestUnsupportedModalityNote:
+    """A file the model can't consume still runs the tool — the note is appended
+    to the real output, never substituted for it, so the agent can say why it is
+    answering blind instead of silently losing the read.
+    """
+
+    @staticmethod
+    def _read(file_path):
+        return types.SimpleNamespace(
+            tool_call={"name": "Read", "args": {"file_path": file_path}, "id": "tc-1"}
+        )
+
+    @staticmethod
+    async def _handler(_request):
+        return ToolMessage(content="ok", tool_call_id="tc-1")
+
+    @pytest.mark.parametrize(
+        "file_path",
+        ["chart.png", "report.pdf", "https://example.com/asset"],
+        ids=["image-ext", "pdf-ext", "url-without-extension"],
+    )
+    @pytest.mark.asyncio
+    async def test_text_only_model_gets_the_note(self, file_path):
+        """The extensionless URL is the interesting one: it could resolve to
+        either kind, so a model with neither modality has to be told."""
+        mw = MultimodalMiddleware(model_name="stub", custom_modalities=["text"])
+        result = await mw.awrap_tool_call(self._read(file_path), self._handler)
+        assert result.content.startswith("ok")
+        assert "does not support" in result.content
+
+    @pytest.mark.asyncio
+    async def test_a_model_holding_the_modality_is_not_noted(self):
+        """Routed to the injection path instead — which fails here only because
+        this middleware has no sandbox, well past the branch under test."""
+        mw = MultimodalMiddleware(model_name="stub", custom_modalities=["text", "image"])
+        result = await mw.awrap_tool_call(self._read("chart.png"), self._handler)
+        assert "does not support" not in result.content
+
+
+class TestContentSizeCap:
+    @pytest.mark.asyncio
+    async def test_oversized_download_is_aborted(self, monkeypatch):
+        """The body is streamed so the cap can fire mid-transfer — a Content-Length
+        check alone is a header a server can simply lie about."""
+        mw = MultimodalMiddleware()
+        monkeypatch.setattr(mw, "MAX_CONTENT_BYTES", 1024)
+
+        def handler(request):
+            return httpx.Response(200, content=b"x" * 4096)
+
+        monkeypatch.setattr(
+            multimodal, "GuardedAsyncTransport", lambda: httpx.MockTransport(handler)
+        )
+
+        result = await mw._handle_url_content(
+            "https://example.com/big.png", AIMessage(content="ok"), "call-1"
+        )
+        assert "larger than" in result.content
+        assert result.tool_call_id == "call-1"
+
+    @pytest.mark.asyncio
+    async def test_oversized_sandbox_file_is_refused(self, monkeypatch):
+        """The sandbox path was uncapped while the URL path was not. Both write
+        into graph state, so an oversized block there is checkpointed and
+        replayed on every later turn — a permanent 400, not a one-turn error."""
+
+        class _Sandbox:
+            async def adownload_file_bytes(self, path):
+                return b"x" * 4096
+
+        mw = MultimodalMiddleware(sandbox=_Sandbox())
+        monkeypatch.setattr(mw, "MAX_CONTENT_BYTES", 1024)
+
+        result = await mw._handle_sandbox_content(
+            "/home/workspace/big.png", AIMessage(content="ok"), "call-1"
+        )
+        assert "larger than" in result.content
+        assert result.tool_call_id == "call-1"
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_never_reaches_graph_state(self, monkeypatch):
+        """A Command would write the block into the checkpoint; refusing has to
+        stay a plain ToolMessage or the cap accomplishes nothing."""
+
+        class _Sandbox:
+            async def adownload_file_bytes(self, path):
+                return b"x" * 4096
+
+        mw = MultimodalMiddleware(sandbox=_Sandbox())
+        monkeypatch.setattr(mw, "MAX_CONTENT_BYTES", 1024)
+
+        result = await mw._handle_sandbox_content(
+            "/home/workspace/big.png", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, ToolMessage)
+        assert not isinstance(result, Command)
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_address_does_not_name_the_resolved_ip(self, monkeypatch):
+        """The URL is model-chosen, so echoing the guard's message back — it names
+        the resolved address — turns Read into a DNS-to-IP probe steerable by
+        anything the agent reads."""
+        from src.tools.web.inhouse.guard import BlockedAddressError
+
+        class _Blocking(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                raise BlockedAddressError(
+                    "Blocked private/reserved address 10.11.12.13 for host 'x.corp'",
+                    request=request,
+                )
+
+        mw = MultimodalMiddleware()
+        monkeypatch.setattr(multimodal, "GuardedAsyncTransport", _Blocking)
+
+        result = await mw._handle_url_content(
+            "http://x.corp/a.png", AIMessage(content="ok"), "call-1"
+        )
+        assert "10.11.12.13" not in result.content
+        assert "x.corp" in result.content  # the URL the model already knows
+        assert "not allowed" in result.content
+
+    def test_the_cap_matches_the_binding_provider_limit(self):
+        """5MB is Anthropic's per-image ceiling, which binds before any
+        per-request limit. Raising this re-opens the checkpoint brick."""
+        assert MultimodalMiddleware.MAX_CONTENT_BYTES == 5 * 1024 * 1024

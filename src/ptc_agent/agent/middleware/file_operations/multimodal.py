@@ -1,14 +1,14 @@
 """Multimodal middleware for injecting images and PDFs into LLM conversations.
 
-This middleware intercepts read_file tool calls for image/PDF paths and URLs,
+This middleware intercepts Read tool calls for image/PDF paths and URLs,
 downloading the content and injecting it as a HumanMessage content block
 for multimodal models.
 
 Architecture:
-- Intercepts read_file tool calls that match image/PDF patterns
+- Intercepts Read tool calls that match image/PDF patterns
 - Downloads content from sandbox or URL
 - Injects as HumanMessage using LangGraph's Command pattern
-- Passes through non-visual read_file calls unchanged
+- Passes through non-visual Read calls unchanged
 
 Supported formats:
 - Images: PNG, JPG, JPEG, GIF, WebP
@@ -16,7 +16,6 @@ Supported formats:
 """
 
 import base64
-import contextvars
 import io
 import logging
 from collections.abc import Awaitable, Callable
@@ -30,7 +29,9 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from langgraph.types import Command
 from PIL import Image
 
+from ptc_agent.agent.tools.file_ops import is_memo_text_path
 from src.llms.llm import get_input_modalities
+from src.tools.web.inhouse.guard import BlockedAddressError, GuardedAsyncTransport
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +43,6 @@ DOCUMENT_EXTENSIONS = frozenset({".pdf"})
 
 # Combined visual extensions
 VISUAL_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS
-
-# Active model for the current async context (set in awrap_model_call, read in awrap_tool_call)
-_active_model: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    'multimodal_model', default=None
-)
 
 
 def _strip_unsupported_content_blocks(
@@ -84,8 +80,24 @@ def _strip_unsupported_content_blocks(
                 msg_modified = True
                 continue
 
-            # Check file blocks (PDF)
-            if block_type == "file" and block.get("mime_type", "").startswith("application/pdf") and not has_pdf:
+            # Any block typed "image" — covers the Anthropic-native `source`
+            # shape and the langchain v1 `base64` one. Matched on the type alone
+            # rather than a key, so a shape that drifts on a lib bump still gets
+            # stripped: this is the only thing standing between a mid-thread
+            # switch and a 400, and failing closed here only costs a placeholder.
+            if block_type == "image" and not has_image:
+                new_blocks.append({
+                    "type": "text",
+                    "text": "[Image attached in prior turn — not visible to current model]"
+                })
+                msg_modified = True
+                continue
+
+            # Any block typed "file", matched on the type alone for the same
+            # reason as "image" above: `pdf` is the only file-modality flag the
+            # manifest carries, so a file block we can't classify — mime absent,
+            # null, or non-PDF — is one a model without it has no way to accept.
+            if block_type == "file" and not has_pdf:
                 new_blocks.append({
                     "type": "text",
                     "text": "[PDF attached in prior turn — not visible to current model]"
@@ -112,6 +124,29 @@ def _strip_unsupported_content_blocks(
     return result if modified else messages
 
 
+_UNSUPPORTED_NOTE = (
+    "\n\n<system-reminder>"
+    "You cannot view this file directly because the current model does not support "
+    "this input type. Be transparent with the user about this limitation and suggest "
+    "they try switching to a model that supports image/PDF input. "
+    "Work in best effort to answer their query."
+    "</system-reminder>"
+)
+
+
+def _can_view(ext: str, modalities: list[str]) -> bool:
+    """Whether *modalities* cover the kind of file *ext* names.
+
+    A URL carrying no recognizable extension could resolve to either kind, so it
+    needs one of the two rather than a specific one.
+    """
+    if ext in DOCUMENT_EXTENSIONS:
+        return "pdf" in modalities
+    if ext in IMAGE_EXTENSIONS:
+        return "image" in modalities
+    return "image" in modalities or "pdf" in modalities
+
+
 def _is_visual_request(file_path: str) -> bool:
     """Check if the file_path is a visual file (image or PDF - URL or file extension).
 
@@ -125,15 +160,20 @@ def _is_visual_request(file_path: str) -> bool:
     if file_path.startswith(("http://", "https://")):
         return True
 
+    # A memo PDF is served as extracted text and has no sandbox-FS copy to
+    # fetch, so intercepting it would trade real content for a not-found error.
+    if is_memo_text_path(file_path):
+        return False
+
     # Check for visual file extensions (images + documents)
     suffix = Path(file_path).suffix.lower()
     return suffix in VISUAL_EXTENSIONS
 
 
 class MultimodalMiddleware(AgentMiddleware):
-    """Middleware that intercepts read_file for images/PDFs and injects them as HumanMessage.
+    """Middleware that intercepts Read for images/PDFs and injects them as HumanMessage.
 
-    When read_file is called with an image/PDF path or URL, this middleware:
+    When Read is called with an image/PDF path or URL, this middleware:
     1. Executes the tool to get the acknowledgment message
     2. Downloads the content (from URL or sandbox)
     3. Converts to base64 for universal LLM provider compatibility
@@ -141,7 +181,13 @@ class MultimodalMiddleware(AgentMiddleware):
        - The ToolMessage (for tool call completion)
        - A HumanMessage with the base64 content (for multimodal model processing)
 
-    Non-visual read_file calls pass through unchanged.
+    Non-visual Read calls pass through unchanged.
+
+    Independently of that, it strips image/PDF blocks out of history when the
+    current model lacks the modality — the half that keeps a mid-thread switch
+    to a text-only model from replaying an earlier turn's blocks. That half
+    needs no sandbox, so an agent with no Read tool wires it with
+    ``sandbox=None`` to get the strip alone.
 
     Note: Content is always downloaded and converted to base64 because many LLM
     providers (like Anthropic) cannot fetch external URLs directly.
@@ -154,7 +200,18 @@ class MultimodalMiddleware(AgentMiddleware):
         sandbox: PTCSandbox instance for reading files from sandbox paths
     """
 
-    TOOL_NAME = "read_file"
+    # Must track the name file_ops.py registers (``@tool("Read")``) — this is
+    # what awrap_tool_call matches on, and a mismatch silently turns the whole
+    # injection half into dead code rather than failing anywhere visible.
+    TOOL_NAME = "Read"
+
+    # Anthropic caps a single image at 5MB, which binds well before any
+    # per-request ceiling. Both injection paths return a Command that writes the
+    # block into graph state, so an oversized block is not a one-turn error: it
+    # is checkpointed and replayed on every later turn, and the modality strip
+    # cannot save a target that legitimately has the image modality. Refuse
+    # before encoding rather than brick the thread.
+    MAX_CONTENT_BYTES = 5 * 1024 * 1024
 
     # MIME type mapping for supported extensions
     MIME_TYPES = {
@@ -219,6 +276,49 @@ class MultimodalMiddleware(AgentMiddleware):
         )
         return handler(request)
 
+    def _too_large_message(self, source: str, tool_call_id: str) -> ToolMessage:
+        """Refuse an oversized block as a plain ToolMessage, never a Command.
+
+        A Command would write the block into graph state; the point of refusing
+        is that nothing oversized reaches the checkpoint.
+        """
+        limit_mb = self.MAX_CONTENT_BYTES // (1024 * 1024)
+        logger.warning(
+            f"[MULTIMODAL] Content exceeds {self.MAX_CONTENT_BYTES} bytes, refusing: {source}"
+        )
+        return ToolMessage(
+            content=(
+                f"ERROR: Content is larger than the {limit_mb}MB limit and was "
+                f"not loaded: {source}"
+            ),
+            tool_call_id=tool_call_id,
+        )
+
+    def _resolve_modalities(self, request: Any) -> list[str]:
+        """Modalities of the model this request will actually reach.
+
+        Read off ``request.model`` rather than the configured name so a
+        resilience fallback — or a subagent running its own model — is judged on
+        the client in hand.
+        """
+        metadata = getattr(request.model, "metadata", None)
+        stamped = metadata.get("manifest_model") if isinstance(metadata, dict) else None
+
+        if not isinstance(stamped, str) or not stamped:
+            # Unattributable: the client skipped LLM.get_llm(), which today means
+            # a subagent whose config names a bare model string for deepagents to
+            # resolve via init_chat_model. Falling back to the configured name
+            # would lend a vision parent's modalities to a text-only target and
+            # replay exactly the blocks this strip exists to remove, so an
+            # unstamped client is judged text-only — the same fail-closed reading
+            # LLM.get_llm() documents when it writes the stamp.
+            return ["text"]
+        # ``custom_modalities`` is a per-model override from user preferences, so
+        # it describes only the model it was configured for — a fallback is a
+        # different model and has to be judged on its own manifest entry.
+        overrides = self.custom_modalities if stamped == self.model_name else None
+        return get_input_modalities(stamped, custom_modalities=overrides)
+
     async def awrap_model_call(self, request, handler):
         """Strip unsupported content blocks from historical messages for text-only models.
 
@@ -226,31 +326,26 @@ class MultimodalMiddleware(AgentMiddleware):
         the checkpoint contains image/PDF content blocks that would cause 400 errors.
         This method replaces those blocks with text placeholders.
         """
-        model = self.model_name
-        token = _active_model.set(model)
-        try:
-            modalities = get_input_modalities(model, custom_modalities=self.custom_modalities) if model else ["text"]
-            has_image = "image" in modalities
-            has_pdf = "pdf" in modalities
+        modalities = self._resolve_modalities(request)
+        has_image = "image" in modalities
+        has_pdf = "pdf" in modalities
 
-            # Fast path: model supports all visual types
-            if has_image and has_pdf:
-                return await handler(request)
-
-            # Strip unsupported content blocks from messages
-            sanitized = _strip_unsupported_content_blocks(request.messages, has_image, has_pdf)
-            if sanitized is not request.messages:
-                return await handler(request.override(messages=sanitized))
+        # Fast path: model supports all visual types
+        if has_image and has_pdf:
             return await handler(request)
-        finally:
-            _active_model.reset(token)
+
+        # Strip unsupported content blocks from messages
+        sanitized = _strip_unsupported_content_blocks(request.messages, has_image, has_pdf)
+        if sanitized is not request.messages:
+            return await handler(request.override(messages=sanitized))
+        return await handler(request)
 
     async def awrap_tool_call(
         self,
         request: Any,
         handler: Callable[[Any], Awaitable[Any]],
     ) -> Any:
-        """Async wrapper that intercepts read_file for images/PDFs and injects as HumanMessage.
+        """Async wrapper that intercepts Read for images/PDFs and injects as HumanMessage.
 
         Args:
             request: Tool call request containing tool_call dict with name, args, id
@@ -275,8 +370,12 @@ class MultimodalMiddleware(AgentMiddleware):
         if not _is_visual_request(file_path):
             return await handler(request)
 
-        # Check model capabilities — skip content injection for unsupported modalities
-        model = _active_model.get() or self.model_name
+        # Check model capabilities — skip content injection for unsupported
+        # modalities. The configured model is the right basis here: which model
+        # actually consumes the injected blocks isn't decided until the next
+        # model call, and awrap_model_call re-checks against that one anyway. So
+        # this note is a UX affordance, not the thing preventing a 400.
+        model = self.model_name
         modalities = get_input_modalities(model, custom_modalities=self.custom_modalities) if model else ["text"]
 
         # Determine file extension (from local path or URL path)
@@ -285,39 +384,17 @@ class MultimodalMiddleware(AgentMiddleware):
         else:
             ext = Path(file_path).suffix.lower()
 
-        _unsupported_note = (
-            "\n\n<system-reminder>"
-            "You cannot view this file directly because the current model does not support "
-            "this input type. Be transparent with the user about this limitation and suggest "
-            "they try switching to a model that supports image/PDF input. "
-            "Work in best effort to answer their query."
-            "</system-reminder>"
-        )
-        if ext in IMAGE_EXTENSIONS and "image" not in modalities:
-            # Model can't view images — run the tool normally, append a note
+        if not _can_view(ext, modalities):
+            # Run the tool anyway and append the note — the text output is still
+            # useful, and replacing it would lose a read the agent asked for.
             result = await handler(request)
             result_content = result.content if hasattr(result, "content") else str(result)
             return ToolMessage(
-                content=result_content + _unsupported_note,
-                tool_call_id=tool_call_id,
-            )
-        if ext in DOCUMENT_EXTENSIONS and "pdf" not in modalities:
-            result = await handler(request)
-            result_content = result.content if hasattr(result, "content") else str(result)
-            return ToolMessage(
-                content=result_content + _unsupported_note,
-                tool_call_id=tool_call_id,
-            )
-        # URLs without recognizable extension: block if model is text-only
-        if ext not in VISUAL_EXTENSIONS and "image" not in modalities and "pdf" not in modalities:
-            result = await handler(request)
-            result_content = result.content if hasattr(result, "content") else str(result)
-            return ToolMessage(
-                content=result_content + _unsupported_note,
+                content=result_content + _UNSUPPORTED_NOTE,
                 tool_call_id=tool_call_id,
             )
 
-        logger.debug(f"[MULTIMODAL] Intercepting read_file for visual content: {file_path}")
+        logger.debug(f"[MULTIMODAL] Intercepting Read for visual content: {file_path}")
 
         # Execute the tool to get the acknowledgment message
         result = await handler(request)
@@ -387,18 +464,31 @@ class MultimodalMiddleware(AgentMiddleware):
             Command with ToolMessage + HumanMessage, or ToolMessage with error
         """
         try:
-            # Download the content
-            async with httpx.AsyncClient(http2=True, timeout=30.0) as client:
-                response = await client.get(url, follow_redirects=True)
+            # Download the content. The URL is model-chosen and this fetch runs
+            # in the backend process — not the sandbox — so it inherits the
+            # backend's reach into the private network. GuardedAsyncTransport
+            # re-checks the resolved address on every hop, which is what keeps a
+            # public page from redirecting the fetch at 169.254.169.254.
+            async with httpx.AsyncClient(
+                transport=GuardedAsyncTransport(), timeout=30.0
+            ) as client:
+                async with client.stream("GET", url, follow_redirects=True) as response:
+                    if response.status_code != 200:
+                        logger.warning(
+                            f"[MULTIMODAL] Failed to download content: {url} (status {response.status_code})"
+                        )
+                        return ToolMessage(
+                            content=f"ERROR: Could not download content (HTTP {response.status_code}): {url}",
+                            tool_call_id=tool_call_id,
+                        )
 
-                if response.status_code != 200:
-                    logger.warning(f"[MULTIMODAL] Failed to download content: {url} (status {response.status_code})")
-                    return ToolMessage(
-                        content=f"ERROR: Could not download content (HTTP {response.status_code}): {url}",
-                        tool_call_id=tool_call_id,
-                    )
+                    buffer = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        buffer.extend(chunk)
+                        if len(buffer) > self.MAX_CONTENT_BYTES:
+                            return self._too_large_message(url, tool_call_id)
+                    content_bytes = bytes(buffer)
 
-                content_bytes = response.content
                 if not content_bytes:
                     logger.warning(f"[MULTIMODAL] Empty content from URL: {url}")
                     return ToolMessage(
@@ -473,6 +563,16 @@ class MultimodalMiddleware(AgentMiddleware):
                 content=f"ERROR: Timeout downloading content: {url}",
                 tool_call_id=tool_call_id,
             )
+        except BlockedAddressError as e:
+            # The message names the resolved address ("Blocked private/reserved
+            # address 10.1.2.3 for host x"). The URL is model-chosen, so echoing
+            # that back turns Read into a DNS-to-IP probe steerable by anything
+            # the agent reads. Keep the detail in the log, not in the transcript.
+            logger.warning(f"[MULTIMODAL] Blocked address for {url}: {e}")
+            return ToolMessage(
+                content=f"ERROR: This address is not allowed: {url}",
+                tool_call_id=tool_call_id,
+            )
         except httpx.RequestError as e:
             logger.warning(f"[MULTIMODAL] Network error downloading content {url}: {e}")
             return ToolMessage(
@@ -518,6 +618,9 @@ class MultimodalMiddleware(AgentMiddleware):
                     content=f"ERROR: Could not read file: {file_path}",
                     tool_call_id=tool_call_id,
                 )
+
+            if len(file_bytes) > self.MAX_CONTENT_BYTES:
+                return self._too_large_message(file_path, tool_call_id)
 
             # Determine MIME type from extension
             ext = Path(file_path).suffix.lower()
