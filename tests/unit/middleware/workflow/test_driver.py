@@ -1064,6 +1064,27 @@ async def test_run_terminal_error_is_scrubbed_and_clipped_like_a_child() -> None
 
 
 @pytest.mark.asyncio
+async def test_absorbed_slot_diagnostic_is_scrubbed_like_an_error() -> None:
+    """The prelude names the absorbed exception on the run log, so a `log`
+    frame now carries error text the terminal path would have scrubbed — an
+    upstream failure reaching the script is the same string either way."""
+    driver, registry, _, _ = await _make_driver(
+        _script(
+            "return await parallel(["
+            "  async () => { throw new Error('401 from Bearer sk-liveKey12345678'); }"
+            "]);"
+        )
+    )
+
+    await driver.run()
+
+    logs = [e for e in registry.events if e["phase"] == "log"]
+    assert any("[runtime]" in e["message"] for e in logs)
+    assert not any("sk-liveKey12345678" in e["message"] for e in logs)
+    assert any("[REDACTED]" in e["message"] for e in logs)
+
+
+@pytest.mark.asyncio
 async def test_unlisted_frame_field_never_reaches_the_wire() -> None:
     """The frame whitelist is closed: the live stream and the checkpointed
     snapshot are the same dict, so an unlisted key would leak into both."""

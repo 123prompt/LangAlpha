@@ -26,10 +26,11 @@ logger = structlog.get_logger(__name__)
 # there are two, and a name missing from the replay copy renders fine live and
 # blanks on refresh. Ordered because replay projects in this order.
 #
-# ``error`` is deliberately absent: it is the one caller-supplied string, so it
-# is sanitized and clipped rather than passed through. Kept closed because the
-# live frame and the checkpointed snapshot are the same dict — an unlisted key
-# would leak into both at once.
+# ``error`` is deliberately absent: it is sanitized and clipped rather than
+# passed through, so it never rides the whitelist. ``message`` is listed but
+# scrubbed on the way out for the same reason — neither string is the driver's
+# to compose. Kept closed because the live frame and the checkpointed snapshot
+# are the same dict — an unlisted key would leak into both at once.
 WORKFLOW_FRAME_FIELDS: tuple[str, ...] = (
     "agent",
     "run_id",
@@ -169,6 +170,11 @@ class WorkflowEmitter:
         data.update(
             (k, v) for k, v in fields.items() if k in _FRAME_FIELDS and k not in data
         )
+        # A `log` frame's message is script text, and since the prelude began
+        # naming the absorbed exception in its `[runtime] … → null` line it can
+        # be an upstream error — the same string the terminal path scrubs.
+        if isinstance(data.get("message"), str):
+            data["message"] = sanitize_error_text(data["message"])
         # `error` is present iff there is one. Replay's projector already drops
         # a non-string error, so emitting `error: None` on a success frame would
         # make the same run read differently before and after a reload.
