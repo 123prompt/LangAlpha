@@ -270,6 +270,12 @@ class LLM:
     # Class-level model config instance
     _model_config = None
 
+    # Both real constructors set this; the default only covers instances built
+    # attribute-by-attribute off ``__new__``. Downstream reads fail closed
+    # (get_input_modalities treats an unknown model as text-only), so a missing
+    # stamp costs a stripped image block, never a rejected request.
+    custom_model_name: str | None = None
+
     @classmethod
     def get_model_config(cls) -> ModelConfig:
         """Get or create the model configuration singleton."""
@@ -489,12 +495,18 @@ class LLM:
         # request actually takes — langchain's own ``model_provider`` field
         # cannot be trusted here (ChatAnthropic reports "anthropic" for every
         # Anthropic-compatible shim).
+        # ``manifest_model`` is the models.json key, not ``self.model`` (the API
+        # model id) — it is what get_input_modalities() looks up. Middleware that
+        # runs inside ModelResilienceMiddleware sees a substituted client, so a
+        # capability read has to come off the client in hand rather than off a
+        # name captured when the stack was built.
         billing_type = self._resolve_billing_type()
         existing = client.metadata or {}
         client.metadata = {
             **existing,
             "billing_type": billing_type,
             "provider_route": self._provider_route(),
+            "manifest_model": self.custom_model_name,
         }
 
         return client
