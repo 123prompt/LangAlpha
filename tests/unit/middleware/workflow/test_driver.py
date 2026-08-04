@@ -455,10 +455,13 @@ async def test_a_timed_out_child_frees_its_slot() -> None:
 
 @pytest.mark.asyncio
 async def test_dispatch_cap_is_js_catchable() -> None:
+    """A plain Error, not a TypeError: spending the cap is a run reaching its
+    limit, not a bug in the script, so it stays absorbable."""
     driver, _, dispatcher, backend = await _make_driver(
         _script(
             "await agent('first'); "
-            "try { await agent('second'); } catch (e) { return String(e); }"
+            "try { await agent('second'); } "
+            "catch (e) { return e.constructor.name + ' | ' + e.message; }"
         ),
         caps=_caps(max_dispatches_per_run=1),
     )
@@ -466,6 +469,7 @@ async def test_dispatch_cap_is_js_catchable() -> None:
     await driver.run()
 
     result = json.loads(backend.writes[f"{driver.base_rel}/result.json"])
+    assert result.startswith("Error | ")
     assert "max_dispatches_per_run=1" in result
     assert len(dispatcher.calls) == 1
 
@@ -542,16 +546,19 @@ async def test_dispatch_cap_holds_with_every_call_in_flight_at_once() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_agent_type_is_js_catchable() -> None:
+    """Catchable, and a TypeError — the class the prelude escalates on. A
+    script that lets it through must end the run, not collect a null."""
     driver, _, dispatcher, backend = await _make_driver(
         _script(
             "try { await agent('x', { agentType: 'missing' }); } "
-            "catch (e) { return String(e); }"
+            "catch (e) { return e.constructor.name + ' | ' + e.message; }"
         )
     )
 
     await driver.run()
 
     result = json.loads(backend.writes[f"{driver.base_rel}/result.json"])
+    assert result.startswith("TypeError | ")
     assert "Available: general-purpose, research" in result
     assert dispatcher.calls == []
 
@@ -1054,6 +1061,27 @@ async def test_run_terminal_error_is_scrubbed_and_clipped_like_a_child() -> None
     assert "sk-liveKey12345678" not in terminal["error"]
     assert "[REDACTED]" in terminal["error"]
     assert len(terminal["error"].encode()) <= WorkflowEmitter._UI_ERROR_BYTES + 16
+
+
+@pytest.mark.asyncio
+async def test_absorbed_slot_diagnostic_is_scrubbed_like_an_error() -> None:
+    """The prelude names the absorbed exception on the run log, so a `log`
+    frame now carries error text the terminal path would have scrubbed — an
+    upstream failure reaching the script is the same string either way."""
+    driver, registry, _, _ = await _make_driver(
+        _script(
+            "return await parallel(["
+            "  async () => { throw new Error('401 from Bearer sk-liveKey12345678'); }"
+            "]);"
+        )
+    )
+
+    await driver.run()
+
+    logs = [e for e in registry.events if e["phase"] == "log"]
+    assert any("[runtime]" in e["message"] for e in logs)
+    assert not any("sk-liveKey12345678" in e["message"] for e in logs)
+    assert any("[REDACTED]" in e["message"] for e in logs)
 
 
 @pytest.mark.asyncio

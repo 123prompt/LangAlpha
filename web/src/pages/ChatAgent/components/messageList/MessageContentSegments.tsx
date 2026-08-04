@@ -11,6 +11,7 @@ import StartQuestionCard from '../StartQuestionCard';
 import PTCAgentCard from '../PTCAgentCard';
 import SecretaryConfirmCard from '../SecretaryConfirmCard';
 import TaskSegmentCard from './TaskSegmentCard';
+import type { SubagentTaskRecord } from '@/types/chat';
 import TextMessageContent from '../TextMessageContent';
 import InlineWidget from '../viewers/InlineWidget';
 import ToolCallMessageContent from '../ToolCallMessageContent';
@@ -47,7 +48,7 @@ interface MessageContentSegmentsProps {
   reasoningProcesses: Record<string, Record<string, unknown>>;
   toolCallProcesses: Record<string, ToolCallProcessRecord>;
   todoListProcesses: Record<string, Record<string, unknown>>;
-  subagentTasks: Record<string, Record<string, unknown>>;
+  subagentTasks: Record<string, SubagentTaskRecord>;
   planApprovals?: Record<string, Record<string, unknown>>;
   userQuestions?: Record<string, Record<string, unknown>>;
   workspaceProposals?: Record<string, Record<string, unknown>>;

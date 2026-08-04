@@ -359,6 +359,9 @@ async def test_prebuilt_fallback_and_unknown_workflow_message() -> None:
     assert "Unknown workflow 'missing'." in missing
     assert "Available pre-built workflows: alpha" in missing
     assert ".agents/workflows/<name>.js" in missing
+    # This wording alone used to read as prose, leaving the launch card it
+    # could not settle spinning "Running". Invariant test below.
+    assert missing.startswith("Error: ")
 
 
 @pytest.mark.asyncio
@@ -506,6 +509,89 @@ async def test_run_cap_ledger_read_failure_refuses_instead_of_counting_locally()
     # retry it invites would be blocked by its own predecessor.
     tasks = await dispatcher.registry.get_all_tasks()
     assert [t for t in tasks if t.is_pending] == []
+
+
+def _reads_as_a_launch_failure(reply: Any) -> bool:
+    """The client's rule for a reply carrying no artifact — ``isToolResultFailure``
+    in ``web/src/pages/ChatAgent/session/subagents/subagentStatus.ts``, whose
+    ``!artifact`` conjunct every refusal satisfies by answering bare text."""
+    return isinstance(reply, str) and reply.strip()[:5].lower() == "error"
+
+
+@pytest.mark.asyncio
+async def test_every_refusal_reads_as_a_failure_to_the_launch_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused launch has nothing but this text to settle its card with.
+
+    Nothing started, so no task artifact binds the card to a run and no
+    channel will ever close — the client stamps 'error' from the reply's own
+    opening word. One refusal phrased as ordinary prose is enough to leave a
+    card spinning "Running" for the life of the thread, live and on reload,
+    so the rule is asserted over every refusal rather than the newest one.
+    """
+
+    class _FailingStore:
+        async def aget(self, *_: Any) -> Any:
+            raise RuntimeError("store down")
+
+    capped = FakeDispatcher()
+    capped.registry.run_ledger = FakeRunLedger(
+        rows=[{"task_id": "task_aaa111"}, {"task_id": "task_bbb222"}]
+    )
+    capped.middleware.checkpointer = object()
+    uncheckpointed = FakeDispatcher()
+    uncheckpointed.registry.run_ledger = FakeRunLedger()
+
+    plain = _make_tool(FakeBackend())
+    refusals = {
+        "no source": plain.coroutine(),
+        "two sources": plain.coroutine(script=_script(), workflow="alpha"),
+        "unknown workflow": _make_tool(
+            FakeBackend(), prebuilt=FakePrebuilt({})
+        ).coroutine(workflow="missing"),
+        "unreadable store": _make_tool(
+            FakeBackend(), store=_FailingStore()
+        ).coroutine(workflow="named"),
+        "managed script_path": plain.coroutine(
+            script_path=f"{MEMORY_USER_DIR}/x.js"
+        ),
+        "unreadable script_path": plain.coroutine(script_path="work/nope.js"),
+        "empty script_path": _make_tool(
+            FakeBackend({"work/empty.js": ""})
+        ).coroutine(script_path="work/empty.js"),
+        "invalid script": plain.coroutine(script="return 1;"),
+        "meta name mismatch": _make_tool(
+            FakeBackend(), prebuilt=FakePrebuilt({"alpha": _script("other")})
+        ).coroutine(workflow="alpha"),
+        "no checkpointer": _make_tool(
+            FakeBackend(), dispatcher=uncheckpointed
+        ).coroutine(script=_script()),
+        "run cap reached": _make_tool(
+            FakeBackend(), dispatcher=capped
+        ).coroutine(script=_script()),
+    }
+    replies = {label: await coroutine for label, coroutine in refusals.items()}
+
+    # Reads its cap when the script is already in hand, so it needs its own
+    # config rather than a seat in the table above.
+    monkeypatch.setattr(
+        "src.config.settings.get_workflow_orchestration_config",
+        lambda: WorkflowOrchestrationConfig().model_copy(
+            update={"max_script_bytes": 200}
+        ),
+    )
+    replies["oversized script"] = await plain.coroutine(
+        script=_script() + "x" * 300
+    )
+
+    unsettled = {
+        label: reply
+        for label, reply in replies.items()
+        if not _reads_as_a_launch_failure(reply)
+    }
+    assert unsettled == {}
+    assert CapturingDriver.specs == []
 
 
 @pytest.mark.asyncio

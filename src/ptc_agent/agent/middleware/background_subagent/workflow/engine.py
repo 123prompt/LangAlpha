@@ -66,6 +66,11 @@ class WorkflowHostError(Exception):
     """Dispatch-time host failure exposed as a JavaScript throw."""
 
 
+class WorkflowUsageError(WorkflowHostError):
+    """A dispatch the script got wrong — deterministic misuse, not a child or
+    infrastructure failure, so the prelude escalates it as a script bug."""
+
+
 @dataclass(frozen=True)
 class WorkflowMeta:
     """Validated workflow metadata."""
@@ -459,7 +464,11 @@ async def run_workflow_script(
                 future.cancel()
                 raise
             except WorkflowHostError as error:
-                return {"ok": False, "error": str(error)}
+                return {
+                    "ok": False,
+                    "error": str(error),
+                    "usage": isinstance(error, WorkflowUsageError),
+                }
 
         def _host_phase(title: Any) -> None:
             host.phase(str(title)[:_HOST_TEXT_LIMIT])

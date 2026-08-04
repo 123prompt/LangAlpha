@@ -44,6 +44,12 @@ export interface SubagentTaskSegment {
 /**
  * The card record a `SubagentTaskSegment` points at: what the Task/RunWorkflow
  * tool call recorded, plus the fields the stream stamps on it afterwards.
+ *
+ * `action` and `status` are `string` rather than unions on purpose — both come
+ * off the wire and `normalizeAction` passes an unrecognized spelling through
+ * verbatim. A parallel declaration of this record did narrow them, and the
+ * narrowing was simply false; it survived only because the producer and the
+ * reader both went through untyped bags and never met it.
  */
 export interface SubagentTaskRecord {
   subagentId: string;
@@ -57,13 +63,10 @@ export interface SubagentTaskRecord {
   status: string;
   /** Resume cards only: the `task:<id>` the follow-up call targets. */
   resumeTargetId?: string;
-  /** Spawn tool result text, stamped once the Task call returns — written by
-   *  the replay path (`historyHandlers`) and the field every reader consumes. */
+  /** The launch call's own reply — what `Task` or `RunWorkflow` returned, not
+   *  the task's eventual outcome. A refused launch never starts a task, so for
+   *  those this reply is the whole account of what happened. */
   result?: string;
-  /** The same datum under the live path's spelling (`mainEventHandlers`). The
-   *  two transports have never converged on one name, so a live thread carries
-   *  this one and a replayed thread carries `result`. */
-  toolCallResult?: string;
 }
 
 export interface NotificationSegment {
@@ -267,18 +270,6 @@ export interface TodoListProcess {
   baseTodoListId: string;
 }
 
-export interface SubagentTask {
-  subagentId: string;
-  description: string;
-  prompt: string;
-  type: string;
-  action: 'init' | 'update' | 'resume';
-  status: 'running' | 'completed' | 'cancelled' | 'error';
-  resumeTargetId?: string;
-  result?: string;
-  toolCallResult?: string;
-}
-
 export interface PendingToolCallChunk {
   toolName: string | null;
   chunkCount: number;
@@ -394,7 +385,7 @@ export interface AssistantMessage {
   toolCallProcesses: Record<string, ToolCallProcess>;
   provenanceRecords?: Record<string, ProvenanceRecord>;
   todoListProcesses?: Record<string, TodoListProcess>;
-  subagentTasks?: Record<string, SubagentTask>;
+  subagentTasks?: Record<string, SubagentTaskRecord>;
   pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
   // HITL interrupt state
   planApprovals?: Record<string, PlanApprovalState>;

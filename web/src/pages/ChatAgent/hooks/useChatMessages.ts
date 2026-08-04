@@ -14,6 +14,7 @@ import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResp
 import { useLocalRunPublisher } from '@/lib/threadLifecycle/useLocalRunPublisher';
 import { peekThreadMux } from '../session/stream/threadStreamMux';
 import type { WorkflowStatusResponse } from '../utils/api';
+import type { CancelOutcome } from '../utils/cancelOutcome';
 // Imported from the dependency-free signal module (not `../utils/api`) so this
 // keeps decoding wire status even in the hook tests that fully mock `../utils/api`.
 import { shouldArmForStatus } from '../utils/reportBackSignal';
@@ -1169,18 +1170,30 @@ export function useChatMessages(
     // (d) Tell the backend to hard-cancel: one retry, then a visible error
     // toast so a failed cancel doesn't silently diverge UI from backend.
     if (tid && tid !== '__default__') {
+      let outcome: CancelOutcome | null = null;
       try {
-        await cancelWorkflow(tid, stoppedRunId);
+        outcome = await cancelWorkflow(tid, stoppedRunId);
       } catch (firstErr) {
-        // Log the first failure — when both attempts fail the toast only
-        // reflects the second, so a degraded-network first error would
-        // otherwise vanish from diagnostics.
+        // Log the first failure — the toast below reflects only the final
+        // state, so a degraded-network first error would otherwise vanish
+        // from diagnostics.
         console.warn('[stopWorkflow] cancel failed, retrying once:', firstErr);
         try {
-          await cancelWorkflow(tid, stoppedRunId);
+          outcome = await cancelWorkflow(tid, stoppedRunId);
         } catch {
-          toast({ description: t('chat.stopFailed'), variant: 'destructive' });
+          // Both attempts failed; `outcome` stays null and the toast fires.
         }
+      }
+
+      // A 200 is not proof of a stop, so an unreachable endpoint and an
+      // honest "stopped nothing" get the same treatment. `another_run_active`
+      // means the run we named was gone while the thread stayed busy — the
+      // turn the user just stopped may still be spending model and sandbox
+      // time, and the client already tore its own streaming state down above,
+      // so saying nothing would leave the two sides silently diverged. The
+      // remaining no-op states genuinely had nothing left to stop.
+      if (!outcome || outcome.state === 'another_run_active') {
+        toast({ description: t('chat.stopFailed'), variant: 'destructive' });
       }
     }
   };

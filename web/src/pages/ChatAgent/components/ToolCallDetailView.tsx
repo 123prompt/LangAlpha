@@ -3,7 +3,6 @@ import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { ArrowRight, ChevronRight, ExternalLink, FileText } from 'lucide-react';
-import { Loader } from '@/components/ui/loader';
 import { stripLineNumbers, parseTruncatedResult } from './toolDisplayConfig';
 import {
   StockPriceChart,
@@ -17,6 +16,7 @@ import { FaviconImg, googleFaviconUrl } from './charts/InlineArtifactCards';
 import { unwrapMarketOverview } from './charts/inlineCardsShared';
 import AutomationDetailPanel from './charts/AutomationDetailPanel';
 import Markdown, { CodeBlock } from './Markdown';
+import { TaskStatusChip, taskCardStatusKind } from './taskStatusUi';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
 import { parseDisplayableResults, buildRichResultMap, resolveSnippet } from './webSearchUtils';
@@ -45,7 +45,6 @@ export interface ToolCallProcessRecord {
   isInProgress?: boolean;
   isComplete?: boolean;
   isFailed?: boolean;
-  _subagentResult?: string | null;
   _subagentStatus?: string | null;
   [key: string]: unknown;
 }
@@ -113,7 +112,6 @@ export default function ToolCallDetailView({
             description={subagentDescription}
             type={subagentType}
             subagentId={subagentId}
-            subagentResult={toolCallProcess._subagentResult || null}
             subagentStatus={toolCallProcess._subagentStatus || null}
             onOpenSubagentTask={onOpenSubagentTask}
           />
@@ -138,12 +136,21 @@ interface TaskToolContentProps {
   description: string;
   type: string;
   subagentId: string | null;
-  subagentResult: string | null;
   subagentStatus: string | null;
   onOpenSubagentTask?: (info: SubagentInfo) => void;
 }
 
-function TaskToolContent({ description, type, subagentId, subagentResult, subagentStatus, onOpenSubagentTask }: TaskToolContentProps): React.ReactElement {
+/**
+ * A spawned task's detail panel: what it was asked to do, how it is going, and
+ * the way through to what it actually produced.
+ *
+ * It deliberately shows no result of its own. The `Task` tool returns the
+ * moment the subagent is dispatched, and nothing ever overwrites that reply —
+ * so the only "result" this panel could reach is the dispatch boilerplate,
+ * which used to render here under a heading reading "Result", telling the
+ * reader to call `TaskOutput(...)`. The output lives in the subagent's tab.
+ */
+function TaskToolContent({ description, type, subagentId, subagentStatus, onOpenSubagentTask }: TaskToolContentProps): React.ReactElement {
   const { t } = useTranslation();
 
   const handleGoToSubagent = () => {
@@ -157,10 +164,18 @@ function TaskToolContent({ description, type, subagentId, subagentResult, subage
     }
   };
 
-  const isRunning = subagentStatus && subagentStatus !== 'completed';
+  // The same mapping the chip above renders, so the panel cannot say "Failed"
+  // in one line and show the still-working glyph in the next.
+  const isRunning = taskCardStatusKind(subagentStatus) === 'running';
 
   return (
     <div className="space-y-4">
+      <TaskStatusChip
+        kind={taskCardStatusKind(subagentStatus)}
+        rawStatus={subagentStatus ?? undefined}
+        style={{ paddingLeft: 4 }}
+      />
+
       {description && (
         <div>
           <div
@@ -177,43 +192,6 @@ function TaskToolContent({ description, type, subagentId, subagentResult, subage
           </div>
         </div>
       )}
-
-      <div>
-        <div
-          className="text-xs font-medium uppercase tracking-wider mb-2 px-1"
-          style={{ color: 'var(--color-text-tertiary)' }}
-        >
-          {t('toolArtifact.result')}
-        </div>
-        {subagentResult ? (
-          <div
-            className="rounded-lg px-3 py-3"
-            style={{ backgroundColor: 'var(--color-bg-surface)', border: '1px solid var(--color-border-muted)' }}
-          >
-            <Markdown variant="panel" content={subagentResult} className="text-sm" />
-          </div>
-        ) : isRunning ? (
-          <div
-            className="flex items-center gap-2 px-3 py-3 rounded-lg"
-            style={{ backgroundColor: 'var(--color-bg-surface)', border: '1px solid var(--color-border-muted)' }}
-          >
-            {/* Shared liveness glyph (nav tree, task cards): ascii spinner, amber. */}
-            <span aria-hidden="true" className="flex-shrink-0">
-              <Loader size={14} className="text-[color:var(--color-accent-primary)]" />
-            </span>
-            <span className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-              {t('toolArtifact.subagentStillRunning')}
-            </span>
-          </div>
-        ) : (
-          <div
-            className="px-3 py-3 rounded-lg text-sm"
-            style={{ backgroundColor: 'var(--color-bg-surface)', border: '1px solid var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
-          >
-            {t('toolArtifact.noResultAvailable')}
-          </div>
-        )}
-      </div>
 
       {onOpenSubagentTask && subagentId && (
         <button

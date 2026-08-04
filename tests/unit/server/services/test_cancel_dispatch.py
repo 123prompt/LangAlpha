@@ -20,7 +20,11 @@ Covers the behaviors that survived the cutover:
 - manual-mutation stop (ThreadMutationRunner.request_stop, v4 2.4) returns
   early and stamps no run intent — local cancel and cross-worker signal alike;
 - idle thread (no active run) stamps no intent — thread not mislabeled;
-- an already-terminal run answers an honest "already finished".
+- an already-terminal run answers an honest "already finished";
+- a cancel that stopped nothing splits on liveness: `no_active_run` when the
+  thread is idle (benign — nothing to stop), `another_run_active` when a run
+  is still live (the stop the user asked for did not happen). The live run is
+  reported, never cancelled as a fallback.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -264,8 +268,12 @@ async def test_cancel_idle_thread_stamps_no_intent_but_runs_safety_net():
 
     # Nothing was running to cancel → honest "not cancelled".
     assert result["cancelled"] is False
+    assert result["state"] == "no_active_run"
     # No mislabel: no run to stamp, so request_run_cancel is never called.
-    get_active_run.assert_awaited_once_with("t-1")
+    # Read twice: once to resolve a target, once to answer "did this cancel
+    # leave something running?" — a fresh read, since the first is stale by
+    # the time the dispatch has finished.
+    assert get_active_run.await_count == 2
     request_run_cancel.assert_not_awaited()
     # No target run → no registry action at all (never a thread-wide wipe).
     registry_store.cancel_and_clear.assert_not_awaited()
@@ -385,6 +393,102 @@ async def test_remote_run_cancel_never_wipes_local_registry():
     registry_store.cancel_run_tasks.assert_awaited_once_with(
         "t-1", "run-REMOTE", force=True
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_run_id_with_a_live_run_says_nothing_was_cancelled():
+    """A run_id that no longer resolves (rewound row, wrong id) while the
+    thread still has a live run stopped nothing the user asked for — and the
+    caller cannot tell that from an idle thread without being told, because
+    the client tears its own streaming state down before this answers.
+
+    The live run must NOT be cancelled as a fallback: that is the cross-turn
+    hazard the run_id parameter exists to prevent. Only the named run is ever
+    the target of the safety net.
+    """
+    from src.server.services.cancel_dispatch import cancel_workflow
+
+    patches, registry_store, _manager, _runner, get_active_run, _intent = (
+        _patch_common(
+            manager_cancel_returns=False,
+            has_active_returns=False,
+            active_run=_active_run("run-LIVE"),
+            intent_state="not_found",
+        )
+    )
+    for p in patches:
+        p.start()
+    try:
+        result = await cancel_workflow("t-1", "run-GONE")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert result["cancelled"] is False
+    assert result["state"] == "another_run_active"
+    get_active_run.assert_awaited_once_with("t-1")
+    # Scoped to the named run only — the live one is reported, never touched.
+    registry_store.cancel_run_tasks.assert_awaited_once_with(
+        "t-1", "run-GONE", force=True
+    )
+    registry_store.cancel_and_clear.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_run_id_on_an_idle_thread_is_just_no_active_run():
+    """The same unresolvable run_id with nothing live is benign: there was
+    nothing to stop, which is what `no_active_run` says. Splitting these two
+    is the whole point — a client that warned on both would cry wolf on every
+    stop that raced its own turn's teardown."""
+    from src.server.services.cancel_dispatch import cancel_workflow
+
+    patches, _registry_store, _manager, _runner, get_active_run, _intent = (
+        _patch_common(
+            manager_cancel_returns=False,
+            has_active_returns=False,
+            active_run=None,
+            intent_state="not_found",
+        )
+    )
+    for p in patches:
+        p.start()
+    try:
+        result = await cancel_workflow("t-1", "run-GONE")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert result["cancelled"] is False
+    assert result["state"] == "no_active_run"
+    get_active_run.assert_awaited_once_with("t-1")
+
+
+@pytest.mark.asyncio
+async def test_pre_start_window_still_reports_a_dispatched_cancel():
+    """`not_found` WITH a successful local signal is the pre-START window —
+    the placeholder cancel took, so this is a real stop and must not be
+    demoted to a no-op by the liveness check."""
+    from src.server.services.cancel_dispatch import cancel_workflow
+
+    patches, _registry_store, _manager, _runner, get_active_run, _intent = (
+        _patch_common(
+            manager_cancel_returns=True,
+            has_active_returns=False,
+            active_run=_active_run("run-LIVE"),
+            intent_state="not_found",
+        )
+    )
+    for p in patches:
+        p.start()
+    try:
+        result = await cancel_workflow("t-1", "run-PENDING")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert result["cancelled"] is True
+    assert "state" not in result
+    get_active_run.assert_not_awaited()
 
 
 # --- cancel_subagent_task (targeted single-task stop) ---------------------

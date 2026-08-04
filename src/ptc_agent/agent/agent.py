@@ -208,9 +208,6 @@ class PTCAgent:
     def __init__(self, config: AgentConfig) -> None:
         self.config = config
         self.llm: Any = config.get_llm_client()
-        self.subagents: dict[
-            str, Any
-        ] = {}  # Populated in create_agent() for introspection
 
     def _build_system_prompt(
         self,
@@ -768,18 +765,6 @@ class PTCAgent:
             memo_enabled=gates.memo,
             crawl_enabled=bool(crawl_tools),
         )
-
-        self.subagents = {}
-        for subagent in subagents:
-            name = subagent.get("name", "unknown")
-            subagent_tools = subagent.get("tools", [])
-            tool_names = [
-                t.name if hasattr(t, "name") else str(t) for t in subagent_tools
-            ]
-            self.subagents[name] = {
-                "description": subagent.get("description", ""),
-                "tools": tool_names,
-            }
 
         logger.debug(
             "Creating agent with custom middleware stack",

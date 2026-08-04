@@ -1309,7 +1309,7 @@
     },
     "subagentCard": {
       "titleFallback": "子智能体任务",
-      "viewOutput": "查看子智能体输出",
+      "viewDetails": "查看任务详情",
       "openUpdated": "点击查看已更新的子智能体",
       "openResumed": "点击查看已恢复的子智能体",
       "openRunning": "点击查看运行中的子智能体",
@@ -2017,9 +2017,6 @@
     "noPlanDescription": "暂无计划描述。",
     "subagentTask": "子 Agent 任务",
     "instructions": "指令",
-    "result": "结果",
-    "subagentStillRunning": "子 Agent 运行中...",
-    "noResultAvailable": "暂无结果",
     "goToSubagentTab": "前往子 Agent 标签",
     "noResultContent": "无结果内容",
     "input": "输入",

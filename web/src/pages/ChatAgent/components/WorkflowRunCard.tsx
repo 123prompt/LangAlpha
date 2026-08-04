@@ -7,6 +7,7 @@ import {
   workflowRunDisplayStatus,
   type WorkflowRunState,
 } from '../session/subagents/workflowRunState';
+import { isToolResultFailure } from '../session/subagents/subagentStatus';
 import { WorkflowRunContext } from './WorkflowRunContext';
 import TaskCardShell from './TaskCardShell';
 import { WorkflowChildRow, summarizeRun } from './workflowRunUi';
@@ -27,6 +28,10 @@ interface WorkflowRunCardProps {
   /** Inline-record status ('running' | 'completed' | 'cancelled' | 'error') —
    *  the fallback before any workflow_lifecycle state has arrived. */
   status?: string;
+  /** The launch call's own reply, read only when the card settled without ever
+   *  having a run — a refused launch starts none, so nothing else accounts for
+   *  the failure. */
+  launchReply?: string;
   onOpen?: (info: WorkflowSubagentInfo) => void;
   /** Direct state override for tests; the context resolver is the live path. */
   workflowRun?: WorkflowRunState;
@@ -43,6 +48,7 @@ function WorkflowRunCard({
   subagentId,
   description,
   status = 'running',
+  launchReply,
   onOpen,
   workflowRun: workflowRunProp,
 }: WorkflowRunCardProps): React.ReactElement | null {
@@ -68,6 +74,18 @@ function WorkflowRunCard({
   const latestLog = isRunning && run?.logs.length ? run.logs[run.logs.length - 1] : null;
 
   const title = run?.description || description || run?.name || t('chat.workflowRun.titleFallback');
+
+  // A run that failed owns the account of why; a launch that was refused never
+  // produced one, and its tool reply is all there is. The reply has to say so
+  // itself — `run` being absent is a surface property (shared links mount no
+  // provider) or a view that has yet to hydrate, never evidence the launch
+  // failed, and the reply of a launch that *did* start reads "Workflow run
+  // started", which would render as the reason a finished run failed.
+  const refusalReply =
+    launchReply && isToolResultFailure({ content: launchReply })
+      ? launchReply
+      : undefined;
+  const failureDetail = run ? run.error : refusalReply;
 
   const metaParts: string[] = [];
   if (agentCount > 0) {
@@ -189,8 +207,9 @@ function WorkflowRunCard({
         </div>
       )}
 
-      {kind === 'error' && run?.error && (
+      {kind === 'error' && failureDetail && (
         <div
+          data-testid="workflow-failure-detail"
           style={{
             marginTop: 8,
             fontSize: '0.6875rem',
@@ -201,7 +220,7 @@ function WorkflowRunCard({
             overflow: 'hidden',
           }}
         >
-          {run.error}
+          {failureDetail}
         </div>
       )}
     </TaskCardShell>

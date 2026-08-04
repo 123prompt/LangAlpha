@@ -25,7 +25,7 @@ from ptc_agent.agent.middleware.background_subagent.task import (
     WORKFLOW_SUBAGENT_TYPE,
 )
 from ptc_agent.agent.middleware.background_subagent.spawn import (
-    DispatchSpawnError,
+    SpawnError,
     TaskRunRefused,
     spawn_task_writer,
 )
@@ -69,9 +69,17 @@ _STORE_OP_TIMEOUT_S = 2.0
 
 class _Refused(Exception):
     """Carries the reply a refused call answers with, raised by the phase
-    helpers so a resolved script has exactly one shape at the call site."""
+    helpers so a resolved script has exactly one shape at the call site.
 
-    def __init__(self, reply: str) -> None:
+    The failure prefix is stamped here rather than written at each raise. A
+    refusal starts no run, so no task artifact binds the launch card and no
+    channel will ever close it — this text is the only signal the card has to
+    settle on, and the one wording that omitted the prefix left the card
+    spinning "Running" for the life of the thread.
+    """
+
+    def __init__(self, reason: str) -> None:
+        reply = reason if reason[:5].lower() == "error" else f"Error: {reason}"
         super().__init__(reply)
         self.reply = reply
 
@@ -244,7 +252,7 @@ def create_run_workflow_tool(
                 for form in _script_path_forms(backend, script_path)
             ):
                 raise _Refused(
-                    f"Error: script_path '{script_path}' is not on the "
+                    f"script_path '{script_path}' is not on the "
                     "workspace filesystem — memory, memo and _internal paths "
                     "are managed elsewhere. Pass the script inline with "
                     "'script', or save it as .agents/workflows/<name>.js and "
@@ -264,12 +272,12 @@ def create_run_workflow_tool(
                     exc_info=True,
                 )
                 raise _Refused(
-                    f"Error: could not read script_path '{script_path}'. "
+                    f"could not read script_path '{script_path}'. "
                     "Try again, or pass the script inline."
                 ) from error
             if not from_file:
                 raise _Refused(
-                    f"Error: script_path '{script_path}' is missing or empty."
+                    f"script_path '{script_path}' is missing or empty."
                 )
             return from_file, "file"
 
@@ -284,7 +292,7 @@ def create_run_workflow_tool(
                     exc_info=True,
                 )
                 raise _Refused(
-                    f"Error: could not read workflow '{workflow}' from the "
+                    f"could not read workflow '{workflow}' from the "
                     "workflow store. Try again, or pass the script inline."
                 ) from error
             if resolved is None:
@@ -327,7 +335,7 @@ def create_run_workflow_tool(
                     )
                     run_task.mark_never_started("workflow cap ledger unreadable")
                     raise _Refused(
-                        "Error: could not read the workflow run ledger to "
+                        "could not read the workflow run ledger to "
                         "check the per-thread cap. Try again shortly."
                     ) from error
                 active_ids = [
@@ -339,7 +347,7 @@ def create_run_workflow_tool(
                 running = ", ".join(active_ids)
                 run_task.mark_never_started("per-thread workflow cap reached")
                 raise _Refused(
-                    f"Error: {len(active_ids)} workflow run(s) already active "
+                    f"{len(active_ids)} workflow run(s) already active "
                     f"({running}); the per-thread cap is "
                     f"{caps.max_runs_per_thread}. "
                     "Wait for one to finish or cancel it first."
@@ -359,32 +367,25 @@ def create_run_workflow_tool(
             except TaskRunRefused as refusal:
                 run_task.mark_never_started(refusal.settle_reason)
                 raise _Refused(
-                    f"Error: could not start {run_task.display_id} — "
+                    f"could not start {run_task.display_id} — "
                     f"{refusal.reason}."
                 ) from refusal
             run_task.task_run_id = admitted or None
 
-    @tool("RunWorkflow")
-    async def run_workflow(
-        script: str | None = None,
-        script_path: str | None = None,
-        workflow: str | None = None,
-        params: Any = None,
-        description: str | None = None,
-        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    async def _launch(
+        script: str | None,
+        script_path: str | None,
+        workflow: str | None,
+        params: Any,
+        description: str | None,
+        tool_call_id: str,
     ) -> str | ToolMessage:
-        """Run a JavaScript workflow script server-side to orchestrate subagents.
-
-        Use for multi-subagent pipelines instead of issuing many Task calls.
-        Provide a script with a ``meta`` literal that uses ``agent()``,
-        ``parallel()``, ``pipeline()``, ``phase()`` and ``log()``; or run a
-        saved or pre-built workflow by name. ``params`` is exposed to the
-        script as its ``args`` global.
-        """
+        """Every path that starts a run, raising ``_Refused`` for those that
+        do not — so the caller turns a refusal into a reply exactly once."""
         sources = (script, script_path, workflow)
         if sum(source is not None for source in sources) != 1:
-            return (
-                "Error: Provide exactly one of 'script', 'script_path', "
+            raise _Refused(
+                "Provide exactly one of 'script', 'script_path', "
                 "or 'workflow'."
             )
 
@@ -392,36 +393,33 @@ def create_run_workflow_tool(
         # only a checkpointer can hold. Refusing here beats admitting a run
         # whose result would be unreadable the moment its turn ends.
         if getattr(registry, "run_ledger", None) is not None and mw.checkpointer is None:
-            return (
-                "Error: workflow runs are unavailable — no checkpointer is "
+            raise _Refused(
+                "workflow runs are unavailable — no checkpointer is "
                 "configured for this thread."
             )
 
-        try:
-            script, script_source = await _resolve_script(
-                script, script_path, workflow
-            )
-        except _Refused as refused:
-            return refused.reply
+        script, script_source = await _resolve_script(
+            script, script_path, workflow
+        )
 
         from src.config.settings import get_workflow_orchestration_config
 
         caps = get_workflow_orchestration_config()
         if len(script.encode()) > caps.max_script_bytes:
-            return (
-                f"Error: Invalid workflow script — script exceeds "
+            raise _Refused(
+                f"Invalid workflow script — script exceeds "
                 f"{caps.max_script_bytes // 1024}KB"
             )
         try:
             meta = await acompile_check(script)
         except WorkflowScriptError as error:
-            return f"Error: Invalid workflow script — {error}"
+            raise _Refused(f"Invalid workflow script — {error}") from error
         # A name-resolved run is announced, framed and carded under meta.name,
         # so a script saved as one name and declaring another runs as the
         # other everywhere — while the REST surface lists it invalid.
         if workflow is not None and meta.name != workflow:
-            return (
-                f"Error: workflow '{workflow}' declares meta.name "
+            raise _Refused(
+                f"workflow '{workflow}' declares meta.name "
                 f"'{meta.name}'. Rename one so they agree, then run it again."
             )
 
@@ -468,12 +466,11 @@ def create_run_workflow_tool(
         # Admission runs AFTER registration so a checkpoint re-execution of a
         # live call reattaches idempotently above instead of tripping over its
         # own run in the count.
-        # A refused admission answers with an error rather than the entry, so
-        # the id dies here — and a never-started entry has no writer, capture
-        # or usage, which is exactly what stops a collector claiming and
-        # evicting it. Same asymmetry the direct-dispatch path handles, and
-        # the same guard: `discard_unstarted` refuses anything that settled
-        # some other way, so a stop mid-admission keeps its entry.
+        # A refused admission leaves the id nowhere — and a never-started entry
+        # has no writer, capture or usage, which is exactly what stops a
+        # collector claiming and evicting it. Same asymmetry the direct-dispatch
+        # path handles, and the same guard: `discard_unstarted` refuses anything
+        # that settled some other way, so a stop mid-admission keeps its entry.
         try:
             await _admit_run(
                 run_task,
@@ -481,9 +478,6 @@ def create_run_workflow_tool(
                 description=launch_description,
                 launch_tool_call_id=launch_tool_call_id,
             )
-        except _Refused as refused:
-            await registry.discard_unstarted(launch_tool_call_id)
-            return refused.reply
         except BaseException:
             await registry.discard_unstarted(launch_tool_call_id)
             raise
@@ -529,8 +523,10 @@ def create_run_workflow_tool(
                 name=f"workflow_run_{run_task.display_id}",
                 action="init",
             )
-        except DispatchSpawnError as error:
-            return f"Error: could not start {run_task.display_id} — {error}."
+        except SpawnError as error:
+            raise _Refused(
+                f"could not start {run_task.display_id} — {error}."
+            ) from error
 
         logger.info(
             "Workflow run started",
@@ -545,5 +541,33 @@ def create_run_workflow_tool(
             base_rel=base_rel,
             tool_call_id=tool_call_id,
         )
+
+    @tool("RunWorkflow")
+    async def run_workflow(
+        script: str | None = None,
+        script_path: str | None = None,
+        workflow: str | None = None,
+        params: Any = None,
+        description: str | None = None,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    ) -> str | ToolMessage:
+        """Run a JavaScript workflow script server-side to orchestrate subagents.
+
+        Use for multi-subagent pipelines instead of issuing many Task calls.
+        Provide a script with a ``meta`` literal that uses ``agent()``,
+        ``parallel()``, ``pipeline()``, ``phase()`` and ``log()``; or run a
+        saved or pre-built workflow by name. ``params`` is exposed to the
+        script as its ``args`` global.
+        """
+        # The one place a refusal becomes a reply. A launch that is turned away
+        # never starts a run, so nothing binds its card and no channel closes —
+        # the reply text is the card's only settle signal, and routing every
+        # refusal through `_Refused` is what keeps that text one shape.
+        try:
+            return await _launch(
+                script, script_path, workflow, params, description, tool_call_id
+            )
+        except _Refused as refused:
+            return refused.reply
 
     return run_workflow

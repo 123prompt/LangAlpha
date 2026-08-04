@@ -6,20 +6,21 @@ import structlog
 from langchain_core.tools import BaseTool, tool
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
+from ptc_agent.core.paths import MEMO_USER_DIR, MEMORY_USER_DIR, MEMORY_WORKSPACE_DIR
 
 logger = structlog.get_logger(__name__)
 
 # Same guard as bash — sandbox Python cannot reach the store-backed memory or
 # user-managed memo store. Memo paths are additionally read-only to the agent.
 _MEMORY_PATH_MARKERS: tuple[str, ...] = (
-    ".agents/user/memory/",
-    ".agents/workspace/memory/",
-    ".agents/user/memo/",
+    f"{MEMORY_USER_DIR}/",
+    f"{MEMORY_WORKSPACE_DIR}/",
+    f"{MEMO_USER_DIR}/",
 )
 
 _MEMORY_ROUTE_ERROR = (
-    "ERROR: Store-backed paths (.agents/user/memory/**, .agents/workspace/memory/**, "
-    ".agents/user/memo/**) are managed by the long-term memory/memo system and "
+    f"ERROR: Store-backed paths ({MEMORY_USER_DIR}/**, {MEMORY_WORKSPACE_DIR}/**, "
+    f"{MEMO_USER_DIR}/**) are managed by the long-term memory/memo system and "
     "are NOT on the sandbox filesystem. Read them with the Read tool before this "
     "call and pass the content in as a string; write memory paths with "
     "Write/Edit. Memo paths are read-only — ask the user to upload via the memo "
