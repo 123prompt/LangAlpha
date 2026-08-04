@@ -63,15 +63,27 @@
   // A slot may be a thunk or an already-started promise: scripts write the
   // idiomatic `parallel([agent(...)])` as readily as the documented thunk form,
   // and by then the children are dispatched — invoking is impossible, and
-  // treating the slot as an error would silently null a healthy child. Give
-  // non-callables `Promise.all` semantics instead. Promise.all also carries
-  // the escalation: a rethrown script bug rejects the whole call on the spot,
-  // while its reactions on every element keep sibling rejections handled.
+  // treating the slot as an error would silently null a healthy child. Await
+  // those instead. Anything else is the script's bug and says so: a slot of
+  // plain values (`parallel(args.tickers)`) would otherwise resolve to the
+  // tickers having dispatched nothing — an answer indistinguishable from work.
+  const awaited = (value, where) => {
+    const thenable =
+      value !== null && typeof value === "object" && typeof value.then === "function";
+    if (thenable) return value;
+    throw new NativeTypeError(
+      `${where}: expected a function or a promise, got ${value === null ? "null" : typeof value}`
+    );
+  };
+
+  // Promise.all carries the escalation: a rethrown script bug rejects the whole
+  // call on the spot, while its reactions on every element keep sibling
+  // rejections handled.
   globalThis.parallel = async function parallel(thunks) {
     if (!Array.isArray(thunks)) throw new NativeTypeError("parallel(thunks): thunks must be an array");
     return Promise.all(thunks.map((t, i) =>
       Promise.resolve()
-        .then(() => (typeof t === "function" ? t() : t))
+        .then(() => (typeof t === "function" ? t() : awaited(t, `parallel slot ${i}`)))
         .catch((e) => absorb(e, `parallel slot ${i}`))
     ));
   };
@@ -82,7 +94,11 @@
       let prev = item;
       for (let s = 0; s < stages.length; s++) {
         const stage = stages[s];
-        try { prev = await (typeof stage === "function" ? stage(prev, item, index) : stage); }
+        try {
+          prev = await (typeof stage === "function"
+            ? stage(prev, item, index)
+            : awaited(stage, `pipeline stage ${s}`));
+        }
         catch (e) { return absorb(e, `pipeline item ${index} stage ${s}`); }
       }
       return prev;

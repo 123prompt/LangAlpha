@@ -153,6 +153,33 @@ async def test_parallel_awaits_already_started_promise_slots() -> None:
 
 
 @pytest.mark.asyncio
+async def test_parallel_rejects_a_slot_that_is_neither_thunk_nor_promise() -> None:
+    """The leniency above is for dispatched work, not for plain values.
+    ``parallel(args.tickers)`` would otherwise resolve to the tickers having
+    dispatched nothing — a run that reads like it worked."""
+    outcome = await run_workflow_script(
+        _script("return await parallel(['AAPL', 'MSFT']);"),
+        None,
+        PreludeHost(),
+        WorkflowLimits(),
+    )
+    assert outcome.status == "script_error"
+    assert "parallel slot 0" in (outcome.error or "")
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_a_stage_that_is_neither_callable_nor_promise() -> None:
+    outcome = await run_workflow_script(
+        _script("return await pipeline([1, 2], 'not-a-stage');"),
+        None,
+        PreludeHost(),
+        WorkflowLimits(),
+    )
+    assert outcome.status == "script_error"
+    assert "pipeline stage 0" in (outcome.error or "")
+
+
+@pytest.mark.asyncio
 async def test_parallel_nulls_a_rejected_promise_slot() -> None:
     outcome = await run_workflow_script(
         _script("return await parallel([agent('fail'), agent('ok')]);"),
