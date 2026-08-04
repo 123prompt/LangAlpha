@@ -1,9 +1,11 @@
+import io
 import types
 
 import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
+from PIL import Image
 
 from ptc_agent.agent.middleware.file_operations import multimodal
 from ptc_agent.agent.middleware.file_operations.multimodal import (
@@ -12,6 +14,30 @@ from ptc_agent.agent.middleware.file_operations.multimodal import (
     _strip_unsupported_content_blocks,
 )
 from src.llms.llm import LLM, get_input_modalities
+
+
+def _png_bytes() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class _Sandbox:
+    """Stands in for PTCSandbox — which normalizes on its own, not on download."""
+
+    def __init__(self, content: bytes = b"", *, work_dir: str = "/home/workspace"):
+        self._content = content
+        self._work_dir = work_dir
+        self.downloaded: str | None = None
+
+    def normalize_path(self, path: str) -> str:
+        if path.startswith((self._work_dir, "/tmp")):
+            return path
+        return f"{self._work_dir}/{path.lstrip('/')}"
+
+    async def adownload_file_bytes(self, path: str) -> bytes:
+        self.downloaded = path
+        return self._content
 
 
 class TestStripUnsupportedContentBlocks:
@@ -399,12 +425,7 @@ class TestContentSizeCap:
         """The sandbox path was uncapped while the URL path was not. Both write
         into graph state, so an oversized block there is checkpointed and
         replayed on every later turn — a permanent 400, not a one-turn error."""
-
-        class _Sandbox:
-            async def adownload_file_bytes(self, path):
-                return b"x" * 4096
-
-        mw = MultimodalMiddleware(sandbox=_Sandbox())
+        mw = MultimodalMiddleware(sandbox=_Sandbox(b"x" * 4096))
         monkeypatch.setattr(mw, "MAX_CONTENT_BYTES", 1024)
 
         result = await mw._handle_sandbox_content(
@@ -417,12 +438,7 @@ class TestContentSizeCap:
     async def test_a_refusal_never_reaches_graph_state(self, monkeypatch):
         """A Command would write the block into the checkpoint; refusing has to
         stay a plain ToolMessage or the cap accomplishes nothing."""
-
-        class _Sandbox:
-            async def adownload_file_bytes(self, path):
-                return b"x" * 4096
-
-        mw = MultimodalMiddleware(sandbox=_Sandbox())
+        mw = MultimodalMiddleware(sandbox=_Sandbox(b"x" * 4096))
         monkeypatch.setattr(mw, "MAX_CONTENT_BYTES", 1024)
 
         result = await mw._handle_sandbox_content(
@@ -459,3 +475,104 @@ class TestContentSizeCap:
         """5MB is Anthropic's per-image ceiling, which binds before any
         per-request limit. Raising this re-opens the checkpoint brick."""
         assert MultimodalMiddleware.MAX_CONTENT_BYTES == 5 * 1024 * 1024
+
+
+class TestSandboxPathNormalization:
+    @pytest.mark.asyncio
+    async def test_a_virtual_path_is_normalized_before_download(self):
+        """The Read tool normalizes through SandboxBackend, this middleware holds
+        the sandbox itself. Skipping it makes the middleware miss a file the tool
+        just read and overwrite that success with a not-found error."""
+        sandbox = _Sandbox(_png_bytes())
+        mw = MultimodalMiddleware(sandbox=sandbox)
+
+        result = await mw._handle_sandbox_content(
+            "/results/chart.png", AIMessage(content="ok"), "call-1"
+        )
+        assert sandbox.downloaded == "/home/workspace/results/chart.png"
+        assert isinstance(result, Command)
+
+    @pytest.mark.asyncio
+    async def test_an_already_absolute_path_is_left_alone(self):
+        sandbox = _Sandbox(_png_bytes())
+        mw = MultimodalMiddleware(sandbox=sandbox)
+
+        await mw._handle_sandbox_content(
+            "/home/workspace/work/t/charts/fig.png", AIMessage(content="ok"), "call-1"
+        )
+        assert sandbox.downloaded == "/home/workspace/work/t/charts/fig.png"
+
+
+class TestContentIsTypedByItsBytes:
+    """The extension is whatever wrote the file claimed, and a URL may carry none
+    at all. Both injection paths checkpoint what they build, so a wrong call here
+    is replayed on every later turn instead of failing once.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_corrupt_sandbox_image_is_refused(self):
+        """The URL path already ran PIL over its bytes; the sandbox path trusted
+        the extension, so a truncated chart reached graph state unexamined."""
+        mw = MultimodalMiddleware(sandbox=_Sandbox(_png_bytes()[:20]))
+
+        result = await mw._handle_sandbox_content(
+            "chart.png", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, ToolMessage)
+        assert not isinstance(result, Command)
+        assert "not a readable image or PDF" in result.content
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_pdf_named_png_is_read_as_a_pdf(self):
+        mw = MultimodalMiddleware(sandbox=_Sandbox(b"%PDF-1.4 body"))
+
+        result = await mw._handle_sandbox_content(
+            "report.png", AIMessage(content="ok"), "call-1"
+        )
+        blocks = result.update["messages"][-1].content
+        assert [b["type"] for b in blocks] == ["text", "file"]
+        assert blocks[-1]["mime_type"] == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_an_extensionless_url_serving_a_pdf_is_not_judged_as_an_image(
+        self, monkeypatch
+    ):
+        """Signed and redirected URLs routinely end without a suffix; branching on
+        it sent every one of them down the image path."""
+        mw = MultimodalMiddleware()
+        monkeypatch.setattr(
+            multimodal,
+            "GuardedAsyncTransport",
+            lambda: httpx.MockTransport(
+                lambda request: httpx.Response(200, content=b"%PDF-1.4 body")
+            ),
+        )
+
+        result = await mw._handle_url_content(
+            "https://files.example.com/d/abc123", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, Command)
+        assert result.update["messages"][-1].content[-1]["mime_type"] == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_a_format_no_provider_accepts_is_refused_not_relabeled(
+        self, monkeypatch
+    ):
+        """The old URL path defaulted an unmapped PIL format to image/png, which
+        ships a BMP under a PNG mime and earns a 400 on every replay."""
+        buf = io.BytesIO()
+        Image.new("RGB", (2, 2), "blue").save(buf, format="BMP")
+        mw = MultimodalMiddleware()
+        monkeypatch.setattr(
+            multimodal,
+            "GuardedAsyncTransport",
+            lambda: httpx.MockTransport(
+                lambda request: httpx.Response(200, content=buf.getvalue())
+            ),
+        )
+
+        result = await mw._handle_url_content(
+            "https://example.com/a.bmp", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, ToolMessage)
+        assert "not a readable image or PDF" in result.content

@@ -44,6 +44,33 @@ DOCUMENT_EXTENSIONS = frozenset({".pdf"})
 # Combined visual extensions
 VISUAL_EXTENSIONS = IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS
 
+# PIL reports a format name; providers speak MIME. A format outside this map is
+# one no provider accepts, so it resolves to None rather than a near-miss guess.
+_PIL_FORMAT_TO_MIME = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
+
+
+def _detect_mime_type(content: bytes) -> str | None:
+    """MIME type read off the bytes, or None if they are neither PDF nor image.
+
+    The name can't decide this: a URL may carry no extension at all, and a
+    sandbox path is only as accurate as whatever wrote the file. Both callers
+    checkpoint what they inject, so a mislabeled or truncated file would replay
+    its provider 400 on every later turn rather than failing once.
+    """
+    if content.startswith(b"%PDF"):
+        return "application/pdf"
+    try:
+        img = Image.open(io.BytesIO(content))
+        img.verify()
+    except Exception:
+        return None
+    return _PIL_FORMAT_TO_MIME.get(img.format or "")
+
 
 def _strip_unsupported_content_blocks(
     messages: list, has_image: bool, has_pdf: bool
@@ -212,16 +239,6 @@ class MultimodalMiddleware(AgentMiddleware):
     # cannot save a target that legitimately has the image modality. Refuse
     # before encoding rather than brick the thread.
     MAX_CONTENT_BYTES = 5 * 1024 * 1024
-
-    # MIME type mapping for supported extensions
-    MIME_TYPES = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-        ".pdf": "application/pdf",
-    }
 
     def __init__(
         self,
@@ -496,39 +513,16 @@ class MultimodalMiddleware(AgentMiddleware):
                         tool_call_id=tool_call_id,
                     )
 
-            # Detect type from URL extension
-            suffix = Path(urlparse(url).path).suffix.lower()
-
-            if suffix in DOCUMENT_EXTENSIONS:
-                # PDF: validate magic bytes
-                if not content_bytes.startswith(b"%PDF"):
-                    logger.warning(f"[MULTIMODAL] Invalid PDF data from URL {url}")
-                    return ToolMessage(
-                        content=f"ERROR: Invalid PDF file from URL: {url}",
-                        tool_call_id=tool_call_id,
-                    )
-                mime_type = "application/pdf"
-            else:
-                # Image: validate and detect format using PIL
-                try:
-                    img = Image.open(io.BytesIO(content_bytes))
-                    img.verify()
-                    pil_format = img.format
-                except Exception as e:
-                    logger.warning(f"[MULTIMODAL] Invalid image data from URL {url}: {e}")
-                    return ToolMessage(
-                        content=f"ERROR: Invalid image data from URL: {url}",
-                        tool_call_id=tool_call_id,
-                    )
-
-                # Map PIL format to MIME type
-                format_to_mime = {
-                    "PNG": "image/png",
-                    "JPEG": "image/jpeg",
-                    "GIF": "image/gif",
-                    "WEBP": "image/webp",
-                }
-                mime_type = format_to_mime.get(pil_format, "image/png")
+            # Typed from the bytes, not the URL: a signed or redirected URL can
+            # end without an extension, and branching on that would send a PDF
+            # down the image path and reject it as corrupt.
+            mime_type = _detect_mime_type(content_bytes)
+            if mime_type is None:
+                logger.warning(f"[MULTIMODAL] Unreadable content from URL: {url}")
+                return ToolMessage(
+                    content=f"ERROR: Content is not a readable image or PDF: {url}",
+                    tool_call_id=tool_call_id,
+                )
 
             # Encode as base64
             b64_string = base64.b64encode(content_bytes).decode("utf-8")
@@ -610,8 +604,14 @@ class MultimodalMiddleware(AgentMiddleware):
             )
 
         try:
-            # Download file bytes from sandbox
-            file_bytes = await self.sandbox.adownload_file_bytes(file_path)
+            # The Read tool reaches the sandbox through SandboxBackend, which
+            # normalizes first; this middleware holds the sandbox itself, whose
+            # adownload_file_bytes does not. Without this, a virtual path the
+            # tool resolved fine ("/results/chart.png") misses here and replaces
+            # the tool's success with a not-found error.
+            file_bytes = await self.sandbox.adownload_file_bytes(
+                self.sandbox.normalize_path(file_path)
+            )
             if not file_bytes:
                 logger.warning(f"[MULTIMODAL] Failed to download file: {file_path}")
                 return ToolMessage(
@@ -622,21 +622,14 @@ class MultimodalMiddleware(AgentMiddleware):
             if len(file_bytes) > self.MAX_CONTENT_BYTES:
                 return self._too_large_message(file_path, tool_call_id)
 
-            # Determine MIME type from extension
-            ext = Path(file_path).suffix.lower()
-            mime_type = self.MIME_TYPES.get(ext)
-
-            if not mime_type:
+            # Typed from the bytes for the same reason the URL path is: the
+            # extension is whatever wrote the file claimed, and a truncated
+            # chart named .png is checkpointed before any provider sees it.
+            mime_type = _detect_mime_type(file_bytes)
+            if mime_type is None:
+                logger.warning(f"[MULTIMODAL] Unreadable content in file: {file_path}")
                 return ToolMessage(
-                    content=f"ERROR: Unsupported file type: {ext}",
-                    tool_call_id=tool_call_id,
-                )
-
-            # Validate PDF magic bytes
-            if mime_type == "application/pdf" and not file_bytes.startswith(b"%PDF"):
-                logger.warning(f"[MULTIMODAL] Invalid PDF file: {file_path}")
-                return ToolMessage(
-                    content=f"ERROR: Invalid PDF file: {file_path}",
+                    content=f"ERROR: File is not a readable image or PDF: {file_path}",
                     tool_call_id=tool_call_id,
                 )
 
