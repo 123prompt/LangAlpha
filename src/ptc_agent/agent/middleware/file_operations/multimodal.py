@@ -15,20 +15,21 @@ Supported formats:
 - Documents: PDF
 """
 
+import asyncio
 import base64
 import io
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.types import Command
 from PIL import Image
 
+from ptc_agent.agent.middleware._utils import append_to_system_message
 from ptc_agent.agent.tools.file_ops import is_memo_text_path
 from src.llms.llm import get_input_modalities
 from src.tools.web.inhouse.guard import BlockedAddressError, GuardedAsyncTransport
@@ -186,17 +187,54 @@ _UNSUPPORTED_NOTE = (
 )
 
 
-def _can_view(ext: str, modalities: list[str]) -> bool:
-    """Whether *modalities* cover the kind of file *ext* names.
+def _tool_results_first(messages: list) -> list:
+    """Order each tool-result run so its ToolMessages precede injected content.
 
-    A URL carrying no recognizable extension could resolve to either kind, so it
-    needs one of the two rather than a specific one.
+    A visual Read resolves to a Command carrying ``[ToolMessage, HumanMessage]``,
+    and a parallel batch interleaves that with the other calls' results —
+    ``tool_result, text, image, tool_result``. Anthropic requires a user turn's
+    tool_result blocks to come before any other content and 400s otherwise, and
+    since the Command is checkpointed the bad order would replay every turn.
+    Repaired here rather than at injection time because only this side sees the
+    whole batch; the checkpoint keeps the original order and heals on read.
     """
-    if ext in DOCUMENT_EXTENSIONS:
-        return "pdf" in modalities
-    if ext in IMAGE_EXTENSIONS:
-        return "image" in modalities
-    return "image" in modalities or "pdf" in modalities
+    out: list = []
+    run: list = []
+    in_run = False
+    changed = False
+
+    def flush() -> None:
+        nonlocal changed
+        if not run:
+            return
+        needs, seen_other = False, False
+        for msg in run:
+            if isinstance(msg, ToolMessage):
+                if seen_other:
+                    needs = True
+                    break
+            else:
+                seen_other = True
+        if needs:
+            changed = True
+            out.extend(m for m in run if isinstance(m, ToolMessage))
+            out.extend(m for m in run if not isinstance(m, ToolMessage))
+        else:
+            out.extend(run)
+        run.clear()
+
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            flush()
+            in_run = bool(getattr(msg, "tool_calls", None))
+            out.append(msg)
+        elif in_run:
+            run.append(msg)
+        else:
+            out.append(msg)
+    flush()
+
+    return out if changed else messages
 
 
 def _is_visual_request(file_path: str) -> bool:
@@ -369,19 +407,30 @@ class MultimodalMiddleware(AgentMiddleware):
         the checkpoint contains image/PDF content blocks that would cause 400 errors.
         This method replaces those blocks with text placeholders.
         """
+        # Runs for every target, not just modality-limited ones: the interleaving
+        # only arises where injection succeeded, which is a model that can see it.
+        messages = _tool_results_first(request.messages)
+        overrides: dict[str, Any] = {}
+
         modalities = self._resolve_modalities(request)
         has_image = "image" in modalities
         has_pdf = "pdf" in modalities
 
-        # Fast path: model supports all visual types
-        if has_image and has_pdf:
-            return await handler(request)
+        if not (has_image and has_pdf):
+            sanitized = _strip_unsupported_content_blocks(messages, has_image, has_pdf)
+            if sanitized is not messages:
+                messages = sanitized
+                # Told to the model that actually can't see the file, on the call
+                # where that is true. The tool-time note this replaces judged the
+                # configured model and froze that verdict into the transcript,
+                # which a subagent on its own model then inherited wrongly.
+                overrides["system_message"] = append_to_system_message(
+                    request.system_message, _UNSUPPORTED_NOTE
+                )
 
-        # Strip unsupported content blocks from messages
-        sanitized = _strip_unsupported_content_blocks(request.messages, has_image, has_pdf)
-        if sanitized is not request.messages:
-            return await handler(request.override(messages=sanitized))
-        return await handler(request)
+        if messages is not request.messages:
+            overrides["messages"] = messages
+        return await handler(request.override(**overrides) if overrides else request)
 
     async def awrap_tool_call(
         self,
@@ -413,30 +462,13 @@ class MultimodalMiddleware(AgentMiddleware):
         if not _is_visual_request(file_path):
             return await handler(request)
 
-        # Check model capabilities — skip content injection for unsupported
-        # modalities. The configured model is the right basis here: which model
-        # actually consumes the injected blocks isn't decided until the next
-        # model call, and awrap_model_call re-checks against that one anyway. So
-        # this note is a UX affordance, not the thing preventing a 400.
-        model = self.model_name
-        modalities = get_input_modalities(model, custom_modalities=self.custom_modalities) if model else ["text"]
-
-        # Determine file extension (from local path or URL path)
-        if file_path.startswith(("http://", "https://")):
-            ext = Path(urlparse(file_path).path).suffix.lower()
-        else:
-            ext = Path(file_path).suffix.lower()
-
-        if not _can_view(ext, modalities):
-            # Run the tool anyway and append the note — the text output is still
-            # useful, and replacing it would lose a read the agent asked for.
-            result = await handler(request)
-            result_content = result.content if hasattr(result, "content") else str(result)
-            return ToolMessage(
-                content=result_content + _UNSUPPORTED_NOTE,
-                tool_call_id=tool_call_id,
-            )
-
+        # Injected unconditionally, without asking whether the model can view it.
+        # This middleware is a single instance shared with every subagent, so the
+        # only model it could ask about is the configured one — and gating on that
+        # withheld the blocks from a subagent running its own vision model, which
+        # awrap_model_call cannot undo because it only ever removes blocks. The
+        # cost is that a text-only turn still checkpoints content it will strip on
+        # every read; that is the accepted price of never silently losing a read.
         logger.debug(f"[MULTIMODAL] Intercepting Read for visual content: {file_path}")
 
         # Execute the tool to get the acknowledgment message
@@ -543,7 +575,10 @@ class MultimodalMiddleware(AgentMiddleware):
             # end without an extension, and branching on that would send a PDF
             # down the image path and reject it as corrupt.
             try:
-                mime_type = _detect_mime_type(content_bytes)
+                # Off-loop: pypdf walks the xref of up to MAX_CONTENT_BYTES of
+                # model-chosen content, which is milliseconds on a real document
+                # but ~100ms on one padded with junk after %%EOF.
+                mime_type = await asyncio.to_thread(_detect_mime_type, content_bytes)
             except _UnusableContent as exc:
                 logger.warning(f"[MULTIMODAL] Refusing content from URL ({exc}): {url}")
                 return ToolMessage(
@@ -653,7 +688,7 @@ class MultimodalMiddleware(AgentMiddleware):
             # extension is whatever wrote the file claimed, and a truncated
             # chart named .png is checkpointed before any provider sees it.
             try:
-                mime_type = _detect_mime_type(file_bytes)
+                mime_type = await asyncio.to_thread(_detect_mime_type, file_bytes)
             except _UnusableContent as exc:
                 logger.warning(f"[MULTIMODAL] Refusing file ({exc}): {file_path}")
                 return ToolMessage(

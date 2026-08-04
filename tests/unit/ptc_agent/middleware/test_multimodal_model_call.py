@@ -259,14 +259,16 @@ class _ModelCallRequest:
     """Minimal stand-in for the model-call request: a stamped client, a history,
     and the ``override`` the middleware must go through to replace messages."""
 
-    def __init__(self, manifest_model, messages):
+    def __init__(self, manifest_model, messages, system_message=None):
         self.model = types.SimpleNamespace(metadata={"manifest_model": manifest_model})
         self.messages = messages
+        self.system_message = system_message
 
     def override(self, **kwargs):
         clone = _ModelCallRequest.__new__(_ModelCallRequest)
         clone.model = self.model
         clone.messages = kwargs.get("messages", self.messages)
+        clone.system_message = kwargs.get("system_message", self.system_message)
         return clone
 
 
@@ -372,10 +374,13 @@ class TestVisualRequestRouting:
         assert MultimodalMiddleware.TOOL_NAME in names
 
 
-class TestUnsupportedModalityNote:
-    """A file the model can't consume still runs the tool — the note is appended
-    to the real output, never substituted for it, so the agent can say why it is
-    answering blind instead of silently losing the read.
+class TestUnsupportedModalityIsJudgedReadSide:
+    """Which model can see the file is decided where the model is known.
+
+    One middleware instance is shared with every subagent, so the configured name
+    is not the consuming model. Deciding at tool-call time withheld the block from
+    a subagent running its own vision model — and the read side only ever removes
+    blocks, so nothing downstream could recover a block never created.
     """
 
     @staticmethod
@@ -388,27 +393,47 @@ class TestUnsupportedModalityNote:
     async def _handler(_request):
         return ToolMessage(content="ok", tool_call_id="tc-1")
 
+    @pytest.mark.asyncio
+    async def test_a_text_only_configured_model_still_injects(self):
+        """The block has to exist for a vision subagent sharing this instance."""
+        mw = MultimodalMiddleware(
+            sandbox=_Sandbox(_png_bytes()), model_name="stub", custom_modalities=["text"]
+        )
+
+        result = await mw.awrap_tool_call(self._read("chart.png"), self._handler)
+        assert isinstance(result, Command)
+        assert result.update["messages"][-1].content[-1]["type"] == "image_url"
+
     @pytest.mark.parametrize(
         "file_path",
         ["chart.png", "report.pdf", "https://example.com/asset"],
         ids=["image-ext", "pdf-ext", "url-without-extension"],
     )
     @pytest.mark.asyncio
-    async def test_text_only_model_gets_the_note(self, file_path):
+    async def test_no_verdict_is_frozen_into_the_transcript(self, file_path):
         """The extensionless URL is the interesting one: it could resolve to
-        either kind, so a model with neither modality has to be told."""
+        either kind, and the old gate judged all three off the configured name."""
         mw = MultimodalMiddleware(model_name="stub", custom_modalities=["text"])
         result = await mw.awrap_tool_call(self._read(file_path), self._handler)
-        assert result.content.startswith("ok")
-        assert "does not support" in result.content
+        assert "does not support" not in str(result.content)
 
     @pytest.mark.asyncio
-    async def test_a_model_holding_the_modality_is_not_noted(self):
-        """Routed to the injection path instead — which fails here only because
-        this middleware has no sandbox, well past the branch under test."""
-        mw = MultimodalMiddleware(model_name="stub", custom_modalities=["text", "image"])
-        result = await mw.awrap_tool_call(self._read("chart.png"), self._handler)
-        assert "does not support" not in result.content
+    async def test_the_note_reaches_the_model_that_actually_cannot_see(self):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        request = _ModelCallRequest("deepseek-v4-pro", [
+            HumanMessage(content=[
+                {"type": "text", "text": "Look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]),
+        ])
+        await MultimodalMiddleware().awrap_model_call(request, handler)
+
+        assert "does not support" in str(seen["request"].system_message.content)
 
 
 class TestContentSizeCap:
@@ -589,6 +614,143 @@ class TestContentIsTypedByItsBytes:
         assert isinstance(result, ToolMessage)
         assert not isinstance(result, Command)
         assert "BMP" in result.content
+
+
+def _batch(*after_ai):
+    """A turn whose assistant message issued two parallel tool calls."""
+    return [
+        HumanMessage(content="look at the chart and list the files"),
+        AIMessage(content="", tool_calls=[
+            {"name": "Read", "args": {"file_path": "chart.png"}, "id": "toolu_A",
+             "type": "tool_call"},
+            {"name": "bash", "args": {"command": "ls"}, "id": "toolu_B",
+             "type": "tool_call"},
+        ]),
+        *after_ai,
+    ]
+
+
+def _media():
+    return HumanMessage(content=[
+        {"type": "text", "text": "[Viewing image]"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ])
+
+
+class TestToolResultsPrecedeInjectedMedia:
+    """Injection returns a Command carrying [ToolMessage, HumanMessage], so a
+    visual Read that is not last in a parallel batch interleaves its media between
+    two tool results. Anthropic requires a user turn's tool_result blocks to come
+    before any other content; the raw order earns a 400, and the Command is
+    checkpointed, so the 400 repeats on every replay.
+    """
+
+    @pytest.mark.asyncio
+    async def test_media_between_two_results_is_moved_after_both(self):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        history = _batch(
+            ToolMessage(content="Read image", tool_call_id="toolu_A"),
+            _media(),
+            ToolMessage(content="file1", tool_call_id="toolu_B"),
+        )
+        request = _ModelCallRequest("claude-sonnet-4-6", history)
+        await MultimodalMiddleware().awrap_model_call(request, handler)
+
+        kinds = [type(m).__name__ for m in seen["request"].messages]
+        assert kinds == ["HumanMessage", "AIMessage", "ToolMessage", "ToolMessage",
+                         "HumanMessage"]
+        # Read-side only: the checkpoint's copy keeps the order it was written in.
+        assert [type(m).__name__ for m in history][2:] == ["ToolMessage", "HumanMessage",
+                                                            "ToolMessage"]
+
+    def test_the_repair_produces_a_payload_anthropic_accepts(self):
+        """The contract this exists for, asserted where it is actually enforced —
+        block order inside the converted user turn, not message order."""
+        from langchain_anthropic.chat_models import _format_messages
+
+        broken = _batch(
+            ToolMessage(content="Read image", tool_call_id="toolu_A"),
+            _media(),
+            ToolMessage(content="file1", tool_call_id="toolu_B"),
+        )
+        _, before = _format_messages(broken)
+        assert [b["type"] for b in before[-1]["content"]] == [
+            "tool_result", "text", "image", "tool_result"
+        ], "precondition: the raw order interleaves a tool_result after content"
+
+        _, after = _format_messages(multimodal._tool_results_first(broken))
+        kinds = [b["type"] for b in after[-1]["content"]]
+        assert kinds.index("text") > max(
+            i for i, k in enumerate(kinds) if k == "tool_result"
+        ), "every tool_result must precede any other block"
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            pytest.param(
+                [ToolMessage(content="a", tool_call_id="toolu_A"),
+                 ToolMessage(content="b", tool_call_id="toolu_B"), _media()],
+                id="media-already-last",
+            ),
+            pytest.param(
+                [ToolMessage(content="a", tool_call_id="toolu_A")],
+                id="single-result",
+            ),
+            pytest.param([], id="no-results-yet"),
+        ],
+    )
+    def test_an_already_valid_turn_is_returned_unchanged(self, tail):
+        """Identity, not equality — an unnecessary copy would defeat the caller's
+        `is not` check and clone every request in the process."""
+        messages = _batch(*tail)
+        assert multimodal._tool_results_first(messages) is messages
+
+    def test_a_turn_with_no_tool_calls_is_untouched(self):
+        messages = [
+            HumanMessage(content="hi"),
+            AIMessage(content="hello"),
+            HumanMessage(content="thanks"),
+        ]
+        assert multimodal._tool_results_first(messages) is messages
+
+    def test_relative_order_inside_each_group_is_preserved(self):
+        """Two injected reads in one batch must stay in the order they ran."""
+        first, second = _media(), _media()
+        messages = _batch(
+            ToolMessage(content="a", tool_call_id="toolu_A"),
+            first,
+            ToolMessage(content="b", tool_call_id="toolu_B"),
+            second,
+        )
+        tail = multimodal._tool_results_first(messages)[2:]
+        assert [m.content for m in tail[:2]] == ["a", "b"]
+        assert tail[2] is first and tail[3] is second
+
+    def test_an_earlier_healthy_batch_is_left_alone(self):
+        """Only the offending run is rewritten; earlier turns keep their shape."""
+        good_media = _media()
+        messages = [
+            *_batch(ToolMessage(content="a", tool_call_id="toolu_A"), good_media),
+            AIMessage(content="", tool_calls=[
+                {"name": "Read", "args": {"file_path": "x.png"}, "id": "toolu_C",
+                 "type": "tool_call"},
+                {"name": "bash", "args": {"command": "ls"}, "id": "toolu_D",
+                 "type": "tool_call"},
+            ]),
+            ToolMessage(content="c", tool_call_id="toolu_C"),
+            _media(),
+            ToolMessage(content="d", tool_call_id="toolu_D"),
+        ]
+        result = multimodal._tool_results_first(messages)
+        assert result[2].content == "a" and result[3] is good_media
+        assert [type(m).__name__ for m in result[5:]] == [
+            "ToolMessage", "ToolMessage", "HumanMessage"
+        ]
 
 
 class TestPDFsAreVerifiedNotSniffed:
