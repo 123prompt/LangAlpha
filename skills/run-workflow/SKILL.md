@@ -51,7 +51,7 @@ const results = await parallel(args.tickers.map((t) => () =>
 phase('Synthesize')
 const briefs = {}
 const failed = []
-results.forEach((r, i) => { if (r) briefs[args.tickers[i]] = r; else failed.push(args.tickers[i]) })
+results.forEach((r, i) => { if (r !== null) briefs[args.tickers[i]] = r; else failed.push(args.tickers[i]) })
 log(`${Object.keys(briefs).length} briefs, ${failed.length} failed`)
 return { briefs, failed }
 ```
@@ -65,16 +65,16 @@ const reviewed = await pipeline(
   args.tickers,
   (ticker) => agent(`Summarize ${ticker}'s latest 10-Q: segment results, guidance changes, new risk language.`,
     { agentType: 'research', label: ticker, phase: 'Read' }),
-  (summary, ticker) => summary && agent(
+  (summary, ticker) => summary === null ? null : agent(
     `Challenge this ${ticker} summary — what does it overstate, omit, or take on trust?\n\n${summary}`,
     { agentType: 'equity-analyst', label: `${ticker} review`, phase: 'Challenge' }),
 )
 
-log(`${reviewed.filter(Boolean).length}/${args.tickers.length} reviewed`)
+log(`${reviewed.filter((r) => r !== null).length}/${args.tickers.length} reviewed`)
 return Object.fromEntries(args.tickers.map((t, i) => [t, reviewed[i]]))
 ```
 
-Set `phase` per dispatch rather than calling `phase()` inside a stage: items run concurrently, so a global marker set mid-pipeline reflects whichever item reached it last. Guard each stage on its input — `summary && agent(...)` skips the second dispatch for an item whose first stage returned `null`.
+Set `phase` per dispatch rather than calling `phase()` inside a stage: items run concurrently, so a global marker set mid-pipeline reflects whichever item reached it last. Guard each stage on its input, and test against `null` rather than truthiness — `0`, `false` and `""` are answers a child succeeded with, and `summary && agent(...)` would drop them as failures.
 
 ## Saved workflows
 
