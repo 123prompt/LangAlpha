@@ -108,7 +108,8 @@ class AutomationExecutor:
 
         Steps:
         1. Mark execution as running
-        2. Resolve workspace (flash auto-creates, ptc validates)
+        2. Resolve workspace (flash auto-creates; ptc uses the stored id,
+           whose ownership was verified when the automation was written)
         3. Determine thread_id (new or continue)
         4. Build ChatRequest and invoke agent workflow
         5. Drain the async generator
