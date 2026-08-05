@@ -13,6 +13,13 @@ export default defineConfig(({ mode }) => {
   // otherwise yield NaN and silently break the HMR socket.
   const hmrClientPort = Number(env.VITE_HMR_CLIENT_PORT)
   const hasHmrClientPort = Number.isFinite(hmrClientPort) && hmrClientPort > 0
+  // Extra Host headers the dev server accepts, for tunnels (ngrok, Cloudflare)
+  // that front it under their own hostname. Comma-separated — kept in .env so a
+  // tunnel host never needs a local edit to this file.
+  const allowedHosts = (env.VITE_DEV_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim())
+    .filter(Boolean)
 
   return {
     base: env.VITE_CDN_BASE || '/',
@@ -41,6 +48,8 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       host: '127.0.0.1',
+      // Unset leaves Vite's default host checking in place.
+      allowedHosts: allowedHosts.length ? allowedHosts : undefined,
       // In Docker on macOS the bind mount doesn't forward fsevents, so Vite's
       // watcher silently dies and HMR stops (edits don't hot-reload; a reload
       // can even serve the stale transform). Enable polling ONLY when

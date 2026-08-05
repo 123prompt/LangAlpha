@@ -48,6 +48,7 @@ pnpm lint         # ESLint 9 flat config (advisory — NOT gated in CI)
 | `VITE_HOST_MODE` | `oss` | `platform` → Supabase auth mode; `oss` → local-dev, no auth |
 | `VITE_API_BASE_URL` | (empty = same-origin) | Backend base URL for axios (dev: same-origin, proxied) |
 | `VITE_PROXY_BACKEND` | `http://localhost:8000` | Dev-server proxy target for `/api/v1` + `/ws/v1` |
+| `VITE_DEV_ALLOWED_HOSTS` | (unset = Vite default) | Comma-separated extra Host headers the dev server accepts, for tunnels (ngrok etc.) |
 | `VITE_SUPABASE_URL` | — | Supabase project URL (gates client creation, not mode) |
 | `VITE_SUPABASE_PUBLISHABLE_KEY` | — | Supabase anon key |
 | `VITE_AUTH_USER_ID` | `local-dev-user` | User id in `oss` mode |
