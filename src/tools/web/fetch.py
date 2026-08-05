@@ -24,7 +24,9 @@ from src.llms import LLM, format_llm_content, make_api_call, maybe_disable_strea
 from src.tools.web.inhouse.sitemap import get_sitemap_summary
 from src.tools.decorators import log_io
 from src.tools.web.router import FetchRouter
+from src.observability import stamp_run
 from src.tools.web.types import (
+    FetchAttempt,
     FetchRequest,
     FetchResponse,
     FetchResult,
@@ -130,7 +132,7 @@ class FetchService:
                         results[url] = FetchResult(url=url, markdown=cached, source="cache")
 
         remaining = [u for u in urls if u not in results]
-        providers_tried: List[str] = []
+        attempts: List[FetchAttempt] = []
         provider: Optional[str] = None
 
         if remaining and req.max_age_seconds != -1:
@@ -142,7 +144,7 @@ class FetchService:
                     max_age_seconds=req.max_age_seconds,
                 )
             )
-            providers_tried = resp.providers_tried
+            attempts = resp.attempts
             provider = resp.provider
             for result in resp.results:
                 results[result.url] = result
@@ -168,7 +170,7 @@ class FetchService:
                 )
 
         ordered = [results[u] for u in urls]
-        return FetchResponse(results=ordered, provider=provider, providers_tried=providers_tried)
+        return FetchResponse(results=ordered, provider=provider, attempts=attempts)
 
 
 _fetch_service: Optional[FetchService] = None
@@ -361,6 +363,7 @@ async def web_fetch(
             url = result.url
             artifact["url"] = url
             artifact["provider"] = response.provider
+            artifact["attempts"] = [str(a) for a in response.attempts]
             artifact["source"] = result.source
 
             if result.error is not None:
@@ -413,8 +416,22 @@ async def _web_fetch_tool_impl(
     url: Annotated[str, "The URL to fetch content from"],
     prompt: Annotated[str, "The prompt to run on the fetched content"],
 ) -> tuple[str, dict]:
-    """Delegate to web_fetch(); the agent-facing contract is ``description``."""
-    return await web_fetch(url=url, prompt=prompt)
+    """Delegate to web_fetch(); the agent-facing contract is ``description``.
+
+    Stamps here rather than inside web_fetch() because this is the one point
+    every branch — native excerpts, empty page, per-URL error, catch-all —
+    passes through on its way out of the tool run.
+    """
+    content, artifact = await web_fetch(url=url, prompt=prompt)
+    provider = artifact.get("provider")
+    stamp_run(
+        tags=[f"fetch_provider:{provider}"] if provider else None,
+        fetch_provider=provider,
+        fetch_attempts=artifact.get("attempts") or None,
+        fetch_source=artifact.get("source"),
+        fetch_error=artifact.get("error"),
+    )
+    return content, artifact
 
 
 # Apply decorator and create tool

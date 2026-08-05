@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from langchain_core.tools import tool
 
 from src.config.tool_settings import get_crawl_provider
+from src.observability import stamp_run
 from src.tools.decorators import create_logged_tool, get_tool_tracker
 from src.tools.web.manifest import (
     CAPABILITY_CRAWL,
@@ -170,6 +171,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
                 <output_dir>/<host>/. Defaults to work/crawl. Pass your task's
                 work dir (e.g. work/<task>/crawl) when running a task workflow.
         """
+        stamp_run(crawl_provider=provider)
         limit_ = max(1, min(int(limit), _MAX_CRAWL_PAGES))
         base_dir = (output_dir or _DEFAULT_OUTPUT_DIR).rstrip("/")
         dest_dir = f"{base_dir}/{_host_dirname(url)}"
@@ -318,7 +320,14 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
     tools: List[Any] = [web_crawl]
     if map_cap is not None:
         map_key = map_cap.tracking_key(map_cap.default_level_spec)
-        tools.append(create_logged_tool(web_map, name="WebMap", tracking_name=map_key))
+        tools.append(
+            create_logged_tool(
+                web_map,
+                name="WebMap",
+                tracking_name=map_key,
+                run_metadata={"map_provider": provider},
+            )
+        )
     else:
         # Capability-driven: a provider without a manifest map capability
         # simply doesn't offer WebMap (never ship an unmetered tool).
