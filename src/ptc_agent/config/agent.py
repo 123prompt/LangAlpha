@@ -221,10 +221,6 @@ class AgentConfig(BaseModel):
     # Custom model input modalities override (set by resolve_llm_config for custom models)
     input_modalities: list[str] | None = None
 
-    # Vision tool configuration
-    # If True, enable view_image tool for viewing images (requires vision-capable model)
-    enable_view_image: bool = True
-
     # Subagent configuration
     subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
 
@@ -324,7 +320,6 @@ class AgentConfig(BaseModel):
             log_level: Logging level (default: "INFO")
             allowed_directories: Sandbox paths (default: ["/home/workspace", "/tmp"])
             subagents: SubagentsConfig or use subagents_enabled for backward compat
-            enable_view_image: Enable image viewing (default: True)
             background_auto_wait: Wait for background tasks (default: False)
 
         Returns:
@@ -473,7 +468,6 @@ class AgentConfig(BaseModel):
             logging=logging_config,
             filesystem=filesystem_config,
             skills=skills_config,
-            enable_view_image=kwargs.pop("enable_view_image", True),
             subagents=SubagentsConfig(
                 enabled=kwargs.pop("subagents_enabled", ["general-purpose"]),
                 definitions=kwargs.pop("subagents_definitions", {}),

@@ -22,6 +22,7 @@ from ptc_agent.agent.middleware import (
     SkillsMiddleware,
     AskUserMiddleware,
     LeakDetectionMiddleware,
+    MultimodalMiddleware,
     ProvenanceMiddleware,
     ReasoningCompatibilityMiddleware,
 )
@@ -287,6 +288,19 @@ class FlashAgent:
             "Flash model resilience enabled",
             max_retries=3,
             fallback_models=[name for name, _ in fallbacks],
+        )
+
+        # Only the read-side strip is live here: Flash exposes no filesystem
+        # tool at all, so the injection half has nothing to intercept. Without
+        # it, a mid-thread switch to a text-only model replays an earlier turn's
+        # image/PDF blocks and strict providers reject the request outright.
+        # Inside model resilience so it strips against the post-fallback model.
+        main_middleware.append(
+            MultimodalMiddleware(
+                sandbox=None,
+                model_name=self.config.llm.flash or self.config.llm.name,
+                custom_modalities=self.config.input_modalities,
+            )
         )
 
         # Prompt caching (per-provider breakpoints), empty tool call retry,

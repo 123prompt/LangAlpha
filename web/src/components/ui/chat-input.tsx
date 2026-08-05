@@ -13,7 +13,8 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useIsMobile } from '@/hooks/useIsMobile';
-import { deriveQuickAccessModels, type ModelMetadata } from './chat-input.models';
+import { deriveQuickAccessModels } from './chat-input.models';
+import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { supportsXhighEffort } from '@/lib/modelCapabilities';
 import { getModelMetadata } from '../../pages/ChatAgent/utils/api';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
@@ -166,7 +167,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   const [reasoningEffort, setReasoningEffort] = useState<string | null>(null);
   const [fastMode, setFastMode] = useState(false);
 
-  const [modelMetadata, setModelMetadata] = useState<ModelMetadata>({});
+  const [modelMetadata, setModelMetadata] = useState<Record<string, ModelMetadataEntry>>({});
 
   // Sync selectedModel when initialModel or preferredModel changes
   useEffect(() => {
@@ -179,7 +180,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     onModelChange?.(selectedModel);
   }, [selectedModel, onModelChange]);
 
-  // Fetch model metadata for compatibility checking (eager prefetch, resolves instantly after first load)
+  // Fetch model metadata to detect Codex-SDK models (eager prefetch, resolves instantly after first load)
   useEffect(() => { getModelMetadata().then((d: Record<string, unknown>) => setModelMetadata(d as typeof modelMetadata)).catch(() => { }); }, []);
 
   const isCodexModel = selectedModel ? modelMetadata[selectedModel]?.sdk === 'codex' : false;
@@ -542,12 +543,11 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   /** Quick-access models for both the desktop submenu and mobile inline expand */
   const moreModelsItems = useMemo(
     () => deriveQuickAccessModels({
-      preferredModel, preferredFlashModel, starredModels,
-      validModelNames, initialModel, selectedModel, modelMetadata,
+      preferredModel, preferredFlashModel, starredModels, validModelNames,
       // Don't repeat models already shown in the primary (selected + thread) section.
       excludeModels: [selectedModel, ...threadModelsProp].filter((m): m is string => !!m),
     }),
-    [preferredModel, preferredFlashModel, starredModels, validModelNames, initialModel, selectedModel, modelMetadata, threadModelsProp],
+    [preferredModel, preferredFlashModel, starredModels, validModelNames, selectedModel, threadModelsProp],
   );
 
   return (
@@ -827,8 +827,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                 selectedModel={selectedModel}
                 onSelectModel={setSelectedModel}
                 threadModels={threadModelsProp}
-                initialModel={initialModel}
-                modelMetadata={modelMetadata}
+                validModelNames={validModelNames}
                 moreModelsItems={moreModelsItems}
                 hasStarredModels={starredModels.length > 0}
                 reasoningEffort={reasoningEffort}

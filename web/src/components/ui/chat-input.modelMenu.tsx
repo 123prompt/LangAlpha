@@ -9,8 +9,8 @@ import {
   DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent,
 } from './dropdown-menu';
 import { useIsMobile } from '@/hooks/useIsMobile';
-import { areModelsCompatible, type ModelMetadata } from './chat-input.models';
 import { getModelDisplayName } from './chat-input.helpers';
+import { derivePrimaryModels } from './chat-input.models';
 
 /** Pill geometry for the model trigger — shared with the measure chip so the
  *  fold budget can never drift from what actually renders. */
@@ -54,8 +54,7 @@ export function ChatInputModelMenu({
   selectedModel,
   onSelectModel,
   threadModels,
-  initialModel,
-  modelMetadata,
+  validModelNames,
   moreModelsItems,
   hasStarredModels,
   reasoningEffort,
@@ -70,8 +69,8 @@ export function ChatInputModelMenu({
   selectedModel: string | null;
   onSelectModel: (model: string) => void;
   threadModels: string[];
-  initialModel: string | null;
-  modelMetadata: ModelMetadata;
+  /** Gates thread history — a model can be revoked after a turn used it. */
+  validModelNames: Set<string>;
   moreModelsItems: string[];
   hasStarredModels: boolean;
   reasoningEffort: string | null;
@@ -95,9 +94,7 @@ export function ChatInputModelMenu({
   // the settings link reachable).
   if (moreModelsItems.length === 0 && !hasStarredModels && !selectedModel) return null;
 
-  const primaryModels: string[] = threadModels.length > 0
-    ? [...new Set([...threadModels, selectedModel].filter((m): m is string => !!m))]
-    : [selectedModel].filter((m): m is string => !!m);
+  const primaryModels = derivePrimaryModels({ selectedModel, threadModels, validModelNames });
 
   return (
     <DropdownMenu modal={false} open={menuOpen} onOpenChange={(open) => { setMenuOpen(open); if (!open) setShowMoreModels(false); }}>
@@ -121,19 +118,17 @@ export function ChatInputModelMenu({
         style={{ backgroundColor: 'var(--color-bg-elevated)', borderColor: 'var(--color-border-muted)' }}
       >
         {/* Thread models */}
-        {primaryModels
-          .filter((m) => !initialModel || areModelsCompatible(selectedModel, m, modelMetadata))
-          .map((m) => (
-            <DropdownMenuItem
-              key={m}
-              onSelect={() => onSelectModel(m)}
-              className="text-[0.8125rem] justify-between"
-              style={{ color: 'var(--color-text-primary)' }}
-            >
-              <span>{getModelDisplayName(m)}</span>
-              {m === selectedModel && <Check className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
-            </DropdownMenuItem>
-          ))}
+        {primaryModels.map((m) => (
+          <DropdownMenuItem
+            key={m}
+            onSelect={() => onSelectModel(m)}
+            className="text-[0.8125rem] justify-between"
+            style={{ color: 'var(--color-text-primary)' }}
+          >
+            <span>{getModelDisplayName(m)}</span>
+            {m === selectedModel && <Check className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
+          </DropdownMenuItem>
+        ))}
         <DropdownMenuSeparator style={{ backgroundColor: 'var(--color-border-muted)' }} />
         {/* Reasoning effort (custom control — not a menu item, won't close on click) */}
         <div className="model-effort-section">

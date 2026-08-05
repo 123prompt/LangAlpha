@@ -154,13 +154,11 @@ class TestAgentConfigCreate:
                 daytona_api_key="key",
                 python_version="3.11",
                 log_level="DEBUG",
-                enable_view_image=False,
                 background_auto_wait=True,
                 subagents_enabled=["general-purpose", "research"],
             )
         assert config.daytona.python_version == "3.11"
         assert config.logging.level == "DEBUG"
-        assert config.enable_view_image is False
         assert config.background_auto_wait is True
         assert config.subagents.enabled == ["general-purpose", "research"]
 

@@ -154,8 +154,12 @@ def _sanitize(
     cross-lineage message, so gate B sees nothing left to judge there.
     """
     stats = SanitizeStats()
-    # UNKNOWN targets carry no provenance to compare against, so gate A would
-    # strip the entire history on no evidence. Skip it and keep the repair.
+    # A target goes UNKNOWN only when its client skipped LLM.get_llm() — today
+    # that is a subagent whose config declares a bare model string, which
+    # deepagents resolves via init_chat_model. Gate A would then strip that
+    # subagent's whole history every turn on no evidence, and skipping it is
+    # safe: such a target only sees its own output, and a resilience fallback
+    # moves it onto a stamped candidate that re-arms both gates. Repair stays.
     origin_gate = target_lineage != UNKNOWN_LINEAGE
     drop_unsigned = target_lineage == ANTHROPIC_LINEAGE
 

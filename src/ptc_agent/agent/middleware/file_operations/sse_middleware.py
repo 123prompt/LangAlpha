@@ -48,7 +48,7 @@ class FileOperationMiddleware(AgentMiddleware):
     Middleware that emits file_operation SSE events after tool execution.
 
     Hooks into tool execution to emit custom events with full file content
-    for write_file and edit_file operations, enabling frontend to display
+    for Write and Edit operations, enabling frontend to display
     file changes without polluting agent context.
     """
 

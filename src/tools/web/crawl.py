@@ -153,7 +153,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
 
         Starts an asynchronous crawl at ``url``, follows internal links up to
         ``limit`` pages, and writes one .md file per page plus an index.jsonl
-        manifest. Read the dumped files with glob/read_file afterwards — page
+        manifest. Read the dumped files with Glob/Read afterwards — page
         content is never returned inline. Scope a site with WebMap first, and
         prefer WebFetch when you already know the handful of URLs you need.
         Crawling bills per delivered page, so keep ``limit`` tight and focus
@@ -266,7 +266,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
             lines.append(f"{failures} page(s) failed — see {index_path}.")
         if ok_pages:
             lines.append(
-                f"Manifest: {index_path}. Use glob('{dest_dir}/*.md') and read_file to work "
+                f"Manifest: {index_path}. Use Glob('{dest_dir}/*.md') and Read to work "
                 f"through the pages."
             )
         artifact = {

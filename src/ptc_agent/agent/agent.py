@@ -621,14 +621,6 @@ class PTCAgent:
         shared_middleware.append(ProvenanceMiddleware(redactor=leak_detection.redact))
         shared_middleware.append(TodoWriteMiddleware())
 
-        # Add multimodal middleware for read_file image/PDF support (when enabled)
-        if self.config.enable_view_image and self.config.llm:
-            shared_middleware.append(MultimodalMiddleware(
-                sandbox=sandbox,
-                model_name=self.config.llm.name,
-                custom_modalities=self.config.input_modalities,
-            ))
-
         skill_sources = (
             [f"{self.config.skills.sandbox_skills_base}/"]
             if self.config.skills.enabled
@@ -784,6 +776,22 @@ class PTCAgent:
 
         model_resilience = self._build_model_resilience_middleware()
 
+        # Inside model_resilience so it strips against the post-fallback model:
+        # a vision primary falling back to a text-only candidate would otherwise
+        # replay image/PDF blocks and earn the 400 the fallback exists to avoid.
+        # In both stacks because a subagent on its own model needs the same
+        # protection; it reads that model off each request, so the two stacks
+        # can share one instance rather than needing one apiece.
+        multimodal = (
+            MultimodalMiddleware(
+                sandbox=sandbox,
+                model_name=self.config.llm.name,
+                custom_modalities=self.config.input_modalities,
+            )
+            if self.config.llm
+            else None
+        )
+
         # Placed before (outer to) model_resilience so sandbox images are
         # captured once, on the final response only — not per retry attempt.
         image_capture = (
@@ -802,6 +810,7 @@ class PTCAgent:
                 image_capture,
                 compaction,
                 *model_resilience,
+                multimodal,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
@@ -897,6 +906,7 @@ class PTCAgent:
                 image_capture,
                 compaction,
                 *model_resilience,
+                multimodal,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 OpenAIPromptCachingMiddleware(),
                 # Market watch (main agent only): appends the ephemeral

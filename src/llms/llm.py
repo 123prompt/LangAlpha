@@ -270,6 +270,12 @@ class LLM:
     # Class-level model config instance
     _model_config = None
 
+    # Both real constructors set this; the default only covers instances built
+    # attribute-by-attribute off ``__new__``. Downstream reads fail closed
+    # (get_input_modalities treats an unknown model as text-only), so a missing
+    # stamp costs a stripped image block, never a rejected request.
+    custom_model_name: str | None = None
+
     @classmethod
     def get_model_config(cls) -> ModelConfig:
         """Get or create the model configuration singleton."""
@@ -489,12 +495,18 @@ class LLM:
         # request actually takes — langchain's own ``model_provider`` field
         # cannot be trusted here (ChatAnthropic reports "anthropic" for every
         # Anthropic-compatible shim).
+        # ``manifest_model`` is the models.json key, not ``self.model`` (the API
+        # model id) — it is what get_input_modalities() looks up. Middleware that
+        # runs inside ModelResilienceMiddleware sees a substituted client, so a
+        # capability read has to come off the client in hand rather than off a
+        # name captured when the stack was built.
         billing_type = self._resolve_billing_type()
         existing = client.metadata or {}
         client.metadata = {
             **existing,
             "billing_type": billing_type,
             "provider_route": self._provider_route(),
+            "manifest_model": self.custom_model_name,
         }
 
         return client
@@ -927,6 +939,41 @@ def get_input_modalities(
     if custom_modalities is not None:
         return custom_modalities
     return LLM.get_model_config().get_input_modalities(model_name)
+
+
+# Published per-request PDF page ceilings. Anthropic's is the only one that
+# moves with the context window (600 at 1M, 100 below it), and it is the reason
+# a single global cap can't be right: the same document is fine on Sonnet 5 and
+# rejected on Sonnet 4.6. OpenAI documents a size limit but no page limit, hence
+# None — "not bounded by pages" rather than "unknown".
+_ANTHROPIC_SDK_PROVIDERS = frozenset({"anthropic", "claude-oauth", "doubao-anthropic"})
+_GEMINI_MAX_PDF_PAGES = 1000
+_ANTHROPIC_MAX_PDF_PAGES_1M = 600
+_ANTHROPIC_MAX_PDF_PAGES = 100
+
+
+def get_max_pdf_pages(model_name: str) -> int | None:
+    """Documented per-request PDF page ceiling for a model, or None if unbounded.
+
+    Unknown models get the tightest published ceiling rather than None: this
+    gates what we transmit, so guessing generously turns an unknown into a 400
+    the caller has no way to recover.
+    """
+    model_info = LLM.get_model_config().get_model_config(model_name) or {}
+    provider = model_info.get("provider", "")
+
+    if provider in _ANTHROPIC_SDK_PROVIDERS:
+        context = model_info.get("context") or 0
+        return (
+            _ANTHROPIC_MAX_PDF_PAGES_1M
+            if context >= 1_000_000
+            else _ANTHROPIC_MAX_PDF_PAGES
+        )
+    if provider == "gemini":
+        return _GEMINI_MAX_PDF_PAGES
+    if provider in ("openai", "codex-oauth"):
+        return None
+    return _ANTHROPIC_MAX_PDF_PAGES
 
 
 def should_enable_caching(model_name: str) -> bool:
