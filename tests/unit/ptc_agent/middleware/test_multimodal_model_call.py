@@ -17,6 +17,16 @@ from ptc_agent.agent.middleware.file_operations.multimodal import (
 from src.llms.llm import LLM, get_input_modalities
 
 
+def _system_text(request) -> str:
+    """The system message as flat text, whether it is a string or block list."""
+    content = request.system_message.content
+    if isinstance(content, list):
+        return "".join(
+            b.get("text", "") for b in content if isinstance(b, dict)
+        )
+    return str(content)
+
+
 def _pdf_bytes(pages: int = 1) -> bytes:
     """A structurally valid PDF. Generated rather than committed as a blob so the
     page count is a parameter — that is what the provider ceiling is measured in."""
@@ -207,7 +217,7 @@ class TestStripUnsupportedContentBlocks:
 
 
 def _request(manifest_model):
-    """A model-call request carrying only what _resolve_modalities reads."""
+    """A model-call request carrying only what _resolve_target reads."""
     metadata = {"manifest_model": manifest_model} if manifest_model else {}
     return types.SimpleNamespace(model=types.SimpleNamespace(metadata=metadata))
 
@@ -221,13 +231,13 @@ class TestResolveModalities:
         mw = MultimodalMiddleware(model_name="gpt-5.5")
         # Configured for a vision model, but resilience substituted a text-only
         # client; judging on the configured name would replay image blocks at it.
-        assert mw._resolve_modalities(_request("deepseek-v4-pro")) == ["text"]
+        assert mw._resolve_target(_request("deepseek-v4-pro"))[1] == ["text"]
 
     def test_custom_modalities_apply_only_to_the_configured_model(self):
         mw = MultimodalMiddleware(model_name="my-custom-vlm", custom_modalities=["text", "image"])
-        assert mw._resolve_modalities(_request("my-custom-vlm")) == ["text", "image"]
+        assert mw._resolve_target(_request("my-custom-vlm"))[1] == ["text", "image"]
         # A fallback is a different model — the override must not follow it over.
-        assert mw._resolve_modalities(_request("deepseek-v4-pro")) == ["text"]
+        assert mw._resolve_target(_request("deepseek-v4-pro"))[1] == ["text"]
 
     def test_an_unstamped_client_is_text_only_even_under_a_vision_parent(self):
         """Regression: a bare-string subagent resolves via ``init_chat_model`` and
@@ -236,23 +246,23 @@ class TestResolveModalities:
         400 this strip exists to prevent."""
         mw = MultimodalMiddleware(model_name="claude-sonnet-4-6")
         assert "image" in get_input_modalities("claude-sonnet-4-6")  # parent sees images
-        assert mw._resolve_modalities(_request(None)) == ["text"]
+        assert mw._resolve_target(_request(None))[1] == ["text"]
 
     def test_a_client_with_no_metadata_at_all_is_text_only(self):
         mw = MultimodalMiddleware(model_name="claude-sonnet-4-6")
         no_metadata = types.SimpleNamespace(model=types.SimpleNamespace())
-        assert mw._resolve_modalities(no_metadata) == ["text"]
+        assert mw._resolve_target(no_metadata)[1] == ["text"]
 
     def test_no_model_name_at_all_is_text_only(self):
         """Fail closed: over-stripping costs a placeholder, under-stripping a 400."""
         mw = MultimodalMiddleware()
-        assert mw._resolve_modalities(_request(None)) == ["text"]
+        assert mw._resolve_target(_request(None))[1] == ["text"]
 
     def test_a_custom_modalities_override_does_not_survive_an_unstamped_client(self):
         """The override describes the configured model; an unattributable client
         is not that model."""
         mw = MultimodalMiddleware(model_name="my-custom-vlm", custom_modalities=["text", "image"])
-        assert mw._resolve_modalities(_request(None)) == ["text"]
+        assert mw._resolve_target(_request(None))[1] == ["text"]
 
 
 class _ModelCallRequest:
@@ -341,7 +351,7 @@ class TestManifestModelStampRoundTrip:
         # Configured for a text-only model, handed a vision client: the stamp is
         # what must win, which only works if both sides name the same key.
         mw = MultimodalMiddleware(model_name="deepseek-v4-pro")
-        modalities = mw._resolve_modalities(types.SimpleNamespace(model=client))
+        _, modalities = mw._resolve_target(types.SimpleNamespace(model=client))
         assert "image" in modalities
 
     def test_the_stamp_is_the_manifest_key_not_the_provider_model_id(self):
@@ -433,7 +443,7 @@ class TestUnsupportedModalityIsJudgedReadSide:
         ])
         await MultimodalMiddleware().awrap_model_call(request, handler)
 
-        assert "does not support" in str(seen["request"].system_message.content)
+        assert multimodal._UNSUPPORTED_NOTE in _system_text(seen["request"])
 
 
 class TestContentSizeCap:
@@ -786,30 +796,46 @@ class TestPDFsAreVerifiedNotSniffed:
         assert "not a readable PDF" in result.content
 
     @pytest.mark.asyncio
-    async def test_a_pdf_over_the_page_ceiling_is_refused_with_its_count(self):
+    async def test_a_pdf_over_the_page_ceiling_is_refused_with_its_count(
+        self, monkeypatch
+    ):
         """Page count is the ceiling that binds: this fixture is a few KB, so no
         byte cap would catch it. The message names the count so the agent can
-        split the document rather than retry the same read."""
-        mw = MultimodalMiddleware(
-            sandbox=_Sandbox(_pdf_bytes(multimodal.MAX_PDF_PAGES + 1))
-        )
+        split the document rather than retry the same read. The cap is patched
+        down because what is under test is that it is enforced, not its value."""
+        monkeypatch.setattr(multimodal, "MAX_PDF_PAGES", 3)
+        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(4)))
 
         result = await mw._handle_sandbox_content(
             "long.pdf", AIMessage(content="ok"), "call-1"
         )
         assert isinstance(result, ToolMessage)
         assert not isinstance(result, Command)
-        assert f"{multimodal.MAX_PDF_PAGES + 1}-page" in result.content
+        assert "4-page" in result.content
 
     @pytest.mark.asyncio
-    async def test_a_pdf_at_the_page_ceiling_is_accepted(self):
+    async def test_a_pdf_at_the_page_ceiling_is_accepted(self, monkeypatch):
         """The limit is inclusive — off-by-one here silently rejects a legal doc."""
-        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(multimodal.MAX_PDF_PAGES)))
+        monkeypatch.setattr(multimodal, "MAX_PDF_PAGES", 3)
+        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(3)))
 
         result = await mw._handle_sandbox_content(
             "long.pdf", AIMessage(content="ok"), "call-1"
         )
         assert isinstance(result, Command)
+
+    @pytest.mark.asyncio
+    async def test_the_injection_cap_is_the_widest_ceiling_not_the_tightest(self):
+        """The case that motivated splitting the cap in two: a 150-page filing is
+        legal on a 1M-context route, and injection cannot know it isn't headed
+        there, so refusing it at tool time would be a guess against the user."""
+        mw = MultimodalMiddleware(sandbox=_Sandbox(_pdf_bytes(150)))
+
+        result = await mw._handle_sandbox_content(
+            "filing.pdf", AIMessage(content="ok"), "call-1"
+        )
+        assert isinstance(result, Command)
+        assert result.update["messages"][-1].content[-1]["pages"] == 150
 
     @pytest.mark.asyncio
     async def test_trailing_bytes_do_not_condemn_an_otherwise_readable_pdf(self):
@@ -822,3 +848,79 @@ class TestPDFsAreVerifiedNotSniffed:
         )
         assert isinstance(result, Command)
         assert result.update["messages"][-1].content[-1]["mime_type"] == "application/pdf"
+
+
+def _pdf_block(pages):
+    return HumanMessage(content=[
+        {"type": "text", "text": "[Viewing PDF: filing.pdf]"},
+        {"type": "file", "base64": "abc", "mime_type": "application/pdf",
+         "filename": "filing.pdf", "pages": pages},
+    ])
+
+
+async def _blocks_reaching(model, message):
+    """The content blocks the middleware actually hands the target."""
+    seen = {}
+
+    async def handler(request):
+        seen["request"] = request
+        return "ok"
+
+    await MultimodalMiddleware().awrap_model_call(
+        _ModelCallRequest(model, [message]), handler
+    )
+    return seen["request"].messages[0].content, seen["request"]
+
+
+class TestPDFPageCeilingIsPerTarget:
+    """The page ceiling belongs to the model that reads the block, not to the
+    tool call that made it: Anthropic publishes 600 at a 1M context and 100
+    below it, so one global cap is wrong for someone whichever value it takes."""
+
+    @pytest.mark.asyncio
+    async def test_a_long_pdf_survives_to_a_1m_context_route(self):
+        blocks, _ = await _blocks_reaching("claude-sonnet-5", _pdf_block(300))
+        assert [b["type"] for b in blocks] == ["text", "file"]
+
+    @pytest.mark.asyncio
+    async def test_the_same_pdf_is_stripped_for_a_200k_route(self):
+        blocks, request = await _blocks_reaching("claude-sonnet-4-6", _pdf_block(300))
+        assert [b["type"] for b in blocks] == ["text", "text"]
+        assert "300 pages" in blocks[1]["text"]
+        assert multimodal._UNSUPPORTED_NOTE in _system_text(request)
+
+    @pytest.mark.asyncio
+    async def test_a_pdf_inside_the_200k_ceiling_still_reaches_it(self):
+        blocks, _ = await _blocks_reaching("claude-sonnet-4-6", _pdf_block(80))
+        assert [b["type"] for b in blocks] == ["text", "file"]
+
+    @pytest.mark.asyncio
+    async def test_a_provider_documenting_no_page_limit_keeps_the_block(self):
+        blocks, _ = await _blocks_reaching("gpt-5.5", _pdf_block(900))
+        assert [b["type"] for b in blocks] == ["text", "file"]
+
+    @pytest.mark.asyncio
+    async def test_an_unstamped_block_is_left_alone(self):
+        """Blocks written before the stamp existed. Re-deriving the count would
+        mean decoding every PDF in history per call; leaving them keeps the old
+        behaviour rather than regressing threads that already work."""
+        legacy = HumanMessage(content=[
+            {"type": "text", "text": "[Viewing PDF: old.pdf]"},
+            {"type": "file", "base64": "abc", "mime_type": "application/pdf",
+             "filename": "old.pdf"},
+        ])
+        blocks, _ = await _blocks_reaching("claude-sonnet-4-6", legacy)
+        assert [b["type"] for b in blocks] == ["text", "file"]
+
+
+class TestPageStampStaysLocal:
+    def test_the_stamp_never_reaches_the_wire(self):
+        """The count rides on the block so the read side can judge it. That is
+        only safe because every provider converter drops keys it doesn't know —
+        if one passed it through, it would be an unknown field in the payload."""
+        from langchain_anthropic.chat_models import _format_messages
+
+        _, payload = _format_messages([_pdf_block(300)])
+        document = [b for b in payload[0]["content"] if b["type"] == "document"][0]
+        assert "pages" not in document
+        assert "pages" not in document["source"]

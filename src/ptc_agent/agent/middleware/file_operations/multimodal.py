@@ -31,7 +31,7 @@ from PIL import Image
 
 from ptc_agent.agent.middleware._utils import append_to_system_message
 from ptc_agent.agent.tools.file_ops import is_memo_text_path
-from src.llms.llm import get_input_modalities
+from src.llms.llm import get_input_modalities, get_max_pdf_pages
 from src.tools.web.inhouse.guard import BlockedAddressError, GuardedAsyncTransport
 
 logger = logging.getLogger(__name__)
@@ -54,10 +54,13 @@ _PIL_FORMAT_TO_MIME = {
     "WEBP": "image/webp",
 }
 
-# The tightest published per-request page ceiling (Anthropic's, below a 1M-token
-# context). Page count is what binds for PDFs — a 300-page report can sit well
-# under MAX_CONTENT_BYTES and still be rejected on arrival.
-MAX_PDF_PAGES = 100
+# The widest per-request page ceiling any provider we ship publishes (Gemini's).
+# Deliberately not the tightest: injection cannot know which model will consume
+# the block — the middleware instance is shared with every subagent — so a cap
+# picked for the strictest target would refuse documents the actual target
+# accepts. What each target can really take is enforced on the read side, where
+# the model is known; this bound only rejects what nobody would accept.
+MAX_PDF_PAGES = 1000
 
 
 class _UnusableContent(Exception):
@@ -65,14 +68,18 @@ class _UnusableContent(Exception):
     predicate ("not a readable PDF") that slots into the caller's message."""
 
 
-def _detect_mime_type(content: bytes) -> str:
-    """MIME type read off the bytes, raising `_UnusableContent` if nothing accepts them.
+def _detect_mime_type(content: bytes) -> tuple[str, int | None]:
+    """MIME type and page count, raising `_UnusableContent` if nothing accepts the bytes.
 
     The name can't decide this: a URL may carry no extension at all, and a
     sandbox path is only as accurate as whatever wrote the file. Both callers
     checkpoint what they inject, so anything a provider would reject has to be
     caught here — otherwise it replays its 400 on every later turn instead of
     failing once. Hence structural verification, not just a magic-byte peek.
+
+    The page count is returned so it can be stamped on the block: the read side
+    needs it to judge the PDF against the target's own ceiling, and re-deriving
+    it there would mean decoding and reparsing every PDF in history per call.
     """
     if content.startswith(b"%PDF"):
         import pypdf
@@ -85,7 +92,7 @@ def _detect_mime_type(content: bytes) -> str:
             raise _UnusableContent(
                 f"a {pages}-page PDF, over the {MAX_PDF_PAGES}-page limit"
             )
-        return "application/pdf"
+        return "application/pdf", pages
 
     try:
         img = Image.open(io.BytesIO(content))
@@ -95,13 +102,22 @@ def _detect_mime_type(content: bytes) -> str:
     mime_type = _PIL_FORMAT_TO_MIME.get(img.format or "")
     if mime_type is None:
         raise _UnusableContent(f"in {img.format} format, which no provider accepts")
-    return mime_type
+    return mime_type, None
 
 
 def _strip_unsupported_content_blocks(
-    messages: list, has_image: bool, has_pdf: bool
+    messages: list,
+    has_image: bool,
+    has_pdf: bool,
+    max_pdf_pages: int | None = None,
 ) -> list:
     """Replace unsupported image/file content blocks with text placeholders.
+
+    ``max_pdf_pages`` is the target's own page ceiling (None = unbounded). A PDF
+    over it is dropped here rather than refused at injection, because the ceiling
+    is a property of the model that reads the block, not of the tool call that
+    created it — the same document is fine on a 1M-context route and rejected on
+    a 200K one, and only this side knows which one is being called.
 
     Returns the original list if no changes needed (avoids unnecessary copies).
     Does not mutate the original messages (checkpoint integrity).
@@ -158,6 +174,26 @@ def _strip_unsupported_content_blocks(
                 msg_modified = True
                 continue
 
+            # Over the target's page ceiling. Unstamped blocks pass: they predate
+            # the stamp, and re-deriving the count would mean decoding every PDF
+            # in history on every call. They keep the old failure mode; nothing
+            # that already worked starts failing here.
+            if (
+                block_type == "file"
+                and max_pdf_pages is not None
+                and isinstance(block.get("pages"), int)
+                and block["pages"] > max_pdf_pages
+            ):
+                new_blocks.append({
+                    "type": "text",
+                    "text": (
+                        f"[PDF attached in prior turn — {block['pages']} pages, over "
+                        f"the current model's {max_pdf_pages}-page limit]"
+                    ),
+                })
+                msg_modified = True
+                continue
+
             new_blocks.append(block)
 
         if msg_modified:
@@ -177,12 +213,16 @@ def _strip_unsupported_content_blocks(
     return result if modified else messages
 
 
+# One note for both strip reasons: the placeholder already states which one
+# applied, next to the block it replaced, so branching the reminder would only
+# duplicate that where the model is less likely to be reading.
 _UNSUPPORTED_NOTE = (
     "\n\n<system-reminder>"
-    "You cannot view this file directly because the current model does not support "
-    "this input type. Be transparent with the user about this limitation and suggest "
-    "they try switching to a model that supports image/PDF input. "
-    "Work in best effort to answer their query."
+    "Content shown as a bracketed placeholder is not visible to the current model; "
+    "the placeholder states why. Be transparent with the user about the limitation: "
+    "an unsupported input type means switching to a model that accepts it, and a "
+    "page-limit rejection means splitting the document or moving to a model with a "
+    "longer context. Work in best effort to answer their query."
     "</system-reminder>"
 )
 
@@ -375,12 +415,13 @@ class MultimodalMiddleware(AgentMiddleware):
             tool_call_id=tool_call_id,
         )
 
-    def _resolve_modalities(self, request: Any) -> list[str]:
-        """Modalities of the model this request will actually reach.
+    def _resolve_target(self, request: Any) -> tuple[str | None, list[str]]:
+        """Name and modalities of the model this request will actually reach.
 
         Read off ``request.model`` rather than the configured name so a
         resilience fallback — or a subagent running its own model — is judged on
-        the client in hand.
+        the client in hand. The name comes back too because the PDF page ceiling
+        is per-model and has to be looked up against the same target.
         """
         metadata = getattr(request.model, "metadata", None)
         stamped = metadata.get("manifest_model") if isinstance(metadata, dict) else None
@@ -393,12 +434,12 @@ class MultimodalMiddleware(AgentMiddleware):
             # replay exactly the blocks this strip exists to remove, so an
             # unstamped client is judged text-only — the same fail-closed reading
             # LLM.get_llm() documents when it writes the stamp.
-            return ["text"]
+            return None, ["text"]
         # ``custom_modalities`` is a per-model override from user preferences, so
         # it describes only the model it was configured for — a fallback is a
         # different model and has to be judged on its own manifest entry.
         overrides = self.custom_modalities if stamped == self.model_name else None
-        return get_input_modalities(stamped, custom_modalities=overrides)
+        return stamped, get_input_modalities(stamped, custom_modalities=overrides)
 
     async def awrap_model_call(self, request, handler):
         """Strip unsupported content blocks from historical messages for text-only models.
@@ -412,21 +453,26 @@ class MultimodalMiddleware(AgentMiddleware):
         messages = _tool_results_first(request.messages)
         overrides: dict[str, Any] = {}
 
-        modalities = self._resolve_modalities(request)
+        stamped, modalities = self._resolve_target(request)
         has_image = "image" in modalities
         has_pdf = "pdf" in modalities
+        # Looked up even for a fully multimodal target: a model that accepts PDFs
+        # can still be handed one past its page ceiling, which is the judgement
+        # the tool side deliberately no longer attempts.
+        max_pdf_pages = get_max_pdf_pages(stamped) if stamped and has_pdf else None
 
-        if not (has_image and has_pdf):
-            sanitized = _strip_unsupported_content_blocks(messages, has_image, has_pdf)
-            if sanitized is not messages:
-                messages = sanitized
-                # Told to the model that actually can't see the file, on the call
-                # where that is true. The tool-time note this replaces judged the
-                # configured model and froze that verdict into the transcript,
-                # which a subagent on its own model then inherited wrongly.
-                overrides["system_message"] = append_to_system_message(
-                    request.system_message, _UNSUPPORTED_NOTE
-                )
+        sanitized = _strip_unsupported_content_blocks(
+            messages, has_image, has_pdf, max_pdf_pages
+        )
+        if sanitized is not messages:
+            messages = sanitized
+            # Told to the model that actually can't see the file, on the call
+            # where that is true. The tool-time note this replaces judged the
+            # configured model and froze that verdict into the transcript,
+            # which a subagent on its own model then inherited wrongly.
+            overrides["system_message"] = append_to_system_message(
+                request.system_message, _UNSUPPORTED_NOTE
+            )
 
         if messages is not request.messages:
             overrides["messages"] = messages
@@ -491,13 +537,19 @@ class MultimodalMiddleware(AgentMiddleware):
         b64_string: str,
         file_path: str,
         mime_type: str,
+        pages: int | None = None,
     ) -> list[dict[str, Any]]:
         """Build appropriate content blocks based on file type.
+
+        ``pages`` is stamped on the PDF block for the read-side ceiling check.
+        Every provider converter drops keys it doesn't recognise, so it stays a
+        local annotation and never reaches the wire.
 
         Args:
             b64_string: Base64-encoded file content
             file_path: Original file path (for display name)
             mime_type: MIME type of the content
+            pages: PDF page count, or None for images
 
         Returns:
             List of content block dicts for HumanMessage
@@ -512,9 +564,17 @@ class MultimodalMiddleware(AgentMiddleware):
         elif mime_type == "application/pdf":
             # PDF: use LangChain's file content block format (converts to Anthropic's document format)
             filename = Path(file_path).name
+            block = {
+                "type": "file",
+                "base64": b64_string,
+                "mime_type": mime_type,
+                "filename": filename,
+            }
+            if pages is not None:
+                block["pages"] = pages
             return [
                 {"type": "text", "text": f"[Viewing PDF: {filename}]"},
-                {"type": "file", "base64": b64_string, "mime_type": mime_type, "filename": filename},
+                block,
             ]
         return []
 
@@ -578,7 +638,9 @@ class MultimodalMiddleware(AgentMiddleware):
                 # Off-loop: pypdf walks the xref of up to MAX_CONTENT_BYTES of
                 # model-chosen content, which is milliseconds on a real document
                 # but ~100ms on one padded with junk after %%EOF.
-                mime_type = await asyncio.to_thread(_detect_mime_type, content_bytes)
+                mime_type, pages = await asyncio.to_thread(
+                    _detect_mime_type, content_bytes
+                )
             except _UnusableContent as exc:
                 logger.warning(f"[MULTIMODAL] Refusing content from URL ({exc}): {url}")
                 return ToolMessage(
@@ -590,7 +652,9 @@ class MultimodalMiddleware(AgentMiddleware):
             b64_string = base64.b64encode(content_bytes).decode("utf-8")
 
             # Build content blocks based on type
-            content_blocks = self._build_content_blocks(b64_string, url, mime_type)
+            content_blocks = self._build_content_blocks(
+                b64_string, url, mime_type, pages
+            )
             if not content_blocks:
                 return ToolMessage(
                     content=f"ERROR: Unsupported content type: {mime_type}",
@@ -688,7 +752,9 @@ class MultimodalMiddleware(AgentMiddleware):
             # extension is whatever wrote the file claimed, and a truncated
             # chart named .png is checkpointed before any provider sees it.
             try:
-                mime_type = await asyncio.to_thread(_detect_mime_type, file_bytes)
+                mime_type, pages = await asyncio.to_thread(
+                    _detect_mime_type, file_bytes
+                )
             except _UnusableContent as exc:
                 logger.warning(f"[MULTIMODAL] Refusing file ({exc}): {file_path}")
                 return ToolMessage(
@@ -700,7 +766,9 @@ class MultimodalMiddleware(AgentMiddleware):
             b64_string = base64.b64encode(file_bytes).decode("utf-8")
 
             # Build content blocks based on type
-            content_blocks = self._build_content_blocks(b64_string, file_path, mime_type)
+            content_blocks = self._build_content_blocks(
+                b64_string, file_path, mime_type, pages
+            )
             if not content_blocks:
                 return ToolMessage(
                     content=f"ERROR: Unsupported content type: {mime_type}",

@@ -941,6 +941,41 @@ def get_input_modalities(
     return LLM.get_model_config().get_input_modalities(model_name)
 
 
+# Published per-request PDF page ceilings. Anthropic's is the only one that
+# moves with the context window (600 at 1M, 100 below it), and it is the reason
+# a single global cap can't be right: the same document is fine on Sonnet 5 and
+# rejected on Sonnet 4.6. OpenAI documents a size limit but no page limit, hence
+# None — "not bounded by pages" rather than "unknown".
+_ANTHROPIC_SDK_PROVIDERS = frozenset({"anthropic", "claude-oauth", "doubao-anthropic"})
+_GEMINI_MAX_PDF_PAGES = 1000
+_ANTHROPIC_MAX_PDF_PAGES_1M = 600
+_ANTHROPIC_MAX_PDF_PAGES = 100
+
+
+def get_max_pdf_pages(model_name: str) -> int | None:
+    """Documented per-request PDF page ceiling for a model, or None if unbounded.
+
+    Unknown models get the tightest published ceiling rather than None: this
+    gates what we transmit, so guessing generously turns an unknown into a 400
+    the caller has no way to recover.
+    """
+    model_info = LLM.get_model_config().get_model_config(model_name) or {}
+    provider = model_info.get("provider", "")
+
+    if provider in _ANTHROPIC_SDK_PROVIDERS:
+        context = model_info.get("context") or 0
+        return (
+            _ANTHROPIC_MAX_PDF_PAGES_1M
+            if context >= 1_000_000
+            else _ANTHROPIC_MAX_PDF_PAGES
+        )
+    if provider == "gemini":
+        return _GEMINI_MAX_PDF_PAGES
+    if provider in ("openai", "codex-oauth"):
+        return None
+    return _ANTHROPIC_MAX_PDF_PAGES
+
+
 def should_enable_caching(model_name: str) -> bool:
     """
     Check if a model should enable Anthropic prompt caching.
