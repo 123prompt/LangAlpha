@@ -83,7 +83,9 @@ def _build_db_uri() -> str:
     name = os.getenv("TEST_DB_NAME", "langalpha_test")
     user = os.getenv("TEST_DB_USER", "postgres")
     password = os.getenv("TEST_DB_PASSWORD", "postgres")
-    sslmode = "require" if "supabase.com" in host else "disable"
+    # Deliberately not DB_SSLMODE — reading it would let a production-shaped .env
+    # dictate test TLS policy, which is what TEST_DB_* exists to prevent.
+    sslmode = os.getenv("TEST_DB_SSLMODE", "prefer")
     return f"postgresql://{user}:{password}@{host}:{port}/{name}?sslmode={sslmode}"
 
 

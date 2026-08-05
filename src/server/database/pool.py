@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import anyio
 from psycopg_pool import AsyncConnectionPool
 
+from src.config.env import DB_SSLMODE
 from src.config.settings import get_conversation_pool_max
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,22 @@ logger = logging.getLogger(__name__)
 # Module-level connection pool cache for conversation database operations
 # This ensures we reuse connections across operations, reducing connection overhead
 _conversation_db_pool_cache = {}
+
+# Warn once per process, not once per connection — plaintext is the norm for a
+# local Postgres and a per-connection warning would drown the log.
+_warned_plaintext = False
+
+
+def _warn_if_plaintext(conn) -> None:
+    """Surface an unencrypted session so `prefer` can't downgrade silently."""
+    global _warned_plaintext
+    if _warned_plaintext or DB_SSLMODE != "prefer" or conn.pgconn.ssl_in_use:
+        return
+    _warned_plaintext = True
+    logger.warning(
+        "Postgres session is unencrypted — the server did not offer TLS "
+        "(DB_SSLMODE=prefer). Set DB_SSLMODE=require to fail closed instead."
+    )
 
 
 def get_db_connection_string() -> str:
@@ -33,6 +50,7 @@ def get_db_connection_string() -> str:
         DB_NAME: Database name (default: postgres)
         DB_USER: Database user (default: postgres)
         DB_PASSWORD: Database password (default: postgres)
+        DB_SSLMODE: TLS mode (default: prefer)
     """
     import os
 
@@ -44,8 +62,7 @@ def get_db_connection_string() -> str:
     db_user = os.getenv("DB_USER", "postgres")
     db_password = os.getenv("DB_PASSWORD", "postgres")
 
-    sslmode = "require" if "supabase.com" in db_host else "disable"
-    return f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}@{db_host}:{db_port}/{db_name}?sslmode={sslmode}"
+    return f"postgresql://{quote_plus(db_user)}:{quote_plus(db_password)}@{db_host}:{db_port}/{db_name}?sslmode={DB_SSLMODE}"
 
 
 def _on_reconnect_failed(pool):
@@ -65,6 +82,7 @@ async def _configure_postgres_connection(conn):
     """
     conn.prepare_threshold = 0  # Disable prepared statements
     await conn.set_autocommit(True)  # Set autocommit at creation
+    _warn_if_plaintext(conn)
     logger.debug(
         "Configured conversation DB connection with prepare_threshold=0, autocommit=True"
     )

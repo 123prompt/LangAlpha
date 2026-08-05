@@ -17,6 +17,15 @@ LOCAL_DEV_USER_ID: str = os.getenv("AUTH_USER_ID", "local-dev-user")
 # Quota / auth enforcement service URL
 AUTH_SERVICE_URL: str = os.getenv("AUTH_SERVICE_URL", "")
 
+# TLS mode for the app-data and checkpointer pools. "prefer" negotiates TLS when the
+# server offers it and falls back to plaintext when it doesn't — the only value that
+# works across the range of Postgres a self-hosted user may bring. The pools log once
+# when a session ends up plaintext, so the fallback is visible rather than silent.
+# Deployments that must guarantee encryption set DB_SSLMODE=require.
+# Read from the environment directly outside src/ (migrations, ops scripts), which
+# must run without the application stack importable.
+DB_SSLMODE: str = os.getenv("DB_SSLMODE", "prefer")
+
 # Minimum platform access tier required to customize the web-search provider.
 # Only enforced in platform mode; OSS deployments are ungated.
 SEARCH_PROVIDER_MIN_TIER: int = int(os.getenv("SEARCH_PROVIDER_MIN_TIER", "1"))
