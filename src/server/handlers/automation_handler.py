@@ -173,7 +173,8 @@ async def update_automation(
         Updated automation dict, or None if not found
 
     Raises:
-        ValueError: On invalid cron/timezone
+        ValueError: On invalid cron/timezone, or a merged state that leaves
+            agent_mode='ptc' without a workspace
     """
     # Get current automation for reference
     current = await auto_db.get_automation(automation_id, user_id)
@@ -212,6 +213,14 @@ async def update_automation(
     new_cron = update_kwargs.get("cron_expression")
     if new_cron:
         validate_cron_expression(new_cron)
+
+    # create enforces this, but a PATCH can flip agent_mode without naming a
+    # workspace — check the merged state, or 'ptc' activates on a row that has
+    # none and the executor only finds out at run time, burning a failure.
+    merged_mode = update_kwargs.get("agent_mode") or current.get("agent_mode")
+    merged_workspace = update_kwargs.get("workspace_id") or current.get("workspace_id")
+    if merged_mode == "ptc" and not merged_workspace:
+        raise ValueError("workspace_id is required for agent_mode='ptc'")
 
     # Recalculate next_run_at if cron expression or timezone changed
     cron_expr = new_cron or current["cron_expression"]
