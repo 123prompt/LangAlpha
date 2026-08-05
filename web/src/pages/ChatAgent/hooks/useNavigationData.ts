@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
-import { queryKeys } from '../../../lib/queryKeys';
+import { CACHE_ONLY_META, queryKeys } from '../../../lib/queryKeys';
 import { createEmitter } from '@/lib/emitter';
 import { isArchivedThreadsKey, patchThreadRows, rollbackThreadRows } from '@/lib/threadRowActions';
 import type { ThreadRowMapper } from '@/lib/threadRowActions';
@@ -531,11 +531,14 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   // refetch every retained workspace on every mounted panel — so these observe
   // without ever fetching. `combine` returns the data refs, which
   // replaceEqualDeep keeps identity-stable while nothing changes.
+  // Every id here is a real workspace, so these may be thawed after a
+  // lifecycle-feed resync — see CACHE_ONLY_META for what that opt-in attests to.
   const pageData = useQueries({
     queries: observedWsIds.map((wsId) => ({
       queryKey: threadPageKey(wsId, threadPageSize),
       queryFn: () => getWorkspaceThreads(wsId, threadPageSize, 0),
       enabled: false,
+      meta: CACHE_ONLY_META,
       staleTime: 30_000,
     })),
     combine: (results) => results.map((r) => r.data as ThreadsResponse | undefined),

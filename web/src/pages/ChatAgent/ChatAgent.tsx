@@ -13,6 +13,7 @@ import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadP
 import { useWarmWorkspaceSandbox } from './hooks/useWarmWorkspaceSandbox';
 import { warmWorkspace } from './utils/warmWorkspace';
 import { isValidUuid } from './utils/uuid';
+import { shouldLeaveThreadRoute } from './utils/threadRouteGuard';
 import ChatView from './components/ChatView';
 import './ChatAgent.css';
 
@@ -149,12 +150,11 @@ function ChatAgent(): React.ReactElement | null {
     }
   }, [resolvedThread]);
 
-  // Redirect on non-403 thread lookup errors
   useEffect(() => {
-    if (threadError && !accessDenied) {
+    if (shouldLeaveThreadRoute(needsThreadLookup, threadError, accessDenied)) {
       navigate('/chat', { replace: true });
     }
-  }, [threadError, accessDenied, navigate]);
+  }, [needsThreadLookup, threadError, accessDenied, navigate]);
 
   // __default__ with lost state — redirect
   useEffect(() => {

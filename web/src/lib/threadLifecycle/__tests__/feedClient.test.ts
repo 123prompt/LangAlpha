@@ -22,7 +22,7 @@ import {
   getEffectiveObservation,
   resetThreadLifecycle,
 } from '../store';
-import { queryKeys } from '@/lib/queryKeys';
+import { CACHE_ONLY_META, queryKeys } from '@/lib/queryKeys';
 import {
   getNavThreadsSnapshot,
   resetSharedWorkspaceThreads,
@@ -354,7 +354,7 @@ describe('threadLifecycleFeed — thread_pinned', () => {
 });
 
 describe('threadLifecycleFeed — cache-only list refetch', () => {
-  it('explicitly fetches an invalidated list whose only observers are disabled', async () => {
+  it('explicitly fetches an invalidated list whose only observers opt in', async () => {
     // The nav tree's page-0 queries observe with `enabled: false`, which
     // invalidateQueries (refetchType 'active') marks stale but never refetches
     // — a thread started in the background would stay missing until the user
@@ -365,7 +365,12 @@ describe('threadLifecycleFeed — cache-only list refetch', () => {
     const finiteKey = [...queryKeys.threads.byWorkspace('w1'), 10, 0];
     queryClient.setQueryData(finiteKey, { threads: [], total: 0 });
     const queryFn = vi.fn().mockResolvedValue({ threads: [{ thread_id: 't-new' }], total: 1 });
-    const observer = new QueryObserver(queryClient, { queryKey: finiteKey, queryFn, enabled: false });
+    const observer = new QueryObserver(queryClient, {
+      queryKey: finiteKey,
+      queryFn,
+      enabled: false,
+      meta: CACHE_ONLY_META,
+    });
     const unsubscribe = observer.subscribe(() => {});
 
     conns[0].emit({
@@ -388,11 +393,15 @@ describe('threadLifecycleFeed — cache-only list refetch', () => {
   it('leaves observer-less queries lazy', async () => {
     // An unmounted gallery's cache entry has zero observers — invalidation
     // alone is right there (it refetches on next mount); eager-fetching every
-    // stale entry would refetch views nobody is rendering.
+    // stale entry would refetch views nobody is rendering. The queryFn arrives
+    // via defaults rather than an observer so the entry stays observer-less
+    // while still being fetchable — otherwise nothing here can fail.
     startThreadLifecycleFeed(queryClient);
     await flush();
 
     const finiteKey = [...queryKeys.threads.byWorkspace('w1'), 10, 0];
+    const queryFn = vi.fn().mockResolvedValue({ threads: [{ thread_id: 't-new' }], total: 1 });
+    queryClient.setQueryDefaults(finiteKey, { queryFn });
     queryClient.setQueryData(finiteKey, { threads: [], total: 0 });
 
     conns[0].emit({
@@ -406,8 +415,77 @@ describe('threadLifecycleFeed — cache-only list refetch', () => {
     });
     await flush(400);
 
+    expect(queryFn).not.toHaveBeenCalled();
     const finite = queryClient.getQueryData(finiteKey) as { threads: Array<{ thread_id: string }> };
     expect(finite.threads).toEqual([]);
+  });
+
+  it('still fetches when only one of several observers opts in', async () => {
+    // Observers on one key share its arguments, so one voucher covers the key.
+    // This is the production shape, not an edge case: a page-0 list is observed
+    // by the sidebar tree (opted in) AND by every parked ChatView, which mounts
+    // useNavigationData disabled and registers a plain no-meta observer on its
+    // own workspace's list. Requiring every observer to opt in froze exactly
+    // the lists this refetch exists to thaw.
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    const finiteKey = [...queryKeys.threads.byWorkspace('w1'), 10, 0];
+    queryClient.setQueryData(finiteKey, { threads: [], total: 0 });
+    const queryFn = vi.fn().mockResolvedValue({ threads: [{ thread_id: 't-new' }], total: 1 });
+    const navObserver = new QueryObserver(queryClient, {
+      queryKey: finiteKey,
+      queryFn,
+      enabled: false,
+      meta: CACHE_ONLY_META,
+    });
+    const parkedChatView = new QueryObserver(queryClient, {
+      queryKey: finiteKey,
+      queryFn,
+      enabled: false,
+    });
+    const unsubscribes = [navObserver.subscribe(() => {}), parkedChatView.subscribe(() => {})];
+
+    conns[0].emit({
+      event: 'thread_lifecycle',
+      type: 'run_started',
+      thread_id: 't-new',
+      workspace_id: 'w1',
+      run_id: 'r1',
+      run_seq: 1,
+      status: 'running',
+    });
+    await flush(400);
+
+    expect(queryFn).toHaveBeenCalledTimes(1);
+    const finite = queryClient.getQueryData(finiteKey) as { threads: Array<{ thread_id: string }> };
+    expect(finite.threads.map((t) => t.thread_id)).toEqual(['t-new']);
+    unsubscribes.forEach((u) => u());
+  });
+
+  it('leaves a disabled query that never opted in alone on a full resync', async () => {
+    // `enabled: false` also means "the argument isn't here yet" — ChatAgent's
+    // thread lookup with no :threadId, the nav tree's page-0 query with no
+    // current workspace. Those queryFns throw on the missing id, so fetching
+    // them parks a permanent error that ChatAgent's redirect effect then reads
+    // on every navigation, bouncing the user out of /chat/* forever. The
+    // connection's first snapshot invalidates the whole threads prefix, which
+    // is what used to sweep these argument-less entries in.
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    const detailKey = queryKeys.threads.detail(undefined as unknown as string);
+    queryClient.setQueryData(detailKey, { thread_id: null });
+    const queryFn = vi.fn().mockRejectedValue(new Error('Thread ID is required'));
+    const observer = new QueryObserver(queryClient, { queryKey: detailKey, queryFn, enabled: false });
+    const unsubscribe = observer.subscribe(() => {});
+
+    conns[0].emit({ event: 'snapshot', as_of_seq: 1, oldest_included_unseen_seq: 0, live: [], unseen: [] });
+    await flush(400);
+
+    expect(queryFn).not.toHaveBeenCalled();
+    expect(queryClient.getQueryState(detailKey)?.status).not.toBe('error');
+    unsubscribe();
   });
 });
 
