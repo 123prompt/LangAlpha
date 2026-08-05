@@ -23,7 +23,7 @@ import {
 } from '../useNavigationData';
 import { resetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { isArchivedThreadsKey, patchThreadRows } from '@/lib/threadRowActions';
-import { queryKeys } from '@/lib/queryKeys';
+import { isCacheOnlyMeta, queryKeys } from '@/lib/queryKeys';
 import { resetNavPrefs, setNavPrefs } from '../../utils/navPrefs';
 
 vi.mock('../../utils/api', () => ({
@@ -158,6 +158,23 @@ describe('useNavigationData — stable thread ordering', () => {
     });
 
     await waitFor(() => expect(mockGetWorkspaceThreads).toHaveBeenCalledWith('ws-1', 20, 0));
+  });
+
+  it('page-0 observers opt into the lifecycle-feed thaw', async () => {
+    // The other half of this contract lives in refetchCacheOnlyLists
+    // (lib/threadLifecycle/feedClient.ts), which fetches a stale page-0 list
+    // only when an observer vouches for it via meta. Nothing else fails if this
+    // hook stops sending the flag — the tree would just silently stop picking
+    // up background runs — so assert the exact predicate that consumer uses.
+    const { queryClient, idsFor } = setup();
+    await waitFor(() => expect(idsFor('ws-1')).toEqual(['t-3', 't-1', 't-2']));
+
+    const pageZero = queryClient
+      .getQueryCache()
+      .findAll({ queryKey: [...queryKeys.threads.byWorkspace('ws-1'), 10, 0] });
+
+    expect(pageZero).toHaveLength(1);
+    expect(pageZero[0].observers.some((o) => isCacheOnlyMeta(o.options.meta))).toBe(true);
   });
 
   it('refetch with reshuffled updated_at keeps the frozen order', async () => {
