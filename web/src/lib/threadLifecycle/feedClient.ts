@@ -21,7 +21,7 @@
  * would be worse than a lib→pages import.
  */
 import type { QueryClient } from '@tanstack/react-query';
-import { queryKeys } from '@/lib/queryKeys';
+import { isCacheOnlyMeta, queryKeys } from '@/lib/queryKeys';
 import { patchThreadTitle } from '@/lib/threadListCache';
 import { isArchivedThreadsKey, patchThreadRows } from '@/lib/threadRowActions';
 import {
@@ -107,18 +107,23 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /** invalidateQueries only refetches enabled observers, and the nav tree's
  * page-0 lists observe cache-only (`enabled: false`) — a stale marking alone
- * leaves them frozen until the user navigates into the workspace. Explicitly
- * fetch every invalidated query whose observers are ALL disabled; queries
- * with no observers at all (unmounted galleries) stay lazy. */
+ * leaves them frozen until the user navigates into the workspace. Fetch the
+ * invalidated ones a {@link CACHE_ONLY_META} observer vouches for.
+ *
+ * One voucher is enough: a key's observers all share its arguments, and
+ * unrelated disabled observers do attach to these keys — a parked ChatView
+ * holds one on its own workspace's list — so demanding unanimity would
+ * refreeze exactly the lists this exists to thaw. */
 function refetchCacheOnlyLists(qc: QueryClient, queryKey: readonly unknown[]): void {
   for (const query of qc.getQueryCache().findAll({ queryKey })) {
-    // state.isInvalidated, not the `stale` filter: the filter reads observer
-    // results, which recompute in a batched notification AFTER this runs.
+    // state.isInvalidated, not the `stale` filter: with observers attached
+    // isStale() reads their results, and a disabled observer never reports
+    // stale, so the filter matches none of these.
     if (!query.state.isInvalidated) continue;
-    const observers = query.observers;
-    if (observers.length > 0 && observers.every((o) => o.options.enabled === false)) {
-      void query.fetch().catch(() => {});
-    }
+    // An enabled observer means invalidateQueries already refetched it.
+    if (query.isActive()) continue;
+    if (!query.observers.some((o) => isCacheOnlyMeta(o.options.meta))) continue;
+    void query.fetch().catch(() => {});
   }
 }
 

@@ -1,5 +1,8 @@
+import type { QueryMeta } from '@tanstack/react-query';
+
 /**
- * Hierarchical query key factory for React Query.
+ * Hierarchical query key factory for React Query, plus the query `meta`
+ * contract that rides alongside it (see {@link CACHE_ONLY_META}).
  *
  * Each level builds on its parent to enable prefix-based invalidation:
  *   invalidateQueries({ queryKey: queryKeys.user.all })
@@ -92,3 +95,21 @@ export const queryKeys = {
     detail: (symbol: string) => [...queryKeys.quote.all, symbol],
   },
 };
+
+/**
+ * Marks a query as observed cache-only *by choice* — its arguments are complete
+ * and its queryFn would succeed, it simply must not fetch on its own schedule.
+ * Carrying it is what lets `refetchCacheOnlyLists`
+ * (lib/threadLifecycle/feedClient.ts) fetch a query behind `enabled: false`.
+ *
+ * Never put it on a query that is disabled because an argument is missing:
+ * those queryFns throw on the absent id, and the parked error is then read as a
+ * real failure by whatever watches the query — which is how a thread lookup
+ * with no id once evicted the user from every /chat route.
+ */
+export const CACHE_ONLY_META = { cacheOnly: true } as const;
+
+/** Reader for {@link CACHE_ONLY_META} — keeps the flag's name in one module. */
+export function isCacheOnlyMeta(meta: QueryMeta | undefined): boolean {
+  return meta?.cacheOnly === true;
+}
