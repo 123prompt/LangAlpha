@@ -8,7 +8,6 @@ import BottomTabBar from './components/BottomTabBar/BottomTabBar';
 import Main, { preloadRouteChunk } from './components/Main/Main';
 import PageLoading from './components/PageLoading/PageLoading';
 import AuthConfirm from './pages/Login/AuthConfirm';
-import SharedChatView from './pages/SharedChat/SharedChatView';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from './contexts/AuthContext';
 import { useIsMobile } from './hooks/useIsMobile';
@@ -22,6 +21,10 @@ import './App.css';
 // Login carries the market-tape canvas subsystem (~2k lines that only a
 // logged-out visitor ever renders) — split it out of the main bundle.
 const LoginPage = React.lazy(() => import('./pages/Login/LoginPage'));
+// The public share route reuses the chat transcript renderer, so a static import
+// pulled the whole ChatAgent tree — plus the markdown and chart vendors it reaches
+// — into the entry chunk that every visitor loads before login.
+const SharedChatView = React.lazy(() => import('./pages/SharedChat/SharedChatView'));
 const SetupWizard = React.lazy(() => import('./pages/Setup/SetupWizard'));
 const PrivacyPolicy = React.lazy(() => import('./pages/Legal/PrivacyPolicy'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
@@ -252,7 +255,11 @@ function App() {
           <ResetPassword />
         </Suspense>
       } />
-      <Route path="/s/:shareToken" element={<SharedChatView />} />
+      <Route path="/s/:shareToken" element={
+        <Suspense fallback={<PageLoading />}>
+          <SharedChatView />
+        </Suspense>
+      } />
       <Route path="/privacy" element={
         <Suspense fallback={<PageLoading />}>
           <PrivacyPolicy />
