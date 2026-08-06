@@ -36,6 +36,15 @@ def record(name, text):
 first_spawn = not os.path.exists(os.path.join(STATE, "spawns"))
 record("spawns", "spawn")
 
+if MODE == "import_crash":
+    sys.stderr.write(
+        "Traceback (most recent call last):\\n"
+        "  File \\"server.py\\", line 1, in <module>\\n"
+        "ModuleNotFoundError: No module named 'mcp.server.fastmcp'\\n"
+    )
+    sys.stderr.flush()
+    sys.exit(1)
+
 MODERN = {"supportedVersions": ["2026-07-28"], "resultType": "complete"}
 seen_discover = False
 
@@ -199,6 +208,19 @@ class TestNegotiation:
         assert result == {"ok": True}
         assert ns["_PROTO"]["fake"]["mode"] == "legacy"
         assert _spawn_count(state) == 2
+        ns["cleanup_mcp_servers"]()
+
+    def test_import_crash_reports_cause_and_isolation_hint(self, tmp_path):
+        """A server that dies on import (era-locked runtime) must surface the
+        child's stderr cause and the uvx/npx isolation hint, not a bare
+        "closed connection"."""
+        ns, state = _client_ns(tmp_path, "import_crash")
+        with pytest.raises(RuntimeError) as exc_info:
+            ns["_call_mcp_tool"]("fake", "t", {})
+        message = str(exc_info.value)
+        assert "No module named 'mcp.server.fastmcp'" in message
+        assert "uvx/npx" in message
+        assert _spawn_count(state) == 2  # probe EOF still restarts once
         ns["cleanup_mcp_servers"]()
 
     def test_silent_probe_restarts_once(self, tmp_path):

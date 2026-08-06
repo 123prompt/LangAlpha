@@ -18,10 +18,49 @@ from mcp.client.streamable_http import streamable_http_client
 # The SDK's own httpx factory (sse_client's default); no public re-export yet.
 from mcp.shared._httpx_utils import create_mcp_http_client
 
+from mcp.shared.exceptions import MCPError
+from mcp.types import CONNECTION_CLOSED
+
 from ptc_agent.config.core import CoreConfig, MCPServerConfig
 from src.observability.tracing import tracer as _otel_tracer
 
 logger = structlog.get_logger(__name__)
+
+
+def _contains_connection_closed(error: BaseException) -> bool:
+    if isinstance(error, MCPError) and error.code == CONNECTION_CLOSED:
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return any(_contains_connection_closed(sub) for sub in error.exceptions)
+    return _contains_connection_closed(error.__cause__) if error.__cause__ else False
+
+
+def classify_startup_failure(error: BaseException, stderr_tail: str) -> str | None:
+    """Name the failure when a stdio server process dies before the handshake.
+
+    The SDK surfaces a crashed child as CONNECTION_CLOSED buried in TaskGroup
+    wrappers; the child's actual traceback exists only in our stderr capture.
+    Returns a one-line human diagnosis, or None for other failure shapes.
+    """
+    if not _contains_connection_closed(error):
+        return None
+    if "No module named 'mcp." in stderr_tail or (
+        "ImportError" in stderr_tail and "from mcp." in stderr_tail
+    ):
+        return (
+            "server process crashed importing an MCP SDK module its runtime "
+            "does not provide — its environment pins an incompatible mcp "
+            "version; launch it isolated (uvx/npx) with pinned versions"
+        )
+    if stderr_tail:
+        return (
+            "server process exited before completing the MCP handshake — "
+            "see stderr_tail for the crash output"
+        )
+    return (
+        "server process exited before completing the MCP handshake, "
+        "with no stderr output"
+    )
 
 
 class _StreamsTransport:
@@ -193,6 +232,9 @@ class MCPServerConnector:
         self._ready: asyncio.Event = asyncio.Event()
         self._disconnect_event: asyncio.Event = asyncio.Event()
         self._connection_error: Exception | None = None
+        # Human diagnosis of a startup failure; connect_all logs this instead
+        # of the exception's opaque TaskGroup repr.
+        self.failure_reason: str | None = None
 
         logger.debug("Initialized MCPServerConnector", server=config.name)
 
@@ -389,11 +431,14 @@ class MCPServerConnector:
                 # subprocess's traceback into the deque.
                 stderr_tail = stderr_capture.tail(drain=True)
 
+            self.failure_reason = classify_startup_failure(e, stderr_tail) or str(e)
+
             logger.error(
                 "Failed to connect to MCP server",
                 server=self.config.name,
                 error=str(e),
                 error_type=type(e).__name__,
+                diagnosis=self.failure_reason,
                 traceback=error_details,
                 stderr_tail=stderr_tail or None,
             )
@@ -657,18 +702,19 @@ class MCPRegistry:
         # contains a server with empty tools. Pre-refactor, a per-workspace
         # registry would retry on next workspace start; post-refactor, one bad
         # boot would otherwise degrade the process for its lifetime.
-        failed: list[tuple[str, Exception]] = []
+        failed: list[tuple[str, str]] = []
         for name, result in zip(connector_names, results, strict=True):
             if isinstance(result, Exception):
-                failed.append((name, result))
-                self.connectors.pop(name, None)
+                connector = self.connectors.pop(name, None)
+                reason = getattr(connector, "failure_reason", None) or str(result)
+                failed.append((name, reason))
 
         if failed:
             logger.warning(
                 "Some MCP servers failed to connect; dropped from registry",
                 error_count=len(failed),
                 failed_servers=[name for name, _ in failed],
-                errors=[str(exc) for _, exc in failed],
+                errors=[reason for _, reason in failed],
             )
 
         logger.debug("MCP servers connected", servers=list(self.connectors.keys()))

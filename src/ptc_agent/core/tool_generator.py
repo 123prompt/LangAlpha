@@ -956,6 +956,7 @@ This module manages MCP server processes and provides tool calling functionality
 It supports both stdio (subprocess) and SSE (HTTP) transports.
 """
 
+import collections
 import datetime
 import hashlib
 import json
@@ -1228,6 +1229,16 @@ def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout:
         if line is None:  # EOF sentinel from the pump thread
             _kill_server(server_name, proc)
             error_msg = f"MCP server {{server_name}} closed connection"
+            stderr_tail = "\\n".join(getattr(proc, "mcp_stderr_tail", ()))
+            if "No module named 'mcp." in stderr_tail:
+                error_msg += (
+                    " — the server crashed importing an MCP SDK module its"
+                    " runtime does not provide (incompatible mcp version in"
+                    " its environment); launch it isolated via uvx/npx with"
+                    " pinned versions"
+                )
+            if stderr_tail:
+                error_msg += f"\\nserver stderr tail:\\n{{stderr_tail}}"
             print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
             raise RuntimeError(error_msg)
         try:
@@ -1278,8 +1289,19 @@ def _spawn_mcp_process(server_name: str{discovery_param}) -> subprocess.Popen:
 
     # Drain stderr in background to prevent pipe buffer deadlock.
     # MCP servers log INFO to stderr; if the 64KB pipe buffer fills, the
-    # server blocks on write(stderr) and can't respond on stdout.
-    threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
+    # server blocks on write(stderr) and can't respond on stdout. A bounded
+    # tail is kept so a crash-on-spawn can report its cause.
+    err_tail = collections.deque(maxlen=40)
+
+    def _drain_stderr(p=proc, t=err_tail):
+        try:
+            for line in p.stderr:
+                t.append(line.rstrip("\\n"))
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+    proc.mcp_stderr_tail = err_tail
 
     # Pump stdout lines onto a queue: readers wait on the queue, not
     # select() on the fd, which goes quiet once a message burst has been
