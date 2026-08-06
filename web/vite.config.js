@@ -2,6 +2,14 @@ import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
+// Shared by the entry and the lazy vendors — see manualChunks below.
+const EAGER_SHARED = new Set(['clsx', 'use-sync-external-store'])
+const MARKDOWN = new Set([
+  'react-markdown', 'remark-gfm', 'remark-math', 'remark-cjk-friendly',
+  'rehype-katex', 'rehype-raw', 'katex',
+])
+const CHARTS = new Set(['recharts', 'lightweight-charts'])
+
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => {
   // Load VITE_-prefixed vars from .env files (.env, .env.local, …) so they can
@@ -36,12 +44,25 @@ export default defineConfig(({ mode }) => {
         // or multi-page config change starts picking up root .html files.
         input: path.resolve(__dirname, 'index.html'),
         output: {
-          manualChunks: {
-            'vendor-react': ['react', 'react-dom', 'react-router-dom'],
-            'vendor-markdown': ['react-markdown', 'remark-gfm', 'remark-math', 'remark-cjk-friendly', 'rehype-katex', 'rehype-raw', 'katex'],
-            'vendor-charts': ['recharts', 'lightweight-charts'],
-            'vendor-motion': ['framer-motion'],
-            'vendor-dnd': ['@dnd-kit/core', '@dnd-kit/sortable', '@dnd-kit/utilities'],
+          // Vendors get a pinned chunk so app deploys don't re-invalidate them.
+          //
+          // The order below is load-bearing. `clsx` and `use-sync-external-store`
+          // are imported by both the entry and the lazy vendors; left to Rollup
+          // they land in a lazy vendor chunk, and the entry then has to preload
+          // that whole chunk to reach 3 kB — which is how 170 kB of charts sat on
+          // the critical path for five months. Claiming them for an already-eager
+          // chunk first keeps the lazy vendors genuinely lazy.
+          // Enforced by scripts/check-critical-path.mjs.
+          manualChunks(id) {
+            if (!id.includes('node_modules')) return
+            const tail = id.split(/[\\/]node_modules[\\/]/).pop().split(/[\\/]/)
+            const pkg = tail[0].startsWith('@') ? `${tail[0]}/${tail[1]}` : tail[0]
+            if (EAGER_SHARED.has(pkg)) return 'vendor-react'
+            if (['react', 'react-dom', 'react-router-dom'].includes(pkg)) return 'vendor-react'
+            if (pkg === 'framer-motion') return 'vendor-motion'
+            if (pkg.startsWith('@dnd-kit')) return 'vendor-dnd'
+            if (MARKDOWN.has(pkg)) return 'vendor-markdown'
+            if (CHARTS.has(pkg)) return 'vendor-charts'
           },
         },
       },
