@@ -52,6 +52,25 @@ ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,127}$")
 # bounds it (plan §Security #4).
 ALLOWED_COMMANDS = frozenset({"npx", "uvx", "uv", "python", "python3", "node"})
 
+# Commands that resolve dependencies from the shared sandbox environment rather
+# than an isolated per-server venv. Allowed, but nudged: the platform image pins
+# their runtime (including the mcp SDK), so an SDK-major bump can kill a server
+# born outside it — the uvx/npx form is immune.
+SHARED_ENV_COMMANDS = frozenset({"uv", "python", "python3", "node"})
+
+
+def isolation_warnings(server: "McpServerInput") -> list[str]:
+    """Non-blocking policy nudges for a validated server definition."""
+    if server.transport == "stdio" and server.command in SHARED_ENV_COMMANDS:
+        return [
+            f"command {server.command!r} runs from the shared sandbox "
+            "environment, whose dependency versions (including the mcp SDK) "
+            "are pinned by the platform image and may change under it. For "
+            "third-party servers prefer an isolated launch: uvx --from "
+            "'<package>==<version>' <entrypoint> (or npx <package>@<version>)."
+        ]
+    return []
+
 DESCRIPTION_MAX = 512
 INSTRUCTION_MAX = 1024
 

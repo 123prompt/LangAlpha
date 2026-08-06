@@ -61,6 +61,7 @@ from src.server.models.mcp_server import (
     _format_validation_error,
     catalog_row_to_response,
     collect_vault_refs,
+    isolation_warnings,
     parse_mcp_servers_payload,
 )
 from src.server.services.workspace_manager import WorkspaceManager
@@ -378,7 +379,10 @@ async def add_server(
             status_code=409, detail=f"{server.name!r} already exists in this workspace"
         )
     _schedule_proactive_apply(workspace_id, user_id)
-    return {"name": row["name"], "source": row["source"], "enabled": row["enabled"]}
+    response = {"name": row["name"], "source": row["source"], "enabled": row["enabled"]}
+    if warnings := isolation_warnings(server):
+        response["warnings"] = warnings
+    return response
 
 
 async def _server_from_template(user_id: str, body: dict) -> McpServerInput:
@@ -852,7 +856,10 @@ async def edit_server(
         config=body.to_config_blob(),
     )
     _schedule_proactive_apply(workspace_id, user_id)
-    return {"name": row["name"], "source": row["source"], "enabled": row["enabled"]}
+    response = {"name": row["name"], "source": row["source"], "enabled": row["enabled"]}
+    if warnings := isolation_warnings(body):
+        response["warnings"] = warnings
+    return response
 
 
 # ---------------------------------------------------------------------------

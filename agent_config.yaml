@@ -68,6 +68,12 @@ mcp:
   # MCP server configurations
   # Note: Filesystem is now a first-class tool (see filesystem section below)
   # Each server can have 'enabled: true/false' to enable/disable it (default: true)
+  #
+  # Third-party stdio servers: always launch isolated — uvx/npx with pinned
+  # versions — never from the shared environment, whose dependency pins
+  # (including the mcp SDK) will strand them on the next SDK major. Builtin
+  # servers under mcp_servers/ are era-proof via _bootstrap and run with
+  # `uv run python`.
   servers:
     # Price data MCP server for OHLCV time series.
     - name: "price_data"
