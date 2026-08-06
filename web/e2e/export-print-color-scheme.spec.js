@@ -12,13 +12,11 @@
 // the first link; the pixel end of the chain was verified by hand at authoring
 // time (dark scheme rasterized to rgb(18,18,18), light to rgb(255,255,255)).
 import { test, expect } from '@playwright/test';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
 import { PRINT_PAGE_STYLE } from '../src/pages/ChatAgent/components/printPageStyle.ts';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const read = (p) => readFileSync(resolve(HERE, '..', p), 'utf8');
+// Shared with tv-embed-color-scheme.spec.js — both rebuild an embedded document
+// around the same index.html declaration, and a drifted copy would silently
+// guard a collision that no longer exists.
+import { readWebFile as read, indexHtmlInlineStyle } from './helpers/indexHtmlStyle.js';
 
 // Composite `color` over `backdrop` before measuring. Alpha has to be applied
 // here or a semi-transparent colour scores as its opaque base: several theme
@@ -31,19 +29,10 @@ function luminanceOver(color, backdrop) {
   return 0.2126 * mix(r, br) + 0.7152 * mix(g, bg) + 0.0722 * mix(b, bb);
 }
 
-// The rule that leaks into the print document: react-to-print builds its iframe
-// from srcdoc="<!DOCTYPE html>", so it carries no data-theme and this unscoped
-// dark branch matches for every user, light-theme ones included.
-function indexHtmlInlineStyle() {
-  const html = read('index.html');
-  const blocks = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]);
-  const scheme = blocks.find((b) => b.includes('color-scheme'));
-  // If index.html stops shipping an unscoped dark color-scheme, this test is
-  // guarding a collision that no longer exists — fail loudly rather than pass.
-  expect(scheme, 'index.html should still declare an inline color-scheme').toBeTruthy();
-  expect(scheme).toMatch(/html\s*\{[^}]*color-scheme:\s*dark/);
-  return scheme;
-}
+// `indexHtmlInlineStyle()` (imported above) reads the rule that leaks into the
+// print document: react-to-print builds its iframe from srcdoc="<!DOCTYPE
+// html>", so it carries no data-theme and index.html's unscoped dark branch
+// matches for every user, light-theme ones included.
 
 // Shape of what pagedjs injects into the parent document and react-to-print
 // then copies into the iframe. Asserted against the real dist bundle below.
