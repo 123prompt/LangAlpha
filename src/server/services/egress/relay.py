@@ -46,9 +46,9 @@ WALL_CLOCK_S = 55.0
 REQUEST_HEADER_ALLOWLIST = frozenset(
     {"accept", "content-type", "mcp-protocol-version", "mcp-session-id"}
 )
-# Vendor → sandbox: transport essentials only.
+# Vendor → sandbox: transport essentials plus the vendor's backoff hint.
 RESPONSE_HEADER_ALLOWLIST = frozenset(
-    {"content-type", "mcp-session-id", "mcp-protocol-version"}
+    {"content-type", "mcp-session-id", "mcp-protocol-version", "retry-after"}
 )
 
 
@@ -130,7 +130,9 @@ async def prepare_relay(
 
     grant = await fetch_grant_for_relay(grant_id)
     # Absent, revoked, and wrong-scope all answer the same 404 — the relay is
-    # never an oracle for other users' grant ids.
+    # never an oracle for other users' grant ids. claims.sandbox_id is carried
+    # for audit only, not authorized against: workspace↔sandbox is 1:1, so a
+    # stale sandbox's JWT reaches exactly the same grants its workspace owns.
     if (
         grant is None
         or grant["grant_status"] != "active"
@@ -141,6 +143,11 @@ async def prepare_relay(
 
     if grant["connection_status"] not in ("connected", "refresh_ambiguous"):
         raise RelayRejection(401, "needs_reauth")
+
+    # HTTP-verb grant policy (defaults to ["POST"]). The route is POST-only
+    # today, so this bites only when a grant is deliberately narrowed to [].
+    if "POST" not in (grant.get("allowed_methods") or []):
+        raise RelayRejection(403, "method_blocked", "POST not in grant policy")
 
     allowlist = grant.get("tool_allowlist")
     if (
@@ -174,14 +181,16 @@ async def prepare_relay(
 def _vendor_headers(
     prepared: PreparedRelay, incoming: dict[str, str]
 ) -> dict[str, str]:
+    # Keys normalized to lowercase: a case-preserving copy plus a title-case
+    # setdefault would put the same header on the wire twice.
     headers = {
-        k: v
+        k.lower(): v
         for k, v in incoming.items()
         if k.lower() in REQUEST_HEADER_ALLOWLIST
     }
-    headers.setdefault("Accept", "application/json, text/event-stream")
-    headers.setdefault("Content-Type", "application/json")
-    headers["Authorization"] = f"{prepared.token_type} {prepared.access_token}"
+    headers.setdefault("accept", "application/json, text/event-stream")
+    headers.setdefault("content-type", "application/json")
+    headers["authorization"] = f"{prepared.token_type} {prepared.access_token}"
     return headers
 
 
@@ -234,7 +243,7 @@ async def open_upstream(
         and current.get("access_token")
         and current["access_token"] != prepared.access_token
     ):
-        headers["Authorization"] = (
+        headers["authorization"] = (
             f"{current.get('token_type') or 'Bearer'} {current['access_token']}"
         )
         try:

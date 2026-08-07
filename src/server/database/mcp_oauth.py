@@ -160,11 +160,12 @@ async def _fetch_one(
             row = await cur.fetchone()
             if not row:
                 return None
-            out = _row_summary(row)
-            out["client_info"] = row["client_info"]
-            out["as_metadata"] = row["as_metadata"]
-            out["resource_metadata"] = row["resource_metadata"]
-            out["token_type"] = row["token_type"]
+            # Native types throughout — lifecycle does expiry math on
+            # expires_at; the ISO-string form is list_connections' concern.
+            out = dict(row)
+            out["connection_id"] = str(row["connection_id"])
+            for plain in ("access_token_plain", "refresh_token_plain", "client_secret_plain"):
+                out.pop(plain, None)
             if decrypt:
                 out["access_token"] = row["access_token_plain"]
                 out["refresh_token"] = row["refresh_token_plain"]
