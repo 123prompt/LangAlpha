@@ -53,6 +53,15 @@ class Session:
         self.mcp_tool_summary: str | None = None
         self.mcp_config_version: int | None = None
 
+        # Egress-relay binding state for OAuth-connected servers: the
+        # server→grant map last pushed to the sandbox, the JWT's expiry epoch
+        # (drives the cheap remint check on the warm fast path), and the
+        # user_id the grants/JWT were minted for (Session has no user_id;
+        # remint happens on paths where it isn't otherwise in hand).
+        self.egress_grants: dict[str, str] = {}
+        self.egress_jwt_exp: float | None = None
+        self.egress_user_id: str | None = None
+
         # The platform-secret fleet generation whose bindings were last applied
         # to this session's sandbox (the ``mcp_config_version`` analog) — lets
         # the per-acquisition resync short-circuit without touching the provider.

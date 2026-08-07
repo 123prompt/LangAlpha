@@ -194,6 +194,9 @@ class MCPServerConfig(BaseModel):
     # this server — the server is then bound through the egress relay and its
     # sandbox config carries a grant reference instead of the vendor URL.
     oauth_connection_id: str | None = None
+    # Set when the workspace has an active egress grant for this OAuth-bound
+    # server; the generated client dials the relay with this id, never the vendor.
+    egress_grant_id: str | None = None
 
 
 class MCPConfig(BaseModel):

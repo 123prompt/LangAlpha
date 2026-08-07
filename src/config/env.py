@@ -52,6 +52,11 @@ PDF_RENDER_INTERNAL_BASE: str = os.getenv("PDF_RENDER_INTERNAL_BASE", "http://12
 # then have no execution path, but nothing else is affected.
 EGRESS_RELAY_SECRET: str = os.getenv("EGRESS_RELAY_SECRET", "")
 
+# Base URL sandboxes use to reach the egress relay. Sandboxes are remote (or in
+# OSS Docker, on a different network), so this must be a sandbox-reachable
+# address; defaults to the public server base.
+EGRESS_RELAY_BASE_URL: str = os.getenv("EGRESS_RELAY_BASE_URL", "") or SERVER_BASE_URL
+
 # Credit conversion rate (USD → credits).  Override with USD_TO_CREDITS_RATE env var.
 USD_TO_CREDITS_RATE: int = int(os.getenv("USD_TO_CREDITS_RATE", "1000"))
 

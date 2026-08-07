@@ -64,6 +64,9 @@ def _make_session(*, version=None, summary=None):
     session._builtin_mcp_registry = session.mcp_registry
     session.mcp_tool_summary = summary
     session.mcp_config_version = version
+    session.egress_grants = {}
+    session.egress_jwt_exp = None
+    session.egress_user_id = None
     return session
 
 
@@ -363,9 +366,11 @@ class TestVersionDeltaBackgroundDiscovery:
         alpha = MagicMock()
         alpha.name = "alpha"
         alpha.source = "workspace"
+        alpha.oauth_connection_id = None
         beta = MagicMock()
         beta.name = "beta"
         beta.source = "workspace"
+        beta.oauth_connection_id = None
         resolved = _resolved(2, servers=[alpha, beta])
 
         needing = wm._servers_needing_discovery(session, resolved)

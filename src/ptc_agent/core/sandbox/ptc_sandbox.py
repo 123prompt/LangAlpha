@@ -125,6 +125,10 @@ class PTCSandbox:
     def _token_file_path(self) -> str:
         return f"{self._work_dir}/_internal/.mcp_tokens.json"
 
+    @property
+    def _egress_relay_file_path(self) -> str:
+        return f"{self._work_dir}/_internal/.egress_relay.json"
+
     # ── Effective vs built-in server views ───────────────────────────────
     #
     # ``self.config.mcp.servers`` holds the per-workspace EFFECTIVE set the
@@ -510,6 +514,47 @@ class PTCSandbox:
             logger.info("Uploaded vault secrets file", path=vault_path)
         except Exception as e:
             logger.warning("Failed to upload vault secrets file", error=str(e))
+
+    async def upload_egress_relay_credentials(self, payload: dict | None) -> None:
+        """Write (or remove) the egress-relay credential file in the sandbox.
+
+        Carries the relay base URL, the sandbox's relay JWT, and the
+        server→grant map. The generated MCP client reads it at call time, so a
+        re-upload (JWT remint, grant change) needs no sandbox convergence.
+        """
+        if not self.runtime:
+            return
+
+        path = self._egress_relay_file_path
+
+        if not payload:
+            try:
+                await self._runtime_call(
+                    self.runtime.exec,
+                    f"rm -f {path}",
+                    retry_policy=RetryPolicy.SAFE,
+                )
+            except Exception as e:
+                logger.warning("Failed to remove egress relay file", error=str(e))
+            return
+
+        try:
+            await self._runtime_call(
+                self.runtime.upload_file,
+                json.dumps(payload).encode("utf-8"),
+                path,
+                retry_policy=RetryPolicy.SAFE,
+            )
+            # Docker's tar upload lands 0644; the relay JWT must not be
+            # readable by other sandbox users.
+            await self._runtime_call(
+                self.runtime.exec,
+                f"chmod 600 {path}",
+                retry_policy=RetryPolicy.SAFE,
+            )
+            logger.debug("Uploaded egress relay credentials", path=path)
+        except Exception as e:
+            logger.warning("Failed to upload egress relay credentials", error=str(e))
 
     async def ensure_sandbox_ready(self) -> None:
         await self._wait_ready()
