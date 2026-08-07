@@ -305,6 +305,17 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to start PlatformSecretSweeper: {e}")
 
+        # MCP OAuth refresh sweep: proactively refreshes expiring connection
+        # tokens (per-connection advisory try-lock dedups across workers).
+        try:
+            from src.server.services.mcp_oauth.sweep import (
+                McpOAuthRefreshSweeper,
+            )
+
+            McpOAuthRefreshSweeper.get_instance().start()
+        except Exception as e:
+            logger.warning(f"Failed to start McpOAuthRefreshSweeper: {e}")
+
         # Connect once, freeze, install as the process-global registry so every
         # Session borrows the same tool snapshot instead of spawning its own
         # MCP cohort. Failures here are non-fatal: Sessions fall back to a
@@ -612,6 +623,13 @@ async def lifespan(app: FastAPI):
         await PlatformSecretSweeper.get_instance().stop()
     except Exception as e:
         logger.warning(f"Error stopping PlatformSecretSweeper: {e}")
+
+    try:
+        from src.server.services.mcp_oauth.sweep import McpOAuthRefreshSweeper
+
+        await McpOAuthRefreshSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error stopping McpOAuthRefreshSweeper: {e}")
 
     # 0.0b. Stop the turn-cancel nudge listener.
     try:
@@ -1011,6 +1029,7 @@ from src.server.app.memo import router as memo_router
 from src.server.app.memory import router as memory_router
 from src.server.app.workflows import include_workflow_router
 from src.server.app.mcp_catalog import router as mcp_catalog_router
+from src.server.app.mcp_oauth import router as mcp_oauth_router
 from src.server.app.mcp_servers import router as mcp_servers_router
 
 # Conditionally import ginlix-data WS proxy (only when GINLIX_DATA_WS_URL is set)
@@ -1091,7 +1110,10 @@ app.include_router(
 include_workflow_router(app)  # /api/v1/workflows/* - Reusable JavaScript workflows
 app.include_router(
     mcp_catalog_router
-)  # /api/v1/mcp/servers - User-level MCP server catalog (templates)
+)  # /api/v1/mcp/servers - User-level MCP servers (Connectors backing store)
+app.include_router(
+    mcp_oauth_router
+)  # /api/v1/mcp/servers/{name}/oauth + /api/v1/mcp/oauth/callback - MCP OAuth
 app.include_router(
     mcp_servers_router
 )  # /api/v1/workspaces/{id}/mcp/servers - Per-workspace MCP server config
