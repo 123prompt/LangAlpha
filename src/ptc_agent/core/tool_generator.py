@@ -37,7 +37,8 @@ logger = structlog.get_logger(__name__)
 # interpreter is not one of them.
 # "4": MCP 2026-07-28 client — server/discover negotiation with legacy
 # initialize fallback, per-request _meta, id-matched replies, structuredContent
-# preference, resultType handling, spec HTTP headers, legacy "sse" rejected.
+# preference, resultType handling, spec HTTP headers, legacy "sse" rejected;
+# relay-bound OAuth servers — vendor calls ride POST {base}/v1/egress/{id}.
 MCP_CLIENT_CODEGEN_VERSION = "4"
 
 # Aggregate per-execution ceiling on result_body bytes emitted BY THE GENERATED
@@ -592,7 +593,7 @@ except ImportError:
 
         return doc
 
-    def _vault_runtime_block(self, working_dir: str) -> str:
+    def _vault_runtime_block(self, working_dir: str, *, has_relay: bool = False) -> str:
         """Runtime helpers for vault-only secret resolution (workspace servers).
 
         Emitted into the generated client ONLY when at least one workspace
@@ -603,6 +604,12 @@ except ImportError:
         vault file is absent, so refs resolve to an inert placeholder.
         """
         # NOTE: keep this pattern byte-identical to mcp_sanitize.VAULT_REF_RE.
+        relay_route = (
+            '    if config.get("relay_bound"):\n'
+            "        return _resolve_relay(config, server_name)\n\n"
+            if has_relay
+            else ""
+        )
         return f'''
 import re as _re
 
@@ -643,12 +650,12 @@ def _resolve_vault_refs(value, vault, *, missing, discovery=False):
 def _build_proc_env(config, server_name="?", *, discovery=False):
     """Build the stdio subprocess env.
 
-    Builtin servers inherit os.environ. Workspace (untrusted) servers get a
+    Builtin servers inherit os.environ. Workspace/user (untrusted) servers get a
     MINIMAL scoped env (PATH/HOME plus only their own declared env values), with
     ${{vault:NAME}} refs resolved vault-only — never the sandbox's full
     os.environ, never a host-env fallback.
     """
-    if config.get("source") != "workspace":
+    if config.get("source") not in ("workspace", "user"):
         proc_env = os.environ.copy()
         for key in config.get("env_keys", []):
             if key in os.environ:
@@ -693,7 +700,7 @@ def _resolve_cmd_args(config, server_name, *, discovery=False):
     discovery, where they become inert placeholders.
     """
     args = list(config.get("args") or [])
-    if config.get("source") != "workspace":
+    if config.get("source") not in ("workspace", "user"):
         return args
     vault = _load_vault() if (not discovery or config.get("discovery_uses_secrets")) else {{}}
     missing = []
@@ -718,8 +725,8 @@ def _resolve_sse(config, server_name, *, discovery=False):
     the resolved headers. Missing refs raise (named, never valued) unless in
     discovery, where they become inert placeholders.
     """
-    url = config.get("url", "") or ""
-    if config.get("source") != "workspace":
+{relay_route}    url = config.get("url", "") or ""
+    if config.get("source") not in ("workspace", "user"):
         def _env_sub(match):
             return os.environ.get(match.group(1), match.group(0))
 
@@ -741,6 +748,72 @@ def _resolve_sse(config, server_name, *, discovery=False):
             + repr(server_name) + ": " + ", ".join(sorted(set(missing)))
         )
     return url, headers
+'''
+
+    def _relay_runtime_block(self, working_dir: str) -> str:
+        """Egress-relay client runtime, emitted only when an OAuth-connected
+        server is present.
+
+        Credentials are read from the sandbox file at CALL time — never embedded
+        — so a host-side JWT remint or grant change needs zero codegen resync.
+        The vendor URL never appears in generated code; the relay is the only
+        destination an OAuth-bound server ever dials.
+        """
+        return f'''
+_EGRESS_RELAY_FILE = "{working_dir}/_internal/.egress_relay.json"
+
+# Relay rejection codes (X-Relay-Error header) -> actionable guidance.
+_RELAY_ERROR_HINTS = {{
+    "needs_reauth": "the OAuth connection needs re-authorization; reconnect the server in Connectors",
+    "relay_auth": "this sandbox's relay credentials are invalid or expired",
+    "tool_blocked": "the tool is not permitted by this connection's policy",
+    "refresh_in_progress": "the vendor token is being refreshed; retry in a few seconds",
+    "limited_rate": "rate limit reached for this connection; retry shortly",
+    "limited_concurrency": "too many concurrent calls for this connection; retry shortly",
+    "relay_disabled": "the egress relay is disabled on this deployment",
+    "wall_clock": "the call exceeded the relay's time budget",
+}}
+
+
+def _load_relay_credentials() -> dict:
+    """Read the relay credential file fresh (it is re-minted host-side)."""
+    for _attempt in (0, 1):
+        try:
+            with open(_EGRESS_RELAY_FILE) as _f:
+                return json.load(_f)
+        except ValueError:
+            time.sleep(0.2)  # caught mid-rewrite; one retry
+        except (FileNotFoundError, OSError):
+            break
+    return {{}}
+
+
+def _relay_error(response, server_name: str):
+    """Actionable message when the RELAY (not the vendor) rejected the call.
+
+    Returns None for vendor responses — the relay's response-header allowlist
+    guarantees X-Relay-Error only ever originates from the relay itself.
+    """
+    code = response.headers.get("x-relay-error")
+    if not code:
+        return None
+    hint = _RELAY_ERROR_HINTS.get(code, code)
+    return f"MCP server {{server_name}}: relay rejected the call [{{code}}]: {{hint}}"
+
+
+def _resolve_relay(config, server_name):
+    """(url, headers) for an OAuth-connected server: always the egress relay."""
+    creds = _load_relay_credentials()
+    grant_id = (creds.get("grants") or {{}}).get(server_name) or config.get("relay_grant_id")
+    base = (creds.get("relay_base_url") or "").rstrip("/")
+    token = creds.get("token") or ""
+    if not (grant_id and base and token):
+        raise RuntimeError(
+            f"MCP server {{server_name}} is OAuth-connected but this sandbox has "
+            "no relay credentials - the egress relay may be disabled, or the "
+            "binding failed at session start; check the connection in Connectors"
+        )
+    return base + "/v1/egress/" + str(grant_id), {{"Authorization": "Bearer " + token}}
 '''
 
     def generate_mcp_client_code(
@@ -767,18 +840,35 @@ def _resolve_sse(config, server_name, *, discovery=False):
         # in os.environ (injected by _build_sandbox_env_vars at creation time),
         # so the generated code resolves them from os.environ at runtime.
         #
-        # Workspace servers (source == "workspace", untrusted): env/header
-        # values may hold ``${vault:NAME}`` references. Those resolve ONLY from
-        # _internal/.vault_secrets.json — never from host os.environ — and a
-        # stdio server's subprocess gets a minimal scoped env (PATH/HOME plus
-        # its own declared values). The vault machinery is emitted only when at
-        # least one workspace server is present, so a builtin-only config yields
+        # Workspace/user servers (source == "workspace" | "user", untrusted):
+        # env/header values may hold ``${vault:NAME}`` references. Those resolve
+        # ONLY from _internal/.vault_secrets.json — never from host os.environ —
+        # and a stdio server's subprocess gets a minimal scoped env (PATH/HOME
+        # plus its own declared values). The vault machinery is emitted only when
+        # at least one such server is present, so a builtin-only config yields
         # the byte-identical module it always has (no `vault` references appear).
+        #
+        # OAuth-connected servers (oauth_connection_id set) are relay-bound:
+        # their sandbox config carries a grant reference and the generated code
+        # dials the egress relay — the vendor URL and every token stay host-side.
         has_workspace = any(is_user_server(s) for s in server_configs)
+        has_relay = any(
+            getattr(s, "oauth_connection_id", None) for s in server_configs
+        )
 
         servers_dict = "{\n"
         for server in server_configs:
             is_workspace = is_user_server(server)
+            if getattr(server, "oauth_connection_id", None):
+                grant = getattr(server, "egress_grant_id", None)
+                servers_dict += f"""    "{server.name}": {{
+        "transport": "http",
+        "source": {server.source!r},
+        "relay_bound": True,
+        "relay_grant_id": {grant!r},
+    }},
+"""
+                continue
             if server.transport in ("sse", "http"):
                 url = server.url or ""
                 if is_workspace:
@@ -787,7 +877,7 @@ def _resolve_sse(config, server_name, *, discovery=False):
                     servers_dict += f"""    "{server.name}": {{
         "transport": "{server.transport}",
         "url": {url!r},
-        "source": "workspace",
+        "source": {server.source!r},
         "headers": {headers_repr},
         "discovery_uses_secrets": {dus!r},
     }},
@@ -835,7 +925,7 @@ def _resolve_sse(config, server_name, *, discovery=False):
         "transport": "stdio",
         "command": "{command}",
         "args": [{args_list}],
-        "source": "workspace",
+        "source": {server.source!r},
         "env": {env_repr},
         "discovery_uses_secrets": {dus!r},
     }},
@@ -855,7 +945,44 @@ def _resolve_sse(config, server_name, *, discovery=False):
 """
         servers_dict += "}"
 
-        vault_block = self._vault_runtime_block(working_dir) if has_workspace else ""
+        vault_block = (
+            self._vault_runtime_block(working_dir, has_relay=has_relay)
+            if has_workspace
+            else ""
+        )
+        relay_block = self._relay_runtime_block(working_dir) if has_relay else ""
+
+        # Relay error handling in the HTTP call/negotiate paths, emitted only
+        # when a relay-bound server exists so other configs stay noise-free.
+        if has_relay:
+            relay_call_handling = (
+                "            _msg = _relay_error(response, server_name)\n"
+                '            if _msg and response.headers.get("x-relay-error") == "relay_auth":\n'
+                "                # The credential file may have been re-minted between\n"
+                "                # our read and this call - re-read it and retry once.\n"
+                "                url, _headers = _resolve_sse(config, server_name)\n"
+                '                headers = _mcp_headers("tools/call", tool_name, proto, _headers)\n'
+                "                response = client.post(url, json=request, headers=headers)\n"
+                "                _msg = _relay_error(response, server_name)\n"
+                "            if _msg:\n"
+                "                # A relay rejection also invalidates the negotiated\n"
+                "                # vendor session (e.g. reconnect mints a new grant).\n"
+                "                _PROTO.pop(server_name, None)\n"
+                "                raise RuntimeError(_msg)\n"
+            )
+            relay_init_check = (
+                "            _msg = _relay_error(response, server_name)\n"
+                "            if _msg:\n"
+                "                raise RuntimeError(_msg)\n"
+            )
+        else:
+            relay_call_handling = ""
+            relay_init_check = ""
+        # Relay-bound configs carry no vendor URL by design — their URL comes
+        # from _resolve_relay at request time, so the no-URL guard must not fire.
+        relay_url_exempt = (
+            ' and not config.get("relay_bound")' if has_relay else ""
+        )
 
         # The stdio env-setup section. For builtin-only configs it is the
         # historical inline block (byte-identical). When any workspace server is
@@ -993,7 +1120,7 @@ _CALL_TIMEOUT = 120.0
 
 # MCP server configurations
 _SERVER_CONFIGS = {servers_dict}
-{vault_block}
+{vault_block}{relay_block}
 # Per-execution running sum of emitted result_body bytes. Each execute_code runs
 # in a FRESH interpreter process — both the Daytona and Docker providers spawn a
 # new `python` per code_run (a one-shot run, NOT a persistent kernel/session), so
@@ -1444,7 +1571,18 @@ def _parse_http_reply(response, want_id: int, server_name: str) -> dict:
             message = json.loads(payload)
         except json.JSONDecodeError:
             return None
-        if isinstance(message, dict) and message.get("id") == want_id and "method" not in message:
+        if not isinstance(message, dict):
+            return None
+        if "method" in message and "id" in message:
+            # Server-initiated request (sampling/elicitation): unsupported —
+            # fail fast instead of scanning on until the stream times out.
+            msg = (
+                f"MCP server {{server_name}}: server-initiated request "
+                f"{{message['method']!r}} is not supported by this client "
+                "[unsupported_server_request]"
+            )
+            raise RuntimeError(msg)
+        if message.get("id") == want_id and "method" not in message:
             return message
         return None
 
@@ -1487,7 +1625,7 @@ def _ensure_http_server(server_name: str{discovery_param}) -> dict:
         raise ValueError(msg)
 
     url = config.get("url")
-    if not url:
+    if not url{relay_url_exempt}:
         msg = f"Remote MCP server {{server_name}} has no URL configured"
         raise ValueError(msg)
 {sse_init_resolve}
@@ -1524,7 +1662,7 @@ def _ensure_http_server(server_name: str{discovery_param}) -> dict:
             init_headers = {{"Accept": "application/json, text/event-stream"}}
             init_headers.update(_headers)
             response = client.post(url, json=init, headers=init_headers)
-            response.raise_for_status()
+{relay_init_check}            response.raise_for_status()
             reply = _parse_http_reply(response, init["id"], server_name)
             if "error" in reply:
                 msg = f"MCP SSE initialization failed: {{reply['error']}}"
@@ -1574,9 +1712,25 @@ def _call_mcp_tool_http(server_name: str, tool_name: str, arguments: dict[str, A
             request = _legacy_request("tools/call", params)
         headers = _mcp_headers("tools/call", tool_name, proto, _headers)
 
-        # Send request via HTTP POST
-        with httpx.Client(timeout=60.0) as client:
+        # Send request via HTTP POST. The 65s outer timeout sits strictly above
+        # the egress relay's 55s hard wall so relay budget errors stay typed.
+        with httpx.Client(timeout=65.0) as client:
             response = client.post(url, json=request, headers=headers)
+{relay_call_handling}            if (
+                response.status_code == 404
+                and proto.get("mode") == "legacy"
+                and proto.get("session_id")
+            ):
+                # 2025-11-25 session expiry: the server dropped our session id.
+                # Reinitialize once and retry with the fresh session.
+                _PROTO.pop(server_name, None)
+                proto = _ensure_http_server(server_name)
+                if proto["mode"] == "modern":
+                    request = _modern_request("tools/call", params, proto["version"])
+                else:
+                    request = _legacy_request("tools/call", params)
+                headers = _mcp_headers("tools/call", tool_name, proto, _headers)
+                response = client.post(url, json=request, headers=headers)
             response.raise_for_status()
             result = _parse_http_reply(response, request["id"], server_name)
 
