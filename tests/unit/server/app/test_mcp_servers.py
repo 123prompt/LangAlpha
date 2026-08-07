@@ -70,6 +70,30 @@ async def client():
         yield c
 
 
+@pytest.fixture(autouse=True)
+def _no_user_level_rows():
+    """Default the user-level (Connectors) reads to empty.
+
+    Tests exercising the inherited layer re-patch these inside their own
+    ``with`` blocks; everything else keeps its pre-Connectors behavior.
+    """
+    with (
+        patch(
+            "src.server.app.mcp_servers.get_user_secret_names",
+            new=AsyncMock(return_value=set()),
+        ),
+        patch(
+            "src.server.app.mcp_servers.get_user_tool_schemas",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Status derivation (pure unit)
 # ---------------------------------------------------------------------------
@@ -439,10 +463,12 @@ async def test_add_server_409_when_name_exists(client):
     # insert_workspace_server returning None — must be a 409, never a silent 201.
     ws = _ws()
     base = _agent_config([])
+    existing = [{"name": "dupe_server", "source": "workspace", "enabled": True}]
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
         patch("src.server.app.mcp_servers.insert_workspace_server", new=AsyncMock(return_value=None)) as ins,
+        patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=existing)),
     ):
         resp = await client.post(
             f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers",
@@ -1204,6 +1230,7 @@ async def test_patch_workspace_row_404_when_absent(client):
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=[])),
         patch("src.server.app.mcp_servers.set_workspace_server_enabled", new=AsyncMock(return_value=False)),
     ):
         resp = await client.patch(
@@ -1236,9 +1263,11 @@ async def test_delete_builtin_409(client):
 async def test_delete_workspace_row_happy(client):
     ws = _ws()
     base = _agent_config([])
+    existing = [{"name": "remote_server", "source": "workspace", "enabled": True}]
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=existing)),
         patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)),
     ):
         resp = await client.delete(

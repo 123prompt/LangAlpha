@@ -31,16 +31,42 @@ def _ws_row(name, source="workspace", enabled=True, config=None):
     return {"name": name, "source": source, "enabled": enabled, "config": config}
 
 
-def _patch_db_target(rows, version):
-    """Patch the resolver's single snapshot-consistent DB read."""
-    return patch(
-        "src.server.database.mcp_servers.get_workspace_servers_and_version",
-        new=AsyncMock(return_value=(rows, version)),
-    )
+def _user_row(name, **overrides):
+    """Build a user_mcp_servers row dict (flat columns) as the DB layer returns it."""
+    row = {
+        "name": name,
+        "transport": "http",
+        "command": None,
+        "args": [],
+        "url": f"https://{name}.example.test/mcp",
+        "env": {},
+        "headers": {},
+        "description": "",
+        "instruction": "",
+        "tool_exposure_mode": "summary",
+        "discovery_uses_secrets": False,
+        "enabled": True,
+    }
+    row.update(overrides)
+    return row
 
 
-async def _resolve(base, rows, version=0):
-    with _patch_db_target(rows, version):
+async def _resolve(base, rows, version=0, user_rows=None, connections=None):
+    """Run resolve_mcp_config with all three DB reads mocked."""
+    with (
+        patch(
+            "src.server.database.mcp_servers.get_workspace_servers_and_version",
+            new=AsyncMock(return_value=(rows, version)),
+        ),
+        patch(
+            "src.server.database.mcp_servers.list_enabled_user_servers",
+            new=AsyncMock(return_value=list(user_rows or [])),
+        ),
+        patch(
+            "src.server.database.mcp_oauth.list_connections",
+            new=AsyncMock(return_value=list(connections or [])),
+        ),
+    ):
         return await resolve_mcp_config(base, "user-1", "ws-1")
 
 
@@ -243,3 +269,134 @@ class TestResolveMergePrecedence:
         )
         resolved = await _resolve(base, rows=[])
         assert [s.name for s in resolved.servers] == ["alpha"]
+
+
+# ---------------------------------------------------------------------------
+# resolve_mcp_config — inherited user-level layer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestResolveInheritedLayer:
+    async def test_inherited_server_between_builtins_and_local(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("local", config={"transport": "stdio", "command": "npx"})]
+        user_rows = [_user_row("acme")]
+
+        resolved = await _resolve(base, rows, user_rows=user_rows)
+
+        assert [s.name for s in resolved.servers] == ["alpha", "acme", "local"]
+        assert resolved.inherited_names == frozenset({"acme"})
+        assert resolved.user_names == frozenset({"local"})
+        acme = resolved.servers[1]
+        assert acme.source == "user"
+        assert acme.oauth_connection_id is None
+
+    async def test_inherited_only_still_resolves_without_workspace_rows(self):
+        # user servers alone must defeat the zero-row builtin short-circuit.
+        b1 = MCPServerConfig(name="alpha")
+        base = _base_config(b1)
+
+        resolved = await _resolve(base, rows=[], user_rows=[_user_row("acme")])
+
+        assert [s.name for s in resolved.servers] == ["alpha", "acme"]
+
+    async def test_inherited_sorted_alphabetically(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        user_rows = [_user_row("zulu"), _user_row("bravo"), _user_row("mike")]
+
+        resolved = await _resolve(base, rows=[], user_rows=user_rows)
+
+        assert [s.name for s in resolved.servers] == [
+            "alpha", "bravo", "mike", "zulu",
+        ]
+
+    async def test_tombstone_removes_inherited_from_this_workspace(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("acme", source="user", enabled=False, config=None)]
+
+        resolved = await _resolve(base, rows, user_rows=[_user_row("acme")])
+
+        assert [s.name for s in resolved.servers] == ["alpha"]
+        assert resolved.inherited_names == frozenset()
+        # Carried (full config) so the UI keeps a re-enable toggle.
+        assert [s.name for s in resolved.tombstoned_inherited_servers] == ["acme"]
+
+    async def test_workspace_local_shadows_inherited(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("acme", config={"transport": "stdio", "command": "npx"})]
+
+        resolved = await _resolve(base, rows, user_rows=[_user_row("acme")])
+
+        names = [s.name for s in resolved.servers]
+        assert names == ["alpha", "acme"]
+        # The one effective 'acme' is the LOCAL fork, not the inherited config.
+        assert resolved.servers[1].source == "workspace"
+        assert resolved.shadowed_inherited_names == frozenset({"acme"})
+        assert resolved.inherited_names == frozenset()
+
+    async def test_disabled_local_fork_still_shadows_inherited(self):
+        # A disabled local fork must not fall back to running the inherited
+        # config the user explicitly forked away from.
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [
+            _ws_row(
+                "acme", enabled=False,
+                config={"transport": "stdio", "command": "npx"},
+            )
+        ]
+
+        resolved = await _resolve(base, rows, user_rows=[_user_row("acme")])
+
+        assert [s.name for s in resolved.servers] == ["alpha"]
+        assert resolved.shadowed_inherited_names == frozenset({"acme"})
+        assert [s.name for s in resolved.disabled_workspace_servers] == ["acme"]
+
+    async def test_user_server_colliding_with_builtin_is_skipped(self):
+        b1 = MCPServerConfig(name="alpha")
+        base = _base_config(b1)
+
+        resolved = await _resolve(base, rows=[], user_rows=[_user_row("alpha")])
+
+        assert [s.name for s in resolved.servers] == ["alpha"]
+        assert resolved.servers[0] is b1
+        assert resolved.inherited_names == frozenset()
+
+    async def test_oauth_connection_id_annotated(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        connections = [
+            {
+                "connection_id": "conn-1",
+                "server_name": "acme",
+                "status": "connected",
+            },
+            {
+                "connection_id": "conn-2",
+                "server_name": "gone",
+                "status": "revoked",
+            },
+        ]
+
+        resolved = await _resolve(
+            base,
+            rows=[],
+            user_rows=[_user_row("acme"), _user_row("gone")],
+            connections=connections,
+        )
+
+        by_name = {s.name: s for s in resolved.servers}
+        assert by_name["acme"].oauth_connection_id == "conn-1"
+        # A revoked connection never binds a server to the relay.
+        assert by_name["gone"].oauth_connection_id is None
+
+    async def test_inert_enabled_user_marker_row_is_skipped(self):
+        # An (source='user', enabled=true) row is meaningless — not a tombstone,
+        # not a local config. It must neither run nor block the inherited server.
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("acme", source="user", enabled=True, config=None)]
+
+        resolved = await _resolve(base, rows, user_rows=[_user_row("acme")])
+
+        assert [s.name for s in resolved.servers] == ["alpha", "acme"]
+        assert resolved.servers[1].source == "user"
+        assert resolved.inherited_names == frozenset({"acme"})

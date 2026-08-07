@@ -493,7 +493,7 @@ class EffectiveServer(BaseModel):
     """
 
     name: str
-    origin: Literal["builtin", "workspace"]
+    origin: Literal["builtin", "user", "workspace"]
     transport: str
     enabled: bool
     editable: bool
@@ -515,6 +515,10 @@ class EffectiveServer(BaseModel):
     args: list[str] = Field(default_factory=list)
     url: Optional[str] = None
     config_version: int = 0
+    # True on a workspace-local row that shadows an inherited user server of
+    # the same name (the local-fork affordance) — deleting the local row
+    # reveals the inherited one again.
+    shadows_inherited: bool = False
 
 
 class EffectiveServerList(BaseModel):
@@ -536,10 +540,18 @@ class EffectiveServerList(BaseModel):
 
 
 class CatalogServer(BaseModel):
-    """A user catalog template row (masked — only vault refs surfaced)."""
+    """A user-level server row (masked — only vault refs surfaced).
+
+    ``enabled`` rows are live: inherited into every one of the user's
+    workspaces by ``resolve_mcp_config``. Disabled rows are inert templates
+    (the legacy catalog behavior). ``oauth_status`` reflects the user's OAuth
+    connection for this server name (None when the server has none).
+    """
 
     name: str
     transport: str
+    enabled: bool = False
+    oauth_status: Optional[str] = None
     command: Optional[str] = None
     args: list[str] = Field(default_factory=list)
     url: Optional[str] = None
@@ -574,11 +586,15 @@ def collect_vault_refs(mapping: dict[str, str] | None) -> list[str]:
     return sorted(names)
 
 
-def catalog_row_to_response(row: dict[str, Any]) -> CatalogServer:
+def catalog_row_to_response(
+    row: dict[str, Any], *, oauth_status: str | None = None
+) -> CatalogServer:
     """Mask a DB catalog row: drop env/header literals, expose vault refs only."""
     return CatalogServer(
         name=row["name"],
         transport=row["transport"],
+        enabled=bool(row.get("enabled", False)),
+        oauth_status=oauth_status,
         command=row.get("command"),
         args=row.get("args") or [],
         url=row.get("url"),

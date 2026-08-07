@@ -35,6 +35,7 @@ from src.server.database.mcp_servers import (
     delete_workspace_server,
     get_catalog_server,
     get_tool_schemas,
+    get_user_tool_schemas,
     get_workspace_servers_and_version,
     insert_workspace_server,
     list_workspace_servers,
@@ -42,6 +43,7 @@ from src.server.database.mcp_servers import (
     update_catalog_server,
     upsert_workspace_server,
 )
+from src.server.database.user_vault_secrets import get_user_secret_names
 from src.server.database.vault_secrets import (
     create_secret as create_secret_db,
     delete_secret as delete_secret_db,
@@ -105,6 +107,12 @@ async def _require_owned_workspace(workspace_id: str, user_id: str) -> dict:
     workspace = await db_get_workspace(workspace_id)
     require_workspace_owner(workspace, user_id=user_id)
     return workspace
+
+
+async def _is_inherited_user_server(user_id: str, name: str) -> bool:
+    """True when ``name`` is one of the user's enabled (live) Connectors servers."""
+    row = await get_catalog_server(user_id, name)
+    return bool(row and row.get("enabled"))
 
 
 def _missing_secrets(
@@ -238,81 +246,106 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
             max_servers=MAX_MCP_SERVERS_PER_WORKSPACE, config_version=0,
         )
 
-    resolved, secret_names, schema_rows = await asyncio.gather(
-        resolve_mcp_config(base_config, user_id, workspace_id),
-        get_workspace_secret_names(workspace_id),
-        get_tool_schemas(workspace_id),
+    resolved, secret_names, schema_rows, user_secret_names, user_schema_rows = (
+        await asyncio.gather(
+            resolve_mcp_config(base_config, user_id, workspace_id),
+            get_workspace_secret_names(workspace_id),
+            get_tool_schemas(workspace_id),
+            get_user_secret_names(user_id),
+            get_user_tool_schemas(user_id),
+        )
     )
     schema_by_name = {r["server_name"]: r for r in schema_rows}
+    # The sandbox vault merges user + workspace secrets (workspace wins), so a
+    # ref resolvable from either tier is satisfied.
+    merged_secret_names = set(secret_names) | set(user_secret_names)
+
+    def _schema_for(srv: Any, origin: str) -> dict[str, Any] | None:
+        """Hash-checked schema-cache row for one server, or None.
+
+        Accept a cached snapshot only if it's for THIS server's current config.
+        A stale-hash row (the server's own config changed but it hasn't been
+        re-discovered yet) reads as pending → re-verify; an unrelated mutation
+        leaves the hash untouched → the row stays a valid hit. Inherited
+        servers check the per-workspace cache first (in-sandbox discovery),
+        then the user-level cache (host-side OAuth discovery).
+        """
+        if origin == "builtin":
+            return None
+        fingerprint = mcp_discovery_fingerprint(srv)
+        row = schema_by_name.get(srv.name)
+        if row is not None and row.get("config_hash") == fingerprint:
+            return row
+        if origin == "user":
+            for user_row in user_schema_rows:
+                if (
+                    user_row["server_name"] == srv.name
+                    and user_row.get("config_hash") == fingerprint
+                ):
+                    return user_row
+        return None
+
+    def _row_for(srv: Any, origin: str, *, enabled: bool) -> EffectiveServer:
+        env_refs = collect_vault_refs(dict(srv.env or {}))
+        header_refs = collect_vault_refs(dict(srv.headers or {}))
+        if enabled:
+            schema_row = _schema_for(srv, origin)
+            status, error, missing = _derive_status(
+                origin=origin,
+                env_refs=env_refs,
+                header_refs=header_refs,
+                secret_names=(
+                    merged_secret_names if origin == "user" else secret_names
+                ),
+                schema_row=schema_row,
+            )
+            tools = _tools_from_schema(schema_row)
+        else:
+            status, error, missing, tools = "disabled", "", [], []
+        row = _effective_server(
+            srv,
+            origin=origin,
+            enabled=enabled,
+            status=status,
+            error=error,
+            tools=tools,
+            missing_secrets=missing,
+            env_refs=env_refs,
+            header_refs=header_refs,
+            config_version=resolved.version,
+        )
+        if origin == "workspace" and srv.name in resolved.shadowed_inherited_names:
+            row.shadows_inherited = True
+        return row
 
     servers: list[EffectiveServer] = []
     for srv in resolved.servers:
-        origin = "builtin" if srv.name in resolved.builtin_names else "workspace"
-        env_refs = collect_vault_refs(dict(srv.env or {}))
-        header_refs = collect_vault_refs(dict(srv.headers or {}))
-        schema_row = schema_by_name.get(srv.name) if origin == "workspace" else None
-        # Accept a cached snapshot only if it's for THIS server's current config.
-        # A stale-hash row (the server's own config changed but it hasn't been
-        # re-discovered yet) reads as pending → re-verify; an unrelated mutation
-        # leaves the hash untouched → the row stays a valid hit.
-        if schema_row is not None and schema_row.get("config_hash") != mcp_discovery_fingerprint(srv):
-            schema_row = None
-        status, error, missing = _derive_status(
-            origin=origin,
-            env_refs=env_refs,
-            header_refs=header_refs,
-            secret_names=secret_names,
-            schema_row=schema_row,
-        )
-        tools = _tools_from_schema(schema_row)
-        servers.append(
-            _effective_server(
-                srv,
-                origin=origin,
-                enabled=srv.enabled,
-                status=status,
-                error=error,
-                tools=tools,
-                missing_secrets=missing,
-                env_refs=env_refs,
-                header_refs=header_refs,
-                config_version=resolved.version,
-            )
-        )
+        if srv.name in resolved.builtin_names:
+            origin = "builtin"
+        elif srv.name in resolved.inherited_names:
+            origin = "user"
+        else:
+            origin = "workspace"
+        servers.append(_row_for(srv, origin, enabled=srv.enabled))
 
     # Disabled built-ins are filtered out of the resolver's effective set, but
     # the UI still needs a row (with its toggle) to re-enable them.
     for srv in base_config.mcp.servers:
         if srv.name not in resolved.disabled_builtin_names:
             continue
-        servers.append(
-            _effective_server(
-                srv,
-                origin="builtin",
-                enabled=False,
-                status="disabled",
-                config_version=resolved.version,
-            )
-        )
+        servers.append(_row_for(srv, "builtin", enabled=False))
+
+    # Inherited user servers tombstoned in THIS workspace — same re-enable
+    # affordance as disabled built-ins.
+    for srv in resolved.tombstoned_inherited_servers:
+        servers.append(_row_for(srv, "user", enabled=False))
 
     # Disabled workspace servers are likewise dropped from the resolver's
     # effective set; surface them (greyed, with their toggle) so disabling a
     # workspace server isn't a one-way trip — mirrors the disabled-builtin
     # re-add above.
     for srv in resolved.disabled_workspace_servers:
-        env_refs = collect_vault_refs(dict(srv.env or {}))
-        header_refs = collect_vault_refs(dict(srv.headers or {}))
-        servers.append(
-            _effective_server(
-                srv,
-                origin="workspace",
-                enabled=False,
-                status="disabled",
-                env_refs=env_refs,
-                header_refs=header_refs,
-                config_version=resolved.version,
-            )
-        )
+        servers.append(_row_for(srv, "workspace", enabled=False))
 
     # Version the running session has actually applied (no I/O) — drives the
     # frontend's version-accurate "synced" state. None when no warm session.
@@ -371,6 +404,20 @@ async def add_server(
             server.name,
             config=server.to_config_blob(),
         )
+        if row is None:
+            # A tombstone marker (source='user', from disabling an inherited
+            # server) squats the UNIQUE(workspace_id, name) slot — replace it
+            # with the local fork. Real workspace rows stay a 409.
+            rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
+            existing = rows.get(server.name)
+            if existing is not None and existing["source"] == "user":
+                row = await upsert_workspace_server(
+                    workspace_id,
+                    server.name,
+                    source="workspace",
+                    enabled=True,
+                    config=server.to_config_blob(),
+                )
     except ValueError as e:
         # DB layer signals over-cap by raising ValueError under the advisory lock.
         raise HTTPException(status_code=409, detail=str(e))
@@ -844,7 +891,19 @@ async def edit_server(
     rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
     existing = rows.get(name)
     if existing is None:
+        if await _is_inherited_user_server(user_id, name):
+            raise HTTPException(
+                status_code=409,
+                detail="This server is inherited from your Connectors — edit it "
+                "there, or add a copy to this workspace to fork it.",
+            )
         raise HTTPException(status_code=404, detail="MCP server not found")
+    if existing["source"] == "user":
+        raise HTTPException(
+            status_code=409,
+            detail="This server is inherited from your Connectors — edit it "
+            "there, or add a copy to this workspace to fork it.",
+        )
     if existing["source"] != "workspace":
         raise HTTPException(status_code=409, detail="Cannot edit a built-in server")
 
@@ -886,8 +945,23 @@ async def set_enabled(
         _schedule_proactive_apply(workspace_id, user_id)
         return {"name": name, "enabled": body.enabled}
 
-    found = await set_workspace_server_enabled(workspace_id, name, body.enabled)
-    if not found:
+    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
+    existing = rows.get(name)
+    if existing is not None and existing["source"] == "workspace":
+        await set_workspace_server_enabled(workspace_id, name, body.enabled)
+    elif existing is not None and existing["source"] == "user":
+        # An existing tombstone for an inherited server; enabling = delete it.
+        # (Disabling again is a no-op — it's already tombstoned.)
+        if body.enabled:
+            await delete_workspace_server(workspace_id, name)
+    elif await _is_inherited_user_server(user_id, name):
+        # Inherited and not yet marked: disabling writes the per-workspace
+        # tombstone; enabling is a no-op (it's already live via inheritance).
+        if not body.enabled:
+            await upsert_workspace_server(
+                workspace_id, name, source="user", enabled=False, config=None
+            )
+    else:
         raise HTTPException(status_code=404, detail="MCP server not found")
     _schedule_proactive_apply(workspace_id, user_id)
     return {"name": name, "enabled": body.enabled}
@@ -908,9 +982,28 @@ async def delete_server(
     if name in _builtin_names():
         raise HTTPException(status_code=409, detail="Cannot delete a built-in server")
 
-    found = await delete_workspace_server(workspace_id, name)
-    if not found:
+    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
+    existing = rows.get(name)
+    if existing is None:
+        if await _is_inherited_user_server(user_id, name):
+            raise HTTPException(
+                status_code=409,
+                detail="This server is inherited from your Connectors — remove "
+                "it there, or disable it for this workspace.",
+            )
         raise HTTPException(status_code=404, detail="MCP server not found")
+    if existing["source"] == "user":
+        # A tombstone marker, not a workspace server. Deleting it here would
+        # silently re-enable the inherited server — make the toggle explicit.
+        raise HTTPException(
+            status_code=409,
+            detail="This server is inherited from your Connectors — remove "
+            "it there, or re-enable it for this workspace.",
+        )
+    if existing["source"] != "workspace":
+        raise HTTPException(status_code=409, detail="Cannot delete a built-in server")
+
+    await delete_workspace_server(workspace_id, name)
     _schedule_proactive_apply(workspace_id, user_id)
     return {"ok": True}
 
@@ -941,8 +1034,18 @@ async def discover_server(
 
     resolved = await resolve_mcp_config(base_config, user_id, workspace_id)
     server = next((s for s in resolved.servers if s.name == name), None)
-    if server is None or name not in resolved.user_names:
+    if server is None or (
+        name not in resolved.user_names and name not in resolved.inherited_names
+    ):
         raise HTTPException(status_code=404, detail="MCP server not found")
+    if getattr(server, "oauth_connection_id", None):
+        # OAuth-connected servers are discovered host-side (on connect and via
+        # the Connectors refresh) — never probed from the sandbox.
+        raise HTTPException(
+            status_code=409,
+            detail="OAuth-connected servers are discovered host-side; refresh "
+            "from Connectors instead.",
+        )
 
     # Debounce: if the cached snapshot is for this server's CURRENT config and is
     # fresh + not pending, return it without re-running discovery. A stale-hash
