@@ -11,6 +11,7 @@ import pytest
 from ptc_agent.core.mcp_sanitize import (
     VAULT_REF_RE,
     discovery_should_use_secrets,
+    is_user_server,
     sanitize_tool_name,
     sanitize_tool_set,
     sanitize_tool_text,
@@ -25,6 +26,30 @@ class _Tool:
 
     def __init__(self, name: str) -> None:
         self.name = name
+
+
+class TestIsUserServer:
+    """The trust-boundary predicate: everything user-configured is untrusted."""
+
+    def test_workspace_source_is_untrusted(self):
+        srv = MCPServerConfig(name="s", transport="stdio", command="npx", source="workspace")
+        assert is_user_server(srv) is True
+
+    def test_user_source_is_untrusted(self):
+        # Inherited (Connectors) servers must sanitize exactly like
+        # workspace-local ones — user-supplied either way.
+        srv = MCPServerConfig(name="s", transport="stdio", command="npx", source="user")
+        assert is_user_server(srv) is True
+
+    def test_builtin_source_is_trusted(self):
+        srv = MCPServerConfig(name="s", transport="stdio", command="npx", source="builtin")
+        assert is_user_server(srv) is False
+
+    def test_missing_source_attr_defaults_to_trusted(self):
+        class Bare:
+            pass
+
+        assert is_user_server(Bare()) is False
 
 
 class TestDiscoveryShouldUseSecrets:
