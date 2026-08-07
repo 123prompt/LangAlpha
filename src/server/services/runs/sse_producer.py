@@ -1538,18 +1538,18 @@ class RunSSEProducer:
                     raw_args = state["args_accumulated"]
                     parsed_args, err_repr, err_window = _parse_tool_args(raw_args)
 
-                    if parsed_args is None:
+                    args_parse_error = parsed_args is None
+                    if args_parse_error:
                         logger.error(
                             f"[TOOL_CALL_PARSE_ERROR] agent={agent_name} provider={provider_type} "
                             f"name={state.get('name')} args_length={len(raw_args)} "
                             f"error={err_repr} window={err_window!r}"
                         )
-                        # Clear state so the broken call doesn't leak across turns.
-                        if provider_type == "response_api":
-                            self.function_call_state.pop(state_key, None)
-                        else:  # anthropic
-                            self.anthropic_tool_call_state.pop(state_key, None)
-                        continue
+                        # The graph parses args independently and may still run this
+                        # call — dropping the event leaves the stream without a card
+                        # for a call whose tool_call_result arrives later. Emit with
+                        # empty args so the call stays addressable by id.
+                        parsed_args = {}
 
                     try:
                         # id field differs by provider: "call_id" for Response API, "id" for Anthropic.
@@ -1569,6 +1569,8 @@ class RunSSEProducer:
                             "tool_calls": tool_calls,
                             "finish_reason": finish_reason,
                         }
+                        if args_parse_error:
+                            tool_calls_message["args_parse_error"] = True
 
                         logger.debug(
                             f"[TOOL_CALLS_COMPLETE] agent={agent_name} provider={provider_type} "
