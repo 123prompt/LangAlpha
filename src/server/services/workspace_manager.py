@@ -307,11 +307,14 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         self,
         workspace_id: str,
         sandbox: "PTCSandbox | None" = None,
+        user_id: str | None = None,
     ) -> None:
         """Push vault secrets to the running sandbox.
 
-        Called by the vault API on mutation and by ``_sync_sandbox_assets``
-        during workspace startup/restart.
+        Called by the vault APIs on mutation and by ``_sync_sandbox_assets``
+        during workspace startup/restart. The pushed set is the MERGE of the
+        owner's user-level secrets and the workspace's own, workspace winning
+        on name collision — user secrets back inherited (Connectors) servers.
 
         Args:
             workspace_id: Workspace UUID.
@@ -319,6 +322,8 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 sandbox is looked up from the session cache — this fails during
                 initial startup (session not cached yet), so callers that
                 already hold a sandbox reference should pass it explicitly.
+            user_id: The workspace owner. Looked up from the workspace row
+                when omitted (one extra read).
         """
         if sandbox is None:
             session = self._sessions.get(workspace_id)
@@ -326,9 +331,18 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 return
             sandbox = session.sandbox
 
+        from src.server.database.user_vault_secrets import get_user_secrets_decrypted
         from src.server.database.vault_secrets import get_workspace_secrets_decrypted
 
+        if user_id is None:
+            workspace = await db_get_workspace(workspace_id)
+            user_id = (workspace or {}).get("user_id")
+
         secrets = await get_workspace_secrets_decrypted(workspace_id)
+        if user_id:
+            user_secrets = await get_user_secrets_decrypted(user_id)
+            if user_secrets:
+                secrets = {**user_secrets, **secrets}
         await sandbox.upload_vault_secrets(secrets)
         logger.debug(
             f"[vault] Pushed {len(secrets)} secret(s) to sandbox",
@@ -825,7 +839,10 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # secrets are available after stop/start and sandbox recovery.
         # Pass sandbox directly: session may not be in self._sessions yet.
         tasks.append(
-            _timed("vault", self.push_vault_secrets(workspace_id, sandbox=sandbox))
+            _timed(
+                "vault",
+                self.push_vault_secrets(workspace_id, sandbox=sandbox, user_id=user_id),
+            )
         )
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
