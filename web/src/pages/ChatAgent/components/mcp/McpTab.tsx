@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { AnimatePresence } from 'framer-motion';
-import { Plus, ServerCog, Download } from 'lucide-react';
+import { Plus, ServerCog, Download, Cable } from 'lucide-react';
 import {
   useWorkspaceMcpServers,
   useAddWorkspaceMcpServer,
@@ -18,11 +19,12 @@ import { formatApiErrorDetail, getVaultSecrets, type EffectiveServer, type McpSe
 import { McpServerRow } from './McpServerRow';
 import { McpServerModal } from './McpServerModal';
 import { McpImportModal } from './McpImportModal';
-import { TemplatesView } from './TemplatesView';
 
 /**
- * The "MCP" tab in the workspace settings panel. Segmented control switches
- * between the effective per-workspace list and the user's template catalog.
+ * The "MCP" tab in the workspace settings panel — the workspace-scoped view.
+ * User-level servers (and their OAuth lifecycle) are managed on /connectors;
+ * inherited rows render here with their per-workspace enable toggle (writing
+ * the workspace tombstone) plus a "Manage in Connectors" deep link.
  *
  * Three UX guarantees this component owns:
  *  - **Live discovery progress.** A freshly-added (or any `pending`) workspace
@@ -49,8 +51,6 @@ import { TemplatesView } from './TemplatesView';
  * name) for the needs_secret "Set up NAME" affordance.
  */
 
-type SubView = 'workspace' | 'templates';
-
 interface McpTabProps {
   workspaceId: string;
   /** Deep-link into the Vault tab, optionally with a prefilled secret name. */
@@ -58,7 +58,7 @@ interface McpTabProps {
 }
 
 export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
-  const [view, setView] = useState<SubView>('workspace');
+  const navigate = useNavigate();
 
   const { data, isLoading, error } = useWorkspaceMcpServers(workspaceId);
   const addMutation = useAddWorkspaceMcpServer(workspaceId);
@@ -116,7 +116,6 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   const maxServers = data?.max_servers ?? 20;
   const workspaceCount = servers.filter((s) => s.origin === 'workspace').length;
   const atCap = workspaceCount >= maxServers;
-  const workspaceServerNames = new Set(servers.map((s) => s.name));
 
   // Apply axis: the running session has loaded the saved config when its applied
   // version has caught up to the workspace's config version. Version-accurate —
@@ -202,13 +201,14 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   async function handleSubmit(body: McpServerInput) {
     setSubmitError(null);
     try {
-      if (editing) {
-        await updateMutation.mutateAsync({ name: editing.name, body });
-      } else {
-        await addMutation.mutateAsync(body);
-      }
+      const saved = editing
+        ? await updateMutation.mutateAsync({ name: editing.name, body })
+        : await addMutation.mutateAsync(body);
       setModalOpen(false);
       setEditing(null);
+      if (saved.warnings?.length) {
+        toast({ title: 'Server saved with warnings', description: saved.warnings.join('\n') });
+      }
     } catch (err) {
       setSubmitError(formatApiErrorDetail(err));
     }
@@ -292,18 +292,9 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
     [templateNames, doPromote],
   );
 
-  async function handleAddFromTemplate(templateName: string) {
-    try {
-      await addMutation.mutateAsync({ from_template: templateName });
-      setView('workspace');
-    } catch (err) {
-      toast({
-        variant: 'destructive',
-        title: 'Could not add template',
-        description: formatApiErrorDetail(err),
-      });
-    }
-  }
+  const handleManageInConnectors = useCallback(() => {
+    navigate('/connectors');
+  }, [navigate]);
 
   async function handleDiscoverFromModal(body: McpServerInput) {
     // "Test saved config" is offered only when editing an existing row (the
@@ -316,29 +307,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Segmented control */}
-      <div
-        className="inline-flex self-start gap-1 p-0.5 rounded-md"
-        style={{ backgroundColor: 'var(--color-bg-card)' }}
-      >
-        {([['workspace', 'This Workspace'], ['templates', 'Templates']] as const).map(([key, label]) => (
-          <button
-            key={key}
-            type="button"
-            onClick={() => setView(key)}
-            className="px-3 py-1.5 text-xs font-medium rounded"
-            style={{
-              color: view === key ? 'var(--color-btn-primary-text)' : 'var(--color-text-tertiary)',
-              backgroundColor: view === key ? 'var(--color-btn-primary-bg)' : 'transparent',
-            }}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {view === 'workspace' ? (
-        <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <ServerCog className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
@@ -350,6 +319,16 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
               </span>
             </div>
             <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={handleManageInConnectors}
+                title="User-level servers, OAuth connections and shared secrets"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors hover:bg-foreground/10"
+                style={{ color: 'var(--color-text-tertiary)' }}
+              >
+                <Cable className="h-3 w-3" />
+                Connectors
+              </button>
               <button
                 type="button"
                 onClick={() => setImportOpen(true)}
@@ -454,20 +433,13 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
                     onDelete={handleDelete}
                     onPromoteToTemplate={server.origin === 'workspace' ? handlePromote : undefined}
                     onSetupSecret={handleSetupSecret}
+                    onManageInConnectors={server.origin === 'user' ? handleManageInConnectors : undefined}
                   />
                 ))}
               </AnimatePresence>
             </div>
           )}
-        </div>
-      ) : (
-        <TemplatesView
-          workspaceId={workspaceId}
-          secretNames={secretNames}
-          onAddToWorkspace={handleAddFromTemplate}
-          workspaceServerNames={workspaceServerNames}
-        />
-      )}
+      </div>
 
       {modalOpen && (
         <McpServerModal

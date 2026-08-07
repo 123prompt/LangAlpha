@@ -14,6 +14,11 @@ import {
   createMcpCatalogServer,
   updateMcpCatalogServer,
   deleteMcpCatalogServer,
+  setMcpCatalogServerEnabled,
+  importMcpCatalogServers,
+  disconnectMcpOauth,
+  refreshMcpOauthSchemas,
+  type CatalogServerList,
   type EffectiveServerList,
   type McpServerInput,
 } from '../pages/ChatAgent/utils/api';
@@ -277,6 +282,72 @@ export function useDeleteMcpCatalogServer() {
     mutationFn: (name: string) => deleteMcpCatalogServer(name),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog() });
+    },
+  });
+}
+
+/**
+ * Optimistic user-level enabled toggle (Connectors). Enabling fans the server
+ * out to every workspace of the user, so on settle we invalidate the whole
+ * mcp prefix — any open workspace panel refetches its effective list too.
+ */
+export function useToggleMcpCatalogServer() {
+  const queryClient = useQueryClient();
+  const key = queryKeys.mcp.catalog();
+  return useMutation({
+    mutationFn: ({ name, enabled }: { name: string; enabled: boolean }) =>
+      setMcpCatalogServerEnabled(name, enabled),
+    onMutate: async ({ name, enabled }) => {
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<CatalogServerList>(key);
+      if (previous) {
+        queryClient.setQueryData<CatalogServerList>(key, {
+          ...previous,
+          servers: previous.servers.map((s) =>
+            s.name === name ? { ...s, enabled } : s,
+          ),
+        });
+      }
+      return { previous };
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) queryClient.setQueryData(key, context.previous);
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
+    },
+  });
+}
+
+/** Bulk-import a standard `mcpServers` blob into the user catalog (Connectors). */
+export function useImportMcpCatalogServers() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: unknown) => importMcpCatalogServers(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog() });
+    },
+  });
+}
+
+/** Disconnect a server's OAuth connection (marks it revoked server-side). */
+export function useDisconnectMcpOauth() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => disconnectMcpOauth(name),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
+    },
+  });
+}
+
+/** Host-side schema re-discovery for an OAuth-connected server. */
+export function useRefreshMcpOauthSchemas() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => refreshMcpOauthSchemas(name),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
     },
   });
 }

@@ -15,6 +15,7 @@ const routeChunks = {
   market: () => import('../../pages/MarketView/MarketView'),
   news: () => import('../../pages/Detail/NewsDetailPage'),
   automations: () => import('../../pages/Automations/Automations'),
+  connectors: () => import('../../pages/Connectors/Connectors'),
   settings: () => import('../../pages/Settings/Settings'),
 };
 
@@ -23,6 +24,7 @@ const ChatAgent = React.lazy(routeChunks.chat);
 const MarketView = React.lazy(routeChunks.market);
 const NewsDetailPage = React.lazy(routeChunks.news);
 const Automations = React.lazy(routeChunks.automations);
+const Connectors = React.lazy(routeChunks.connectors);
 const Settings = React.lazy(routeChunks.settings);
 
 /** Start downloading the chunk for `pathname` without rendering it, so the
@@ -52,6 +54,7 @@ function Main() {
         <Route path="/chat/:workspaceId" element={<ChatAgent />} />
         <Route path="/market" element={<MarketView />} />
         <Route path="/automations" element={<Automations />} />
+        <Route path="/connectors" element={<Connectors />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/news/:id" element={<NewsDetailPage />} />
         <Route path="*" element={<Navigate to="/dashboard" replace />} />

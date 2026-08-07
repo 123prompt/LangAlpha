@@ -68,6 +68,8 @@ export interface McpServerModalProps {
   onSubmit: (body: McpServerInput) => Promise<void>;
   onDiscover?: (body: McpServerInput) => Promise<McpDiscoveryResult>;
   onSecretCreated?: (name: string) => void;
+  /** Inline secret-create override for the picker (user vault on /connectors). */
+  createSecret?: (body: { name: string; value: string }) => Promise<unknown>;
   saving?: boolean;
   submitError?: string | null;
 }
@@ -81,6 +83,7 @@ export function McpServerModal({
   onSubmit,
   onDiscover,
   onSecretCreated,
+  createSecret,
   saving = false,
   submitError = null,
 }: McpServerModalProps) {
@@ -380,6 +383,7 @@ export function McpServerModal({
                   workspaceId={workspaceId}
                   secretNames={secretNames}
                   onSecretCreated={onSecretCreated}
+                  createSecret={createSecret}
                   keyPlaceholder="ENV_VAR"
                 />
                 <FieldError error={errorFor('env')} />
@@ -406,6 +410,7 @@ export function McpServerModal({
                   workspaceId={workspaceId}
                   secretNames={secretNames}
                   onSecretCreated={onSecretCreated}
+                  createSecret={createSecret}
                   keyPlaceholder="Authorization"
                 />
                 <FieldError error={errorFor('headers')} />
@@ -631,10 +636,11 @@ interface KeyValueEditorProps {
   workspaceId: string;
   secretNames: string[];
   onSecretCreated?: (name: string) => void;
+  createSecret?: (body: { name: string; value: string }) => Promise<unknown>;
   keyPlaceholder: string;
 }
 
-function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreated, keyPlaceholder }: KeyValueEditorProps) {
+function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreated, createSecret, keyPlaceholder }: KeyValueEditorProps) {
   return (
     <div className="flex flex-col gap-2">
       {kvs.map((kv, i) => (
@@ -668,6 +674,7 @@ function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreat
             onChange={(value) => onChange(kvs.map((x, j) => (j === i ? { ...x, value } : x)))}
             secretNames={secretNames}
             onSecretCreated={onSecretCreated}
+            createSecret={createSecret}
           />
         </div>
       ))}

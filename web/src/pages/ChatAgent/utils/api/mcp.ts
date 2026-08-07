@@ -42,7 +42,10 @@ export type McpStatus =
 /** One row in the effective per-workspace MCP list. */
 export interface EffectiveServer {
   name: string;
-  origin: 'builtin' | 'workspace';
+  /** 'user' = inherited from the user's Connectors (manage at /connectors). */
+  origin: 'builtin' | 'workspace' | 'user';
+  /** Workspace-local fork that overrides a same-named inherited server. */
+  shadows_inherited?: boolean;
   transport: string;
   enabled: boolean;
   editable: boolean;
@@ -92,6 +95,13 @@ export interface EffectiveServerList {
   sandbox_warming?: boolean;
 }
 
+/** Lifecycle of a server's OAuth connection (absent = never connected). */
+export type McpOauthStatus =
+  | 'connected'
+  | 'needs_reauth'
+  | 'refresh_ambiguous'
+  | 'revoked';
+
 /** A user catalog template row (masked — only vault refs surfaced). */
 export interface CatalogServer {
   name: string;
@@ -105,6 +115,12 @@ export interface CatalogServer {
   instruction: string;
   tool_exposure_mode: string;
   discovery_uses_secrets?: boolean;
+  /** True = inherited by every workspace of the user (Connectors toggle). */
+  enabled?: boolean;
+  /** OAuth connection status, when one exists for this server. */
+  oauth_status?: McpOauthStatus | null;
+  /** Non-blocking policy nudges — present on create/update responses only. */
+  warnings?: string[] | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -141,7 +157,7 @@ export async function addWorkspaceMcpServer(
   body: McpServerInput | { from_template: string },
 ) {
   const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/mcp/servers`, body);
-  return data as { name: string; source: string; enabled: boolean };
+  return data as { name: string; source: string; enabled: boolean; warnings?: string[] };
 }
 
 export async function updateWorkspaceMcpServer(
@@ -153,7 +169,7 @@ export async function updateWorkspaceMcpServer(
     `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}`,
     body,
   );
-  return data as { name: string; source: string; enabled: boolean };
+  return data as { name: string; source: string; enabled: boolean; warnings?: string[] };
 }
 
 export async function setWorkspaceMcpServerEnabled(
@@ -261,4 +277,54 @@ export async function updateMcpCatalogServer(
 export async function deleteMcpCatalogServer(name: string) {
   const { data } = await api.delete(`/api/v1/mcp/servers/${name}`);
   return data as { ok: boolean };
+}
+
+/** Enable/disable a catalog server for ALL the user's workspaces (inheritance). */
+export async function setMcpCatalogServerEnabled(name: string, enabled: boolean) {
+  const { data } = await api.patch(`/api/v1/mcp/servers/${name}/enabled`, { enabled });
+  return data as { name: string; enabled: boolean };
+}
+
+/**
+ * Bulk-import a standard `mcpServers` JSON blob into the user catalog. Inline
+ * literal secrets are auto-extracted into the USER vault; imported rows land
+ * disabled (inert) until the user flips them live.
+ */
+export async function importMcpCatalogServers(payload: unknown): Promise<McpImportResult> {
+  const { data } = await api.post<McpImportResult>('/api/v1/mcp/servers/import', payload);
+  return data;
+}
+
+// --- User-level OAuth (Connectors) ---
+
+/** Phase 1 of the connect flow; the caller navigates to `authorize_url`. */
+export async function startMcpOauth(name: string, returnTo = '/connectors') {
+  const { data } = await api.post<{ authorize_url: string }>(
+    `/api/v1/mcp/servers/${name}/oauth/start`,
+    { return_to: returnTo },
+  );
+  return data;
+}
+
+export async function disconnectMcpOauth(name: string) {
+  const { data } = await api.delete(`/api/v1/mcp/servers/${name}/oauth`);
+  return data as { ok: boolean };
+}
+
+export interface McpOauthSchemaRefreshResult {
+  server_name: string;
+  status: string;
+  error: string;
+  tool_count: number;
+  discovered_at: string | null;
+}
+
+/** Host-side re-discovery of an OAuth server's tool schemas. */
+export async function refreshMcpOauthSchemas(
+  name: string,
+): Promise<McpOauthSchemaRefreshResult> {
+  const { data } = await api.post<McpOauthSchemaRefreshResult>(
+    `/api/v1/mcp/servers/${name}/oauth/refresh-schemas`,
+  );
+  return data;
 }

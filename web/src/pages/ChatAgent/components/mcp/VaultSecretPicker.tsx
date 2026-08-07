@@ -35,6 +35,11 @@ interface VaultSecretPickerProps {
   secretNames: string[];
   /** Called after a successful inline create so the parent can refetch names. */
   onSecretCreated?: (name: string) => void;
+  /**
+   * Inline-create override. Defaults to the workspace vault; the Connectors
+   * page injects the user-level vault so refs resolve for inherited servers.
+   */
+  createSecret?: (body: { name: string; value: string }) => Promise<unknown>;
 }
 
 export function VaultSecretPicker({
@@ -43,6 +48,7 @@ export function VaultSecretPicker({
   onChange,
   secretNames,
   onSecretCreated,
+  createSecret,
 }: VaultSecretPickerProps) {
   const initialRef = refName(value);
   const [mode, setMode] = useState<Mode>(initialRef !== null || value === '' ? 'vault' : 'literal');
@@ -62,7 +68,11 @@ export function VaultSecretPicker({
     setSaving(true);
     setCreateError(null);
     try {
-      await createVaultSecret(workspaceId, { name, value: newValue });
+      if (createSecret) {
+        await createSecret({ name, value: newValue });
+      } else {
+        await createVaultSecret(workspaceId, { name, value: newValue });
+      }
       onChange(vaultRef(name));
       onSecretCreated?.(name);
       setCreating(false);

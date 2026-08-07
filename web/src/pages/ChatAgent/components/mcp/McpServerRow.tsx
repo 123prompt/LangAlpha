@@ -1,6 +1,6 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { MoreVertical, Pencil, Zap, Trash2, Server, KeyRound, BookmarkPlus } from 'lucide-react';
+import { MoreVertical, Pencil, Zap, Trash2, Server, KeyRound, BookmarkPlus, Cable } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import {
   DropdownMenu,
@@ -70,6 +70,9 @@ interface McpServerRowProps {
   onPromoteToTemplate?: (server: EffectiveServer) => void;
   /** Deep-link to the Vault tab, optionally prefilling a secret name. */
   onSetupSecret: (secretName: string) => void;
+  /** Navigate to /connectors — offered on inherited (user-origin) rows, whose
+   *  definition and OAuth lifecycle are managed there, not per-workspace. */
+  onManageInConnectors?: () => void;
 }
 
 function McpServerRowImpl({
@@ -86,8 +89,10 @@ function McpServerRowImpl({
   onDelete,
   onPromoteToTemplate,
   onSetupSecret,
+  onManageInConnectors,
 }: McpServerRowProps) {
   const isBuiltin = server.origin === 'builtin';
+  const isInherited = server.origin === 'user';
 
   return (
     <motion.div
@@ -114,9 +119,19 @@ function McpServerRowImpl({
               backgroundColor: 'var(--color-bg-tag)',
               border: '1px solid var(--color-border-muted)',
             }}
+            title={isInherited ? 'Inherited from your Connectors — applies to all your workspaces' : undefined}
           >
-            {isBuiltin ? 'built-in' : 'workspace'}
+            {isBuiltin ? 'built-in' : isInherited ? 'inherited' : 'workspace'}
           </span>
+          {server.shadows_inherited && (
+            <span
+              className="text-[0.625rem] px-1.5 py-0.5 rounded"
+              style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-tag)' }}
+              title="A workspace copy overrides the same-named Connectors server here"
+            >
+              overrides inherited
+            </span>
+          )}
         </div>
 
         {/* Lifecycle (verify + apply) + tool count */}
@@ -201,6 +216,12 @@ function McpServerRowImpl({
             </button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
+            {isInherited && onManageInConnectors && (
+              <DropdownMenuItem onSelect={onManageInConnectors}>
+                <Cable className="h-3.5 w-3.5 mr-2" />
+                Manage in Connectors
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem disabled={!server.editable} onSelect={() => onEdit(server)}>
               <Pencil className="h-3.5 w-3.5 mr-2" />
               Edit
@@ -214,7 +235,7 @@ function McpServerRowImpl({
               onSelect={() => onPromoteToTemplate?.(server)}
             >
               <BookmarkPlus className="h-3.5 w-3.5 mr-2" />
-              Save as template
+              Save to Connectors
             </DropdownMenuItem>
             <DropdownMenuItem
               disabled={!server.deletable}

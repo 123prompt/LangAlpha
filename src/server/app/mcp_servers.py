@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -52,6 +51,10 @@ from src.server.database.vault_secrets import (
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.mcp_config import resolve_mcp_config
 from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+from src.server.services.mcp_import import (
+    extract_literals_to_vault,
+    rollback_import_secrets,
+)
 from src.server.models.mcp_server import (
     CatalogServer,
     EffectiveServer,
@@ -77,17 +80,6 @@ router = APIRouter(prefix="/api/v1/workspaces", tags=["MCP Servers"])
 # the cached row at the current version is < this many seconds old and not
 # pending (kept simple — no Redis).
 _DISCOVER_DEBOUNCE_SECONDS = 15
-
-# On bulk import, an env/header value is auto-extracted into a vault secret when
-# it looks like a credential — either the key name reads like one, or the value
-# is a long opaque token. Benign config (``MODE=prod``, ``LOG_LEVEL=ERROR``)
-# stays an inline literal so we don't clutter the vault.
-_SECRET_KEY_RE = re.compile(
-    r"(?i)(secret|token|password|passwd|pwd|apikey|api[_-]?key|access[_-]?key|"
-    r"authorization|auth|bearer|credential|cred|private[_-]?key|\bpat\b|\bkey\b)"
-)
-_OPAQUE_TOKEN_MIN_LEN = 20
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -690,27 +682,16 @@ async def import_servers(
     }
 
 
-def _looks_like_secret(key: str, value: str) -> bool:
-    """Heuristic: should this env/header literal be vaulted rather than inlined?"""
-    if _SECRET_KEY_RE.search(key or ""):
-        return True
-    v = value or ""
-    return len(v) >= _OPAQUE_TOKEN_MIN_LEN and " " not in v and not v.isdigit()
+def _workspace_secret_ops(workspace_id: str):
+    """Bind the shared import-extraction helpers to workspace vault storage."""
 
+    async def create(name: str, value: str, description: str) -> None:
+        await create_secret_db(workspace_id, name, value, description)
 
-def _vault_secret_name(server_name: str, key: str, used: set[str]) -> str:
-    """Allocate a unique, NAME_RE-legal vault secret name for ``server.key``."""
-    base = re.sub(r"[^A-Za-z0-9_]", "_", f"{server_name}_{key}".upper())
-    if base and base[0].isdigit():
-        base = f"_{base}"
-    base = base[:64] or "IMPORTED_SECRET"
-    name = base
-    i = 2
-    while name in used:
-        suffix = f"_{i}"
-        name = f"{base[: 64 - len(suffix)]}{suffix}"
-        i += 1
-    return name
+    async def delete(name: str) -> None:
+        await delete_secret_db(workspace_id, name)
+
+    return create, delete
 
 
 async def _rollback_import_secrets(
@@ -720,27 +701,13 @@ async def _rollback_import_secrets(
     allocated: dict[str, str],
     used_secret_names: set[str],
 ) -> None:
-    """Best-effort removal of vault secrets created for a server whose import failed.
-
-    Also unwinds the cross-server dedupe bookkeeping so a later server in the
-    same import can't reuse a ref that points at a deleted secret.
-    """
-    if not names:
-        return
-    refs = {f"${{vault:{n}}}" for n in names}
-    for literal in [k for k, v in allocated.items() if v in refs]:
-        del allocated[literal]
-    for n in names:
-        used_secret_names.discard(n)
-        try:
-            await delete_secret_db(workspace_id, n)
-        except Exception:
-            logger.warning(
-                "[mcp] failed to roll back imported secret %s for workspace %s",
-                n,
-                workspace_id,
-                exc_info=True,
-            )
+    _, delete = _workspace_secret_ops(workspace_id)
+    await rollback_import_secrets(
+        names,
+        allocated=allocated,
+        used_secret_names=used_secret_names,
+        delete_secret=delete,
+    )
 
 
 async def _extract_literals_to_vault(
@@ -751,109 +718,15 @@ async def _extract_literals_to_vault(
     allocated: dict[str, str],
     used_secret_names: set[str],
 ) -> list[str]:
-    """Move credential-looking env/header literals into the vault, in place.
-
-    Existing ``${vault:NAME}`` refs and benign config literals are left alone.
-    Returns the names of any vault secrets created. May raise ``ValueError`` if
-    the vault secret cap is reached — secrets already created for THIS server
-    are rolled back first, so a cap hit never strands orphans.
-    """
-    created: list[str] = []
-    try:
-        return await _extract_literals_inner(
-            workspace_id,
-            server_name,
-            config,
-            allocated=allocated,
-            used_secret_names=used_secret_names,
-            created=created,
-        )
-    except Exception:
-        await _rollback_import_secrets(
-            workspace_id, created, allocated=allocated, used_secret_names=used_secret_names
-        )
-        raise
-
-
-async def _extract_literals_inner(
-    workspace_id: str,
-    server_name: str,
-    config: dict[str, Any],
-    *,
-    allocated: dict[str, str],
-    used_secret_names: set[str],
-    created: list[str],
-) -> list[str]:
-    for field in ("env", "headers"):
-        mapping = config.get(field)
-        if not isinstance(mapping, dict):
-            continue
-        out: dict[str, Any] = {}
-        for k, v in mapping.items():
-            if (
-                not isinstance(v, str)
-                or not v.strip()
-                or VAULT_REF_RE.fullmatch(v)
-                or not _looks_like_secret(str(k), v)
-            ):
-                out[k] = v
-                continue
-            ref = allocated.get(v)
-            if ref is None:
-                secret_name = _vault_secret_name(server_name, str(k), used_secret_names)
-                await create_secret_db(
-                    workspace_id,
-                    secret_name,
-                    v,
-                    f"Imported with MCP server {server_name}",
-                )
-                used_secret_names.add(secret_name)
-                created.append(secret_name)
-                ref = f"${{vault:{secret_name}}}"
-                allocated[v] = ref
-            out[k] = ref
-        config[field] = out
-
-    # stdio ``args`` is a list; the common credential shape is a single
-    # ``--flag=VALUE`` token (or ``KEY=VALUE``). Split on the first ``=`` and
-    # vault the value half when the flag or value looks secret, rewriting the arg
-    # to ``--flag=${vault:NAME}`` (the generated client resolves refs in args).
-    # Bare / space-separated arg secrets (``--token VALUE``) are left as-is —
-    # too ambiguous to auto-extract without over-vaulting benign positionals.
-    args = config.get("args")
-    if isinstance(args, list):
-        new_args: list[Any] = []
-        for arg in args:
-            if not isinstance(arg, str) or "=" not in arg:
-                new_args.append(arg)
-                continue
-            flag, _, val = arg.partition("=")
-            if (
-                not val.strip()
-                or VAULT_REF_RE.search(val)
-                or not _looks_like_secret(flag, val)
-            ):
-                new_args.append(arg)
-                continue
-            ref = allocated.get(val)
-            if ref is None:
-                key_hint = flag.lstrip("-") or "arg"
-                secret_name = _vault_secret_name(
-                    server_name, key_hint, used_secret_names
-                )
-                await create_secret_db(
-                    workspace_id,
-                    secret_name,
-                    val,
-                    f"Imported with MCP server {server_name}",
-                )
-                used_secret_names.add(secret_name)
-                created.append(secret_name)
-                ref = f"${{vault:{secret_name}}}"
-                allocated[val] = ref
-            new_args.append(f"{flag}={ref}")
-        config["args"] = new_args
-    return created
+    create, delete = _workspace_secret_ops(workspace_id)
+    return await extract_literals_to_vault(
+        server_name,
+        config,
+        allocated=allocated,
+        used_secret_names=used_secret_names,
+        create_secret=create,
+        delete_secret=delete,
+    )
 
 
 async def _push_vault_to_sandbox(workspace_id: str) -> None:

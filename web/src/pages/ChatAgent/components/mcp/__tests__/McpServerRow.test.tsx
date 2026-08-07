@@ -107,7 +107,7 @@ describe('McpServerRow — kebab menu (builtins restricted)', () => {
     const h = handlers();
     render(<McpServerRow server={makeServer({ origin: 'builtin', editable: false, deletable: false })} {...h} />);
 
-    for (const label of ['Edit', 'Test connection', 'Save as template', 'Delete']) {
+    for (const label of ['Edit', 'Test connection', 'Save to Connectors', 'Delete']) {
       const item = screen.getByText(label).closest('[role="menuitem"]')!;
       expect(item).toHaveAttribute('aria-disabled', 'true');
     }
@@ -115,7 +115,7 @@ describe('McpServerRow — kebab menu (builtins restricted)', () => {
     // Clicking a disabled item is a no-op.
     fireEvent.click(screen.getByText('Edit'));
     fireEvent.click(screen.getByText('Delete'));
-    fireEvent.click(screen.getByText('Save as template'));
+    fireEvent.click(screen.getByText('Save to Connectors'));
     expect(h.onEdit).not.toHaveBeenCalled();
     expect(h.onDelete).not.toHaveBeenCalled();
     expect(h.onPromoteToTemplate).not.toHaveBeenCalled();
@@ -131,18 +131,18 @@ describe('McpServerRow — kebab menu (builtins restricted)', () => {
     fireEvent.click(screen.getByText('Test connection'));
     expect(h.onDiscover).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByText('Save as template'));
+    fireEvent.click(screen.getByText('Save to Connectors'));
     expect(h.onPromoteToTemplate).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByText('Delete'));
     expect(h.onDelete).toHaveBeenCalledTimes(1);
   });
 
-  it('disables "Save as template" when no promote handler is provided', () => {
+  it('disables "Save to Connectors" when no promote handler is provided', () => {
     const { onPromoteToTemplate, ...rest } = handlers();
     void onPromoteToTemplate;
     render(<McpServerRow server={makeServer()} {...rest} />);
-    const item = screen.getByText('Save as template').closest('[role="menuitem"]')!;
+    const item = screen.getByText('Save to Connectors').closest('[role="menuitem"]')!;
     expect(item).toHaveAttribute('aria-disabled', 'true');
   });
 
@@ -159,9 +159,9 @@ describe('McpServerRow — kebab menu (builtins restricted)', () => {
     expect(screen.getByText('Test connection').closest('[role="menuitem"]'))
       .toHaveAttribute('aria-disabled', 'true');
 
-    // …but Edit / Save as template / Delete still work on a disabled server.
+    // …but Edit / Save to Connectors / Delete still work on a disabled server.
     fireEvent.click(screen.getByText('Edit'));
-    fireEvent.click(screen.getByText('Save as template'));
+    fireEvent.click(screen.getByText('Save to Connectors'));
     fireEvent.click(screen.getByText('Delete'));
     expect(h.onEdit).toHaveBeenCalledTimes(1);
     expect(h.onPromoteToTemplate).toHaveBeenCalledTimes(1);

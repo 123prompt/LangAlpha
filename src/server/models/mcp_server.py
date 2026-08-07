@@ -561,6 +561,9 @@ class CatalogServer(BaseModel):
     instruction: str = ""
     tool_exposure_mode: str = "summary"
     discovery_uses_secrets: bool = False
+    # Non-blocking policy nudges (isolation etc.) — populated on create/update
+    # responses only, never stored.
+    warnings: Optional[list[str]] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

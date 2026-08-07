@@ -22,6 +22,8 @@ import logging
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
 
+from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
+
 from src.server.database.mcp_oauth import list_connections
 from src.server.database.mcp_servers import (
     MAX_CATALOG_SERVERS_PER_USER,
@@ -32,6 +34,11 @@ from src.server.database.mcp_servers import (
     set_catalog_server_enabled,
     update_catalog_server,
 )
+from src.server.database.user_vault_secrets import (
+    create_user_secret,
+    delete_user_secret,
+    get_user_secret_names,
+)
 from src.server.models.mcp_server import (
     CatalogServer,
     CatalogServerList,
@@ -39,6 +46,12 @@ from src.server.models.mcp_server import (
     McpServerInput,
     _format_validation_error,
     catalog_row_to_response,
+    isolation_warnings,
+    parse_mcp_servers_payload,
+)
+from src.server.services.mcp_import import (
+    extract_literals_to_vault,
+    rollback_import_secrets,
 )
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
@@ -115,7 +128,9 @@ async def create_server(
         )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
-    return catalog_row_to_response(row)
+    response = catalog_row_to_response(row)
+    response.warnings = isolation_warnings(server) or None
+    return response
 
 
 @router.get("/servers/{name}")
@@ -161,7 +176,156 @@ async def update_server(
     )
     if not row:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    return catalog_row_to_response(row)
+    response = catalog_row_to_response(row)
+    response.warnings = isolation_warnings(server) or None
+    return response
+
+
+@router.post("/servers/import")
+@handle_api_exceptions("import MCP catalog servers", logger)
+async def import_servers(
+    user_id: CurrentUserId, body: dict = Body(...)
+) -> dict:
+    """Parse a standard ``{"mcpServers": {...}}`` blob into the user catalog.
+
+    Mirrors the workspace import (name coercion, transport mapping, literal
+    credentials auto-extracted — here into the USER vault) with one deliberate
+    difference: imported rows land ``enabled=false`` (inert templates), so an
+    import never silently changes every workspace's toolset. The UI nudges the
+    user to flip each one live.
+    """
+    parsed = parse_mcp_servers_payload(body)
+    if not parsed:
+        raise HTTPException(
+            status_code=422,
+            detail='No MCP servers found. Expected a JSON object like '
+            '{"mcpServers": { "<name>": { ... } }}.',
+        )
+
+    async def create_secret(name: str, value: str, description: str) -> None:
+        await create_user_secret(user_id, name, value, description)
+
+    async def delete_secret(name: str) -> None:
+        await delete_user_secret(user_id, name)
+
+    builtins = _builtin_names()
+    existing_names = {r["name"] for r in await list_catalog_servers(user_id)}
+    used_secret_names = set(await get_user_secret_names(user_id))
+
+    # value → ${vault:NAME}, so an identical token reused across servers is
+    # stored once.
+    allocated: dict[str, str] = {}
+    secrets_created: list[str] = []
+    seen_names: set[str] = set()
+    results: list[dict] = []
+    created_count = 0
+
+    for entry in parsed:
+        base = {
+            "original_name": entry.original_name,
+            "name": entry.name,
+            "renamed": entry.renamed,
+        }
+        if entry.error:
+            results.append({**base, "status": "invalid", "error": entry.error})
+            continue
+        if entry.name in builtins:
+            results.append(
+                {**base, "status": "skipped", "reason": "collides with a built-in server"}
+            )
+            continue
+        if entry.name in seen_names or entry.name in existing_names:
+            reason = (
+                "duplicate name after normalization"
+                if entry.name in seen_names
+                else "already exists in your Connectors"
+            )
+            status = "skipped" if entry.name in seen_names else "exists"
+            results.append({**base, "status": status, "reason": reason})
+            continue
+        if len(existing_names) + created_count >= MAX_CATALOG_SERVERS_PER_USER:
+            results.append(
+                {
+                    **base,
+                    "status": "error",
+                    "error": f"Connectors server cap "
+                    f"({MAX_CATALOG_SERVERS_PER_USER}) reached",
+                }
+            )
+            continue
+
+        seen_names.add(entry.name)
+        config = dict(entry.config)
+        try:
+            made = await extract_literals_to_vault(
+                entry.name,
+                config,
+                allocated=allocated,
+                used_secret_names=used_secret_names,
+                create_secret=create_secret,
+                delete_secret=delete_secret,
+            )
+        except ValueError as e:
+            results.append({**base, "status": "error", "error": str(e)})
+            continue
+
+        # An authenticated remote server needs its header even to list tools,
+        # so discovery must resolve secrets — store that flag honestly.
+        if config.get("transport") in ("http", "sse"):
+            headers = config.get("headers") or {}
+            if any(VAULT_REF_RE.search(str(v)) for v in headers.values()):
+                config["discovery_uses_secrets"] = True
+
+        try:
+            server = McpServerInput(**config)
+        except ValidationError as e:
+            await rollback_import_secrets(
+                made,
+                allocated=allocated,
+                used_secret_names=used_secret_names,
+                delete_secret=delete_secret,
+            )
+            results.append(
+                {**base, "status": "invalid", "error": _format_validation_error(e)}
+            )
+            continue
+
+        try:
+            await create_catalog_server(
+                user_id,
+                server.name,
+                transport=server.transport,
+                command=server.command,
+                args=server.args,
+                url=server.url,
+                env=server.env,
+                headers=server.headers,
+                description=server.description,
+                instruction=server.instruction,
+                tool_exposure_mode=server.tool_exposure_mode,
+                discovery_uses_secrets=server.discovery_uses_secrets,
+            )
+        except ValueError as e:
+            await rollback_import_secrets(
+                made,
+                allocated=allocated,
+                used_secret_names=used_secret_names,
+                delete_secret=delete_secret,
+            )
+            results.append({**base, "status": "error", "error": str(e)})
+            continue
+
+        secrets_created.extend(made)
+        created_count += 1
+        results.append({**base, "status": "created"})
+
+    # Imported rows are disabled (inert) — no fan-out, no sandbox push needed.
+    return {
+        "results": results,
+        "created": created_count,
+        "secrets_created": secrets_created,
+        "config_version": 0,
+    }
 
 
 @router.patch("/servers/{name}/enabled")

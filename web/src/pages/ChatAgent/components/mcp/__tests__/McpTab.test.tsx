@@ -229,37 +229,6 @@ describe('McpTab — auto-resolve pending servers', () => {
   });
 });
 
-describe('McpTab — add-from-template error surfacing (FIX 2)', () => {
-  it('surfaces a toast (and does not throw) when adding a template fails', async () => {
-    // Catalog has one template; the from_template add rejects.
-    catalogData = {
-      servers: [{ name: 'svc', transport: 'stdio', description: '' }],
-      max_servers: 20,
-    };
-    mutateAsync.add.mockRejectedValue({
-      response: { data: { detail: 'workspace at server cap' } },
-    });
-    renderWithProviders(<McpTab workspaceId="ws-1" />);
-
-    // Switch to the Templates sub-view and add the template to the workspace.
-    fireEvent.click(screen.getByRole('button', { name: /^templates$/i }));
-    fireEvent.click(await screen.findByRole('button', { name: /add to workspace/i }));
-
-    await waitFor(() =>
-      expect(mutateAsync.add).toHaveBeenCalledWith({ from_template: 'svc' }),
-    );
-    // The rejection is caught and surfaced — no unhandled rejection, user sees it.
-    await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith(
-        expect.objectContaining({
-          variant: 'destructive',
-          description: 'workspace at server cap',
-        }),
-      ),
-    );
-  });
-});
-
 describe('McpTab — Add button cap gating', () => {
   it('disables "Add server" when the workspace is at max_servers', async () => {
     listData = makeList([makeServer('a'), makeServer('b')], 2);

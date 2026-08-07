@@ -29,7 +29,7 @@ type StepState = 'done' | 'active' | 'todo';
 interface McpLifecycleProps {
   status: McpStatus;
   enabled: boolean;
-  origin: 'builtin' | 'workspace';
+  origin: 'builtin' | 'workspace' | 'user';
   /** A discovery probe is in flight for this row. */
   checking: boolean;
   /** The running session has applied the saved config (apply axis complete). */

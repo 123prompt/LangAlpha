@@ -109,7 +109,8 @@
     "workspaceGallery": "Workspace gallery",
     "collapse": "Collapse sidebar",
     "expand": "Expand sidebar",
-    "resize": "Resize sidebar"
+    "resize": "Resize sidebar",
+    "connectors": "Connectors"
   },
   "account": {
     "menuLabel": "Account menu"
@@ -2603,6 +2604,74 @@
       "replayDone": "Page tips and the getting-started guide will show again.",
       "reset": "Reset onboarding",
       "resetDone": "Onboarding reset — tips and the guide start fresh."
+    }
+  },
+  "connectors": {
+    "title": "Connectors",
+    "description": "MCP servers and credentials available to your agent in every workspace.",
+    "tabs": {
+      "servers": "Servers",
+      "secrets": "Secrets"
+    },
+    "servers": {
+      "title": "MCP servers",
+      "addServer": "Add server",
+      "importJson": "Import JSON",
+      "importHint": "Paste a standard mcpServers JSON config",
+      "atCap": "At {{max}}/{{max}} — remove one first",
+      "inheritHint": "A server switched on here is available in every one of your workspaces; switch it off in a single workspace from that workspace's MCP tab. Switched-off servers are inert templates.",
+      "enabledState": "On in all workspaces",
+      "disabledState": "Off — not inherited",
+      "empty": "No connectors yet. Add a server or import a JSON config.",
+      "loadFailed": "Failed to load servers",
+      "toggleFailed": "Could not change server state",
+      "deleteFailed": "Could not delete server",
+      "deleteConfirm": "Delete \"{{server}}\" from your Connectors? Workspaces stop inheriting it immediately.",
+      "deleteConfirmYes": "Delete",
+      "deleteConfirmNo": "Cancel",
+      "edit": "Edit",
+      "delete": "Delete",
+      "warningTitle": "Server saved with warnings"
+    },
+    "oauth": {
+      "connected": "Connected",
+      "needsReauth": "Reconnect needed",
+      "refreshAmbiguous": "Check connection",
+      "revoked": "Disconnected",
+      "connect": "Connect",
+      "reconnect": "Reconnect",
+      "disconnect": "Disconnect",
+      "refreshSchemas": "Refresh tools",
+      "connectFailed": "Could not start the connection",
+      "connectedTitle": "Connected",
+      "connectedDesc": "\"{{server}}\" is connected. Enable it to use it in your workspaces.",
+      "callbackErrorTitle": "Connection failed",
+      "disconnectedTitle": "Disconnected",
+      "disconnectedDesc": "\"{{server}}\" is disconnected. Reconnect anytime; agent calls fail until then.",
+      "disconnectFailed": "Could not disconnect",
+      "refreshedTitle": "Tools refreshed",
+      "refreshedDesc": "\"{{server}}\" now exposes {{count}} tools.",
+      "refreshFailed": "Could not refresh tools"
+    },
+    "import": {
+      "disabledNudgeTitle": "Imported switched off",
+      "disabledNudgeDesc": "Imported servers start off. Switch each one on to make it available in your workspaces."
+    },
+    "secrets": {
+      "title": "Vault",
+      "addSecret": "Add Secret",
+      "scopeHint": "Secrets here back your Connectors servers and are available in every workspace. A workspace secret with the same name overrides the value in that workspace.",
+      "valuePlaceholder": "Secret value",
+      "editValuePlaceholder": "New value (leave empty to keep current)",
+      "descriptionPlaceholder": "Description (optional)",
+      "empty": "No secrets stored. Add API keys or credentials for your connectors.",
+      "loadFailed": "Failed to load secrets",
+      "update": "Update",
+      "edit": "Edit",
+      "delete": "Delete",
+      "deleteConfirmYes": "Confirm",
+      "hideValue": "Hide value",
+      "revealValue": "Reveal value"
     }
   }
 }
