@@ -1,14 +1,20 @@
 """Database CRUD for per-workspace and user-level MCP server configuration.
 
-Three concerns live here:
-- User-level catalog (``user_mcp_servers``): templates the UI copies into a
-  workspace on demand. Plain CRUD by ``(user_id, name)``.
+Four concerns live here:
+- User-level servers (``user_mcp_servers``): CRUD by ``(user_id, name)``.
+  ``enabled`` rows are LIVE config inherited by every workspace of the user at
+  resolve time; disabled rows are inert templates (the pre-connectors
+  behavior). Any mutation of an enabled row fans out a version bump to ALL the
+  user's workspaces in the same transaction — convergence is next-acquire.
 - Per-workspace rows (``workspace_mcp_servers``): the source of truth for a
   workspace's effective MCP set. EVERY write bumps ``workspaces.mcp_config_version``
   in the SAME transaction so sessions can detect drift on their next acquire.
 - Discovery schema cache (``workspace_mcp_tool_schemas``): tool snapshots keyed
   by ``(workspace_id, server_name, config_hash)`` — a per-server config
   fingerprint, so toggling/adding an unrelated server never orphans a snapshot.
+- User-level discovery cache (``user_mcp_tool_schemas``): same shape, keyed by
+  user — for OAuth servers whose discovery runs host-side, plus a
+  ``schema_digest`` so fan-out happens only when tool content actually changed.
 
 Secrets are never stored here — env/header values hold ``${vault:NAME}``
 references resolved against ``workspace_vault_secrets`` inside the sandbox.
@@ -44,7 +50,7 @@ async def list_catalog_servers(user_id: str) -> list[dict[str, Any]]:
                 """
                 SELECT user_mcp_server_id, user_id, name, transport, command, args,
                        url, env, headers, description, instruction, tool_exposure_mode,
-                       discovery_uses_secrets, created_at, updated_at
+                       discovery_uses_secrets, enabled, created_at, updated_at
                 FROM user_mcp_servers
                 WHERE user_id = %s
                 ORDER BY name
@@ -62,7 +68,7 @@ async def get_catalog_server(user_id: str, name: str) -> dict[str, Any] | None:
                 """
                 SELECT user_mcp_server_id, user_id, name, transport, command, args,
                        url, env, headers, description, instruction, tool_exposure_mode,
-                       discovery_uses_secrets, created_at, updated_at
+                       discovery_uses_secrets, enabled, created_at, updated_at
                 FROM user_mcp_servers
                 WHERE user_id = %s AND name = %s
                 """,
@@ -122,7 +128,7 @@ async def create_catalog_server(
                     ON CONFLICT (user_id, name) DO NOTHING
                     RETURNING user_mcp_server_id, user_id, name, transport, command, args,
                               url, env, headers, description, instruction, tool_exposure_mode,
-                              discovery_uses_secrets, created_at, updated_at
+                              discovery_uses_secrets, enabled, created_at, updated_at
                     """,
                     (
                         user_id, name, transport, command, Json(args or []), url,
@@ -167,34 +173,126 @@ async def update_catalog_server(
     params.extend([user_id, name])
 
     async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                f"UPDATE user_mcp_servers SET {', '.join(parts)} "
-                "WHERE user_id = %s AND name = %s "
-                "RETURNING user_mcp_server_id, user_id, name, transport, command, args, "
-                "url, env, headers, description, instruction, tool_exposure_mode, "
-                "discovery_uses_secrets, created_at, updated_at",
-                params,
-            )
-            row = await cur.fetchone()
-            if not row:
-                return None
-            logger.info(f"[mcp_db] update_catalog_server user_id={user_id} name={name}")
-            return _catalog_row_to_dict(row)
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"UPDATE user_mcp_servers SET {', '.join(parts)} "
+                    "WHERE user_id = %s AND name = %s "
+                    "RETURNING user_mcp_server_id, user_id, name, transport, command, args, "
+                    "url, env, headers, description, instruction, tool_exposure_mode, "
+                    "discovery_uses_secrets, enabled, created_at, updated_at",
+                    params,
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                # A live (enabled) server changed shape — every workspace of the
+                # user must re-resolve on next acquire.
+                if row["enabled"]:
+                    await _bump_user_versions(cur, user_id)
+                logger.info(f"[mcp_db] update_catalog_server user_id={user_id} name={name}")
+                return _catalog_row_to_dict(row)
 
 
 async def delete_catalog_server(user_id: str, name: str) -> bool:
-    """Delete a catalog template by name. Returns True if a row existed."""
+    """Delete a user server by name. Returns True if a row existed.
+
+    For an enabled (live) server, the same transaction also purges its
+    per-workspace disable-markers (their name would otherwise squat the
+    UNIQUE(workspace_id, name) slot forever), drops the user-level discovery
+    cache, and fans out the version bump.
+    """
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "DELETE FROM user_mcp_servers WHERE user_id = %s AND name = %s "
+                    "RETURNING enabled",
+                    (user_id, name),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return False
+                await cur.execute(
+                    """
+                    DELETE FROM workspace_mcp_servers
+                    WHERE name = %s AND source = 'user' AND workspace_id IN
+                        (SELECT workspace_id FROM workspaces WHERE user_id = %s)
+                    """,
+                    (name, user_id),
+                )
+                await cur.execute(
+                    "DELETE FROM user_mcp_tool_schemas "
+                    "WHERE user_id = %s AND server_name = %s",
+                    (user_id, name),
+                )
+                if row["enabled"]:
+                    await _bump_user_versions(cur, user_id)
+                logger.info(f"[mcp_db] delete_catalog_server user_id={user_id} name={name}")
+                return True
+
+
+async def set_catalog_server_enabled(
+    user_id: str, name: str, enabled: bool
+) -> dict[str, Any] | None:
+    """Toggle a user server live/inert. Returns the row, or None if absent.
+
+    Both directions change every workspace's effective set, so the fan-out
+    bump always runs in the same transaction.
+    """
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    UPDATE user_mcp_servers
+                    SET enabled = %s, updated_at = NOW()
+                    WHERE user_id = %s AND name = %s
+                    RETURNING user_mcp_server_id, user_id, name, transport, command, args,
+                              url, env, headers, description, instruction, tool_exposure_mode,
+                              discovery_uses_secrets, enabled, created_at, updated_at
+                    """,
+                    (enabled, user_id, name),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                await _bump_user_versions(cur, user_id)
+                logger.info(
+                    f"[mcp_db] set_catalog_server_enabled user_id={user_id} "
+                    f"name={name} enabled={enabled}"
+                )
+                return _catalog_row_to_dict(row)
+
+
+async def list_enabled_user_servers(user_id: str) -> list[dict[str, Any]]:
+    """Enabled (live) user servers, for the resolve-time merge."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT user_mcp_server_id, user_id, name, transport, command, args,
+                       url, env, headers, description, instruction, tool_exposure_mode,
+                       discovery_uses_secrets, enabled, created_at, updated_at
+                FROM user_mcp_servers
+                WHERE user_id = %s AND enabled = TRUE
+                ORDER BY name
+                """,
+                (user_id,),
+            )
+            return [_catalog_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def bump_user_workspaces_mcp_version(user_id: str) -> int:
+    """Bump mcp_config_version on ALL of a user's workspaces (own transaction).
+
+    For out-of-band user-level invalidation (OAuth connect/disconnect, user
+    vault changes referenced by live servers). Returns workspaces touched.
+    """
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM user_mcp_servers WHERE user_id = %s AND name = %s",
-                (user_id, name),
-            )
-            if cur.rowcount == 0:
-                return False
-            logger.info(f"[mcp_db] delete_catalog_server user_id={user_id} name={name}")
-            return True
+            await _bump_user_versions(cur, user_id)
+            return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +661,95 @@ async def delete_tool_schemas_and_bump(
                 return deleted
 
 
+# ---------------------------------------------------------------------------
+# User-level discovery schema cache (host-side discovery for OAuth servers)
+# ---------------------------------------------------------------------------
+
+
+async def get_user_tool_schemas(user_id: str) -> list[dict[str, Any]]:
+    """Latest snapshot per server for a user (any config_hash), like
+    ``get_tool_schemas`` but user-scoped."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT DISTINCT ON (server_name)
+                       user_id, server_name, config_hash, tools, status,
+                       error, schema_digest, observed_meta, discovered_at
+                FROM user_mcp_tool_schemas
+                WHERE user_id = %s
+                ORDER BY server_name, discovered_at DESC
+                """,
+                (user_id,),
+            )
+            return [_user_schema_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def upsert_user_tool_schemas(
+    user_id: str,
+    server_name: str,
+    config_hash: str,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    status: str = "pending",
+    error: str = "",
+    schema_digest: str = "",
+    observed_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Insert or replace a user-level snapshot; same no-downgrade rule as the
+    workspace variant (a non-ok write never clobbers a same-hash ok row)."""
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM user_mcp_tool_schemas
+                    WHERE user_id = %s AND server_name = %s
+                      AND config_hash <> %s
+                    """,
+                    (user_id, server_name, config_hash),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO user_mcp_tool_schemas AS t
+                        (user_id, server_name, config_hash, tools, status,
+                         error, schema_digest, observed_meta, discovered_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (user_id, server_name, config_hash) DO UPDATE
+                        SET tools = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                         THEN t.tools ELSE EXCLUDED.tools END,
+                            status = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                          THEN t.status ELSE EXCLUDED.status END,
+                            error = EXCLUDED.error,
+                            schema_digest = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                                 THEN t.schema_digest ELSE EXCLUDED.schema_digest END,
+                            observed_meta = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                                 THEN t.observed_meta ELSE EXCLUDED.observed_meta END,
+                            discovered_at = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
+                                                 THEN t.discovered_at ELSE NOW() END
+                    RETURNING user_id, server_name, config_hash, tools, status,
+                              error, schema_digest, observed_meta, discovered_at
+                    """,
+                    (
+                        user_id, server_name, config_hash, Json(tools or []),
+                        status, error, schema_digest, Json(observed_meta or {}),
+                    ),
+                )
+                return _user_schema_row_to_dict(await cur.fetchone())
+
+
+async def delete_user_tool_schemas(user_id: str, server_name: str) -> int:
+    """Delete ALL user-level snapshots for one server. Returns count."""
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM user_mcp_tool_schemas "
+                "WHERE user_id = %s AND server_name = %s",
+                (user_id, server_name),
+            )
+            return cur.rowcount
+
+
 async def bump_workspace_mcp_version(workspace_id: str) -> None:
     """Bump mcp_config_version outside a row mutation (own transaction).
 
@@ -588,6 +775,19 @@ async def _bump_version(cur, workspace_id: str) -> None:
     )
 
 
+async def _bump_user_versions(cur, user_id: str) -> None:
+    """Increment mcp_config_version on every workspace of a user (same txn).
+
+    One statement, unpaginated on purpose: a user-level change must never
+    leave a subset of workspaces on the old version.
+    """
+    await cur.execute(
+        "UPDATE workspaces SET mcp_config_version = mcp_config_version + 1 "
+        "WHERE user_id = %s",
+        (user_id,),
+    )
+
+
 def _catalog_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
     """Normalize a user_mcp_servers row into a plain JSON-friendly dict."""
     return {
@@ -604,6 +804,7 @@ def _catalog_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "instruction": row["instruction"] or "",
         "tool_exposure_mode": row["tool_exposure_mode"],
         "discovery_uses_secrets": bool(row.get("discovery_uses_secrets", False)),
+        "enabled": bool(row.get("enabled", False)),
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
     }
@@ -620,6 +821,21 @@ def _workspace_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "config": row["config"],
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
+    }
+
+
+def _user_schema_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a user_mcp_tool_schemas row into a plain dict."""
+    return {
+        "user_id": row["user_id"],
+        "server_name": row["server_name"],
+        "config_hash": row["config_hash"],
+        "tools": row["tools"] or [],
+        "status": row["status"],
+        "error": row["error"] or "",
+        "schema_digest": row["schema_digest"] or "",
+        "observed_meta": row["observed_meta"] or {},
+        "discovered_at": row["discovered_at"].isoformat(),
     }
 
 
