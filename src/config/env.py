@@ -47,6 +47,11 @@ SERVER_BASE_URL: str = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
 # Chromium fetches bytes from this process, not the public ingress.
 PDF_RENDER_INTERNAL_BASE: str = os.getenv("PDF_RENDER_INTERNAL_BASE", "http://127.0.0.1:8000")
 
+# Shared HS256 secret authenticating sandboxes to the egress relay
+# (/v1/egress/*). Empty disables the relay — OAuth-connected MCP servers
+# then have no execution path, but nothing else is affected.
+EGRESS_RELAY_SECRET: str = os.getenv("EGRESS_RELAY_SECRET", "")
+
 # Credit conversion rate (USD → credits).  Override with USD_TO_CREDITS_RATE env var.
 USD_TO_CREDITS_RATE: int = int(os.getenv("USD_TO_CREDITS_RATE", "1000"))
 
