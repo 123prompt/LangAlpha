@@ -1,9 +1,10 @@
 """Background refresh sweep for MCP OAuth connections.
 
 Proactively refreshes connections approaching expiry so relay requests almost
-never pay the refresh on the hot path, and re-discovers aged-out schema
-snapshots. Cross-worker dedup rides the same per-connection advisory try-lock
-``ensure_fresh_access_token`` takes — this loop is just a pacemaker.
+never pay the refresh on the hot path. Cross-worker dedup rides the same
+per-connection advisory try-lock ``ensure_fresh_access_token`` takes — this
+loop is just a pacemaker. Schema snapshots are refreshed only on connect and
+via the Connectors refresh action, never here.
 """
 
 from __future__ import annotations
