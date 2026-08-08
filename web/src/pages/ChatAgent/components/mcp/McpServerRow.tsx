@@ -15,6 +15,7 @@ import {
   ServerRowShell,
   TagBadge,
 } from './McpPrimitives';
+import { isOauthBroken, showsWorkspaceDetail } from './mcpState';
 import type { EffectiveServer } from '../../utils/api';
 
 /**
@@ -98,7 +99,12 @@ function McpServerRowImpl({
   const isInherited = server.origin === 'user';
   // The user-level OAuth connection is broken (revoked / needs reauth) — the
   // only fix is reconnecting in Connectors, so the row leads with that.
-  const oauthBroken = !!server.oauth_status && server.oauth_status !== 'connected';
+  const oauthBroken = isOauthBroken(server.oauth_status);
+  // The one gate for every piece of workspace-local detail below. Sharing it is
+  // the point: when it was spelled out per-gate, the needs_secret one silently
+  // dropped the OAuth conjunct and a revoked row offered both "Set up NAME" and
+  // "Reconnect in Connectors".
+  const showsDetail = showsWorkspaceDetail(server);
 
   return (
     <ServerRowShell
@@ -128,7 +134,7 @@ function McpServerRowImpl({
               sandboxWarming={sandboxWarming}
               oauthStatus={server.oauth_status}
             />
-            {server.enabled && !oauthBroken && server.status === 'connected' && server.tool_count > 0 && (
+            {showsDetail && server.status === 'connected' && server.tool_count > 0 && (
               <span className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
                 {t('mcp.row.toolCount', { count: server.tool_count })}
               </span>
@@ -137,7 +143,7 @@ function McpServerRowImpl({
 
           {/* Error text — silenced when the OAuth pill already names the real
               problem (any cached error predates the disconnect). */}
-          {server.enabled && !oauthBroken && server.status === 'error' && server.error && (
+          {showsDetail && server.status === 'error' && server.error && (
             <p className="text-[0.6875rem] break-words" style={{ color: 'var(--color-loss)' }}>
               {server.error}
             </p>
@@ -151,7 +157,7 @@ function McpServerRowImpl({
                 onClick={onManageInConnectors}
                 className="inline-flex items-center gap-1 text-[0.6875rem] px-2 py-0.5 rounded"
                 style={{
-                  color: 'var(--color-warning, #d97706)',
+                  color: 'var(--color-warning)',
                   backgroundColor: 'var(--color-bg-tag)',
                   border: '1px dashed var(--color-border-default)',
                 }}
@@ -163,7 +169,7 @@ function McpServerRowImpl({
           )}
 
           {/* needs_secret → "Set up NAME" affordance(s) */}
-          {server.enabled && server.status === 'needs_secret' && server.missing_secrets.length > 0 && (
+          {showsDetail && server.status === 'needs_secret' && server.missing_secrets.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {server.missing_secrets.map((name) => (
                 <button
@@ -172,7 +178,7 @@ function McpServerRowImpl({
                   onClick={() => onSetupSecret(name)}
                   className="inline-flex items-center gap-1 text-[0.6875rem] px-2 py-0.5 rounded"
                   style={{
-                    color: 'var(--color-warning, #d97706)',
+                    color: 'var(--color-warning)',
                     backgroundColor: 'var(--color-bg-tag)',
                     border: '1px dashed var(--color-border-default)',
                   }}

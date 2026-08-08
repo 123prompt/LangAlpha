@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '../lib/queryKeys';
+import { needsDiscoveryProbe } from '../pages/ChatAgent/components/mcp/mcpState';
 import {
   getWorkspaceMcpServers,
   addWorkspaceMcpServer,
@@ -102,15 +103,9 @@ function isSettling(data: EffectiveServerList | undefined): boolean {
   const applyingBehind =
     data.applied_config_version != null &&
     data.applied_config_version < data.config_version;
-  // OAuth rows (`oauth_status` set) never verify in-workspace — discovery is
-  // host-side — so counting them would poll forever on a disconnected server.
-  const verifying = data.servers.some(
-    (s) =>
-      (s.origin === 'workspace' || s.origin === 'user') &&
-      !s.oauth_status &&
-      s.enabled &&
-      s.status === 'pending',
-  );
+  // Exactly the rows McpTab will auto-probe (`needsDiscoveryProbe`) — polling
+  // for a probe that never runs is how this hangs, so the two read one gate.
+  const verifying = data.servers.some(needsDiscoveryProbe);
   return applyingBehind || verifying;
 }
 
@@ -325,13 +320,20 @@ export function useToggleMcpCatalogServer() {
   });
 }
 
-/** Bulk-import a standard `mcpServers` blob into the user catalog (Connectors). */
+/**
+ * Bulk-import a standard `mcpServers` blob into the user catalog (Connectors).
+ * The backend also auto-extracts inline literal credentials into the USER
+ * vault, so the vault list is invalidated too — otherwise the freshly created
+ * secrets stay invisible (and the server modal's picker keeps offering to
+ * re-create them) until the 30s staleTime lapses.
+ */
 export function useImportMcpCatalogServers() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (payload: unknown) => importMcpCatalogServers(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.userVault.all });
     },
   });
 }

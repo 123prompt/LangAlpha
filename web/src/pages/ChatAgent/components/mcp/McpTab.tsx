@@ -28,6 +28,7 @@ import {
   ListHeader,
   ListSkeleton,
 } from './McpPrimitives';
+import { needsDiscoveryProbe } from './mcpState';
 
 /**
  * The "MCP" tab in the workspace settings panel — the workspace-scoped view.
@@ -175,8 +176,10 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
       try {
         await discoverAsync(name);
       } catch {
-        // The error surfaces as the row's status (error) after the refetch;
-        // no toast needed for an inline probe.
+        // A probe that reached the backend reports its own failure as the row's
+        // status on the next refetch. A transport-level throw leaves the row on
+        // 'pending'; the workspace poll's verify-stall cap (useMcpServers) stops
+        // it rather than spinning. Either way, no toast for a silent inline probe.
       } finally {
         setCheckingNames((prev) => {
           const next = new Set(prev);
@@ -190,20 +193,14 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
 
   // Auto-resolve pending servers: instead of leaving a freshly-added server on a
   // static "Pending", probe it once so the user sees Checking → Connected/Error.
-  // Only when the sandbox is running (discovery needs it) and only enabled
-  // workspace + inherited servers (disabled rows read as "Disabled"; builtins
-  // are always connected; OAuth rows are discovered host-side — a sandbox
-  // probe would 409). The backend's 15s debounce backs up the mount guard.
+  // Only when the sandbox is running (discovery needs it) and only for the rows
+  // `needsDiscoveryProbe` admits — the same gate the list query polls on, so a
+  // row can't be polled-for-but-never-probed. The backend's 15s debounce backs
+  // up the mount guard.
   useEffect(() => {
     if (!sandboxRunning) return;
     for (const s of servers) {
-      if (
-        (s.origin === 'workspace' || s.origin === 'user') &&
-        !s.oauth_status &&
-        s.enabled &&
-        s.status === 'pending' &&
-        !autoCheckedRef.current.has(s.name)
-      ) {
+      if (needsDiscoveryProbe(s) && !autoCheckedRef.current.has(s.name)) {
         autoCheckedRef.current.add(s.name);
         void runDiscover(s.name);
       }

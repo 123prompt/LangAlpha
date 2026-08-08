@@ -226,6 +226,54 @@ describe('McpServerRow — status-specific affordances', () => {
     expect(screen.queryByTestId('mcp-status-connected')).not.toBeInTheDocument();
   });
 
+  it('offers exactly one next step on a revoked row with a stale needs_secret status', () => {
+    // Regression: the needs_secret gate was missing the `!oauthBroken` conjunct
+    // its two sibling gates had, so a revoked inherited row rendered BOTH
+    // "Set up NAME" and "Reconnect in Connectors" — two contradictory fixes,
+    // only one of which works. The missing secret is not the real problem here;
+    // the cached status predates the disconnect.
+    const h = handlers();
+    const onManageInConnectors = vi.fn();
+    render(
+      <McpServerRow
+        server={makeServer({
+          origin: 'user',
+          status: 'needs_secret',
+          missing_secrets: ['PLACEHOLDER_TOKEN'],
+          oauth_status: 'revoked',
+        })}
+        onManageInConnectors={onManageInConnectors}
+        {...h}
+      />,
+    );
+
+    expect(screen.queryByText('Set up PLACEHOLDER_TOKEN')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText('Reconnect in Connectors'));
+    expect(onManageInConnectors).toHaveBeenCalledTimes(1);
+    expect(h.onSetupSecret).not.toHaveBeenCalled();
+  });
+
+  it('still shows "Set up NAME" on a needs_secret row whose OAuth connection is healthy', () => {
+    // The guard must not over-fire: a connected OAuth server genuinely missing
+    // a vault secret keeps its local fix.
+    const h = handlers();
+    render(
+      <McpServerRow
+        server={makeServer({
+          origin: 'user',
+          status: 'needs_secret',
+          missing_secrets: ['PLACEHOLDER_TOKEN'],
+          oauth_status: 'connected',
+        })}
+        onManageInConnectors={vi.fn()}
+        {...h}
+      />,
+    );
+    fireEvent.click(screen.getByText('Set up PLACEHOLDER_TOKEN'));
+    expect(h.onSetupSecret).toHaveBeenCalledWith('PLACEHOLDER_TOKEN');
+    expect(screen.queryByText('Reconnect in Connectors')).not.toBeInTheDocument();
+  });
+
   it('suppresses the tool count while still verifying', () => {
     render(
       <McpServerRow

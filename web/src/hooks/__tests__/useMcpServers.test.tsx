@@ -10,6 +10,7 @@ import {
   useAddWorkspaceMcpServer,
   useDeleteWorkspaceMcpServer,
   useCreateMcpCatalogServer,
+  useImportMcpCatalogServers,
   useDelayedFalse,
 } from '../useMcpServers';
 import type { EffectiveServerList } from '../../pages/ChatAgent/utils/api';
@@ -25,6 +26,7 @@ vi.mock('../../pages/ChatAgent/utils/api', () => ({
   createMcpCatalogServer: vi.fn(),
   updateMcpCatalogServer: vi.fn(),
   deleteMcpCatalogServer: vi.fn(),
+  importMcpCatalogServers: vi.fn(),
 }));
 
 import {
@@ -33,6 +35,7 @@ import {
   addWorkspaceMcpServer,
   deleteWorkspaceMcpServer,
   createMcpCatalogServer,
+  importMcpCatalogServers,
 } from '../../pages/ChatAgent/utils/api';
 
 const WS = 'ws-1';
@@ -245,5 +248,27 @@ describe('mcp mutations — invalidation', () => {
     });
 
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.catalog() });
+  });
+
+  it('catalog import invalidates the user vault too — the backend auto-vaults inline secrets', async () => {
+    // Regression: the import only invalidated the catalog, so secrets the
+    // import created stayed invisible in Connectors → Secrets (and absent from
+    // the server modal's picker) until the 30s staleTime lapsed.
+    const client = makeClient();
+    const spy = vi.spyOn(client, 'invalidateQueries');
+    (importMcpCatalogServers as Mock).mockResolvedValue({
+      results: [{ name: 't1', original_name: 't1', renamed: false, status: 'created' }],
+      created: 1,
+      secrets_created: ['PLACEHOLDER_TOKEN'],
+      config_version: 2,
+    });
+
+    const { result } = renderHook(() => useImportMcpCatalogServers(), { wrapper: wrapperFor(client) });
+    await act(async () => {
+      await result.current.mutateAsync({ mcpServers: {} });
+    });
+
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.catalog() });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.userVault.all });
   });
 });

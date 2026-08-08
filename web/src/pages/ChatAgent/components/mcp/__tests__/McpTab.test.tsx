@@ -178,6 +178,30 @@ describe('McpTab — promote workspace server to template', () => {
     );
   });
 
+  it('surfaces a rejected promote as a toast rather than an unhandled rejection', async () => {
+    // The branch that moved Templates out to /connectors deleted this file's
+    // only toast-error assertion along with it; promote is McpTab's remaining
+    // fire-and-report mutation, and a swallowed failure here reads as success.
+    listData = makeList([makeServer('fresh_server')]);
+    catalogData = { servers: [] };
+    mutateAsync.promote.mockRejectedValue({
+      response: { data: { detail: 'connector catalog at cap' } },
+    });
+    renderWithProviders(<McpTab workspaceId="ws-1" />);
+
+    fireEvent.click(screen.getByText('save-template-fresh_server'));
+
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          variant: 'destructive',
+          title: 'Could not save to Connectors',
+          description: 'connector catalog at cap',
+        }),
+      ),
+    );
+  });
+
   it('cancels the overwrite confirm without promoting', async () => {
     listData = makeList([makeServer('dup_server')]);
     catalogData = { servers: [{ name: 'dup_server' }] };
@@ -217,6 +241,35 @@ describe('McpTab — auto-resolve pending servers', () => {
     renderWithProviders(<McpTab workspaceId="ws-1" />);
 
     await waitFor(() => expect(screen.getByTestId('row-off')).toBeInTheDocument());
+    expect(mutateAsync.discover).not.toHaveBeenCalled();
+  });
+
+  it('probes a pending INHERITED server too (it runs in this sandbox like any other)', async () => {
+    listData = makeList([makeServer('inherited', { origin: 'user', status: 'pending' })]);
+    mutateAsync.discover.mockResolvedValue({ status: 'connected', tools: [], error: '' });
+    renderWithProviders(<McpTab workspaceId="ws-1" />);
+
+    await waitFor(() => expect(mutateAsync.discover).toHaveBeenCalledWith('inherited'));
+  });
+
+  it('does NOT probe an OAuth row — discovery is host-side and the backend 409s', async () => {
+    // The gate that keeps this and the list query's self-stopping poll in
+    // agreement: probing here would 409, and counting it there would poll
+    // forever on a server no probe can ever resolve.
+    listData = makeList([
+      makeServer('oauth_row', { origin: 'user', status: 'pending', oauth_status: 'connected' }),
+    ]);
+    renderWithProviders(<McpTab workspaceId="ws-1" />);
+
+    await waitFor(() => expect(screen.getByTestId('row-oauth_row')).toBeInTheDocument());
+    expect(mutateAsync.discover).not.toHaveBeenCalled();
+  });
+
+  it('does NOT probe a builtin (always connected, process-global)', async () => {
+    listData = makeList([makeServer('builtin_row', { origin: 'builtin', status: 'pending' })]);
+    renderWithProviders(<McpTab workspaceId="ws-1" />);
+
+    await waitFor(() => expect(screen.getByTestId('row-builtin_row')).toBeInTheDocument());
     expect(mutateAsync.discover).not.toHaveBeenCalled();
   });
 

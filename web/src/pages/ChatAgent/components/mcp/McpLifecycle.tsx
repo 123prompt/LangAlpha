@@ -2,7 +2,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
 import { McpOauthPill, McpStatusPill } from './McpStatusPill';
-import type { McpOauthStatus, McpStatus } from '../../utils/api';
+import { deriveLifecycle, type McpLifecycleInput, type McpLifecycleStep } from './mcpState';
 
 /**
  * The end-to-end lifecycle indicator for one effective MCP server row.
@@ -21,88 +21,39 @@ import type { McpOauthStatus, McpStatus } from '../../utils/api';
  * Ready) so the user sees real movement and a truthful current phase instead
  * of a dead "Pending". A healthy, fully-applied server collapses back to the
  * clean green "Connected" pill — no perpetual stepper noise.
+ *
+ * Which of those to render is decided by `deriveLifecycle` in `mcpState.ts`;
+ * this component only paints the result.
  */
 
 const SPRING = { type: 'spring' as const, stiffness: 200, damping: 22 };
 
-type StepState = 'done' | 'active' | 'todo';
-
-interface McpLifecycleProps {
-  status: McpStatus;
-  enabled: boolean;
-  origin: 'builtin' | 'workspace' | 'user';
-  /** A discovery probe is in flight for this row. */
-  checking: boolean;
-  /** The running session has applied the saved config (apply axis complete). */
-  synced: boolean;
-  /** Whether the workspace sandbox is running (discovery/apply can happen). */
-  sandboxRunning: boolean;
-  /** The sandbox is warming up toward running (a background apply kicked it). */
-  sandboxWarming?: boolean;
-  /** Inherited rows: the owner's OAuth connection status (incl. 'revoked'). */
-  oauthStatus?: McpOauthStatus | null;
-}
-
-export function McpLifecycle({ status, enabled, origin, checking, synced, sandboxRunning, sandboxWarming = false, oauthStatus = null }: McpLifecycleProps) {
+export function McpLifecycle(props: McpLifecycleInput) {
   const { t } = useTranslation();
-  // Built-ins are process-global: always connected, no per-workspace discovery
-  // or apply state to surface. They never show the verify/apply track.
-  if (origin === 'builtin') return <McpStatusPill status={status} enabled={enabled} />;
-  // Terminal / steady states → a single pill, same as before. A disabled row is
-  // always enabled=false (the optimistic toggle writes enabled+status coherently
-  // at the source), so this guard alone covers it.
-  if (!enabled) return <McpStatusPill status={status} enabled={false} />;
-  // OAuth rows are discovered host-side, never probed from this workspace —
-  // the verify track would be a promise nothing can keep. A broken connection
-  // is the dominant truth (the fix is reconnecting in Connectors, not
-  // waiting); a connected one without a snapshot yet reads as plain Pending.
-  if (oauthStatus && oauthStatus !== 'connected') return <McpOauthPill status={oauthStatus} />;
-  if (oauthStatus && status === 'pending') return <McpStatusPill status="pending" enabled />;
-  if (status === 'error') return <McpStatusPill status="error" enabled />;
-  if (status === 'needs_secret') return <McpStatusPill status="needs_secret" enabled />;
-  if (status === 'unknown') return <McpStatusPill status="unknown" enabled />;
-  // Fully done: verified AND loaded into the running agent.
-  if (status === 'connected' && synced) return <McpStatusPill status="connected" enabled />;
+  const view = deriveLifecycle(props);
 
-  // Otherwise the server is still moving through the lifecycle.
-  const verifying = checking || (status === 'pending' && sandboxRunning);
-  // Pending while the sandbox is coming up: discovery can't run yet, but a warm
-  // is in flight, so the verify step is active ("Starting workspace…") rather
-  // than a dead "Waiting…".
-  const warmingUp = status === 'pending' && !sandboxRunning && sandboxWarming;
-  const verified = status === 'connected';
-
-  const verifyState: StepState = verified ? 'done' : verifying || warmingUp ? 'active' : 'todo';
-  const readyState: StepState = verified ? (synced ? 'done' : 'active') : 'todo';
-
-  let label: string;
-  if (verifying) label = t('mcp.lifecycle.verifying');
-  else if (warmingUp) label = t('mcp.lifecycle.starting');
-  else if (status === 'pending') label = t('mcp.lifecycle.waiting');
-  else if (verified && !synced) label = sandboxRunning ? t('mcp.lifecycle.applying') : t('mcp.lifecycle.appliesOnStart');
-  else label = t('mcp.lifecycle.ready');
-
-  const phase = verifying
-    ? 'verifying'
-    : warmingUp
-      ? 'starting'
-      : readyState === 'active'
-        ? 'applying'
-        : 'waiting';
+  if (view.kind === 'status') return <McpStatusPill status={view.status} enabled={view.enabled} />;
+  if (view.kind === 'oauth') return <McpOauthPill status={view.status} />;
 
   return (
     <span
       className="inline-flex items-center gap-1.5"
       data-testid="mcp-lifecycle"
-      data-phase={phase}
+      data-phase={view.phase}
     >
-      <LifecycleTrack steps={[{ key: 'saved', state: 'done' }, { key: 'verify', state: verifyState }, { key: 'ready', state: readyState }]} />
-      <span className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>{label}</span>
+      <LifecycleTrack
+        steps={[
+          { key: 'saved', state: 'done' },
+          { key: 'verify', state: view.verifyState },
+          { key: 'ready', state: view.readyState },
+        ]}
+      />
+      <span className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>{t(view.labelKey)}</span>
     </span>
   );
 }
 
-function LifecycleTrack({ steps }: { steps: Array<{ key: string; state: StepState }> }) {
+function LifecycleTrack({ steps }: { steps: Array<{ key: string; state: McpLifecycleStep }> }) {
   return (
     <span className="inline-flex items-center" aria-hidden>
       {steps.map((step, i) => (
@@ -120,7 +71,7 @@ function LifecycleTrack({ steps }: { steps: Array<{ key: string; state: StepStat
   );
 }
 
-function Node({ state }: { state: StepState }) {
+function Node({ state }: { state: McpLifecycleStep }) {
   const color =
     state === 'done'
       ? 'var(--color-profit)'
