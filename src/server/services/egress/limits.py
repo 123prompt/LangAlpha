@@ -19,7 +19,9 @@ RATE_CLASSES: dict[str, dict[str, int]] = {
     "default": {"rpm": 120, "concurrency": 4},
 }
 
-# TTLs bound leak windows if a worker dies mid-request.
+# TTLs bound leak windows if a worker dies mid-request. The concurrency TTL
+# must exceed the relay's 55s wall clock: a live request outliving its key
+# would decr a fresh counter negative on release and hand out extra slots.
 _RATE_KEY_TTL = 120
 _CONC_KEY_TTL = 120
 
@@ -63,21 +65,26 @@ async def acquire_slot(grant_id: str, rate_class: str):
     if int(count) > limits["rpm"]:
         raise RelayLimited("rate")
 
-    acquired = False
     try:
         async with redis.pipeline(transaction=True) as pipe:
             pipe.incr(conc_key)
             pipe.expire(conc_key, _CONC_KEY_TTL)
             inflight, _ = await pipe.execute()
-        acquired = True
+    except Exception:
+        logger.warning(
+            "[egress_limits] concurrency check failed; failing open", exc_info=True
+        )
+        yield
+        return
+
+    try:
         if int(inflight) > limits["concurrency"]:
             raise RelayLimited("concurrency")
         yield
     finally:
-        if acquired:
-            try:
-                await redis.decr(conc_key)
-            except Exception:
-                logger.warning(
-                    "[egress_limits] slot release failed for %s", grant_id
-                )
+        try:
+            await redis.decr(conc_key)
+        except Exception:
+            logger.warning(
+                "[egress_limits] slot release failed for %s", grant_id
+            )

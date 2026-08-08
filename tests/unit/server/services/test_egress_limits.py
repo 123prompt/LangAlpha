@@ -39,6 +39,10 @@ class _FakeRedis:
         self.values: dict[str, int] = {}
         self.ttls: dict[str, int] = {}
         self.fail: set[str] = set()
+        # Fail incr calls from this 0-based index on — lets a test kill Redis
+        # BETWEEN the rate round trip and the concurrency one.
+        self.fail_incr_from: int | None = None
+        self.incr_seen = 0
         self.calls: list[tuple[str, str]] = []
 
     def _guard(self, command: str) -> None:
@@ -47,6 +51,10 @@ class _FakeRedis:
 
     async def incr(self, key: str) -> int:
         self.calls.append(("incr", key))
+        index = self.incr_seen
+        self.incr_seen += 1
+        if self.fail_incr_from is not None and index >= self.fail_incr_from:
+            raise ConnectionError("redis incr unavailable")
         self._guard("incr")
         self.values[key] = self.values.get(key, 0) + 1
         return self.values[key]
@@ -296,6 +304,21 @@ class TestFailsOpen:
             entered = True
 
         assert entered is True
+        assert ("decr", _conc_key(GRANT_A)) not in redis.calls
+
+    @pytest.mark.asyncio
+    async def test_failed_concurrency_check_yields(self, redis, frozen_clock):
+        # Regression: Redis dying BETWEEN the rate round trip and the
+        # concurrency one used to escape acquire_slot as a raw exception
+        # (a relay 500), while the docstring promises fail-open for both.
+        redis.fail_incr_from = 1  # rate incr succeeds, concurrency incr dies
+
+        entered = False
+        async with acquire_slot(GRANT_A, TIGHT):
+            entered = True
+
+        assert entered is True
+        # Nothing was acquired, so nothing must be released.
         assert ("decr", _conc_key(GRANT_A)) not in redis.calls
 
     @pytest.mark.asyncio
