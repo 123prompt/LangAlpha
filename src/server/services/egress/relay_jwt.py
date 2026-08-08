@@ -15,7 +15,13 @@ from dataclasses import dataclass
 
 import jwt
 
-__all__ = ["RelayClaims", "RelayJwtError", "mint_relay_jwt", "validate_relay_jwt"]
+__all__ = [
+    "MintedJwt",
+    "RelayClaims",
+    "RelayJwtError",
+    "mint_relay_jwt",
+    "validate_relay_jwt",
+]
 
 ISSUER = "langalpha"
 AUDIENCE = "langalpha-egress-relay"
@@ -40,6 +46,15 @@ class RelayClaims:
     expires_at: int
 
 
+@dataclass(frozen=True)
+class MintedJwt:
+    """A freshly minted token with the expiry it was encoded with — callers
+    schedule the remint off ``expires_at`` rather than recomputing it."""
+
+    token: str
+    expires_at: int
+
+
 def mint_relay_jwt(
     secret: str,
     *,
@@ -47,9 +62,10 @@ def mint_relay_jwt(
     workspace_id: str,
     sandbox_id: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
-) -> str:
+) -> MintedJwt:
     now = int(time.time())
-    return jwt.encode(
+    expires_at = now + ttl_seconds
+    token = jwt.encode(
         {
             "iss": ISSUER,
             "aud": AUDIENCE,
@@ -58,12 +74,13 @@ def mint_relay_jwt(
             "sandbox_id": sandbox_id,
             "iat": now,
             "nbf": now,
-            "exp": now + ttl_seconds,
+            "exp": expires_at,
             "jti": uuid.uuid4().hex,
         },
         secret,
         algorithm=ALGORITHM,
     )
+    return MintedJwt(token=token, expires_at=expires_at)
 
 
 def validate_relay_jwt(secret: str, token: str) -> RelayClaims:

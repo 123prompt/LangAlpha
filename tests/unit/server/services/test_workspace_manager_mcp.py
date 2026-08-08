@@ -65,9 +65,7 @@ def _make_session(*, version=None, summary=None):
     session._builtin_mcp_registry = session.mcp_registry
     session.mcp_tool_summary = summary
     session.mcp_config_version = version
-    session.egress_grants = {}
-    session.egress_jwt_exp = None
-    session.egress_user_id = None
+    session.egress_binding = None
     return session
 
 

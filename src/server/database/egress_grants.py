@@ -27,13 +27,15 @@ async def ensure_oauth_grant(
     user_id: str,
     workspace_id: str,
     connection_id: str,
-    destination_url: str,
 ) -> str:
     """Idempotently ensure the (workspace, connection) grant. Returns grant_id.
 
-    Re-running refreshes destination_url and reactivates: the grant is
-    workspace plumbing, not consent — consent lives on the connection, and a
-    revoked/deleted connection cascades its grants away.
+    The relay dials ``destination_url``, and it is taken from the connection's
+    consented ``server_url`` inside this INSERT — never from a caller argument.
+    That is the whole security posture: a mutable catalog-row URL can never
+    steer the grant at a host the token wasn't issued for. The connection is
+    the consent record; when its URL changes the connection is re-consented
+    (a fresh row), and this upsert then reflects the new consented URL.
 
     The connection is selected rather than trusted, under the owner predicate:
     a connection_id that is absent or belongs to a different user matches no
@@ -48,7 +50,7 @@ async def ensure_oauth_grant(
                 INSERT INTO sandbox_egress_grants
                     (user_id, workspace_id, kind, connection_id,
                      destination_url, status, created_at, updated_at)
-                SELECT %s, %s::uuid, %s, c.connection_id, %s, 'active',
+                SELECT %s, %s::uuid, %s, c.connection_id, c.server_url, 'active',
                        NOW(), NOW()
                 FROM user_mcp_oauth_connections c
                 WHERE c.connection_id = %s::uuid AND c.user_id = %s
@@ -59,7 +61,7 @@ async def ensure_oauth_grant(
                 RETURNING grant_id
                 """,
                 (
-                    user_id, workspace_id, GRANT_KIND_OAUTH_MCP, destination_url,
+                    user_id, workspace_id, GRANT_KIND_OAUTH_MCP,
                     connection_id, user_id,
                 ),
             )
@@ -106,6 +108,35 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
                 "grant_status": row["grant_status"],
                 "connection_status": row["connection_status"],
             }
+
+
+async def retire_stale_grants(
+    workspace_id: str, *, keep_grant_ids: tuple[str, ...]
+) -> int:
+    """Revoke this workspace's active OAuth grants outside ``keep_grant_ids``.
+
+    The resolved server set is the intent; an active grant it no longer
+    contains is an authorization overhang — the sandbox may still hold that
+    grant_id and a live relay JWT. Returns the number retired. Re-adding the
+    server re-activates through ``ensure_oauth_grant``'s upsert.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE sandbox_egress_grants
+                SET status = 'revoked', updated_at = NOW()
+                WHERE workspace_id = %s AND kind = %s AND status = 'active'
+                  AND grant_id != ALL(%s::uuid[])
+                """,
+                (workspace_id, GRANT_KIND_OAUTH_MCP, list(keep_grant_ids)),
+            )
+            if cur.rowcount:
+                logger.info(
+                    f"[egress_grants_db] retired {cur.rowcount} stale grant(s) "
+                    f"for workspace {workspace_id}"
+                )
+            return cur.rowcount
 
 
 async def revoke_grants_for_connection(connection_id: str) -> int:

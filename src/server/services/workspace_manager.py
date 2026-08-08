@@ -18,6 +18,11 @@ from ptc_agent.core.mcp_sanitize import is_untrusted_server
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from ptc_agent.core.session import Session, SessionManager
 
+from src.server.services.egress.session_binding import (
+    maybe_remint_egress_jwt,
+    sync_egress_relay,
+)
+
 if TYPE_CHECKING:
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 
@@ -421,7 +426,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             and session.mcp_tool_summary is not None
         ):
             # The relay JWT ages independently of the config version.
-            await self._maybe_remint_egress_jwt(workspace_id, session)
+            await maybe_remint_egress_jwt(workspace_id, session)
             return None
 
         from src.server.services.mcp_config import resolve_mcp_config
@@ -443,7 +448,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # reads. Best-effort: a relay hiccup leaves those servers unbound (their
         # generated clients fail with a clear error) but never blocks the turn.
         try:
-            await self._sync_egress_relay(workspace_id, user_id, session, resolved)
+            await sync_egress_relay(workspace_id, user_id, session, resolved)
         except Exception as e:
             logger.warning(
                 "[EGRESS] relay binding failed for %s: %s", workspace_id, e
@@ -451,136 +456,6 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
 
         await self._install_session_composite(session, resolved, user_id=user_id)
         return resolved
-
-    async def _sync_egress_relay(
-        self,
-        workspace_id: str,
-        user_id: str | None,
-        session: Session,
-        resolved: Any,
-    ) -> None:
-        """Ensure egress grants + relay JWT + sandbox credential file.
-
-        One grant per OAuth-connected server in the resolved set; the sandbox
-        gets a single credential file (relay URL + JWT + server→grant map) and
-        never any vendor token. Removal converges here too: a resolve with no
-        OAuth servers deletes the file and clears the session state.
-        """
-        oauth_servers = [
-            s for s in resolved.servers if getattr(s, "oauth_connection_id", None)
-        ]
-        sandbox = session.sandbox
-        if not oauth_servers:
-            if session.egress_grants:
-                session.egress_grants = {}
-                session.egress_jwt_exp = None
-                if sandbox is not None:
-                    await sandbox.upload_egress_relay_credentials(None)
-            return
-
-        from src.config.env import EGRESS_RELAY_SECRET
-
-        if not EGRESS_RELAY_SECRET:
-            logger.warning(
-                "[EGRESS] OAuth-connected MCP servers %s present but "
-                "EGRESS_RELAY_SECRET is unset — they stay unbound",
-                [s.name for s in oauth_servers],
-            )
-            return
-        if not user_id:
-            # OAuth connections only resolve for authenticated users.
-            return
-
-        from src.server.database.egress_grants import ensure_oauth_grant
-
-        grants: dict[str, str] = {}
-        for srv in oauth_servers:
-            grant_id = await ensure_oauth_grant(
-                user_id=user_id,
-                workspace_id=workspace_id,
-                connection_id=srv.oauth_connection_id,
-                destination_url=srv.url or "",
-            )
-            srv.egress_grant_id = grant_id
-            grants[srv.name] = grant_id
-
-        await self._push_egress_credentials(workspace_id, session, user_id, grants)
-
-    async def _push_egress_credentials(
-        self,
-        workspace_id: str,
-        session: Session,
-        user_id: str,
-        grants: dict[str, str],
-    ) -> None:
-        """Mint a fresh relay JWT and (re)write the sandbox credential file."""
-        from src.config.env import EGRESS_RELAY_SECRET
-        from src.server.services.egress.reachability import (
-            effective_relay_base_url,
-            relay_reachability_warning,
-        )
-        from src.server.services.egress.relay_jwt import (
-            DEFAULT_TTL_SECONDS,
-            mint_relay_jwt,
-        )
-
-        sandbox = session.sandbox
-        if sandbox is None:
-            return
-        provider = self.config.sandbox.provider
-        relay_base = effective_relay_base_url(provider)
-        warning = relay_reachability_warning(provider, relay_base)
-        if warning:
-            logger.warning("[EGRESS] %s", warning)
-        token = mint_relay_jwt(
-            EGRESS_RELAY_SECRET,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            sandbox_id=getattr(sandbox, "sandbox_id", None) or "",
-        )
-        minted_at = time.time()
-        await sandbox.upload_egress_relay_credentials(
-            {
-                "relay_base_url": relay_base.rstrip("/"),
-                "token": token,
-                "grants": grants,
-            }
-        )
-        session.egress_grants = grants
-        session.egress_jwt_exp = minted_at + DEFAULT_TTL_SECONDS
-        session.egress_user_id = user_id
-
-    async def _maybe_remint_egress_jwt(
-        self, workspace_id: str, session: Session
-    ) -> None:
-        """Cheap fast-path check: re-push credentials when the JWT nears expiry.
-
-        Runs on the warm-cooldown path (which skips ``_apply_session_mcp``
-        entirely), so a long-lived session keeps a valid relay JWT without ever
-        re-resolving config. No-op unless the session has bound grants and the
-        token is inside the remint threshold.
-        """
-        if not session.egress_grants or session.egress_jwt_exp is None:
-            return
-        from src.server.services.egress.relay_jwt import needs_remint
-
-        if not needs_remint(session.egress_jwt_exp):
-            return
-        from src.config.env import EGRESS_RELAY_SECRET
-
-        if not EGRESS_RELAY_SECRET or not session.egress_user_id:
-            return
-        try:
-            await self._push_egress_credentials(
-                workspace_id, session, session.egress_user_id, session.egress_grants
-            )
-            logger.info(
-                "[EGRESS] relay JWT reminted for workspace %s", workspace_id
-            )
-        except Exception as e:
-            logger.warning(
-                "[EGRESS] relay JWT remint failed for %s: %s", workspace_id, e
-            )
 
     async def _install_session_composite(
         self, session: Session, resolved: Any, *, user_id: str | None = None
@@ -1550,7 +1425,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                         # path, no recreation, so no tier re-check needed. The
                         # relay-JWT check is a pure in-memory compare unless the
                         # token is actually near expiry (~once per 90min).
-                        await self._maybe_remint_egress_jwt(workspace_id, session)
+                        await maybe_remint_egress_jwt(workspace_id, session)
                         safe_add(session_path_counter, 1, {"path": "warm_cooldown"})
                         return session
 

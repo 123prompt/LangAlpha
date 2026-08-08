@@ -20,13 +20,13 @@ from src.server.database.egress_grants import (
     GRANT_KIND_OAUTH_MCP,
     GrantConnectionUnavailable,
     ensure_oauth_grant,
+    retire_stale_grants,
 )
 
 OWNER = "user-owner"
 INTRUDER = "user-intruder"
 CONNECTION_ID = "11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID = "22222222-2222-4222-8222-222222222222"
-DESTINATION = "https://vendor.example.com/mcp"
 
 
 class _Cursor:
@@ -41,7 +41,7 @@ class _Cursor:
 
     async def execute(self, sql: str, params: tuple) -> None:
         self.statements.append((sql, params))
-        user_id, workspace_id, kind, _destination, connection_id, owner = params
+        user_id, workspace_id, kind, connection_id, owner = params
         # The source SELECT: no matching row ⇒ the INSERT inserts nothing and
         # ON CONFLICT never fires, so RETURNING yields nothing.
         if self._connections.get(connection_id) != owner:
@@ -82,7 +82,6 @@ class TestOwnership:
             user_id=OWNER,
             workspace_id=WORKSPACE_ID,
             connection_id=CONNECTION_ID,
-            destination_url=DESTINATION,
         )
         assert grant_id == f"grant-for-{CONNECTION_ID}"
 
@@ -94,7 +93,6 @@ class TestOwnership:
                 user_id=INTRUDER,
                 workspace_id=WORKSPACE_ID,
                 connection_id=CONNECTION_ID,
-                destination_url=DESTINATION,
             )
 
     @pytest.mark.asyncio
@@ -105,7 +103,6 @@ class TestOwnership:
                 user_id=OWNER,
                 workspace_id=WORKSPACE_ID,
                 connection_id="33333333-3333-4333-8333-333333333333",
-                destination_url=DESTINATION,
             )
 
     @pytest.mark.asyncio
@@ -119,14 +116,16 @@ class TestOwnership:
             user_id=OWNER,
             workspace_id=WORKSPACE_ID,
             connection_id=CONNECTION_ID,
-            destination_url=DESTINATION,
         )
         sql, params = db.statements[0]
         flat = re.sub(r"\s+", " ", sql)
         assert "FROM user_mcp_oauth_connections c" in flat
         assert "WHERE c.connection_id = %s::uuid AND c.user_id = %s" in flat
-        # The inserted connection_id is c.connection_id, never the parameter.
-        assert "SELECT %s, %s::uuid, %s, c.connection_id" in flat
+        # The inserted connection_id AND destination_url both come from the
+        # connection row (c.connection_id, c.server_url), never a parameter —
+        # a caller can never steer the grant at a host the token wasn't issued
+        # for. No destination_url parameter exists to pass.
+        assert "SELECT %s, %s::uuid, %s, c.connection_id, c.server_url" in flat
         assert params[-2:] == (CONNECTION_ID, OWNER)
 
 
@@ -137,13 +136,68 @@ class TestIdempotence:
             user_id=OWNER,
             workspace_id=WORKSPACE_ID,
             connection_id=CONNECTION_ID,
-            destination_url=DESTINATION,
         )
         second = await ensure_oauth_grant(
             user_id=OWNER,
             workspace_id=WORKSPACE_ID,
             connection_id=CONNECTION_ID,
-            destination_url="https://vendor.example.com/mcp/v2",
         )
         assert first == second
         assert db.statements[0][1][2] == GRANT_KIND_OAUTH_MCP
+
+
+@pytest.fixture
+def recorder():
+    """Plain statement recorder (the ensure-shaped ``db`` fake unpacks the
+    INSERT's five params and can't observe other statements)."""
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.statements: list[tuple[str, tuple]] = []
+            self.rowcount = 3
+
+        async def execute(self, sql: str, params: tuple) -> None:
+            self.statements.append((sql, params))
+
+    cursor = _Recorder()
+
+    @asynccontextmanager
+    async def _cursor_cm(**kwargs):
+        yield cursor
+
+    class _Conn:
+        cursor = staticmethod(_cursor_cm)
+
+    @asynccontextmanager
+    async def _conn_cm():
+        yield _Conn()
+
+    with patch(
+        "src.server.database.egress_grants.get_db_connection", _conn_cm
+    ):
+        yield cursor
+
+
+class TestRetireStaleGrants:
+    """The retire predicate is what closes the authorization overhang: an
+    active grant the resolved set no longer contains must stop being
+    spendable, and the keep-list is the only thing that protects a grant."""
+
+    @pytest.mark.asyncio
+    async def test_retires_only_active_rows_outside_the_keep_list(self, recorder):
+        retired = await retire_stale_grants(WORKSPACE_ID, keep_grant_ids=("g-keep",))
+        assert retired == 3
+        sql, params = recorder.statements[0]
+        flat = re.sub(r"\s+", " ", sql)
+        assert "SET status = 'revoked'" in flat
+        assert (
+            "WHERE workspace_id = %s AND kind = %s AND status = 'active'" in flat
+        )
+        assert "grant_id != ALL(%s::uuid[])" in flat
+        assert params == (WORKSPACE_ID, GRANT_KIND_OAUTH_MCP, ["g-keep"])
+
+    @pytest.mark.asyncio
+    async def test_empty_keep_list_retires_everything_active(self, recorder):
+        await retire_stale_grants(WORKSPACE_ID, keep_grant_ids=())
+        _sql, params = recorder.statements[0]
+        assert params[-1] == []

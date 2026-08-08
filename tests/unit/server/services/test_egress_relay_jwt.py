@@ -84,7 +84,7 @@ class TestRoundTrip:
             user_id=USER_ID,
             workspace_id=WORKSPACE_ID,
             sandbox_id=SANDBOX_ID,
-        )
+        ).token
         claims = validate_relay_jwt(SECRET, token)
 
         assert claims.user_id == USER_ID
@@ -102,7 +102,7 @@ class TestRoundTrip:
                 workspace_id=WORKSPACE_ID,
                 sandbox_id=SANDBOX_ID,
                 ttl_seconds=90,
-            ),
+            ).token,
         )
         second = validate_relay_jwt(
             SECRET,
@@ -112,7 +112,7 @@ class TestRoundTrip:
                 workspace_id=WORKSPACE_ID,
                 sandbox_id=SANDBOX_ID,
                 ttl_seconds=90,
-            ),
+            ).token,
         )
 
         assert first.expires_at - int(time.time()) <= 90
@@ -124,7 +124,7 @@ class TestRoundTrip:
             user_id=USER_ID,
             workspace_id=WORKSPACE_ID,
             sandbox_id=SANDBOX_ID,
-        )
+        ).token
         assert jwt.get_unverified_header(token)["alg"] == "HS256"
 
 
@@ -140,7 +140,7 @@ class TestSignatureAndAlgorithm:
             user_id=USER_ID,
             workspace_id=WORKSPACE_ID,
             sandbox_id=SANDBOX_ID,
-        )
+        ).token
         with pytest.raises(RelayJwtError):
             validate_relay_jwt(SECRET, token)
 
@@ -174,7 +174,7 @@ class TestSignatureAndAlgorithm:
             user_id=USER_ID,
             workspace_id=WORKSPACE_ID,
             sandbox_id=SANDBOX_ID,
-        )
+        ).token
         head, body, sig = token.split(".")
         # Flip a middle character: every bit there is signature-significant,
         # whereas the final char's low bits are base64 padding the decoder
@@ -189,7 +189,7 @@ class TestSignatureAndAlgorithm:
             user_id=USER_ID,
             workspace_id=WORKSPACE_ID,
             sandbox_id=SANDBOX_ID,
-        )
+        ).token
         head, _, sig = token.split(".")
         swapped = _segment(_payload(workspace_id="ws-somebody-else"))
         with pytest.raises(RelayJwtError):
@@ -309,5 +309,5 @@ class TestNeedsRemint:
             user_id=USER_ID,
             workspace_id=WORKSPACE_ID,
             sandbox_id=SANDBOX_ID,
-        )
+        ).token
         assert needs_remint(validate_relay_jwt(SECRET, fresh).expires_at) is False

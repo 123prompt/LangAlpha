@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections.abc import Callable
 from types import TracebackType
+from typing import Any
 
 import structlog
 
@@ -53,14 +54,12 @@ class Session:
         self.mcp_tool_summary: str | None = None
         self.mcp_config_version: int | None = None
 
-        # Egress-relay binding state for OAuth-connected servers: the
-        # server→grant map last pushed to the sandbox, the JWT's expiry epoch
-        # (drives the cheap remint check on the warm fast path), and the
-        # user_id the grants/JWT were minted for (Session has no user_id;
-        # remint happens on paths where it isn't otherwise in hand).
-        self.egress_grants: dict[str, str] = {}
-        self.egress_jwt_exp: float | None = None
-        self.egress_user_id: str | None = None
+        # Egress-relay binding for OAuth-connected servers: what THIS process
+        # last pushed to the sandbox. Execution context only — grant truth is
+        # the sandbox_egress_grants table. An `EgressBinding | None`, typed
+        # loosely because the binding service is server-side and this core
+        # module must not import it (see services/egress/session_binding.py).
+        self.egress_binding: Any = None
 
         # The platform-secret fleet generation whose bindings were last applied
         # to this session's sandbox (the ``mcp_config_version`` analog) — lets

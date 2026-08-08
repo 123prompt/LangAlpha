@@ -100,7 +100,7 @@ def _jwt(
         workspace_id=workspace_id,
         sandbox_id=sandbox_id,
         ttl_seconds=ttl_seconds,
-    )
+    ).token
 
 
 def _rpc(method: str = "tools/call", name: str = "list_positions") -> bytes:
@@ -212,7 +212,10 @@ class RelayEnv:
         self.connection: AccessToken | None = None
         # (connection_id, generation) the relay reported as vendor-rejected.
         self.reauth_reports: list[tuple[str, int]] = []
-        self.pin = PinnedTarget(url=DESTINATION, host=VENDOR_HOST, ip=PINNED_IP)
+        # Default-port destination → the Host authority is the bare hostname.
+        self.pin = PinnedTarget(
+            url=DESTINATION, host=VENDOR_HOST, ip=PINNED_IP, authority=VENDOR_HOST
+        )
         self._vendors: list[_Vendor] = []
         self.vendor = self.set_vendor(_vendor_json())
 
@@ -781,6 +784,21 @@ class TestOutboundHeaders:
         assert "application/json" in sent["content-type"]
 
     @pytest.mark.asyncio
+    async def test_modern_negotiation_headers_pass_through(self, env, client):
+        # The 2026-07-28 stateless negotiation rides Mcp-Method / Mcp-Name;
+        # without them a modern server can't discover through the relay and
+        # every connector silently pins to the legacy handshake.
+        await _post(
+            client,
+            token=_jwt(),
+            headers={"mcp-method": "server/discover", "mcp-name": "probe_tool"},
+        )
+
+        sent = env.vendor.last.headers
+        assert sent["mcp-method"] == "server/discover"
+        assert sent["mcp-name"] == "probe_tool"
+
+    @pytest.mark.asyncio
     async def test_cookies_and_client_host_never_reach_the_vendor(self, env, client):
         await _post(
             client,
@@ -848,6 +866,8 @@ class TestOutboundHeaders:
             "content-type",
             "mcp-protocol-version",
             "mcp-session-id",
+            "mcp-method",
+            "mcp-name",
             "authorization",
             "host",
             # httpx transport bookkeeping, added below the relay
@@ -1293,7 +1313,10 @@ class TestSsrfPosture:
 
         assert resp.status_code == 502
         assert _error(resp) == "destination_blocked"
-        assert "https" in resp.text
+        # The pin-failure reason names the vendor host and is a DNS-resolution
+        # oracle — it stays host-side. The sandbox body carries only the code.
+        assert resp.text == "destination_blocked"
+        assert VENDOR_HOST not in resp.text
         assert env.vendor.sends == 0
 
     @pytest.mark.asyncio
@@ -1318,7 +1341,9 @@ class TestSsrfPosture:
 
         assert resp.status_code == 502
         assert _error(resp) == "destination_blocked"
-        assert "non-global" in resp.text
+        # The reason names the private/loopback host it refused to dial — a probe
+        # oracle. Redacted from the sandbox body; only the code returns.
+        assert resp.text == "destination_blocked"
         assert env.vendor.sends == 0
 
     @pytest.mark.asyncio
@@ -1333,20 +1358,37 @@ class TestSsrfPosture:
         assert env.vendor.sends == 0
 
     @pytest.mark.asyncio
-    async def test_a_public_destination_is_dialled_pinned_with_sni_restored(
+    async def test_a_public_destination_is_dialled_pinned_with_sni_and_host_restored(
         self, env, client
     ):
-        # Literal public IP → the real guard runs with no DNS. The dial goes to
-        # the validated address and the transport still verifies the name.
-        env.grant = _grant(destination_url=f"https://{PUBLIC_IP}:8443/mcp")
+        # A HOSTNAME destination on a non-default port. The real guard resolves
+        # it (stubbed to a fixed public IP so the test needs no DNS), then pins:
+        # the dial goes to the IP, but SNI and the Host authority must both carry
+        # the real name — and the Host must keep the non-default port, which a
+        # bare-host header would silently drop. An IP-literal destination could
+        # never prove any of this (host == ip), so a real hostname is required.
+        env.grant = _grant(destination_url=f"https://{VENDOR_HOST}:8443/mcp")
 
-        with patch("src.server.services.egress.relay.pin_public_url", real_pin_public_url):
+        async def _resolve(host, *, port=443, allow_non_global=False):
+            assert host == VENDOR_HOST
+            return [PUBLIC_IP]
+
+        with (
+            patch("src.server.utils.egress_guard.resolve_public_ips", _resolve),
+            patch(
+                "src.server.services.egress.relay.pin_public_url",
+                real_pin_public_url,
+            ),
+        ):
             resp = await _post(client, token=_jwt())
 
         assert resp.status_code == 200
+        # URL rewritten to the validated IP — the hostname is gone from the netloc.
         assert str(env.vendor.last.url) == f"https://{PUBLIC_IP}:8443/mcp"
-        assert env.vendor.last.extensions["sni_hostname"] == PUBLIC_IP
-        assert env.vendor.last.headers["host"] == PUBLIC_IP
+        # SNI restores the real name so certificate verification runs against it.
+        assert env.vendor.last.extensions["sni_hostname"] == VENDOR_HOST
+        # Host authority keeps the hostname AND the non-default port.
+        assert env.vendor.last.headers["host"] == f"{VENDOR_HOST}:8443"
 
     @pytest.mark.asyncio
     async def test_the_shared_client_never_follows_redirects_or_trusts_env_proxies(self):
@@ -1356,5 +1398,21 @@ class TestSsrfPosture:
         try:
             assert client.follow_redirects is False
             assert client.trust_env is False
+        finally:
+            await close_relay_client()
+
+    @pytest.mark.asyncio
+    async def test_idle_upstream_connections_outlive_the_gap_between_tool_bursts(self):
+        # httpx defaults keepalive_expiry to 5s — shorter than the model latency
+        # between two execute_code blocks, so without an explicit pool every
+        # burst of MCP calls re-pays a TCP+TLS handshake to the vendor. Asserted
+        # against httpx's own default rather than a pinned number, so this locks
+        # the intent without becoming tuning noise.
+        from src.server.services.egress.relay import close_relay_client, get_relay_client
+
+        client = get_relay_client()
+        try:
+            pool = client._transport._pool
+            assert pool._keepalive_expiry >= 10 * httpx.Limits().keepalive_expiry
         finally:
             await close_relay_client()
