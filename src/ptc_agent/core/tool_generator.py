@@ -602,7 +602,9 @@ except ImportError:
         construction: the inner call serializes the config, the outer one turns
         that JSON text into a valid Python string literal with all quoting and
         control characters escaped — hostile server names can never terminate
-        the literal.
+        the literal. The CLI dispatch lives in the epilogue too, after the
+        config apply — the runtime source must never self-dispatch, or CLI-mode
+        discovery would run against the placeholder config.
         """
         config = self.generate_client_config(server_configs, working_dir=working_dir)
         config_json = json.dumps(config, sort_keys=True)
@@ -610,4 +612,5 @@ except ImportError:
             client_runtime_source()
             + "\n\n# --- Per-workspace configuration (generated epilogue). ---\n"
             + f"_apply_config_dict(json.loads({json.dumps(config_json)}))\n"
+            + '\nif __name__ == "__main__":\n    _cli_main()\n'
         )

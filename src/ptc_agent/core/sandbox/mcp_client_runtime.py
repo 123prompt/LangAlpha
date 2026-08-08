@@ -53,18 +53,19 @@ _CALL_TIMEOUT = 120.0
 #                        env_keys?, headers?, discovery_uses_secrets?,
 #                        relay_bound?, relay_grant_id?}},
 #    "result_body_max_bytes": int, "result_body_trace_budget_bytes": int}
-# The defaults below only make the module importable standalone (lint, unit
-# tests); every uploaded copy carries a generated epilogue that calls
-# ``_apply_config_dict`` with the real values.
+# These names are seeded by the _apply_config_dict({}) call below (standalone
+# lint/unit-test import), then overwritten by the generated epilogue's call with
+# the real values. The default literals live only inside _apply_config_dict so
+# there is one source of truth; declaring the names here just keeps them typed.
 # ---------------------------------------------------------------------------
 
-_SERVER_CONFIGS: dict[str, dict] = {}
-_WORK_DIR = "/home/workspace"
-_INTERNAL_ROOT = _WORK_DIR + "/_internal"
-_VAULT_SECRETS_FILE = _INTERNAL_ROOT + "/.vault_secrets.json"
-_EGRESS_RELAY_FILE = _INTERNAL_ROOT + "/.egress_relay.json"
-_RESULT_BODY_MAX_BYTES = 65536
-_RESULT_BODY_TRACE_BUDGET_BYTES = 4 * 1024 * 1024
+_SERVER_CONFIGS: dict[str, dict]
+_WORK_DIR: str
+_INTERNAL_ROOT: str
+_VAULT_SECRETS_FILE: str
+_EGRESS_RELAY_FILE: str
+_RESULT_BODY_MAX_BYTES: int
+_RESULT_BODY_TRACE_BUDGET_BYTES: int
 
 
 def _apply_config_dict(cfg: dict) -> None:
@@ -81,6 +82,9 @@ def _apply_config_dict(cfg: dict) -> None:
     _RESULT_BODY_TRACE_BUDGET_BYTES = int(
         cfg.get("result_body_trace_budget_bytes") or 4 * 1024 * 1024
     )
+
+
+_apply_config_dict({})  # seed standalone-import defaults through the one path
 
 
 
@@ -716,16 +720,34 @@ def _mcp_headers(method: str, mcp_name: str, proto: dict, extra: dict) -> dict:
     return headers
 
 
-def _parse_http_reply(response, want_id: int, server_name: str) -> dict:
+# A single HTTP reply (JSON body or the SSE frames up to the matching message)
+# is read incrementally and bounded: a direct (non-relay) HTTP server is
+# untrusted, and httpx's read timeout resets on every byte — so without these a
+# flooding server OOMs the interpreter and a slow-drip server hangs it forever.
+# Relay-bound traffic is already time-capped by the relay's own wall clock; this
+# is the guard for everything else. 16 MiB sits far above any real JSON-RPC reply.
+_HTTP_REPLY_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _deadline_exceeded(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() > deadline
+
+
+def _parse_http_reply(
+    response, want_id: int, server_name: str, deadline: float | None = None
+) -> dict:
     """Extract the JSON-RPC reply from a JSON or SSE-framed HTTP response.
 
-    SSE parsing joins multiline data: fields per the eventsource spec, skips
-    comment/priming frames and interleaved notifications, and returns the
-    message whose id matches.
+    The response must be a streamed httpx response so the body is consumed
+    incrementally under the size cap and ``deadline`` (a total-exchange wall
+    clock that httpx's per-read timeout can't provide). SSE parsing joins
+    multiline data: fields per the eventsource spec, skips comment/priming
+    frames and interleaved notifications, and returns the first id match.
     """
     ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
     if ctype != "text/event-stream":
-        return response.json()
+        body = _read_body_capped(response, server_name, deadline)
+        return json.loads(body)
 
     def _frame_reply(payload):
         try:
@@ -748,8 +770,21 @@ def _parse_http_reply(response, want_id: int, server_name: str) -> dict:
         return None
 
     data_lines = []
+    seen = 0
     for raw in response.iter_lines():
+        if _deadline_exceeded(deadline):
+            raise RuntimeError(
+                f"MCP server {server_name}: SSE read exceeded the deadline "
+                "before a matching reply [stream_deadline]"
+            )
         line = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+        seen += len(line) + 1
+        if seen > _HTTP_REPLY_MAX_BYTES:
+            raise RuntimeError(
+                f"MCP server {server_name}: SSE stream exceeded "
+                f"{_HTTP_REPLY_MAX_BYTES} bytes without a matching reply "
+                "[reply_too_large]"
+            )
         if line == "":
             if data_lines:
                 reply = _frame_reply("\n".join(data_lines))
@@ -768,6 +803,26 @@ def _parse_http_reply(response, want_id: int, server_name: str) -> dict:
             return reply
     msg = f"MCP server {server_name}: SSE stream ended without a matching reply"
     raise RuntimeError(msg)
+
+
+def _read_body_capped(response, server_name: str, deadline: float | None) -> bytes:
+    """Read a non-SSE response body incrementally under the size cap + deadline."""
+    chunks = []
+    seen = 0
+    for chunk in response.iter_bytes():
+        if _deadline_exceeded(deadline):
+            raise RuntimeError(
+                f"MCP server {server_name}: HTTP read exceeded the deadline "
+                "[stream_deadline]"
+            )
+        seen += len(chunk)
+        if seen > _HTTP_REPLY_MAX_BYTES:
+            raise RuntimeError(
+                f"MCP server {server_name}: HTTP reply exceeded "
+                f"{_HTTP_REPLY_MAX_BYTES} bytes [reply_too_large]"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
@@ -795,6 +850,7 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
     version = _MODERN_VERSIONS[0]
     try:
         with httpx.Client(timeout=30.0) as client:
+            deadline = time.monotonic() + 30.0  # matches the client timeout above
             probe = _modern_request("server/discover", {}, version)
             probe_headers = {
                 "Accept": "application/json, text/event-stream",
@@ -804,9 +860,11 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
             probe_headers.update(_headers)
             reply = None
             try:
-                response = client.post(url, json=probe, headers=probe_headers)
-                if response.status_code < 400:
-                    reply = _parse_http_reply(response, probe["id"], server_name)
+                with client.stream("POST", url, json=probe, headers=probe_headers) as response:
+                    if response.status_code < 400:
+                        reply = _parse_http_reply(
+                            response, probe["id"], server_name, deadline
+                        )
             except (httpx.HTTPError, RuntimeError, ValueError):
                 reply = None
             if isinstance(reply, dict) and "result" in reply:
@@ -824,17 +882,17 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
             })
             init_headers = {"Accept": "application/json, text/event-stream"}
             init_headers.update(_headers)
-            response = client.post(url, json=init, headers=init_headers)
-            _msg = _relay_error(response, server_name)
-            if _msg:
-                raise RuntimeError(_msg)
-            response.raise_for_status()
-            reply = _parse_http_reply(response, init["id"], server_name)
+            with client.stream("POST", url, json=init, headers=init_headers) as response:
+                _msg = _relay_error(response, server_name)
+                if _msg:
+                    raise RuntimeError(_msg)
+                response.raise_for_status()
+                session_id = response.headers.get("mcp-session-id")
+                reply = _parse_http_reply(response, init["id"], server_name, deadline)
             if "error" in reply:
                 msg = f"MCP SSE initialization failed: {reply['error']}"
                 raise RuntimeError(msg)
             adopted = (reply.get("result") or {}).get("protocolVersion") or _LEGACY_OFFER
-            session_id = response.headers.get("mcp-session-id")
             proto = {"mode": "legacy", "version": adopted, "session_id": session_id}
             notif_headers = _mcp_headers("notifications/initialized", "", proto, _headers)
             client.post(
@@ -868,51 +926,65 @@ def _call_mcp_tool_http(server_name: str, tool_name: str, arguments: dict[str, A
         proto = _ensure_http_server(server_name)
 
         config = _SERVER_CONFIGS.get(server_name)
-        url = config.get("url", "")
-
         url, _headers = _resolve_sse(config, server_name)
 
         params = {"name": tool_name, "arguments": arguments}
-        if proto["mode"] == "modern":
-            request = _modern_request("tools/call", params, proto["version"])
-        else:
-            request = _legacy_request("tools/call", params)
+
+        def _build(p: dict) -> dict:
+            return (
+                _modern_request("tools/call", params, p["version"])
+                if p["mode"] == "modern"
+                else _legacy_request("tools/call", params)
+            )
+
+        request = _build(proto)
         headers = _mcp_headers("tools/call", tool_name, proto, _headers)
 
-        # Send request via HTTP POST. The 65s outer timeout sits strictly above
-        # the egress relay's 55s hard wall so relay budget errors stay typed.
+        # Each attempt streams the reply under a size cap + a total deadline: the
+        # 65s outer timeout sits strictly above the egress relay's 55s hard wall
+        # so relay budget errors stay typed, and the deadline bounds a direct
+        # server that drips bytes forever (httpx's read timeout can't). The two
+        # recovery paths — relay credential re-mint and legacy session expiry —
+        # each fire at most once, so the loop is bounded to three sends.
         with httpx.Client(timeout=65.0) as client:
-            response = client.post(url, json=request, headers=headers)
-            _msg = _relay_error(response, server_name)
-            if _msg and response.headers.get("x-relay-error") == "relay_auth":
-                # The credential file may have been re-minted between
-                # our read and this call - re-read it and retry once.
-                url, _headers = _resolve_sse(config, server_name)
-                headers = _mcp_headers("tools/call", tool_name, proto, _headers)
-                response = client.post(url, json=request, headers=headers)
-                _msg = _relay_error(response, server_name)
-            if _msg:
-                # A relay rejection also invalidates the negotiated
-                # vendor session (e.g. reconnect mints a new grant).
-                _PROTO.pop(server_name, None)
-                raise RuntimeError(_msg)
-            if (
-                response.status_code == 404
-                and proto.get("mode") == "legacy"
-                and proto.get("session_id")
-            ):
-                # 2025-11-25 session expiry: the server dropped our session id.
-                # Reinitialize once and retry with the fresh session.
-                _PROTO.pop(server_name, None)
-                proto = _ensure_http_server(server_name)
-                if proto["mode"] == "modern":
-                    request = _modern_request("tools/call", params, proto["version"])
-                else:
-                    request = _legacy_request("tools/call", params)
-                headers = _mcp_headers("tools/call", tool_name, proto, _headers)
-                response = client.post(url, json=request, headers=headers)
-            response.raise_for_status()
-            result = _parse_http_reply(response, request["id"], server_name)
+            deadline = time.monotonic() + 65.0
+            relay_auth_retried = False
+            session_reinited = False
+            while True:
+                with client.stream("POST", url, json=request, headers=headers) as response:
+                    relay_code = response.headers.get("x-relay-error")
+                    if relay_code:
+                        if relay_code == "relay_auth" and not relay_auth_retried:
+                            # The credential file may have been re-minted between
+                            # our read and this call — re-read it and retry once.
+                            relay_auth_retried = True
+                            url, _headers = _resolve_sse(config, server_name)
+                            headers = _mcp_headers("tools/call", tool_name, proto, _headers)
+                            continue
+                        # A relay rejection also invalidates the negotiated
+                        # vendor session (e.g. reconnect mints a new grant).
+                        _PROTO.pop(server_name, None)
+                        raise RuntimeError(_relay_error(response, server_name))
+                    if (
+                        response.status_code == 404
+                        and proto.get("mode") == "legacy"
+                        and proto.get("session_id")
+                        and not session_reinited
+                    ):
+                        # 2025-11-25 session expiry: the server dropped our
+                        # session id. Reinitialize once and retry with the fresh
+                        # session.
+                        session_reinited = True
+                        _PROTO.pop(server_name, None)
+                        proto = _ensure_http_server(server_name)
+                        request = _build(proto)
+                        headers = _mcp_headers("tools/call", tool_name, proto, _headers)
+                        continue
+                    response.raise_for_status()
+                    result = _parse_http_reply(
+                        response, request["id"], server_name, deadline
+                    )
+                    break
 
         # Check for errors
         if "error" in result:
@@ -1014,7 +1086,8 @@ def _call_mcp_tool_stdio(server_name: str, tool_name: str, arguments: dict[str, 
 def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
     """Call an MCP tool via the appropriate transport.
 
-    Routes to SSE or stdio transport based on server configuration.
+    Routes on the server's configured transport: streamable HTTP or stdio.
+    Legacy ``sse`` is refused (the old client never spoke the real SSE flow).
 
     Args:
         server_name: Name of the MCP server
@@ -1125,7 +1198,14 @@ def _discover_sse(server_name: str) -> list:
     return (result.get("result") or {}).get("tools", [])
 
 
-if __name__ == "__main__":
+def _cli_main() -> None:
+    """CLI dispatch: ``mcp_client.py discover <server_name> <output_path>``.
+
+    Invoked from the generated epilogue, never from a module-level guard here:
+    this file's source precedes ``_apply_config_dict`` in the composed client,
+    so a guard at this point would dispatch against the placeholder config and
+    every probe would report "unknown server".
+    """
     if len(sys.argv) >= 4 and sys.argv[1] == "discover":
         _server, _out = sys.argv[2], sys.argv[3]
         _result = discover(_server)

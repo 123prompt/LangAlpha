@@ -7,6 +7,7 @@ retry) must land on a working era or a clear error — never a hang.
 """
 
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -111,6 +112,11 @@ while True:
         send({"jsonrpc": "2.0", "id": mid,
               "result": {"protocolVersion": "2025-03-26", "capabilities": {},
                          "serverInfo": {"name": "fake", "version": "0"}}})
+        continue
+    if method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid,
+              "result": {"tools": [{"name": "t", "description": "d",
+                                    "inputSchema": {"type": "object"}}]}})
         continue
     if method == "tools/call":
         if MODE in ("modern", "modern_noise", "retry_32022", "input_required",
@@ -311,3 +317,55 @@ class TestTransportRouting:
         ns, _ = _client_ns(tmp_path, "modern", transport="sse")
         with pytest.raises(RuntimeError, match="'http'"):
             ns["_call_mcp_tool"]("fake", "t", {})
+
+
+class TestCliDiscover:
+    def test_cli_discover_runs_against_the_applied_config(self, tmp_path):
+        # Regression: the CLI dispatch must run from the generated epilogue,
+        # AFTER _apply_config_dict. A guard inside the runtime source would
+        # dispatch against the placeholder config and report "unknown server"
+        # for every configured server. Only a real subprocess (__main__)
+        # exercises that ordering — the exec-based tests above cannot.
+        server_py = tmp_path / "fake_server.py"
+        server_py.write_text(_FAKE_SERVER)
+        state = tmp_path / "state_cli"
+        state.mkdir()
+        config = MCPServerConfig(
+            name="fake",
+            transport="stdio",
+            command=sys.executable,
+            args=[str(server_py), "modern", str(state)],
+            env={},
+        )
+        code = ToolFunctionGenerator().generate_mcp_client_code(
+            [config], working_dir=str(tmp_path)
+        )
+        client = tmp_path / "mcp_client.py"
+        client.write_text(code)
+        out = tmp_path / "out.json"
+        proc = subprocess.run(
+            [sys.executable, str(client), "discover", "fake", str(out)],
+            capture_output=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr.decode()
+        result = json.loads(out.read_text())
+        assert result["status"] == "ok", result
+        assert [t["name"] for t in result["tools"]] == ["t"]
+
+    def test_cli_discover_unknown_name_still_reports_it(self, tmp_path):
+        code = ToolFunctionGenerator().generate_mcp_client_code(
+            [], working_dir=str(tmp_path)
+        )
+        client = tmp_path / "mcp_client.py"
+        client.write_text(code)
+        out = tmp_path / "out.json"
+        proc = subprocess.run(
+            [sys.executable, str(client), "discover", "ghost", str(out)],
+            capture_output=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr.decode()
+        result = json.loads(out.read_text())
+        assert result == {"server": "ghost", "status": "error",
+                          "error": "unknown server", "tools": []}
