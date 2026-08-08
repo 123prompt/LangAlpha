@@ -39,6 +39,7 @@ from src.server.services.mcp_oauth.connect import (
     McpOAuthError,
     complete_callback,
     sanitize_return_to,
+    sanitize_web_origin,
     start_connect,
 )
 from src.server.services.mcp_oauth.http import OAuthHopBlocked
@@ -178,6 +179,18 @@ def _query(url: str) -> dict[str, str]:
     return {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
 
 
+async def _callback(started: dict, **kwargs) -> str:
+    """Phase 2 as the initiating browser drives it.
+
+    The real browser presents back the HttpOnly nonce cookie minted in phase 1,
+    so the round trip carries ``started["browser_nonce"]`` by default. Tests
+    exercising the CSRF guard override ``browser_nonce`` (or ``state``).
+    """
+    kwargs.setdefault("state", started["state"])
+    kwargs.setdefault("browser_nonce", started["browser_nonce"])
+    return await complete_callback(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -220,7 +233,9 @@ def phase1(monkeypatch) -> SimpleNamespace:
         env.pinned.append({"url": url, "require_https": require_https})
         if env.pin_error is not None:
             raise env.pin_error
-        return PinnedTarget(url=url, host=AUTH_HOST, ip="203.0.113.10")
+        return PinnedTarget(
+            url=url, host=AUTH_HOST, ip="203.0.113.10", authority=AUTH_HOST
+        )
 
     monkeypatch.setattr(connect, "_discover", _discover)
     monkeypatch.setattr(connect, "_register_client", _register_client)
@@ -393,7 +408,7 @@ class TestRoundTrip:
         verifier = redis.only_record()["code_verifier"]
         challenge = _query(started["authorize_url"])["code_challenge"]
 
-        redirect = await complete_callback(state=started["state"], code="auth-code-1")
+        redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
         [exchange] = phase2.requests
@@ -413,7 +428,7 @@ class TestRoundTrip:
     ):
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        await complete_callback(state=started["state"], code="auth-code-1")
+        await _callback(started, code="auth-code-1")
 
         [upsert] = phase2.upserts
         assert upsert["user_id"] == USER_ID
@@ -430,13 +445,40 @@ class TestRoundTrip:
         assert phase2.discoveries == [(USER_ID, SERVER_NAME)]
 
     @pytest.mark.asyncio
+    async def test_confidential_secret_is_encrypted_not_left_in_the_blob(
+        self, redis, phase1, phase2
+    ):
+        # A DCR confidential client's secret must reach the dedicated (encrypted)
+        # client_secret column, never the plaintext client_info JSONB — which is
+        # persisted verbatim. Carried out-of-band on the state record and
+        # re-attached for the token exchange.
+        phase1.client_info = _client_info(
+            client_secret="s3cr3t-value",
+            token_endpoint_auth_method="client_secret_post",
+        )
+
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        record = redis.only_record()
+        assert record["client_secret"] == "s3cr3t-value"
+        assert "client_secret" not in record["client_info"]
+
+        await _callback(started, code="auth-code-1")
+
+        [upsert] = phase2.upserts
+        assert upsert["client_secret"] == "s3cr3t-value"
+        assert "client_secret" not in upsert["client_info"]
+        # The secret still authenticated the token exchange (client_secret_post).
+        assert phase2.requests[-1]["data"]["client_secret"] == "s3cr3t-value"
+
+    @pytest.mark.asyncio
     async def test_post_connect_discovery_failure_still_connects(
         self, redis, phase1, phase2
     ):
         phase2.discovery_error = RuntimeError("server hung up during tools/list")
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        redirect = await complete_callback(state=started["state"], code="auth-code-1")
+        redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
         assert phase2.upserts, "the connection is stored before discovery is attempted"
@@ -446,9 +488,7 @@ class TestRoundTrip:
         started = await start_connect(USER_ID, SERVER_NAME)
         issuer = redis.only_record()["issuer"]
 
-        redirect = await complete_callback(
-            state=started["state"], code="auth-code-1", iss=issuer
-        )
+        redirect = await _callback(started, code="auth-code-1", iss=issuer)
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
 
@@ -463,8 +503,8 @@ class TestSingleUseState:
     async def test_a_replayed_state_is_rejected(self, redis, phase1, phase2):
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        first = await complete_callback(state=started["state"], code="auth-code-1")
-        second = await complete_callback(state=started["state"], code="auth-code-1")
+        first = await _callback(started, code="auth-code-1")
+        second = await _callback(started, code="auth-code-1")
 
         assert first == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
         assert second == f"{DEFAULT_RETURN_TO}?mcp_error=invalid_state"
@@ -480,8 +520,8 @@ class TestSingleUseState:
         started = await start_connect(USER_ID, SERVER_NAME)
 
         results = await asyncio.gather(
-            complete_callback(state=started["state"], code="auth-code-1"),
-            complete_callback(state=started["state"], code="auth-code-1"),
+            _callback(started, code="auth-code-1"),
+            _callback(started, code="auth-code-1"),
         )
 
         assert sorted(results) == sorted(
@@ -502,6 +542,139 @@ class TestSingleUseState:
         # state ever existed, and no parked return_to to consult.
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_error=invalid_state"
         assert phase2.requests == []
+
+
+# ---------------------------------------------------------------------------
+# CSRF binding — the callback must present the browser nonce minted in phase 1
+# ---------------------------------------------------------------------------
+
+
+class TestCsrfBinding:
+    @pytest.fixture(autouse=True)
+    def deployed_callback(self, monkeypatch):
+        """Pin a non-loopback callback so the binding is actually in force.
+
+        The test env's ``SERVER_BASE_URL`` is a loopback default, which is the
+        one place the nonce is deliberately not minted — leaving it would put
+        every case below on the skip path and silently stop testing the control.
+        """
+        monkeypatch.setattr(connect, "SERVER_BASE_URL", "https://app.example.com")
+
+    @pytest.mark.asyncio
+    async def test_matching_nonce_connects(self, redis, phase1, phase2):
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        redirect = await complete_callback(
+            state=started["state"],
+            code="auth-code-1",
+            browser_nonce=started["browser_nonce"],
+        )
+
+        assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
+        assert len(phase2.requests) == 1
+
+    @pytest.mark.asyncio
+    async def test_wrong_nonce_is_refused_and_burns_the_state(
+        self, redis, phase1, phase2
+    ):
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        redirect = await complete_callback(
+            state=started["state"], code="auth-code-1", browser_nonce="not-the-cookie"
+        )
+
+        assert redirect == (
+            f"{DEFAULT_RETURN_TO}?mcp_error=state_mismatch&server={SERVER_NAME_Q}"
+        )
+        # A forged callback never reaches the token endpoint, and the state is
+        # spent — a subsequent replay (even with the right cookie) is dead.
+        assert phase2.requests == []
+        assert redis.store == {}
+        replay = await complete_callback(
+            state=started["state"],
+            code="auth-code-1",
+            browser_nonce=started["browser_nonce"],
+        )
+        assert replay == f"{DEFAULT_RETURN_TO}?mcp_error=invalid_state"
+
+    @pytest.mark.asyncio
+    async def test_absent_cookie_is_refused(self, redis, phase1, phase2):
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        # A callback landing in a browser that never held the cookie (the
+        # classic login-CSRF replay) carries no nonce at all.
+        redirect = await complete_callback(
+            state=started["state"], code="auth-code-1", browser_nonce=None
+        )
+
+        assert redirect == (
+            f"{DEFAULT_RETURN_TO}?mcp_error=state_mismatch&server={SERVER_NAME_Q}"
+        )
+        assert phase2.requests == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_record_without_a_nonce_skips_the_check(
+        self, redis, phase1, phase2
+    ):
+        """A record parked before this control shipped carries an empty nonce;
+        its callback must still complete rather than fail closed on a field it
+        could never have set."""
+        started = await start_connect(USER_ID, SERVER_NAME)
+        record = redis.only_record()
+        record["browser_nonce"] = ""
+        redis.store.clear()
+        redis.park(started["state"], record)
+
+        redirect = await complete_callback(
+            state=started["state"], code="auth-code-1", browser_nonce=None
+        )
+
+        assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
+
+
+class TestLoopbackCallbackSkipsTheBinding:
+    """A loopback callback can't receive the cookie back, so it mints no nonce.
+
+    An AS accepts an ``http`` redirect_uri only for loopback (RFC 8252), while
+    the cookie only returns if the browsed origin shares the callback's *host* —
+    and a dev box routinely serves its UI from some other host. Requiring the
+    cookie there rejects every connect, so the mint is skipped instead.
+    """
+
+    @pytest.mark.parametrize(
+        "base,loopback",
+        [
+            ("http://127.0.0.1:8060", True),
+            ("http://localhost:8000", True),
+            ("http://wt3.localhost", True),
+            ("http://[::1]:8000", True),
+            ("https://app.example.com", False),
+            ("https://langalpha.ai", False),
+        ],
+    )
+    def test_host_classification(self, monkeypatch, base, loopback):
+        monkeypatch.setattr(connect, "SERVER_BASE_URL", base)
+        assert connect.callback_is_loopback() is loopback
+
+    @pytest.mark.asyncio
+    async def test_no_nonce_is_minted_and_the_callback_completes(
+        self, monkeypatch, redis, phase1, phase2
+    ):
+        monkeypatch.setattr(connect, "SERVER_BASE_URL", "http://127.0.0.1:8060")
+
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        # Empty, so the parked record takes the same skip path a pre-control
+        # record takes — no dev branch in the verification logic.
+        assert started["browser_nonce"] == ""
+        assert redis.only_record()["browser_nonce"] == ""
+
+        redirect = await complete_callback(
+            state=started["state"], code="auth-code-1", browser_nonce=None
+        )
+
+        assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
+        assert len(phase2.requests) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +707,8 @@ class TestCallbackErrors:
     ):
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        redirect = await complete_callback(
-            state=started["state"],
+        redirect = await _callback(
+            started,
             code=None,
             error=error,
             error_description="user cancelled",
@@ -552,7 +725,7 @@ class TestCallbackErrors:
     async def test_missing_code(self, redis, phase1, phase2):
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        redirect = await complete_callback(state=started["state"], code=None)
+        redirect = await _callback(started, code=None)
 
         assert redirect == (
             f"{DEFAULT_RETURN_TO}?mcp_error=missing_code&server={SERVER_NAME_Q}"
@@ -563,8 +736,8 @@ class TestCallbackErrors:
     async def test_issuer_mismatch(self, redis, phase1, phase2):
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        redirect = await complete_callback(
-            state=started["state"], code="auth-code-1", iss="https://evil.test/"
+        redirect = await _callback(
+            started, code="auth-code-1", iss="https://evil.test/"
         )
 
         assert redirect == (
@@ -578,7 +751,7 @@ class TestCallbackErrors:
         phase2.payload = {"error": "invalid_grant"}
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        redirect = await complete_callback(state=started["state"], code="auth-code-1")
+        redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == (
             f"{DEFAULT_RETURN_TO}?mcp_error=token_exchange_failed"
@@ -591,7 +764,7 @@ class TestCallbackErrors:
         phase2.raises = httpx2.ConnectError("connection reset")
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        redirect = await complete_callback(state=started["state"], code="auth-code-1")
+        redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == (
             f"{DEFAULT_RETURN_TO}?mcp_error=token_exchange_failed"
@@ -604,7 +777,7 @@ class TestCallbackErrors:
         phase2.raises = OAuthHopBlocked("egress to token endpoint is blocked")
         started = await start_connect(USER_ID, SERVER_NAME)
 
-        redirect = await complete_callback(state=started["state"], code="auth-code-1")
+        redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == (
             f"{DEFAULT_RETURN_TO}?mcp_error=blocked_endpoint&server={SERVER_NAME_Q}"
@@ -629,6 +802,9 @@ class TestReturnToAllowlist:
             "evil.test",
             "connectors",
             "\\\\evil.test",
+            # Leading slash then backslash: browsers normalize '\' to '/', so
+            # '/\evil.test' becomes protocol-relative '//evil.test' — off-app.
+            "/\\evil.test",
         ],
     )
     def test_off_allowlist_values_fall_back_to_the_default(self, value):
@@ -654,7 +830,7 @@ class TestReturnToAllowlist:
             USER_ID, SERVER_NAME, return_to="/settings/connectors"
         )
 
-        redirect = await complete_callback(state=started["state"], code="auth-code-1")
+        redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == f"/settings/connectors?mcp_connected={SERVER_NAME_Q}"
 
@@ -668,7 +844,7 @@ class TestReturnToAllowlist:
         redis.store.clear()
         redis.park(started["state"], record)
 
-        redirect = await complete_callback(state=started["state"], code="auth-code-1")
+        redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
 
@@ -682,8 +858,110 @@ class TestReturnToAllowlist:
         redis.store.clear()
         redis.park(started["state"], record)
 
-        redirect = await complete_callback(
-            state=started["state"], code=None, error="access_denied"
-        )
+        redirect = await _callback(started, code=None, error="access_denied")
 
         assert redirect.startswith(f"{DEFAULT_RETURN_TO}?mcp_error=denied")
+
+
+# ---------------------------------------------------------------------------
+# web-origin capture (split-port dev: the callback's origin is the API, not
+# the UI — the redirect must resolve on the origin the start request came from)
+# ---------------------------------------------------------------------------
+
+
+class TestWebOriginCapture:
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("http://127.0.0.1:5233", "http://127.0.0.1:5233"),
+            ("https://wt3.localhost", "https://wt3.localhost"),
+            ("http://localhost:5173/", "http://localhost:5173"),
+        ],
+    )
+    def test_bare_origins_are_honored(self, value, expected):
+        assert sanitize_web_origin(value) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            "",
+            "null",
+            "javascript:alert(1)",
+            "https://evil.test/phish",
+            "http://user@evil.test",
+            "//evil.test",
+            "ftp://files.test",
+            "https://e.test?q=1",
+            "https://e.test#frag",
+            # Bare, well-formed, but foreign public origins — an attacker-forged
+            # Origin header on the start request must not become the redirect
+            # prefix, so these are dropped, not echoed back.
+            "https://evil.test",
+            "https://app.example.com",
+        ],
+    )
+    def test_non_origin_values_are_dropped(self, value):
+        assert sanitize_web_origin(value) == ""
+
+    def test_the_deployments_own_origin_is_honored(self, monkeypatch):
+        # A non-loopback origin is honored only when it is this deployment's own
+        # base URL (a same-origin prod redirect), never an arbitrary one.
+        monkeypatch.setattr(connect, "SERVER_BASE_URL", "https://app.example.com")
+        assert sanitize_web_origin("https://app.example.com") == "https://app.example.com"
+        assert sanitize_web_origin("https://evil.test") == ""
+
+    @pytest.mark.asyncio
+    async def test_phase1_parks_the_sanitized_origin(self, redis, phase1):
+        await start_connect(
+            USER_ID, SERVER_NAME, web_origin="http://127.0.0.1:5233"
+        )
+
+        assert redis.only_record()["web_origin"] == "http://127.0.0.1:5233"
+
+    @pytest.mark.asyncio
+    async def test_success_redirect_is_absolute_on_the_captured_origin(
+        self, redis, phase1, phase2
+    ):
+        started = await start_connect(
+            USER_ID,
+            SERVER_NAME,
+            return_to="/connectors",
+            web_origin="http://127.0.0.1:5233",
+        )
+
+        redirect = await _callback(started, code="auth-code-1")
+
+        assert redirect == (
+            f"http://127.0.0.1:5233/connectors?mcp_connected={SERVER_NAME_Q}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_error_redirect_rides_the_captured_origin_too(
+        self, redis, phase1, phase2
+    ):
+        started = await start_connect(
+            USER_ID, SERVER_NAME, web_origin="https://wt3.localhost"
+        )
+
+        redirect = await _callback(started, code=None, error="access_denied")
+
+        assert redirect.startswith(
+            f"https://wt3.localhost{DEFAULT_RETURN_TO}?mcp_error=denied"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_poisoned_record_origin_is_resanitized_at_phase2(
+        self, redis, phase1, phase2
+    ):
+        """Defense in depth: a record whose origin bypassed phase 1 cannot
+        turn the callback into an open redirector."""
+        started = await start_connect(USER_ID, SERVER_NAME)
+        record = redis.only_record()
+        record["web_origin"] = "https://evil.test/phish"
+        redis.store.clear()
+        redis.park(started["state"], record)
+
+        redirect = await _callback(started, code="auth-code-1")
+
+        assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"

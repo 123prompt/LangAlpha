@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 
+from src.config.env import SERVER_BASE_URL
 from src.server.services.mcp_oauth import (
     McpOAuthError,
     TokenUnavailable,
@@ -31,23 +32,69 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/mcp", tags=["MCP OAuth"])
 
+# CSRF binding cookie for the OAuth connect flow. Path-scoped to the callback,
+# HttpOnly, SameSite=Lax (must survive the AS's top-level cross-site redirect —
+# Strict would not send it). Secure only on an HTTPS deployment so http dev
+# still works.
+#
+# The name is per-state (``mcp_oauth_cb_<state>``): a fixed name would let two
+# concurrent connects from the same browser overwrite each other's nonce cookie
+# (same name, same path), so the first flow's callback would read the second
+# flow's nonce and fail state_mismatch. Keying on the single-use state isolates
+# concurrent flows and lets each callback delete exactly its own cookie.
+_OAUTH_COOKIE_PREFIX = "mcp_oauth_cb_"
+_OAUTH_COOKIE_PATH = "/api/v1/mcp/oauth"
+_OAUTH_COOKIE_MAX_AGE = 600  # mirrors the state record TTL
+_OAUTH_COOKIE_SECURE = SERVER_BASE_URL.lower().startswith("https")
+
+
+def _oauth_cookie_name(state: str) -> str:
+    return f"{_OAUTH_COOKIE_PREFIX}{state}"
+
 
 @router.post("/servers/{name}/oauth/start")
 @handle_api_exceptions("start MCP OAuth connect", logger)
 async def oauth_start(
-    name: str, user_id: CurrentUserId, body: dict | None = Body(default=None)
+    name: str,
+    user_id: CurrentUserId,
+    request: Request,
+    response: Response,
+    body: dict | None = Body(default=None),
 ) -> dict:
     return_to = (body or {}).get("return_to")
     try:
-        result = await start_connect(user_id, name, return_to=return_to)
+        result = await start_connect(
+            user_id,
+            name,
+            return_to=return_to,
+            # The browser's Origin is where the UI lives; the callback later
+            # redirects there, since its own origin is the API on split ports.
+            web_origin=request.headers.get("origin"),
+        )
     except McpOAuthError as e:
         status = 404 if "not found" in str(e) else 422
         raise HTTPException(status_code=status, detail=str(e))
+    # Bind the callback to THIS browser: the nonce goes only into an HttpOnly
+    # cookie, never the JSON body. The callback requires it back, so a stolen
+    # (state, code) replayed in another browser has no matching cookie. Empty
+    # on a loopback callback, where the cookie provably cannot come back — see
+    # connect.callback_is_loopback.
+    if result["browser_nonce"]:
+        response.set_cookie(
+            _oauth_cookie_name(result["state"]),
+            result["browser_nonce"],
+            max_age=_OAUTH_COOKIE_MAX_AGE,
+            path=_OAUTH_COOKIE_PATH,
+            httponly=True,
+            secure=_OAUTH_COOKIE_SECURE,
+            samesite="lax",
+        )
     return {"authorize_url": result["authorize_url"]}
 
 
 @router.get("/oauth/callback")
 async def oauth_callback(
+    request: Request,
     state: str | None = None,
     code: str | None = None,
     iss: str | None = None,
@@ -55,6 +102,9 @@ async def oauth_callback(
     error_description: str | None = None,
 ) -> RedirectResponse:
     """AS redirect target. Always answers a redirect — never an error page."""
+    # The nonce cookie is named for this flow's state; with no state there is no
+    # cookie to read and complete_callback will reject on the missing state.
+    cookie_name = _oauth_cookie_name(state) if state else None
     try:
         target = await complete_callback(
             state=state,
@@ -62,12 +112,20 @@ async def oauth_callback(
             iss=iss,
             error=error,
             error_description=error_description,
+            browser_nonce=(
+                request.cookies.get(cookie_name) if cookie_name else None
+            ),
         )
     except Exception:
         logger.exception("[mcp_oauth] callback crashed")
         target = "/connectors?mcp_error=internal"
     # 303: the browser must GET the app route regardless of how it got here.
-    return RedirectResponse(url=target, status_code=303)
+    resp = RedirectResponse(url=target, status_code=303)
+    # The nonce is single-use — clear this flow's cookie so a later navigation
+    # can't resend it.
+    if cookie_name:
+        resp.delete_cookie(cookie_name, path=_OAUTH_COOKIE_PATH)
+    return resp
 
 
 @router.delete("/servers/{name}/oauth")

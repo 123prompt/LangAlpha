@@ -16,7 +16,7 @@ import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
 from mcp.client.auth import PKCEParameters
 from mcp.client.auth.oauth2 import OAuthContext
@@ -83,6 +83,29 @@ def sanitize_return_to(value: str | None) -> str:
     if value and value.startswith("/") and not value.startswith("//"):
         return value
     return DEFAULT_RETURN_TO
+
+
+def sanitize_web_origin(value: str | None) -> str:
+    """An http(s) origin (scheme://host[:port]) or "".
+
+    Captured from the browser's Origin header on the authenticated start
+    request — it is where the UI actually lives, which the callback's own
+    origin is not when the frontend and API run on split dev ports. Anything
+    beyond a bare origin (path, query, userinfo, "null") is dropped.
+    """
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    if (
+        parts.scheme in ("http", "https")
+        and parts.netloc
+        and "@" not in parts.netloc
+        and parts.path in ("", "/")
+        and not parts.query
+        and not parts.fragment
+    ):
+        return f"{parts.scheme}://{parts.netloc}"
+    return ""
 
 
 def _cache_client():
@@ -228,7 +251,11 @@ async def _register_client(
 
 
 async def start_connect(
-    user_id: str, server_name: str, *, return_to: str | None = None
+    user_id: str,
+    server_name: str,
+    *,
+    return_to: str | None = None,
+    web_origin: str | None = None,
 ) -> dict:
     """Phase 1: discovery + DCR + state/PKCE persist. Returns {authorize_url}."""
     row = await get_catalog_server(user_id, server_name)
@@ -320,6 +347,7 @@ async def start_connect(
             prm.model_dump(mode="json", exclude_none=True) if prm else None
         ),
         "return_to": sanitize_return_to(return_to),
+        "web_origin": sanitize_web_origin(web_origin),
     }
     redis = _cache_client()
     stored = await redis.set(
@@ -362,8 +390,9 @@ async def complete_callback(
 ) -> str:
     """Phase 2: claim state, exchange the code, persist the bundle.
 
-    Returns the redirect target (relative path) for the browser. Never raises
-    for user-visible outcomes — errors are encoded in the redirect.
+    Returns the redirect target for the browser — absolute when the start
+    request captured a web origin, relative otherwise. Never raises for
+    user-visible outcomes — errors are encoded in the redirect.
     """
     if not state:
         return f"{DEFAULT_RETURN_TO}?mcp_error=missing_state"
@@ -372,7 +401,12 @@ async def complete_callback(
         # Unknown, expired, or already used — uniform answer, no oracle.
         return f"{DEFAULT_RETURN_TO}?mcp_error=invalid_state"
 
-    return_to = sanitize_return_to(record.get("return_to"))
+    # Absolute when the start request carried a browser Origin (split-port
+    # dev: the callback's own origin is the API, which has no UI routes);
+    # relative otherwise, resolving on the unified proxy/prod origin.
+    return_to = sanitize_web_origin(record.get("web_origin")) + sanitize_return_to(
+        record.get("return_to")
+    )
     server_name = record["server_name"]
 
     def _fail(reason: str) -> str:
