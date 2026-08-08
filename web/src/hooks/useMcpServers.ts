@@ -76,25 +76,28 @@ export function useDelayedFalse(value: boolean, delayMs: number): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Effective per-workspace MCP list (builtins + workspace servers + status).
- *
- * Polls while the workspace is still *settling* so the lifecycle UI advances on
- * its own. A workspace is settling when:
- *  - the sandbox is *warming* (a proactive apply / workspace entry kicked a
- *    cold start) — keep polling so the row advances when it lands on running and
- *    discovery runs, rather than freezing on a stale "stopped"; or
- *  - the sandbox is running AND a workspace server is still `pending` (discovery
- *    hasn't resolved) or the session's `applied_config_version` hasn't caught up
- *    to the saved `config_version` (the change is still applying).
- *
- * Once the sandbox is running and every server is resolved AND applied — or it
- * settles into a steady non-running state (stopped / error) — polling stops
- * (steady state = no network).
+ * Why the per-workspace poll is still running — and whether that reason is safe
+ * to poll indefinitely. Three outcomes:
+ *  - `{ poll: false }` — settled (or nothing to watch): stop.
+ *  - `{ poll: true, bounded: false }` — a *backend-driven* wait (sandbox warming,
+ *    or a numeric apply still catching up). These always resolve on their own
+ *    (an apply can even defer behind a long agent turn), so poll freely.
+ *  - `{ poll: true, bounded: true, sig }` — the *only* thing outstanding is
+ *    discovery of `pending` rows. That advances via McpTab's auto-probe, which
+ *    fires at most once per mount and never retries; if a probe can't move a row
+ *    off `pending` (a thrown probe, or discovery that never settles server-side)
+ *    the row stays `pending` forever. `sig` fingerprints the pending set so the
+ *    caller can stop once it has been static too long instead of spinning.
  */
-function isSettling(data: EffectiveServerList | undefined): boolean {
-  if (!data) return false;
-  if (data.sandbox_warming) return true;
-  if (!data.sandbox_running) return false;
+type SettleState =
+  | { poll: false }
+  | { poll: true; bounded: false }
+  | { poll: true; bounded: true; sig: string };
+
+function settleState(data: EffectiveServerList | undefined): SettleState {
+  if (!data) return { poll: false };
+  if (data.sandbox_warming) return { poll: true, bounded: false };
+  if (!data.sandbox_running) return { poll: false };
   // `applied_config_version == null` means no warm session has applied MCP config
   // yet — that's a *settled* state for an idle running sandbox, NOT "behind".
   // (An in-flight apply surfaces as `sandbox_warming` above, or as a numeric
@@ -103,20 +106,44 @@ function isSettling(data: EffectiveServerList | undefined): boolean {
   const applyingBehind =
     data.applied_config_version != null &&
     data.applied_config_version < data.config_version;
-  // Exactly the rows McpTab will auto-probe (`needsDiscoveryProbe`) — polling
-  // for a probe that never runs is how this hangs, so the two read one gate.
-  const verifying = data.servers.some(needsDiscoveryProbe);
-  return applyingBehind || verifying;
+  if (applyingBehind) return { poll: true, bounded: false };
+  // Exactly the rows McpTab will auto-probe (`needsDiscoveryProbe`).
+  const pending = data.servers.filter(needsDiscoveryProbe).map((s) => s.name).sort();
+  if (pending.length === 0) return { poll: false };
+  return { poll: true, bounded: true, sig: pending.join(',') };
 }
 
+// A verify-only poll whose pending set hasn't changed in this long has stalled:
+// the mount-once auto-probe has already run and won't retry, so continuing to
+// poll just spins. Comfortably clears the backend's ~15s discovery debounce, so
+// a slow-but-resolving probe is never cut short. Warming/applying are exempt
+// (they're backend-bounded) — only the stuck-`pending` case is capped.
+const MAX_VERIFY_STALL_MS = 30_000;
+
 export function useWorkspaceMcpServers(workspaceId: string | null | undefined, enabled = true) {
+  // Tracks how long the verify-only poll has seen the same pending set, so a
+  // row the auto-probe couldn't resolve stops the poll instead of hanging it.
+  const verifyStall = useRef<{ sig: string; since: number } | null>(null);
   return useQuery({
     queryKey: queryKeys.mcp.workspace(workspaceId ?? ''),
     queryFn: () => getWorkspaceMcpServers(workspaceId!),
     enabled: enabled && !!workspaceId,
     staleTime: 15_000,
-    // Self-stopping poll: ~2.5s while settling, off once verified + applied.
-    refetchInterval: (query) => (isSettling(query.state.data) ? 2_500 : false),
+    // Self-stopping poll: ~2.5s while settling, off once verified + applied — or
+    // once a stuck verify-only wait exceeds MAX_VERIFY_STALL_MS.
+    refetchInterval: (query) => {
+      const state = settleState(query.state.data);
+      if (!state.poll || !state.bounded) {
+        verifyStall.current = null;
+        return state.poll ? 2_500 : false;
+      }
+      const now = Date.now();
+      if (!verifyStall.current || verifyStall.current.sig !== state.sig) {
+        verifyStall.current = { sig: state.sig, since: now };
+      }
+      if (now - verifyStall.current.since > MAX_VERIFY_STALL_MS) return false;
+      return 2_500;
+    },
   });
 }
 
@@ -134,12 +161,10 @@ export function useMcpCatalog(enabled = true) {
 // Per-workspace mutations
 // ---------------------------------------------------------------------------
 
-/** Add a workspace server — a full def OR `{ from_template }`. */
 export function useAddWorkspaceMcpServer(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (body: McpServerInput | { from_template: string }) =>
-      addWorkspaceMcpServer(workspaceId, body),
+    mutationFn: (body: McpServerInput) => addWorkspaceMcpServer(workspaceId, body),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
     },

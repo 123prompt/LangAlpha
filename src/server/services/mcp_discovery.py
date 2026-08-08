@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from ptc_agent.config.core import MCPServerConfig
@@ -52,6 +53,67 @@ def mcp_discovery_fingerprint(server: MCPServerConfig) -> str:
     """
     payload = discovery_affecting_payload(server, include_identity=False)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def ok_snapshot(row: dict[str, Any]) -> bool:
+    """Acceptance predicate for consumers that may only serve real tools."""
+    return row.get("status") == "ok"
+
+
+class ToolSnapshotIndex:
+    """Hash-gated view over the two discovery-snapshot tiers.
+
+    A cached snapshot may be served only if it was discovered under the
+    server's CURRENT ``mcp_discovery_fingerprint`` — an unrelated mutation
+    leaves that hash untouched (cache hit), the server's own edit does not
+    (miss ⇒ re-verify). Which tier answers is also fixed here: an inherited
+    (``source='user'``) server reads its USER-tier snapshot first, because the
+    host-side OAuth discovery that writes it is purged on disconnect and
+    refreshed on connect, whereas the per-workspace snapshot's fingerprint is
+    OAuth-blind and can outlive a disconnect/reconnect. The tier is chosen by
+    which one HAS a matching snapshot, before any status filter, so a rejected
+    user-tier row never falls through to a stale workspace one.
+
+    Rows are supplied by the caller (each lane already reads what it needs);
+    the index owns only the acceptance rule.
+    """
+
+    def __init__(
+        self,
+        *,
+        workspace_rows: Iterable[dict[str, Any]] = (),
+        user_rows: Iterable[dict[str, Any]] = (),
+    ) -> None:
+        self._workspace = {(r["server_name"], r.get("config_hash")): r for r in workspace_rows}
+        self._user = {(r["server_name"], r.get("config_hash")): r for r in user_rows}
+
+    def snapshot(
+        self,
+        server: MCPServerConfig,
+        *,
+        accept: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> dict[str, Any] | None:
+        """The current-config snapshot for ``server``, or None.
+
+        ``accept`` further filters the row the tier precedence selected (e.g.
+        ok-only, or a freshness window); a rejected row reads as no snapshot.
+        """
+        key = (server.name, mcp_discovery_fingerprint(server))
+        tiers = (
+            (self._user, self._workspace)
+            if getattr(server, "source", None) == "user"
+            else (self._workspace,)
+        )
+        for tier in tiers:
+            row = tier.get(key)
+            if row is None:
+                continue
+            return row if (accept is None or accept(row)) else None
+        return None
+
+    def ok(self, server: MCPServerConfig) -> dict[str, Any] | None:
+        """The current-config snapshot for ``server`` iff discovery succeeded."""
+        return self.snapshot(server, accept=ok_snapshot)
 
 
 def sanitize_discovered_tools(

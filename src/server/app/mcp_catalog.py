@@ -1,10 +1,10 @@
 """User-level MCP server API — the Connectors backing store.
 
 An ``enabled`` row is live config: ``resolve_mcp_config`` inherits it into
-every one of the user's workspaces. Disabled rows are inert templates (the
-legacy catalog behavior; ``from_template`` still copies them into a
-workspace). All env/header literals are masked in responses; only
-``${vault:NAME}`` reference names are surfaced.
+every one of the user's workspaces. A disabled row is inert — a stored
+definition that reaches no workspace until it is enabled. All env/header
+literals are masked in responses; only ``${vault:NAME}`` reference names are
+surfaced.
 
 Endpoints (user-scoped):
 - GET    /api/v1/mcp/servers
@@ -22,9 +22,8 @@ import logging
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
 
-from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
-
-from src.server.database.mcp_oauth import list_connections
+from src.server.database.mcp_oauth import get_connection, list_connections
+from src.server.services.mcp_config import same_consented_url
 from src.server.database.mcp_servers import (
     MAX_CATALOG_SERVERS_PER_USER,
     create_catalog_server,
@@ -51,8 +50,9 @@ from src.server.models.mcp_server import (
     parse_mcp_servers_payload,
 )
 from src.server.services.mcp_import import (
-    extract_literals_to_vault,
-    rollback_import_secrets,
+    ImportScope,
+    ImportSession,
+    run_mcp_import,
 )
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
@@ -89,13 +89,12 @@ async def _tool_counts_by_server(
 ) -> dict[str, int]:
     """server_name → discovered tool count, hash-gated to the CURRENT config.
 
-    Same acceptance rule as the workspace effective list: a snapshot only
-    counts if it was discovered under the server's current fingerprint and
-    succeeded — so the number shown here always matches what workspaces serve.
+    Same acceptance rule as the workspace effective list (``ToolSnapshotIndex``
+    owns it), so the number shown here always matches what workspaces serve.
     Pure decoration: any failure degrades to no counts, never a 500.
     """
     from src.server.services.mcp_config import user_row_to_server_config
-    from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+    from src.server.services.mcp_discovery import ToolSnapshotIndex
 
     try:
         schema_rows = await get_user_tool_schemas(user_id)
@@ -105,17 +104,14 @@ async def _tool_counts_by_server(
             exc_info=True,
         )
         return {}
+    snapshots = ToolSnapshotIndex(user_rows=schema_rows)
     counts: dict[str, int] = {}
-    by_name = {s["server_name"]: s for s in schema_rows}
     for row in rows:
-        snapshot = by_name.get(row["name"])
-        if snapshot is None or snapshot.get("status") != "ok":
-            continue
         try:
-            fingerprint = mcp_discovery_fingerprint(user_row_to_server_config(row))
+            snapshot = snapshots.ok(user_row_to_server_config(row))
         except Exception:  # noqa: BLE001 — malformed row: just omit the count
             continue
-        if snapshot.get("config_hash") == fingerprint:
+        if snapshot is not None:
             counts[row["name"]] = len(snapshot.get("tools") or [])
     return counts
 
@@ -218,6 +214,23 @@ async def update_server(
     )
     if not row:
         raise HTTPException(status_code=404, detail="MCP server not found")
+
+    from src.server.services.mcp_oauth.lifecycle import disconnect_server
+
+    # Force reconnect when the edit moves an OAuth-connected server off its
+    # consented endpoint: the stored token was issued for the old host, so it
+    # must not carry to the new one. The grant already pins to the connection's
+    # server_url, so no token can leak in the meantime — this revokes the now-
+    # stale connection so the UI shows a clean reconnect. Transport away from a
+    # remote scheme also invalidates consent (no relay path exists).
+    conn = await get_connection(user_id, name)
+    if conn and conn["status"] != "revoked":
+        moved = server.transport not in ("http", "sse") or not same_consented_url(
+            conn.get("server_url"), server.url
+        )
+        if moved:
+            await disconnect_server(user_id, name)
+            row = await get_catalog_server(user_id, name) or row
     response = catalog_row_to_response(row)
     response.warnings = isolation_warnings(server) or None
     return response
@@ -250,122 +263,52 @@ async def import_servers(
     async def delete_secret(name: str) -> None:
         await delete_user_secret(user_id, name)
 
-    builtins = _builtin_names()
+    async def persist(server: McpServerInput) -> bool:
+        # No ON CONFLICT arm here — a raced duplicate raises ValueError, so a
+        # successful call always means "created".
+        await create_catalog_server(
+            user_id,
+            server.name,
+            transport=server.transport,
+            command=server.command,
+            args=server.args,
+            url=server.url,
+            env=server.env,
+            headers=server.headers,
+            description=server.description,
+            instruction=server.instruction,
+            tool_exposure_mode=server.tool_exposure_mode,
+            discovery_uses_secrets=server.discovery_uses_secrets,
+        )
+        return True
+
     existing_names = {r["name"] for r in await list_catalog_servers(user_id)}
-    used_secret_names = set(await get_user_secret_names(user_id))
-
-    # value → ${vault:NAME}, so an identical token reused across servers is
-    # stored once.
-    allocated: dict[str, str] = {}
-    secrets_created: list[str] = []
-    seen_names: set[str] = set()
-    results: list[dict] = []
-    created_count = 0
-
-    for entry in parsed:
-        base = {
-            "original_name": entry.original_name,
-            "name": entry.name,
-            "renamed": entry.renamed,
-        }
-        if entry.error:
-            results.append({**base, "status": "invalid", "error": entry.error})
-            continue
-        if entry.name in builtins:
-            results.append(
-                {**base, "status": "skipped", "reason": "collides with a built-in server"}
-            )
-            continue
-        if entry.name in seen_names or entry.name in existing_names:
-            reason = (
-                "duplicate name after normalization"
-                if entry.name in seen_names
-                else "already exists in your Connectors"
-            )
-            status = "skipped" if entry.name in seen_names else "exists"
-            results.append({**base, "status": status, "reason": reason})
-            continue
-        if len(existing_names) + created_count >= MAX_CATALOG_SERVERS_PER_USER:
-            results.append(
-                {
-                    **base,
-                    "status": "error",
-                    "error": f"Connectors server cap "
-                    f"({MAX_CATALOG_SERVERS_PER_USER}) reached",
-                }
-            )
-            continue
-
-        seen_names.add(entry.name)
-        config = dict(entry.config)
-        try:
-            made = await extract_literals_to_vault(
-                entry.name,
-                config,
-                allocated=allocated,
-                used_secret_names=used_secret_names,
-                create_secret=create_secret,
-                delete_secret=delete_secret,
-            )
-        except ValueError as e:
-            results.append({**base, "status": "error", "error": str(e)})
-            continue
-
-        # An authenticated remote server needs its header even to list tools,
-        # so discovery must resolve secrets — store that flag honestly.
-        if config.get("transport") in ("http", "sse"):
-            headers = config.get("headers") or {}
-            if any(VAULT_REF_RE.search(str(v)) for v in headers.values()):
-                config["discovery_uses_secrets"] = True
-
-        try:
-            server = McpServerInput(**config)
-        except ValidationError as e:
-            await rollback_import_secrets(
-                made,
-                allocated=allocated,
-                used_secret_names=used_secret_names,
-                delete_secret=delete_secret,
-            )
-            results.append(
-                {**base, "status": "invalid", "error": _format_validation_error(e)}
-            )
-            continue
-
-        try:
-            await create_catalog_server(
-                user_id,
-                server.name,
-                transport=server.transport,
-                command=server.command,
-                args=server.args,
-                url=server.url,
-                env=server.env,
-                headers=server.headers,
-                description=server.description,
-                instruction=server.instruction,
-                tool_exposure_mode=server.tool_exposure_mode,
-                discovery_uses_secrets=server.discovery_uses_secrets,
-            )
-        except ValueError as e:
-            await rollback_import_secrets(
-                made,
-                allocated=allocated,
-                used_secret_names=used_secret_names,
-                delete_secret=delete_secret,
-            )
-            results.append({**base, "status": "error", "error": str(e)})
-            continue
-
-        secrets_created.extend(made)
-        created_count += 1
-        results.append({**base, "status": "created"})
+    report = await run_mcp_import(
+        parsed,
+        scope=ImportScope(
+            reserved_names=_builtin_names(),
+            existing_names=existing_names,
+            current_count=len(existing_names),
+            cap=MAX_CATALOG_SERVERS_PER_USER,
+            cap_message=(
+                f"Connectors server cap "
+                f"({MAX_CATALOG_SERVERS_PER_USER}) reached"
+            ),
+            exists_message="already exists in your Connectors",
+            persist=persist,
+        ),
+        session=ImportSession(
+            create_secret=create_secret,
+            delete_secret=delete_secret,
+            used_secret_names=set(await get_user_secret_names(user_id)),
+        ),
+    )
 
     # Imported rows are disabled (inert) — no fan-out, no sandbox push needed.
     return {
-        "results": results,
-        "created": created_count,
-        "secrets_created": secrets_created,
+        "results": report.results,
+        "created": report.created,
+        "secrets_created": report.secrets_created,
         "config_version": 0,
     }
 
@@ -416,6 +359,13 @@ async def set_enabled(
 @router.delete("/servers/{name}")
 @handle_api_exceptions("delete MCP catalog server", logger)
 async def delete_server(name: str, user_id: CurrentUserId) -> dict:
+    from src.server.services.mcp_oauth.lifecycle import disconnect_server
+
+    # Revoke any OAuth connection + its grants before dropping the catalog row.
+    # Deleting the row alone orphans the connection (no catalog FK): the refresh
+    # sweeper keeps the token alive, and a same-name recreate silently reuses
+    # it. disconnect_server is a no-op when no connection exists.
+    await disconnect_server(user_id, name)
     found = await delete_catalog_server(user_id, name)
     if not found:
         raise HTTPException(status_code=404, detail="MCP server not found")

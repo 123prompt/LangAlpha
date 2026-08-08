@@ -27,7 +27,6 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
 
-from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
 from src.server.database.mcp_servers import (
     MAX_MCP_SERVERS_PER_WORKSPACE,
     create_catalog_server,
@@ -49,11 +48,18 @@ from src.server.database.vault_secrets import (
     get_workspace_secret_names,
 )
 from src.server.database.workspace import get_workspace as db_get_workspace
-from src.server.services.mcp_config import resolve_mcp_config
-from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+from src.server.services.mcp_config import (
+    Origin,
+    ResolvedServer,
+    State,
+    classify_server_name,
+    resolve_mcp_config,
+)
+from src.server.services.mcp_discovery import ToolSnapshotIndex
 from src.server.services.mcp_import import (
-    extract_literals_to_vault,
-    rollback_import_secrets,
+    ImportScope,
+    ImportSession,
+    run_mcp_import,
 )
 from src.server.models.mcp_server import (
     CatalogServer,
@@ -81,6 +87,23 @@ router = APIRouter(prefix="/api/v1/workspaces", tags=["MCP Servers"])
 # pending (kept simple — no Redis).
 _DISCOVER_DEBOUNCE_SECONDS = 15
 
+# Mutation refusals, written once — the three endpoints reach the same states.
+_NOT_FOUND = "MCP server not found"
+_BUILTIN_EDIT = "Cannot edit a built-in server"
+_BUILTIN_DELETE = "Cannot delete a built-in server"
+_INHERITED_EDIT = (
+    "This server is inherited from your Connectors — edit it there, or add a "
+    "copy to this workspace to fork it."
+)
+_INHERITED_DELETE = (
+    "This server is inherited from your Connectors — remove it there, or "
+    "disable it for this workspace."
+)
+_INHERITED_DELETE_TOMBSTONE = (
+    "This server is inherited from your Connectors — remove it there, or "
+    "re-enable it for this workspace."
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -99,12 +122,6 @@ async def _require_owned_workspace(workspace_id: str, user_id: str) -> dict:
     workspace = await db_get_workspace(workspace_id)
     require_workspace_owner(workspace, user_id=user_id)
     return workspace
-
-
-async def _is_inherited_user_server(user_id: str, name: str) -> bool:
-    """True when ``name`` is one of the user's enabled (live) Connectors servers."""
-    row = await get_catalog_server(user_id, name)
-    return bool(row and row.get("enabled"))
 
 
 def _missing_secrets(
@@ -180,10 +197,8 @@ def _sandbox_warming(workspace: dict) -> bool:
 
 
 def _effective_server(
-    srv: Any,
+    entry: ResolvedServer,
     *,
-    origin: str,
-    enabled: bool,
     status: str,
     config_version: int,
     error: str = "",
@@ -191,18 +206,19 @@ def _effective_server(
     missing_secrets: list[str] | None = None,
     env_refs: list[str] | None = None,
     header_refs: list[str] | None = None,
-    oauth_status: str | None = None,
 ) -> EffectiveServer:
     """Build one effective-list row; editable/deletable derive from origin."""
     tools = tools or []
+    srv = entry.config
+    origin = entry.origin
     return EffectiveServer(
-        oauth_status=oauth_status,
+        oauth_status=entry.oauth_status,
         name=srv.name,
-        origin=origin,
+        origin=origin.value,
         transport=srv.transport,
-        enabled=enabled,
-        editable=(origin == "workspace"),
-        deletable=(origin == "workspace"),
+        enabled=entry.state is State.ACTIVE,
+        editable=(origin is Origin.WORKSPACE),
+        deletable=(origin is Origin.WORKSPACE),
         status=status,
         error=error,
         tool_count=len(tools),
@@ -212,8 +228,8 @@ def _effective_server(
         header_refs=header_refs or [],
         # Echo the stored reference maps (refs/literals, never resolved
         # secrets) so the edit form round-trips them; built-ins stay empty.
-        env=dict(srv.env or {}) if origin == "workspace" else {},
-        headers=dict(srv.headers or {}) if origin == "workspace" else {},
+        env=dict(srv.env or {}) if origin is Origin.WORKSPACE else {},
+        headers=dict(srv.headers or {}) if origin is Origin.WORKSPACE else {},
         description=srv.description or "",
         instruction=srv.instruction or "",
         tool_exposure_mode=srv.tool_exposure_mode or "summary",
@@ -249,49 +265,30 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
             get_user_tool_schemas(user_id),
         )
     )
-    schema_by_name = {r["server_name"]: r for r in schema_rows}
+    snapshots = ToolSnapshotIndex(
+        workspace_rows=schema_rows, user_rows=user_schema_rows
+    )
     # The sandbox vault merges user + workspace secrets (workspace wins), so a
     # ref resolvable from either tier is satisfied.
     merged_secret_names = set(secret_names) | set(user_secret_names)
 
-    def _schema_for(srv: Any, origin: str) -> dict[str, Any] | None:
-        """Hash-checked schema-cache row for one server, or None.
-
-        Accept a cached snapshot only if it's for THIS server's current config.
-        A stale-hash row (the server's own config changed but it hasn't been
-        re-discovered yet) reads as pending → re-verify; an unrelated mutation
-        leaves the hash untouched → the row stays a valid hit. Inherited
-        servers prefer the user-level cache (host-side OAuth discovery — it is
-        purged on disconnect and refreshed on connect, so it tracks the OAuth
-        lifecycle) over the per-workspace cache (in-sandbox discovery), whose
-        fingerprint is OAuth-blind and can outlive a disconnect/reconnect.
-        """
-        if origin == "builtin":
-            return None
-        fingerprint = mcp_discovery_fingerprint(srv)
-        if origin == "user":
-            for user_row in user_schema_rows:
-                if (
-                    user_row["server_name"] == srv.name
-                    and user_row.get("config_hash") == fingerprint
-                ):
-                    return user_row
-        row = schema_by_name.get(srv.name)
-        if row is not None and row.get("config_hash") == fingerprint:
-            return row
-        return None
-
-    def _row_for(srv: Any, origin: str, *, enabled: bool) -> EffectiveServer:
+    def _row_for(entry: ResolvedServer) -> EffectiveServer:
+        srv = entry.config
+        origin = entry.origin
         env_refs = collect_vault_refs(dict(srv.env or {}))
         header_refs = collect_vault_refs(dict(srv.headers or {}))
-        if enabled:
-            schema_row = _schema_for(srv, origin)
+        if entry.state is State.ACTIVE:
+            # No status gate: an ``error`` snapshot is how the row reports why
+            # a server isn't serving tools. Built-ins never carry one.
+            schema_row = (
+                None if origin is Origin.BUILTIN else snapshots.snapshot(srv)
+            )
             status, error, missing = _derive_status(
                 origin=origin,
                 env_refs=env_refs,
                 header_refs=header_refs,
                 secret_names=(
-                    merged_secret_names if origin == "user" else secret_names
+                    merged_secret_names if origin is Origin.USER else secret_names
                 ),
                 schema_row=schema_row,
             )
@@ -299,9 +296,7 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
         else:
             status, error, missing, tools = "disabled", "", [], []
         row = _effective_server(
-            srv,
-            origin=origin,
-            enabled=enabled,
+            entry,
             status=status,
             error=error,
             tools=tools,
@@ -309,44 +304,20 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
             env_refs=env_refs,
             header_refs=header_refs,
             config_version=resolved.version,
-            oauth_status=(
-                resolved.oauth_status_by_name.get(srv.name)
-                if origin == "user"
-                else None
-            ),
         )
-        if origin == "workspace" and srv.name in resolved.shadowed_inherited_names:
+        if origin is Origin.WORKSPACE and srv.name in resolved.shadowed_inherited_names:
             row.shadows_inherited = True
         return row
 
-    servers: list[EffectiveServer] = []
-    for srv in resolved.servers:
-        if srv.name in resolved.builtin_names:
-            origin = "builtin"
-        elif srv.name in resolved.inherited_names:
-            origin = "user"
-        else:
-            origin = "workspace"
-        servers.append(_row_for(srv, origin, enabled=srv.enabled))
-
-    # Disabled built-ins are filtered out of the resolver's effective set, but
-    # the UI still needs a row (with its toggle) to re-enable them.
-    for srv in base_config.mcp.servers:
-        if srv.name not in resolved.disabled_builtin_names:
-            continue
-        servers.append(_row_for(srv, "builtin", enabled=False))
-
-    # Inherited user servers tombstoned in THIS workspace — same re-enable
-    # affordance as disabled built-ins.
-    for srv in resolved.tombstoned_inherited_servers:
-        servers.append(_row_for(srv, "user", enabled=False))
-
-    # Disabled workspace servers are likewise dropped from the resolver's
-    # effective set; surface them (greyed, with their toggle) so disabling a
-    # workspace server isn't a one-way trip — mirrors the disabled-builtin
-    # re-add above.
-    for srv in resolved.disabled_workspace_servers:
-        servers.append(_row_for(srv, "workspace", enabled=False))
+    # One row per entry, in resolver order: the running set first, then the
+    # rows carried purely so the UI keeps a re-enable toggle (disabled
+    # built-ins, tombstoned inherited, disabled workspace servers). A SHADOWED
+    # inherited server has no row of its own — its local fork carries the flag.
+    servers = [
+        _row_for(entry)
+        for entry in resolved.entries
+        if entry.state is not State.SHADOWED
+    ]
 
     # Version the running session has actually applied (no I/O) — drives the
     # frontend's version-accurate "synced" state. None when no warm session.
@@ -369,7 +340,7 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
 
 
 # ---------------------------------------------------------------------------
-# POST — add (full def OR from_template)
+# POST — add
 # ---------------------------------------------------------------------------
 
 
@@ -382,13 +353,10 @@ async def add_server(
 ) -> dict:
     await _require_owned_workspace(workspace_id, user_id)
 
-    if "from_template" in body:
-        server = await _server_from_template(user_id, body)
-    else:
-        try:
-            server = McpServerInput(**body)
-        except ValidationError as e:
-            raise HTTPException(status_code=422, detail=_format_validation_error(e))
+    try:
+        server = McpServerInput(**body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=_format_validation_error(e))
 
     if server.name in _builtin_names():
         raise HTTPException(
@@ -433,38 +401,6 @@ async def add_server(
     return response
 
 
-async def _server_from_template(user_id: str, body: dict) -> McpServerInput:
-    """Load a catalog template and re-validate it as a workspace server def."""
-    if set(body) != {"from_template"}:
-        raise HTTPException(
-            status_code=422,
-            detail="from_template must be the only field in the body",
-        )
-    template = await get_catalog_server(user_id, body["from_template"])
-    if not template:
-        raise HTTPException(status_code=404, detail="Template not found")
-    # Re-validate the stored template through the same input model. A template
-    # that no longer passes the (possibly tightened) policy yields a 422.
-    try:
-        return McpServerInput(
-            name=template["name"],
-            transport=template["transport"],
-            command=template.get("command"),
-            args=template.get("args") or [],
-            url=template.get("url"),
-            env=template.get("env") or {},
-            headers=template.get("headers") or {},
-            description=template.get("description") or "",
-            instruction=template.get("instruction") or "",
-            tool_exposure_mode=template.get("tool_exposure_mode") or "summary",
-            discovery_uses_secrets=bool(
-                template.get("discovery_uses_secrets", False)
-            ),
-        )
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=_format_validation_error(e))
-
-
 # ---------------------------------------------------------------------------
 # POST — promote a workspace server UP into the user's template catalog
 # ---------------------------------------------------------------------------
@@ -480,8 +416,8 @@ async def promote_server(
 ) -> CatalogServer:
     """Save a workspace server's definition as a reusable user-level template.
 
-    The inverse of ``from_template``: copies the workspace row's config into the
-    user catalog (re-validated through the same input model). Only
+    Copies the workspace row's config into the user catalog (re-validated
+    through the same input model). Only
     ``${vault:NAME}`` reference names travel — secret values are workspace-scoped
     and never copied, so the template surfaces ``missing_secrets`` when later
     added to another workspace. ``overwrite`` replaces an existing template of
@@ -573,169 +509,59 @@ async def import_servers(
             '{"mcpServers": { "<name>": { ... } }}.',
         )
 
-    builtins = _builtin_names()
     existing_rows, _ = await get_workspace_servers_and_version(workspace_id)
-    existing_names = {r["name"] for r in existing_rows}
-    current_ws_count = sum(1 for r in existing_rows if r["source"] == "workspace")
-    used_secret_names = set(await get_workspace_secret_names(workspace_id))
 
-    # value → ${vault:NAME}, so an identical token reused across servers (common
-    # for a single provider) is stored once.
-    allocated: dict[str, str] = {}
-    secrets_created: list[str] = []
-    seen_names: set[str] = set()
-    results: list[dict[str, Any]] = []
-    created_count = 0
+    async def create_secret(name: str, value: str, description: str) -> None:
+        await create_secret_db(workspace_id, name, value, description)
 
-    for entry in parsed:
-        base = {
-            "original_name": entry.original_name,
-            "name": entry.name,
-            "renamed": entry.renamed,
-        }
-        if entry.error:
-            results.append({**base, "status": "invalid", "error": entry.error})
-            continue
-        if entry.name in builtins:
-            results.append(
-                {**base, "status": "skipped", "reason": "collides with a built-in server"}
-            )
-            continue
-        if entry.name in seen_names or entry.name in existing_names:
-            reason = (
-                "duplicate name after normalization"
-                if entry.name in seen_names
-                else "already exists in this workspace"
-            )
-            status = "skipped" if entry.name in seen_names else "exists"
-            results.append({**base, "status": status, "reason": reason})
-            continue
-        if current_ws_count + created_count >= MAX_MCP_SERVERS_PER_WORKSPACE:
-            results.append(
-                {
-                    **base,
-                    "status": "error",
-                    "error": f"workspace MCP server cap "
-                    f"({MAX_MCP_SERVERS_PER_WORKSPACE}) reached",
-                }
-            )
-            continue
+    async def delete_secret(name: str) -> None:
+        await delete_secret_db(workspace_id, name)
 
-        seen_names.add(entry.name)
-        config = dict(entry.config)
-        try:
-            made = await _extract_literals_to_vault(
-                workspace_id,
-                entry.name,
-                config,
-                allocated=allocated,
-                used_secret_names=used_secret_names,
-            )
-        except ValueError as e:
-            results.append({**base, "status": "error", "error": str(e)})
-            continue
+    async def persist(server: McpServerInput) -> bool:
+        # ON CONFLICT DO NOTHING ⇒ None means the name is taken, not an error.
+        return await insert_workspace_server(
+            workspace_id, server.name, config=server.to_config_blob()
+        ) is not None
 
-        # An authenticated remote server needs its header even to list tools, so
-        # discovery must resolve secrets — set it explicitly so the stored value
-        # (and the UI toggle) is honest (matches discovery_should_use_secrets).
-        if config.get("transport") in ("http", "sse"):
-            headers = config.get("headers") or {}
-            if any(VAULT_REF_RE.search(str(v)) for v in headers.values()):
-                config["discovery_uses_secrets"] = True
-
-        try:
-            server = McpServerInput(**config)
-        except ValidationError as e:
-            await _rollback_import_secrets(
-                workspace_id, made, allocated=allocated, used_secret_names=used_secret_names
-            )
-            results.append(
-                {**base, "status": "invalid", "error": _format_validation_error(e)}
-            )
-            continue
-
-        try:
-            row = await insert_workspace_server(
-                workspace_id, server.name, config=server.to_config_blob()
-            )
-        except ValueError as e:
-            await _rollback_import_secrets(
-                workspace_id, made, allocated=allocated, used_secret_names=used_secret_names
-            )
-            results.append({**base, "status": "error", "error": str(e)})
-            continue
-        if row is None:
-            await _rollback_import_secrets(
-                workspace_id, made, allocated=allocated, used_secret_names=used_secret_names
-            )
-            results.append({**base, "status": "exists"})
-            continue
-
-        secrets_created.extend(made)
-        created_count += 1
-        results.append({**base, "status": "created"})
+    report = await run_mcp_import(
+        parsed,
+        scope=ImportScope(
+            reserved_names=_builtin_names(),
+            existing_names={r["name"] for r in existing_rows},
+            # Only the workspace's OWN servers count against the cap; builtin
+            # markers and inherited tombstones are not servers.
+            current_count=sum(
+                1 for r in existing_rows if r["source"] == "workspace"
+            ),
+            cap=MAX_MCP_SERVERS_PER_WORKSPACE,
+            cap_message=(
+                f"workspace MCP server cap "
+                f"({MAX_MCP_SERVERS_PER_WORKSPACE}) reached"
+            ),
+            exists_message="already exists in this workspace",
+            persist=persist,
+        ),
+        session=ImportSession(
+            create_secret=create_secret,
+            delete_secret=delete_secret,
+            used_secret_names=set(await get_workspace_secret_names(workspace_id)),
+        ),
+    )
 
     # Imported secrets are usable immediately on a live sandbox (best-effort);
     # the server set itself applies on the next agent run.
-    if secrets_created:
+    if report.secrets_created:
         await _push_vault_to_sandbox(workspace_id)
 
     _, version = await get_workspace_servers_and_version(workspace_id)
-    if created_count > 0:
+    if report.created > 0:
         _schedule_proactive_apply(workspace_id, user_id)
     return {
-        "results": results,
-        "created": created_count,
-        "secrets_created": secrets_created,
+        "results": report.results,
+        "created": report.created,
+        "secrets_created": report.secrets_created,
         "config_version": version,
     }
-
-
-def _workspace_secret_ops(workspace_id: str):
-    """Bind the shared import-extraction helpers to workspace vault storage."""
-
-    async def create(name: str, value: str, description: str) -> None:
-        await create_secret_db(workspace_id, name, value, description)
-
-    async def delete(name: str) -> None:
-        await delete_secret_db(workspace_id, name)
-
-    return create, delete
-
-
-async def _rollback_import_secrets(
-    workspace_id: str,
-    names: list[str],
-    *,
-    allocated: dict[str, str],
-    used_secret_names: set[str],
-) -> None:
-    _, delete = _workspace_secret_ops(workspace_id)
-    await rollback_import_secrets(
-        names,
-        allocated=allocated,
-        used_secret_names=used_secret_names,
-        delete_secret=delete,
-    )
-
-
-async def _extract_literals_to_vault(
-    workspace_id: str,
-    server_name: str,
-    config: dict[str, Any],
-    *,
-    allocated: dict[str, str],
-    used_secret_names: set[str],
-) -> list[str]:
-    create, delete = _workspace_secret_ops(workspace_id)
-    return await extract_literals_to_vault(
-        server_name,
-        config,
-        allocated=allocated,
-        used_secret_names=used_secret_names,
-        create_secret=create,
-        delete_secret=delete,
-    )
 
 
 async def _push_vault_to_sandbox(workspace_id: str) -> None:
@@ -764,36 +590,28 @@ async def edit_server(
     await _require_owned_workspace(workspace_id, user_id)
 
     if name in _builtin_names():
-        raise HTTPException(status_code=409, detail="Cannot edit a built-in server")
+        raise HTTPException(status_code=409, detail=_BUILTIN_EDIT)
     if body.name != name:
         raise HTTPException(
             status_code=409, detail="name in body must match the path name"
         )
 
-    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
-    existing = rows.get(name)
-    if existing is None:
-        if await _is_inherited_user_server(user_id, name):
-            raise HTTPException(
-                status_code=409,
-                detail="This server is inherited from your Connectors — edit it "
-                "there, or add a copy to this workspace to fork it.",
-            )
-        raise HTTPException(status_code=404, detail="MCP server not found")
-    if existing["source"] == "user":
-        raise HTTPException(
-            status_code=409,
-            detail="This server is inherited from your Connectors — edit it "
-            "there, or add a copy to this workspace to fork it.",
-        )
-    if existing["source"] != "workspace":
-        raise HTTPException(status_code=409, detail="Cannot edit a built-in server")
+    ref = await classify_server_name(workspace_id, user_id, name)
+    if ref is None:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    match ref.origin:
+        case Origin.WORKSPACE:
+            pass
+        case Origin.USER:
+            raise HTTPException(status_code=409, detail=_INHERITED_EDIT)
+        case _:
+            raise HTTPException(status_code=409, detail=_BUILTIN_EDIT)
 
     row = await upsert_workspace_server(
         workspace_id,
         name,
         source="workspace",
-        enabled=bool(existing["enabled"]),
+        enabled=ref.state is State.ACTIVE,
         config=body.to_config_blob(),
     )
     _schedule_proactive_apply(workspace_id, user_id)
@@ -827,24 +645,27 @@ async def set_enabled(
         _schedule_proactive_apply(workspace_id, user_id)
         return {"name": name, "enabled": body.enabled}
 
-    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
-    existing = rows.get(name)
-    if existing is not None and existing["source"] == "workspace":
-        await set_workspace_server_enabled(workspace_id, name, body.enabled)
-    elif existing is not None and existing["source"] == "user":
-        # An existing tombstone for an inherited server; enabling = delete it.
-        # (Disabling again is a no-op — it's already tombstoned.)
-        if body.enabled:
-            await delete_workspace_server(workspace_id, name)
-    elif await _is_inherited_user_server(user_id, name):
-        # Inherited and not yet marked: disabling writes the per-workspace
-        # tombstone; enabling is a no-op (it's already live via inheritance).
-        if not body.enabled:
-            await upsert_workspace_server(
-                workspace_id, name, source="user", enabled=False, config=None
-            )
-    else:
-        raise HTTPException(status_code=404, detail="MCP server not found")
+    ref = await classify_server_name(workspace_id, user_id, name)
+    if ref is None:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    match (ref.origin, ref.state):
+        case (Origin.WORKSPACE, _):
+            await set_workspace_server_enabled(workspace_id, name, body.enabled)
+        case (Origin.USER, State.TOMBSTONED):
+            # An existing tombstone for an inherited server; enabling = delete
+            # it. (Disabling again is a no-op — it's already tombstoned.)
+            if body.enabled:
+                await delete_workspace_server(workspace_id, name)
+        case (Origin.USER, _):
+            # Inherited and not yet marked: disabling writes the per-workspace
+            # tombstone; enabling is a no-op (it's already live via inheritance).
+            if not body.enabled:
+                await upsert_workspace_server(
+                    workspace_id, name, source="user", enabled=False, config=None
+                )
+        case _:
+            # A disable-marker whose built-in no longer exists: nothing to toggle.
+            raise HTTPException(status_code=404, detail=_NOT_FOUND)
     _schedule_proactive_apply(workspace_id, user_id)
     return {"name": name, "enabled": body.enabled}
 
@@ -862,28 +683,24 @@ async def delete_server(
     await _require_owned_workspace(workspace_id, user_id)
 
     if name in _builtin_names():
-        raise HTTPException(status_code=409, detail="Cannot delete a built-in server")
+        raise HTTPException(status_code=409, detail=_BUILTIN_DELETE)
 
-    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
-    existing = rows.get(name)
-    if existing is None:
-        if await _is_inherited_user_server(user_id, name):
+    ref = await classify_server_name(workspace_id, user_id, name)
+    if ref is None:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    match (ref.origin, ref.state):
+        case (Origin.WORKSPACE, _):
+            pass
+        case (Origin.USER, State.TOMBSTONED):
+            # Deleting the tombstone here would silently re-enable the
+            # inherited server — make that toggle explicit instead.
             raise HTTPException(
-                status_code=409,
-                detail="This server is inherited from your Connectors — remove "
-                "it there, or disable it for this workspace.",
+                status_code=409, detail=_INHERITED_DELETE_TOMBSTONE
             )
-        raise HTTPException(status_code=404, detail="MCP server not found")
-    if existing["source"] == "user":
-        # A tombstone marker, not a workspace server. Deleting it here would
-        # silently re-enable the inherited server — make the toggle explicit.
-        raise HTTPException(
-            status_code=409,
-            detail="This server is inherited from your Connectors — remove "
-            "it there, or re-enable it for this workspace.",
-        )
-    if existing["source"] != "workspace":
-        raise HTTPException(status_code=409, detail="Cannot delete a built-in server")
+        case (Origin.USER, _):
+            raise HTTPException(status_code=409, detail=_INHERITED_DELETE)
+        case _:
+            raise HTTPException(status_code=409, detail=_BUILTIN_DELETE)
 
     await delete_workspace_server(workspace_id, name)
     _schedule_proactive_apply(workspace_id, user_id)
@@ -917,7 +734,7 @@ async def discover_server(
     resolved = await resolve_mcp_config(base_config, user_id, workspace_id)
     server = next((s for s in resolved.servers if s.name == name), None)
     if server is None or (
-        name not in resolved.user_names and name not in resolved.inherited_names
+        name not in resolved.local_names and name not in resolved.inherited_names
     ):
         raise HTTPException(status_code=404, detail="MCP server not found")
     if getattr(server, "oauth_connection_id", None) or (
@@ -935,16 +752,13 @@ async def discover_server(
         )
 
     # Debounce: if the cached snapshot is for this server's CURRENT config and is
-    # fresh + not pending, return it without re-running discovery. A stale-hash
+    # fresh + settled, return it without re-running discovery. A stale-hash
     # row (config changed) always falls through to a real probe.
-    existing = {r["server_name"]: r for r in await get_tool_schemas(workspace_id)}
-    cached = existing.get(name)
-    if (
-        cached is not None
-        and cached.get("config_hash") == mcp_discovery_fingerprint(server)
-        and cached.get("status") != "pending"
-        and _is_fresh(cached.get("discovered_at"))
-    ):
+    snapshots = ToolSnapshotIndex(
+        workspace_rows=await get_tool_schemas(workspace_id)
+    )
+    cached = snapshots.snapshot(server, accept=_settled_and_fresh)
+    if cached is not None:
         return {"server": _discovery_row_to_dict(cached)}
 
     sandbox = _get_live_sandbox(workspace_id, workspace)
@@ -1042,6 +856,11 @@ def _get_live_sandbox(workspace_id: str, workspace: dict) -> Any | None:
             "[mcp] could not resolve live sandbox for %s", workspace_id, exc_info=True
         )
         return None
+
+
+def _settled_and_fresh(row: dict[str, Any]) -> bool:
+    """Debounce acceptance: a still-pending probe is never worth returning."""
+    return row.get("status") != "pending" and _is_fresh(row.get("discovered_at"))
 
 
 def _is_fresh(discovered_at: Any) -> bool:

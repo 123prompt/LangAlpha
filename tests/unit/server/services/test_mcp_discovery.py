@@ -22,6 +22,7 @@ from src.server.services import mcp_discovery
 from src.server.services.mcp_discovery import (
     MAX_SCHEMA_CHARS_PER_SERVER,
     MAX_TOOLS_PER_SERVER,
+    ToolSnapshotIndex,
     _stale_server_names as _real_stale_server_names,
     discover_and_cache,
     mcp_discovery_fingerprint,
@@ -566,3 +567,94 @@ class TestDiscoveryFingerprint:
         assert mcp_discovery_fingerprint(
             self._srv(discovery_uses_secrets=False)
         ) != mcp_discovery_fingerprint(self._srv(discovery_uses_secrets=True))
+
+    def test_ignores_resolve_time_binding_fields(self):
+        """The whole user-tier cache rides on this exemption.
+
+        The Connectors catalog hashes a RAW row (no connection bound); the
+        resolver hashes the same server annotated with its
+        ``oauth_connection_id`` (and, in a session, ``egress_grant_id``). If
+        either churned the hash, every OAuth server's snapshot would read as
+        stale forever — permanently 'pending', never any tools.
+        """
+        bare = self._srv(source="user")
+        bound = self._srv(
+            source="user",
+            oauth_connection_id="conn-1",
+            egress_grant_id="grant-1",
+        )
+        assert mcp_discovery_fingerprint(bare) == mcp_discovery_fingerprint(bound)
+
+
+# ---------------------------------------------------------------------------
+# ToolSnapshotIndex — hash gate + tier precedence
+# ---------------------------------------------------------------------------
+
+
+class TestToolSnapshotIndex:
+    """One acceptance rule for every snapshot consumer: current fingerprint
+    only, user tier first for inherited servers."""
+
+    def _srv(self, name="acme", **kw):
+        base = dict(name=name, transport="stdio", command="npx", source="workspace")
+        base.update(kw)
+        return MCPServerConfig(**base)
+
+    def _row(self, server, *, status="ok", tools=(), config_hash=None):
+        return {
+            "server_name": server.name,
+            "status": status,
+            "tools": list(tools),
+            "config_hash": (
+                config_hash
+                if config_hash is not None
+                else mcp_discovery_fingerprint(server)
+            ),
+        }
+
+    def test_hash_gate_rejects_a_stale_snapshot(self):
+        srv = self._srv()
+        index = ToolSnapshotIndex(
+            workspace_rows=[self._row(srv, config_hash="older-config")]
+        )
+        assert index.snapshot(srv) is None
+
+    def test_error_snapshot_is_returned_but_not_ok(self):
+        # The effective list needs the error row (to show why); consumers that
+        # serve tools must not get it.
+        srv = self._srv()
+        index = ToolSnapshotIndex(workspace_rows=[self._row(srv, status="error")])
+        assert index.snapshot(srv) is not None
+        assert index.ok(srv) is None
+
+    def test_inherited_server_prefers_the_user_tier(self):
+        srv = self._srv(source="user")
+        index = ToolSnapshotIndex(
+            workspace_rows=[self._row(srv, tools=[_tool("stale")])],
+            user_rows=[self._row(srv, tools=[_tool("fresh")])],
+        )
+        assert [t["name"] for t in index.ok(srv)["tools"]] == ["fresh"]
+
+    def test_rejected_user_row_does_not_fall_through_to_the_workspace_tier(self):
+        # The workspace snapshot of an OAuth server is OAuth-blind and can
+        # outlive a disconnect — serving it after the user tier said "error"
+        # is exactly the staleness the precedence exists to prevent.
+        srv = self._srv(source="user")
+        index = ToolSnapshotIndex(
+            workspace_rows=[self._row(srv, tools=[_tool("stale")])],
+            user_rows=[self._row(srv, status="error")],
+        )
+        assert index.ok(srv) is None
+
+    def test_inherited_server_falls_back_when_the_user_tier_has_no_match(self):
+        srv = self._srv(source="user")
+        index = ToolSnapshotIndex(
+            workspace_rows=[self._row(srv, tools=[_tool("in_sandbox")])],
+            user_rows=[self._row(srv, config_hash="older-config")],
+        )
+        assert [t["name"] for t in index.ok(srv)["tools"]] == ["in_sandbox"]
+
+    def test_workspace_server_never_reads_the_user_tier(self):
+        srv = self._srv()
+        index = ToolSnapshotIndex(user_rows=[self._row(srv, tools=[_tool("x")])])
+        assert index.snapshot(srv) is None

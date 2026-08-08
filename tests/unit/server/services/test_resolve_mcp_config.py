@@ -45,7 +45,6 @@ def _user_row(name, **overrides):
         "instruction": "",
         "tool_exposure_mode": "summary",
         "discovery_uses_secrets": False,
-        "enabled": True,
     }
     row.update(overrides)
     return row
@@ -121,6 +120,22 @@ class TestConverter:
         row = _ws_row("authoritative", config={"name": "stale", "transport": "stdio"})
         assert workspace_row_to_server_config(row).name == "authoritative"
 
+    def test_strips_resolve_time_binding_fields(self):
+        # oauth_connection_id / egress_grant_id are resolution OUTPUTS: a
+        # stored blob must never be able to bind itself to a connection.
+        row = _ws_row(
+            "acme",
+            config={
+                "transport": "http",
+                "url": "https://example.test/mcp",
+                "oauth_connection_id": "conn-someone-else",
+                "egress_grant_id": "grant-someone-else",
+            },
+        )
+        cfg = workspace_row_to_server_config(row)
+        assert cfg.oauth_connection_id is None
+        assert cfg.egress_grant_id is None
+
 
 # ---------------------------------------------------------------------------
 # resolve_mcp_config — merge precedence
@@ -141,7 +156,7 @@ class TestResolveMergePrecedence:
         assert resolved.servers[0] is b1
         assert resolved.servers[1] is b2
         assert resolved.builtin_names == frozenset({"alpha", "beta"})
-        assert resolved.user_names == frozenset()
+        assert resolved.local_names == frozenset()
         assert resolved.version == 3
 
     async def test_disabled_builtin_is_removed(self):
@@ -172,7 +187,7 @@ class TestResolveMergePrecedence:
 
         assert [s.name for s in resolved.servers] == ["alpha", "zeta"]
         assert resolved.servers[1].source == "workspace"
-        assert resolved.user_names == frozenset({"zeta"})
+        assert resolved.local_names == frozenset({"zeta"})
 
     async def test_user_servers_sorted_alphabetically(self):
         base = _base_config(MCPServerConfig(name="alpha"))
@@ -202,7 +217,7 @@ class TestResolveMergePrecedence:
         resolved = await _resolve(base, rows)
 
         assert [s.name for s in resolved.servers] == ["alpha"]
-        assert resolved.user_names == frozenset()
+        assert resolved.local_names == frozenset()
 
     async def test_disabled_user_row_carried_for_reenable(self):
         # Disabled workspace servers stay out of the effective set but are
@@ -217,7 +232,7 @@ class TestResolveMergePrecedence:
 
         # 'zeta' runs nowhere, but is available to re-enable.
         assert [s.name for s in resolved.servers] == ["alpha", "yankee"]
-        assert resolved.user_names == frozenset({"yankee"})
+        assert resolved.local_names == frozenset({"yankee"})
         disabled = [s.name for s in resolved.disabled_workspace_servers]
         assert disabled == ["zeta"]
         assert resolved.disabled_workspace_servers[0].source == "workspace"
@@ -244,7 +259,7 @@ class TestResolveMergePrecedence:
 
         assert [s.name for s in resolved.servers] == ["alpha"]
         assert resolved.servers[0].source == "builtin"
-        assert resolved.user_names == frozenset()
+        assert resolved.local_names == frozenset()
 
     async def test_disabled_builtins_excluded_from_builtin_names(self):
         base = _base_config(
@@ -259,7 +274,7 @@ class TestResolveMergePrecedence:
 
         assert [s.name for s in resolved.servers] == ["alpha", "gamma"]
         assert resolved.builtin_names == frozenset({"alpha"})
-        assert resolved.user_names == frozenset({"gamma"})
+        assert resolved.local_names == frozenset({"gamma"})
 
     async def test_globally_disabled_builtin_not_in_effective_set(self):
         # A built-in disabled in agent_config.yaml itself is never effective.
@@ -287,7 +302,7 @@ class TestResolveInheritedLayer:
 
         assert [s.name for s in resolved.servers] == ["alpha", "acme", "local"]
         assert resolved.inherited_names == frozenset({"acme"})
-        assert resolved.user_names == frozenset({"local"})
+        assert resolved.local_names == frozenset({"local"})
         acme = resolved.servers[1]
         assert acme.source == "user"
         assert acme.oauth_connection_id is None
@@ -388,6 +403,76 @@ class TestResolveInheritedLayer:
         assert by_name["acme"].oauth_connection_id == "conn-1"
         # A revoked connection never binds a server to the relay.
         assert by_name["gone"].oauth_connection_id is None
+
+    async def test_url_change_since_consent_forces_reconnect(self):
+        # The connection's consented server_url no longer matches the catalog
+        # row URL (edited since connect): the token was issued for a different
+        # host, so the server must NOT bind — no oauth_connection_id, hence no
+        # grant. This is defense-in-depth behind the edit-time revoke.
+        base = _base_config(MCPServerConfig(name="alpha"))
+        connections = [
+            {
+                "connection_id": "conn-1",
+                "server_name": "acme",
+                "server_url": "https://old-host.example.test/mcp",
+                "status": "connected",
+            }
+        ]
+        resolved = await _resolve(
+            base,
+            rows=[],
+            user_rows=[_user_row("acme", url="https://new-host.example.test/mcp")],
+            connections=connections,
+        )
+        by_name = {s.name: s for s in resolved.servers}
+        assert by_name["acme"].oauth_connection_id is None
+
+    async def test_matching_consented_url_still_binds(self):
+        # Same host modulo trailing slash / default port ⇒ still the consented
+        # endpoint, so it binds normally (the guard must not over-fire).
+        base = _base_config(MCPServerConfig(name="alpha"))
+        connections = [
+            {
+                "connection_id": "conn-1",
+                "server_name": "acme",
+                "server_url": "https://acme.example.test:443/mcp/",
+                "status": "connected",
+            }
+        ]
+        resolved = await _resolve(
+            base,
+            rows=[],
+            user_rows=[_user_row("acme", url="https://acme.example.test/mcp")],
+            connections=connections,
+        )
+        by_name = {s.name: s for s in resolved.servers}
+        assert by_name["acme"].oauth_connection_id == "conn-1"
+
+    async def test_user_tier_is_read_through_list_enabled_user_servers(self):
+        # The enabled filter lives in the DB layer: every row that read
+        # returns for THIS user is inherited as enabled — the resolver never
+        # re-checks an ``enabled`` column of its own.
+        base = _base_config(MCPServerConfig(name="alpha"))
+        reader = AsyncMock(return_value=[_user_row("acme")])
+        with (
+            patch(
+                "src.server.database.mcp_servers.get_workspace_servers_and_version",
+                new=AsyncMock(return_value=([], 0)),
+            ),
+            patch(
+                "src.server.database.mcp_servers.list_enabled_user_servers",
+                new=reader,
+            ),
+            patch(
+                "src.server.database.mcp_oauth.list_connections",
+                new=AsyncMock(return_value=[]),
+            ),
+        ):
+            resolved = await resolve_mcp_config(base, "user-1", "ws-1")
+
+        reader.assert_awaited_once_with("user-1")
+        assert resolved.inherited_names == frozenset({"acme"})
+        assert resolved.servers[1].enabled is True
 
     async def test_inert_enabled_user_marker_row_is_skipped(self):
         # An (source='user', enabled=true) row is meaningless — not a tombstone,

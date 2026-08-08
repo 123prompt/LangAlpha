@@ -1,9 +1,10 @@
 """Sanitization helpers for untrusted (user-configured) MCP server schemas.
 
-User MCP servers (``source == "workspace"``) report arbitrary tool names,
-parameter names, and descriptions. That text reaches generated Python code
-(docstrings, wrapper modules) and the system prompt, so it is hostile input.
-These helpers bound identifiers and text before either boundary.
+Untrusted MCP servers (``source`` ``"workspace"`` or ``"user"``) report
+arbitrary tool names, parameter names, and descriptions. That text reaches
+generated Python code (docstrings, wrapper modules) and the system prompt, so
+it is hostile input. These helpers bound identifiers and text before either
+boundary.
 
 The ``${vault:NAME}`` reference regex is defined here ONCE
 (``VAULT_REF_RE``) and imported by every lane that resolves or validates
@@ -48,12 +49,14 @@ def vault_refs(value: str) -> list[str]:
     return VAULT_REF_RE.findall(value or "")
 
 
-def is_user_server(server) -> bool:
+def is_untrusted_server(server) -> bool:
     """True for user-configured servers (``source`` 'workspace' or 'user').
 
     The single definition of the trust-boundary predicate — built-ins (no
     ``source`` attr, or ``'builtin'``) are trusted; workspace-local and
-    user-level (workspace-inherited) servers are not.
+    user-level (workspace-inherited) servers are not. Named for the property
+    that matters: ``source='user'`` is one of the untrusted tiers, not the
+    complement of this predicate.
     """
     return getattr(server, "source", "builtin") in ("workspace", "user")
 
@@ -70,7 +73,7 @@ def discovery_should_use_secrets(server) -> bool:
     """
     if bool(getattr(server, "discovery_uses_secrets", False)):
         return True
-    if is_user_server(server) and getattr(server, "transport", None) in ("sse", "http"):
+    if is_untrusted_server(server) and getattr(server, "transport", None) in ("sse", "http"):
         headers = getattr(server, "headers", {}) or {}
         return any(VAULT_REF_RE.search(str(v)) for v in headers.values())
     return False

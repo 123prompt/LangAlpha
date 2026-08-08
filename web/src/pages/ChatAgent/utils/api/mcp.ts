@@ -5,8 +5,8 @@ import { api } from '@/api/client';
 
 //
 // Per-workspace effective list mixes built-in servers with workspace-added
-// ones; the catalog holds reusable user templates that get copied into a
-// workspace via `from_template`. Env/header literal values are never echoed by
+// ones; the catalog holds reusable user templates managed in Connectors.
+// Env/header literal values are never echoed by
 // the backend — only `${vault:NAME}` reference names surface (as `*_refs`).
 
 /** A full MCP server definition payload (matches backend `McpServerInput`). */
@@ -159,10 +159,9 @@ export async function getWorkspaceMcpServers(workspaceId: string): Promise<Effec
   return data;
 }
 
-/** Add a server to a workspace — either a full def or `{ from_template }`. */
 export async function addWorkspaceMcpServer(
   workspaceId: string,
-  body: McpServerInput | { from_template: string },
+  body: McpServerInput,
 ) {
   const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/mcp/servers`, body);
   return data as { name: string; source: string; enabled: boolean; warnings?: string[] };
@@ -244,8 +243,8 @@ export async function importWorkspaceMcpServers(
 }
 
 /**
- * Promote a workspace server UP into the user's reusable template catalog (the
- * inverse of `from_template`). Only `${vault:NAME}` reference names travel —
+ * Promote a workspace server UP into the user's reusable template catalog.
+ * Only `${vault:NAME}` reference names travel —
  * secret values are workspace-scoped, so the template surfaces `needs_secret`
  * when later added to another workspace. `overwrite` replaces an existing
  * same-named template; without it a clash is a 409.

@@ -27,9 +27,44 @@ effective-list endpoint and the sandbox-sync path can import the same logic
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import StrEnum
+from functools import cached_property
+from urllib.parse import urlsplit
 
 from ptc_agent.config.core import MCPServerConfig
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _canonical_server_url(url: str | None) -> str:
+    """Normalize an MCP endpoint for consent comparison.
+
+    Case-folds scheme/host, drops the default port, and trims a trailing path
+    slash so ``https://H/mcp`` and ``https://h:443/mcp/`` compare equal. Query
+    is kept — it can select a different endpoint. Anything unparseable folds to
+    the raw string, so a broken URL never accidentally matches a real one.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return url.strip()
+    if not parts.scheme or not parts.hostname:
+        return url.strip()
+    scheme = parts.scheme.lower()
+    host = parts.hostname.lower()
+    port = parts.port
+    netloc = host if port in (None, _DEFAULT_PORTS.get(scheme)) else f"{host}:{port}"
+    path = parts.path.rstrip("/")
+    query = f"?{parts.query}" if parts.query else ""
+    return f"{scheme}://{netloc}{path}{query}"
+
+
+def same_consented_url(a: str | None, b: str | None) -> bool:
+    """Whether two URLs address the same consented endpoint (see canonicalizer)."""
+    return _canonical_server_url(a) == _canonical_server_url(b)
 
 # Same hard-coded logger name request_prep uses — existing log routing keys off it.
 logger = logging.getLogger("src.server.handlers.chat_handler")
@@ -41,40 +76,128 @@ logger = logging.getLogger("src.server.handlers.chat_handler")
 # Phase 2 secret-resolution codegen should import it from there.
 
 
+class Origin(StrEnum):
+    """Which tier defined a server. Matches the wire value of ``origin``."""
+
+    BUILTIN = "builtin"
+    WORKSPACE = "workspace"
+    USER = "user"
+
+
+class State(StrEnum):
+    """How a server participates in one workspace's effective set.
+
+    Only ``ACTIVE`` servers run. The other three are carried so the API can
+    render a re-enable affordance (``DISABLED``/``TOMBSTONED``) or flag the
+    local fork that hides an inherited server (``SHADOWED``).
+    """
+
+    ACTIVE = "active"
+    DISABLED = "disabled"
+    TOMBSTONED = "tombstoned"
+    SHADOWED = "shadowed"
+
+
+@dataclass(frozen=True)
+class ResolvedServer:
+    """One server in a workspace's resolved set, with its partition labels."""
+
+    config: MCPServerConfig
+    origin: Origin
+    state: State
+    # OAuth connection status INCLUDING revoked (unlike the config's
+    # ``oauth_connection_id``, which only binds live connections) — lets
+    # consumers tell "never OAuth" from "OAuth but disconnected". Only ever
+    # set on ``USER``-origin entries.
+    oauth_status: str | None = None
+
+    @property
+    def name(self) -> str:
+        return self.config.name
+
+
 @dataclass(frozen=True)
 class ResolvedMCP:
     """The effective MCP server set for one workspace at one config version.
 
-    ``servers`` is deterministic (built-ins in config order, then user servers
-    alphabetical). ``builtin_names`` / ``user_names`` partition the effective
-    set by origin. ``disabled_builtin_names`` lists built-ins removed by a
-    disable-marker row, and ``disabled_workspace_servers`` lists disabled
-    user servers — both are excluded from ``servers`` (so they don't run) but
-    carried so the API can keep a re-enable toggle in the UI. ``version`` is
+    ``entries`` is the single source of truth: one labelled row per server the
+    workspace knows about, ordered so that filtering to ``ACTIVE`` yields the
+    effective run order (built-ins in config order, then inherited, then local
+    — both alphabetical). Every historical projection below is derived from
+    it, so the partition can never disagree with itself. ``version`` is
     ``workspaces.mcp_config_version``.
     """
 
-    servers: list[MCPServerConfig]
-    builtin_names: frozenset[str]
-    user_names: frozenset[str]
+    entries: tuple[ResolvedServer, ...]
     version: int
-    disabled_builtin_names: frozenset[str] = frozenset()
-    disabled_workspace_servers: list[MCPServerConfig] = field(default_factory=list)
-    # User-level (workspace-inherited) layer. inherited_names partitions the
-    # effective set alongside builtin_names/user_names (which keeps its
-    # historical meaning: workspace-LOCAL server names). Tombstoned = removed
-    # from this workspace by a (source='user', enabled=false) marker; shadowed
-    # = hidden behind a workspace-local server of the same name. Both carry
-    # full configs so the UI can render them with their toggle.
-    inherited_names: frozenset[str] = frozenset()
-    tombstoned_inherited_servers: list[MCPServerConfig] = field(default_factory=list)
-    shadowed_inherited_names: frozenset[str] = frozenset()
-    # server_name → OAuth connection status, INCLUDING revoked (unlike the
-    # per-server ``oauth_connection_id``, which only binds live connections).
-    # Lets consumers tell "never OAuth" from "OAuth but disconnected" — the
-    # effective-list API surfaces it and discovery skips such servers (an
-    # in-sandbox probe of a token-less OAuth server can only fail).
-    oauth_status_by_name: dict[str, str] = field(default_factory=dict)
+
+    def _names(self, origin: Origin, state: State) -> frozenset[str]:
+        return frozenset(
+            e.name for e in self.entries if e.origin is origin and e.state is state
+        )
+
+    def _configs(self, origin: Origin, state: State) -> list[MCPServerConfig]:
+        return [
+            e.config for e in self.entries if e.origin is origin and e.state is state
+        ]
+
+    @cached_property
+    def servers(self) -> list[MCPServerConfig]:
+        """The effective (running) set, in deterministic order."""
+        return [e.config for e in self.entries if e.state is State.ACTIVE]
+
+    @cached_property
+    def builtin_names(self) -> frozenset[str]:
+        return self._names(Origin.BUILTIN, State.ACTIVE)
+
+    @cached_property
+    def local_names(self) -> frozenset[str]:
+        """Names of the workspace's OWN (source='workspace') running servers."""
+        return self._names(Origin.WORKSPACE, State.ACTIVE)
+
+    @cached_property
+    def inherited_names(self) -> frozenset[str]:
+        """Names inherited live from the user's Connectors (source='user')."""
+        return self._names(Origin.USER, State.ACTIVE)
+
+    @cached_property
+    def disabled_builtin_names(self) -> frozenset[str]:
+        return self._names(Origin.BUILTIN, State.DISABLED)
+
+    @cached_property
+    def shadowed_inherited_names(self) -> frozenset[str]:
+        return self._names(Origin.USER, State.SHADOWED)
+
+    @cached_property
+    def disabled_workspace_servers(self) -> list[MCPServerConfig]:
+        return self._configs(Origin.WORKSPACE, State.DISABLED)
+
+    @cached_property
+    def tombstoned_inherited_servers(self) -> list[MCPServerConfig]:
+        return self._configs(Origin.USER, State.TOMBSTONED)
+
+    @cached_property
+    def oauth_status_by_name(self) -> dict[str, str]:
+        return {
+            e.name: e.oauth_status
+            for e in self.entries
+            if e.oauth_status is not None
+        }
+
+
+@dataclass(frozen=True)
+class ServerRef:
+    """A workspace-addressable MCP name, classified for the mutation endpoints.
+
+    ``row`` is the workspace row for local/tombstone/marker refs and the
+    Connectors row for a live inherited one — whichever tier the ref resolved
+    from.
+    """
+
+    name: str
+    origin: Origin
+    state: State
+    row: dict | None = None
 
 
 def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
@@ -87,6 +210,10 @@ def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
     config = dict(row.get("config") or {})
     config.pop("vault_blueprints", None)
     config.pop("source", None)  # never trust a stored source tag
+    # Resolution outputs, never inputs: a stored blob must not be able to bind
+    # itself to someone's OAuth connection or egress grant.
+    config.pop("oauth_connection_id", None)
+    config.pop("egress_grant_id", None)
     # The row's name is authoritative over any name baked into the JSON blob.
     config["name"] = row["name"]
     config["source"] = "workspace"
@@ -115,6 +242,43 @@ def user_row_to_server_config(
         discovery_uses_secrets=bool(row.get("discovery_uses_secrets", False)),
         oauth_connection_id=oauth_connection_id,
     )
+
+
+async def classify_server_name(
+    workspace_id: str, user_id: str, name: str
+) -> ServerRef | None:
+    """Classify one MCP name for a workspace mutation, or ``None`` if unknown.
+
+    Reads the two mutable tiers directly (workspace rows, then the Connectors
+    catalog) rather than going through ``resolve_mcp_config`` — mutations need
+    the raw row, not the merged set, and the built-in tier is checked by the
+    caller against the process config. A workspace-local row wins over an
+    inherited server of the same name (it is the fork); a stale
+    ``source='builtin'`` marker only classifies as ``BUILTIN`` once the
+    Connectors tier has been ruled out.
+    """
+    from src.server.database.mcp_servers import (
+        get_catalog_server,
+        list_workspace_servers,
+    )
+
+    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
+    row = rows.get(name)
+    source = (row or {}).get("source")
+    if source == "workspace":
+        state = State.ACTIVE if row["enabled"] else State.DISABLED
+        return ServerRef(name, Origin.WORKSPACE, state, row)
+    if source == "user":
+        # A (source='user', enabled=false) marker: this workspace's tombstone
+        # for an inherited server.
+        return ServerRef(name, Origin.USER, State.TOMBSTONED, row)
+
+    catalog = await get_catalog_server(user_id, name)
+    if catalog and catalog.get("enabled"):
+        return ServerRef(name, Origin.USER, State.ACTIVE, catalog)
+    if source == "builtin":
+        return ServerRef(name, Origin.BUILTIN, State.DISABLED, row)
+    return None
 
 
 async def resolve_mcp_config(
@@ -165,9 +329,10 @@ async def resolve_mcp_config(
     # set IS the built-in list (same objects, no copies).
     if not rows and not user_rows:
         return ResolvedMCP(
-            servers=builtin_servers,
-            builtin_names=frozenset(builtin_name_set),
-            user_names=frozenset(),
+            entries=tuple(
+                ResolvedServer(config=s, origin=Origin.BUILTIN, state=State.ACTIVE)
+                for s in builtin_servers
+            ),
             version=version,
         )
 
@@ -216,7 +381,7 @@ async def resolve_mcp_config(
         local_names.add(cfg.name)
         # Disabled workspace servers are excluded from the effective set (they
         # don't run), but carried separately so the API keeps a re-enable
-        # toggle in the UI — mirrors disabled_builtin_names for built-ins.
+        # toggle in the UI — mirrors the disabled built-in entries.
         if row["enabled"]:
             local_servers.append(cfg)
         else:
@@ -224,7 +389,7 @@ async def resolve_mcp_config(
 
     inherited_servers: list[MCPServerConfig] = []
     tombstoned_inherited: list[MCPServerConfig] = []
-    shadowed_inherited: set[str] = set()
+    shadowed_inherited: list[MCPServerConfig] = []
     for row in user_rows:
         name = row["name"]
         if name in builtin_name_set:
@@ -235,6 +400,28 @@ async def resolve_mcp_config(
             )
             continue
         connection = connection_by_server.get(name)
+        consented_url = connection.get("server_url") if connection else None
+        if (
+            connection
+            and consented_url
+            and not same_consented_url(consented_url, row.get("url"))
+        ):
+            # The catalog URL was edited since consent (or a write path missed
+            # the revoke): the stored token was issued for a different host.
+            # Never bind it — leave the server un-connected so no grant is
+            # created and retire_stale_grants revokes any prior one; surface
+            # needs_reauth so the UI prompts re-consent to the new URL. This is
+            # defense-in-depth behind the edit-time revoke and the grant's own
+            # server_url pinning.
+            logger.warning(
+                "[MCP] user %s server %r URL changed since consent "
+                "(%s → %s); forcing reconnect",
+                user_id, name, connection.get("server_url"), row.get("url"),
+            )
+            connection = None
+            # Surface reconnect intent to the UI (status vocabulary is the raw
+            # DB/wire string, same as the rest of oauth_status_by_name).
+            oauth_status_by_name[name] = "needs_reauth"
         try:
             cfg = user_row_to_server_config(
                 row,
@@ -249,29 +436,49 @@ async def resolve_mcp_config(
             )
             continue
         if name in local_names:
-            shadowed_inherited.add(name)
+            shadowed_inherited.append(cfg)
         elif name in tombstoned_user_names:
             tombstoned_inherited.append(cfg)
         else:
             inherited_servers.append(cfg)
 
-    effective_builtins = [
-        s for s in builtin_servers if s.name not in disabled_builtins
-    ]
     inherited_servers.sort(key=lambda s: s.name)
     tombstoned_inherited.sort(key=lambda s: s.name)
+    shadowed_inherited.sort(key=lambda s: s.name)
     local_servers.sort(key=lambda s: s.name)
     disabled_local_servers.sort(key=lambda s: s.name)
 
-    return ResolvedMCP(
-        servers=[*effective_builtins, *inherited_servers, *local_servers],
-        builtin_names=frozenset(s.name for s in effective_builtins),
-        user_names=frozenset(s.name for s in local_servers),
-        version=version,
-        disabled_builtin_names=frozenset(disabled_builtins & builtin_name_set),
-        disabled_workspace_servers=disabled_local_servers,
-        inherited_names=frozenset(s.name for s in inherited_servers),
-        tombstoned_inherited_servers=tombstoned_inherited,
-        shadowed_inherited_names=frozenset(shadowed_inherited),
-        oauth_status_by_name=oauth_status_by_name,
-    )
+    def _user_entry(cfg: MCPServerConfig, state: State) -> ResolvedServer:
+        return ResolvedServer(
+            config=cfg,
+            origin=Origin.USER,
+            state=state,
+            oauth_status=oauth_status_by_name.get(cfg.name),
+        )
+
+    # Entry order IS the API's row order: the running set first (built-ins,
+    # inherited, local), then the carried-but-not-running rows.
+    entries: list[ResolvedServer] = [
+        *(
+            ResolvedServer(config=s, origin=Origin.BUILTIN, state=State.ACTIVE)
+            for s in builtin_servers
+            if s.name not in disabled_builtins
+        ),
+        *(_user_entry(s, State.ACTIVE) for s in inherited_servers),
+        *(
+            ResolvedServer(config=s, origin=Origin.WORKSPACE, state=State.ACTIVE)
+            for s in local_servers
+        ),
+        *(
+            ResolvedServer(config=s, origin=Origin.BUILTIN, state=State.DISABLED)
+            for s in builtin_servers
+            if s.name in disabled_builtins
+        ),
+        *(_user_entry(s, State.TOMBSTONED) for s in tombstoned_inherited),
+        *(
+            ResolvedServer(config=s, origin=Origin.WORKSPACE, state=State.DISABLED)
+            for s in disabled_local_servers
+        ),
+        *(_user_entry(s, State.SHADOWED) for s in shadowed_inherited),
+    ]
+    return ResolvedMCP(entries=tuple(entries), version=version)

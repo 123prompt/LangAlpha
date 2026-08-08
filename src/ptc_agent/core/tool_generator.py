@@ -21,7 +21,7 @@ from ptc_agent.config.core import MCPServerConfig
 from .mcp_registry import MCPToolInfo
 from .mcp_sanitize import (
     discovery_should_use_secrets,
-    is_user_server,
+    is_untrusted_server,
     sanitize_tool_name,
     sanitize_tool_set,
     sanitize_tool_text,
@@ -534,7 +534,7 @@ except ImportError:
         """
         servers: dict[str, dict[str, Any]] = {}
         for server in server_configs:
-            untrusted = is_user_server(server)
+            untrusted = is_untrusted_server(server)
             if server.oauth_connection_id:
                 servers[server.name] = {
                     "transport": "http",

@@ -1,17 +1,23 @@
-"""Scope-neutral literal→vault extraction for MCP server bulk imports.
+"""Scope-neutral bulk import of standard ``mcpServers`` JSON.
 
 Both import surfaces (per-workspace servers and the user-level Connectors
-catalog) accept standard ``mcpServers`` JSON with inline credentials; this
-module rewrites credential-looking literals to ``${vault:NAME}`` refs through
-caller-supplied secret storage callables, so the heuristic and the rollback
-bookkeeping live once.
+catalog) accept the same blob with inline credentials, and run the same
+per-entry gauntlet: skip reserved/duplicate names, enforce the scope's cap,
+rewrite credential-looking literals to ``${vault:NAME}`` refs, validate, then
+persist — rolling the extracted secrets back whenever the entry fails after
+extraction. That loop, the heuristic, and the rollback bookkeeping live here
+once; a scope supplies only what genuinely differs (its cap, its prose, its
+storage).
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
+
+from pydantic import ValidationError
 
 from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
 
@@ -54,6 +60,164 @@ def vault_secret_name(server_name: str, key: str, used: set[str]) -> str:
         name = f"{base[: 64 - len(suffix)]}{suffix}"
         i += 1
     return name
+
+
+@dataclass(frozen=True)
+class ImportScope:
+    """What one import surface contributes to the shared per-entry loop."""
+
+    reserved_names: set[str]
+    existing_names: set[str]
+    # Rows already counted against ``cap`` (the workspace surface counts only
+    # its OWN servers, not inherited/marker rows, so it can't be derived from
+    # ``existing_names``).
+    current_count: int
+    cap: int
+    cap_message: str
+    exists_message: str
+    # ``True`` when the server was created, ``False`` when the name turned out
+    # to be taken; ``ValueError`` for a scope-level refusal (cap, raced dupe).
+    persist: Callable[[Any], Awaitable[bool]]
+
+
+@dataclass
+class ImportReport:
+    results: list[dict[str, Any]] = field(default_factory=list)
+    created: int = 0
+    secrets_created: list[str] = field(default_factory=list)
+
+
+class ImportSession:
+    """The vault side of one import run: storage plus its dedupe bookkeeping.
+
+    ``allocated`` maps a literal value to the ref it became, so an identical
+    token reused across servers is stored once; ``used_secret_names`` keeps
+    allocated names unique against the vault's existing contents. Both unwind
+    on rollback, so a failed entry can never leave a ref pointing at a deleted
+    secret.
+    """
+
+    def __init__(
+        self,
+        *,
+        create_secret: SecretCreate,
+        delete_secret: SecretDelete,
+        used_secret_names: set[str],
+    ) -> None:
+        self._create_secret = create_secret
+        self._delete_secret = delete_secret
+        self.used_secret_names = used_secret_names
+        self.allocated: dict[str, str] = {}
+
+    async def extract(self, server_name: str, config: dict[str, Any]) -> list[str]:
+        return await extract_literals_to_vault(
+            server_name,
+            config,
+            allocated=self.allocated,
+            used_secret_names=self.used_secret_names,
+            create_secret=self._create_secret,
+            delete_secret=self._delete_secret,
+        )
+
+    async def rollback(self, names: list[str]) -> None:
+        await rollback_import_secrets(
+            names,
+            allocated=self.allocated,
+            used_secret_names=self.used_secret_names,
+            delete_secret=self._delete_secret,
+        )
+
+
+async def run_mcp_import(
+    parsed: list[Any], *, scope: ImportScope, session: ImportSession
+) -> ImportReport:
+    """Import each parsed entry into ``scope``, reporting per-entry outcomes.
+
+    A partial import is the normal case: every entry that fails is reported in
+    place (``invalid`` / ``skipped`` / ``exists`` / ``error``) and the rest
+    continue, so one bad server never aborts the blob.
+    """
+    from src.server.models.mcp_server import (
+        McpServerInput,
+        _format_validation_error,
+    )
+
+    report = ImportReport()
+    seen_names: set[str] = set()
+
+    for entry in parsed:
+        base = {
+            "original_name": entry.original_name,
+            "name": entry.name,
+            "renamed": entry.renamed,
+        }
+        if entry.error:
+            report.results.append({**base, "status": "invalid", "error": entry.error})
+            continue
+        if entry.name in scope.reserved_names:
+            report.results.append(
+                {**base, "status": "skipped", "reason": "collides with a built-in server"}
+            )
+            continue
+        if entry.name in seen_names or entry.name in scope.existing_names:
+            duplicate = entry.name in seen_names
+            report.results.append({
+                **base,
+                "status": "skipped" if duplicate else "exists",
+                "reason": (
+                    "duplicate name after normalization"
+                    if duplicate
+                    else scope.exists_message
+                ),
+            })
+            continue
+        if scope.current_count + report.created >= scope.cap:
+            report.results.append(
+                {**base, "status": "error", "error": scope.cap_message}
+            )
+            continue
+
+        seen_names.add(entry.name)
+        config = dict(entry.config)
+        try:
+            made = await session.extract(entry.name, config)
+        except ValueError as e:
+            report.results.append({**base, "status": "error", "error": str(e)})
+            continue
+
+        # An authenticated remote server needs its header even to list tools, so
+        # discovery must resolve secrets — set it explicitly so the stored value
+        # (and the UI toggle) is honest (matches discovery_should_use_secrets).
+        if config.get("transport") in ("http", "sse"):
+            headers = config.get("headers") or {}
+            if any(VAULT_REF_RE.search(str(v)) for v in headers.values()):
+                config["discovery_uses_secrets"] = True
+
+        try:
+            server = McpServerInput(**config)
+        except ValidationError as e:
+            await session.rollback(made)
+            report.results.append(
+                {**base, "status": "invalid", "error": _format_validation_error(e)}
+            )
+            continue
+
+        try:
+            created = await scope.persist(server)
+        except ValueError as e:
+            await session.rollback(made)
+            report.results.append({**base, "status": "error", "error": str(e)})
+            continue
+        if not created:
+            await session.rollback(made)
+            report.results.append({**base, "status": "exists"})
+            continue
+
+        report.secrets_created.extend(made)
+        report.created += 1
+        report.results.append({**base, "status": "created"})
+
+    return report
 
 
 async def rollback_import_secrets(
@@ -128,8 +292,8 @@ async def _extract_literals_inner(
     created: list[str],
     create_secret: SecretCreate,
 ) -> list[str]:
-    for field in ("env", "headers"):
-        mapping = config.get(field)
+    for section in ("env", "headers"):
+        mapping = config.get(section)
         if not isinstance(mapping, dict):
             continue
         out: dict[str, Any] = {}
@@ -153,7 +317,7 @@ async def _extract_literals_inner(
                 ref = f"${{vault:{secret_name}}}"
                 allocated[v] = ref
             out[k] = ref
-        config[field] = out
+        config[section] = out
 
     # stdio ``args`` is a list; the common credential shape is a single
     # ``--flag=VALUE`` token (or ``KEY=VALUE``). Split on the first ``=`` and

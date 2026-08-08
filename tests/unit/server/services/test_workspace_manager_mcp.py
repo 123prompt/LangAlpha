@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.server.services.workspace_manager import WorkspaceManager
+from tests.unit.server.mcp_builders import resolved_mcp
 
 
 def _make_config():
@@ -70,13 +71,18 @@ def _make_session(*, version=None, summary=None):
     return session
 
 
-def _resolved(version, servers=None, user_names=None):
-    r = MagicMock()
-    r.version = version
-    r.servers = servers or []
-    r.builtin_names = frozenset()
-    r.user_names = frozenset(user_names or [])
-    return r
+def _srv(name, *, source="workspace", oauth_connection_id=None):
+    """A stand-in server config (MagicMock: only the read fields matter)."""
+    server = MagicMock()
+    server.name = name
+    server.source = source
+    server.oauth_connection_id = oauth_connection_id
+    return server
+
+
+def _resolved(version, servers=None):
+    """A real ResolvedMCP whose ``servers`` are workspace-local entries."""
+    return resolved_mcp(version=version, local=list(servers or []))
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +209,61 @@ class TestSessionCachesMcp:
             await wm._install_session_composite(session, resolved)
 
         assert captured["reg"] is builtin
+
+    @pytest.mark.asyncio
+    async def test_composite_prefers_the_user_tier_for_inherited_servers(self):
+        """A workspace snapshot of an inherited server is OAuth-blind and can
+        outlive a disconnect/reconnect; the host-side user snapshot is purged
+        and refreshed with the connection. The agent lane must serve the user
+        tier — the same precedence the effective-list API already used."""
+        from ptc_agent.config.core import MCPServerConfig
+        from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=1, summary="old")
+        inherited = MCPServerConfig(
+            name="robinhood", transport="http",
+            url="https://api.example.test/mcp", source="user",
+        )
+        resolved = resolved_mcp(version=2, inherited=[inherited])
+
+        def _row(tool_name):
+            return {
+                "server_name": "robinhood",
+                "status": "ok",
+                "config_hash": mcp_discovery_fingerprint(inherited),
+                "tools": [{"name": tool_name}],
+            }
+
+        captured = {}
+
+        def fake_build(reg, servers, schemas, disabled=frozenset()):
+            captured["schemas"] = schemas
+            return MagicMock()
+
+        with (
+            patch(
+                "src.server.database.mcp_servers.get_tool_schemas",
+                new=AsyncMock(return_value=[_row("stale_in_sandbox")]),
+            ),
+            patch(
+                "src.server.database.mcp_servers.get_user_tool_schemas",
+                new=AsyncMock(return_value=[_row("fresh_host_side")]),
+            ),
+            patch(
+                "ptc_agent.core.mcp_registry.build_composite_registry",
+                side_effect=fake_build,
+            ),
+            patch(
+                "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+                return_value="S",
+            ),
+        ):
+            await wm._install_session_composite(session, resolved, user_id="user-1")
+
+        assert [t["name"] for t in captured["schemas"]["robinhood"]] == [
+            "fresh_host_side"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -363,15 +424,7 @@ class TestVersionDeltaBackgroundDiscovery:
         session.mcp_registry.get_all_tools = MagicMock(
             return_value={"alpha": [MagicMock()], "beta": []}
         )
-        alpha = MagicMock()
-        alpha.name = "alpha"
-        alpha.source = "workspace"
-        alpha.oauth_connection_id = None
-        beta = MagicMock()
-        beta.name = "beta"
-        beta.source = "workspace"
-        beta.oauth_connection_id = None
-        resolved = _resolved(2, servers=[alpha, beta])
+        resolved = _resolved(2, servers=[_srv("alpha"), _srv("beta")])
 
         needing = wm._servers_needing_discovery(session, resolved)
         assert [s.name for s in needing] == ["beta"]
@@ -549,7 +602,7 @@ class TestDiscoveryKickSeesCachedSession:
         mock_session_mgr.get_session.return_value = session
 
         wm._mint_sandbox_tokens = AsyncMock(return_value={})
-        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, user_names=["alpha"]))
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, servers=[_srv("alpha")]))
         wm._servers_needing_discovery = MagicMock(return_value=[MagicMock(name="alpha")])
         wm._sync_sandbox_assets = AsyncMock()
         wm._restore_files = AsyncMock()
@@ -581,7 +634,7 @@ class TestDiscoveryKickSeesCachedSession:
         session.initialize = AsyncMock()
         mock_session_mgr.get_session.return_value = session
 
-        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, user_names=["alpha"]))
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, servers=[_srv("alpha")]))
         wm._servers_needing_discovery = MagicMock(return_value=[MagicMock(name="alpha")])
         wm._sync_sandbox_assets = AsyncMock()
         wm._maybe_migrate_sandbox = AsyncMock(return_value=None)
@@ -623,7 +676,7 @@ class TestDiscoveryKickSeesCachedSession:
         mock_session_mgr.get_session.return_value = session
 
         wm._mint_sandbox_tokens = AsyncMock(return_value={})
-        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, user_names=["alpha"]))
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, servers=[_srv("alpha")]))
         wm._servers_needing_discovery = MagicMock(return_value=[MagicMock(name="alpha")])
         wm._sync_sandbox_assets = AsyncMock()
         wm._restore_files = AsyncMock()

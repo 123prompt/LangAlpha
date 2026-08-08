@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import secrets
 import shlex
 import time
 from collections.abc import Callable, Iterable
@@ -27,7 +28,7 @@ from ptc_agent.core.sandbox.runtime import (
 
 from ..mcp_registry import MCPRegistry
 from ..mcp_sanitize import (
-    is_user_server,
+    is_untrusted_server,
 )
 from ..tool_generator import ToolFunctionGenerator
 
@@ -142,11 +143,11 @@ class PTCSandbox:
 
     def _builtin_servers(self) -> list:
         """Built-in servers only (``source != 'workspace'``) from the effective set."""
-        return [s for s in self.config.mcp.servers if not is_user_server(s)]
+        return [s for s in self.config.mcp.servers if not is_untrusted_server(s)]
 
     def _user_servers(self) -> list:
         """User-configured servers (``source == 'workspace'``) from the effective set."""
-        return [s for s in self.config.mcp.servers if is_user_server(s)]
+        return [s for s in self.config.mcp.servers if is_untrusted_server(s)]
 
     async def _wait_ready(self) -> None:
         """Wait for sandbox to be ready. Call at start of methods needing sandbox."""
@@ -515,46 +516,89 @@ class PTCSandbox:
         except Exception as e:
             logger.warning("Failed to upload vault secrets file", error=str(e))
 
-    async def upload_egress_relay_credentials(self, payload: dict | None) -> None:
+    async def upload_egress_relay_credentials(self, payload: dict | None) -> bool:
         """Write (or remove) the egress-relay credential file in the sandbox.
 
         Carries the relay base URL, the sandbox's relay JWT, and the
         server→grant map. The generated MCP client reads it at call time, so a
         re-upload (JWT remint, grant change) needs no sandbox convergence.
+
+        The write is atomic: content goes to a per-write temp path, gets its
+        0600 mode, then replaces the target with a same-directory
+        ``os.replace`` (rename(2), which fails rather than copies across a
+        filesystem boundary — unlike ``mv``). A reader — the in-sandbox client
+        reads this on every tool call — therefore sees either the complete old
+        file or the complete new one, never a truncated write. That atomicity is
+        what lets two uvicorn workers push the same workspace concurrently
+        without a cross-worker lock: the last rename wins, both relay JWTs are
+        independently valid, and the grant map converges on the next push.
+
+        Returns ``True`` only on **confirmed** success — a nonzero exit from the
+        sandbox is a failure, not a raised exception, so the exit code is
+        checked explicitly. The caller must not record a fresh binding on a
+        ``False`` return, or the process would believe it published a token it
+        did not and skip reminting until that phantom token nears expiry.
         """
         if not self.runtime:
-            return
+            return False
 
         path = self._egress_relay_file_path
 
         if not payload:
             try:
-                await self._runtime_call(
+                result = await self._runtime_call(
                     self.runtime.exec,
-                    f"rm -f {path}",
+                    f"rm -f {shlex.quote(path)}",
                     retry_policy=RetryPolicy.SAFE,
                 )
+                return getattr(result, "exit_code", 0) == 0
             except Exception as e:
                 logger.warning("Failed to remove egress relay file", error=str(e))
-            return
+                return False
 
+        # 128-bit unique temp so concurrent writers to the same sandbox never
+        # share (and corrupt) a staging file before either renames it into place.
+        tmp_path = f"{path}.{secrets.token_hex(16)}.tmp"
         try:
             await self._runtime_call(
                 self.runtime.upload_file,
                 json.dumps(payload).encode("utf-8"),
-                path,
+                tmp_path,
                 retry_policy=RetryPolicy.SAFE,
             )
-            # Docker's tar upload lands 0644; the relay JWT must not be
-            # readable by other sandbox users.
-            await self._runtime_call(
+            # chmod the temp before the rename so the file is 0600 the instant
+            # it appears at the real path — the relay JWT is never briefly
+            # world-readable there (tar/dev uploads land 0644). os.replace is a
+            # same-directory rename(2): atomic, and it raises (nonzero exit)
+            # rather than silently doing a non-atomic cross-fs copy the way
+            # ``mv`` would. argv-passing keeps the paths out of the shell.
+            result = await self._runtime_call(
                 self.runtime.exec,
-                f"chmod 600 {path}",
+                "chmod 600 {t} && python3 -c "
+                "'import os,sys; os.replace(sys.argv[1], sys.argv[2])' "
+                "{t} {p}".format(t=shlex.quote(tmp_path), p=shlex.quote(path)),
                 retry_policy=RetryPolicy.SAFE,
             )
+            if getattr(result, "exit_code", -1) != 0:
+                raise RuntimeError(
+                    f"publish exec exit={getattr(result, 'exit_code', '?')} "
+                    f"stderr={getattr(result, 'stderr', '')[:200]}"
+                )
             logger.debug("Uploaded egress relay credentials", path=path)
+            return True
         except Exception as e:
             logger.warning("Failed to upload egress relay credentials", error=str(e))
+            # A failed rename would otherwise orphan the staging file; a warm
+            # sandbox reminting every few minutes must not accumulate them.
+            try:
+                await self._runtime_call(
+                    self.runtime.exec,
+                    f"rm -f {shlex.quote(tmp_path)}",
+                    retry_policy=RetryPolicy.SAFE,
+                )
+            except Exception:
+                pass
+            return False
 
     async def ensure_sandbox_ready(self) -> None:
         await self._wait_ready()

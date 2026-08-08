@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 import httpx
 
 from ptc_agent.config import AgentConfig
-from ptc_agent.core.mcp_sanitize import is_user_server
+from ptc_agent.core.mcp_sanitize import is_untrusted_server
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from ptc_agent.core.session import Session, SessionManager
 
@@ -607,52 +607,40 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             sandbox.config.mcp.servers = list(resolved.servers)
         session.config.mcp.servers = list(resolved.servers)
 
-        # User servers (source='workspace') + their ok-status cached schemas.
-        user_servers = [s for s in resolved.servers if is_user_server(s)]
+        # Untrusted servers (workspace-local + inherited) and their ok-status
+        # cached schemas. ToolSnapshotIndex owns the acceptance rule: current
+        # fingerprint only, and the USER tier answers for inherited servers (a
+        # workspace snapshot of an OAuth server is OAuth-blind and can outlive
+        # a disconnect — the agent lane must not serve those tools).
+        untrusted_servers = [s for s in resolved.servers if is_untrusted_server(s)]
         tool_schemas: dict[str, list[dict]] = {}
-        if user_servers:
-            from src.server.database.mcp_servers import get_tool_schemas
-            from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+        if untrusted_servers:
+            from src.server.database.mcp_servers import (
+                get_tool_schemas,
+                get_user_tool_schemas,
+            )
+            from src.server.services.mcp_discovery import ToolSnapshotIndex
 
-            # Load a cached snapshot only when it's for the server's CURRENT
-            # config (hash match). A toggled/unrelated mutation leaves a server's
-            # fingerprint unchanged, so its tools load from cache — no re-verify;
-            # a server whose own config changed misses the cache and is picked up
-            # by background discovery.
-            fp_by_name = {s.name: mcp_discovery_fingerprint(s) for s in user_servers}
-            rows = await get_tool_schemas(session.conversation_id)
-            for row in rows:
-                name = row["server_name"]
-                if row.get("status") == "ok" and row.get(
-                    "config_hash"
-                ) == fp_by_name.get(name):
-                    tool_schemas[name] = row.get("tools") or []
-
-            # Inherited (source='user') servers are discovered HOST-side and
-            # cached at user scope — the workspace-level read above never has
-            # them. Same hash gate: a config change invalidates the snapshot.
-            if user_id and any(
-                getattr(s, "source", "") == "user" for s in user_servers
-            ):
-                from src.server.database.mcp_servers import get_user_tool_schemas
-
-                for row in await get_user_tool_schemas(user_id):
-                    name = row["server_name"]
-                    if (
-                        name not in tool_schemas
-                        and row.get("status") == "ok"
-                        and row.get("config_hash") == fp_by_name.get(name)
-                    ):
-                        tool_schemas[name] = row.get("tools") or []
+            user_rows: list[dict] = []
+            if user_id and any(s.source == "user" for s in untrusted_servers):
+                user_rows = await get_user_tool_schemas(user_id)
+            snapshots = ToolSnapshotIndex(
+                workspace_rows=await get_tool_schemas(session.conversation_id),
+                user_rows=user_rows,
+            )
+            for server in untrusted_servers:
+                snapshot = snapshots.ok(server)
+                if snapshot is not None:
+                    tool_schemas[server.name] = snapshot.get("tools") or []
 
         # Always build from the BUILTIN registry, never a prior composite —
         # session.mcp_registry may already be a composite from an earlier resolve.
         builtin_registry = session._builtin_mcp_registry or session.mcp_registry
         composite = build_composite_registry(
             builtin_registry,
-            user_servers,
+            untrusted_servers,
             tool_schemas,
-            getattr(resolved, "disabled_builtin_names", frozenset()),
+            resolved.disabled_builtin_names,
         )
 
         session.mcp_registry = composite
@@ -669,7 +657,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         session.mcp_config_version = resolved.version
 
     def _servers_needing_discovery(self, session: Session, resolved: Any) -> list[Any]:
-        """User servers in ``resolved`` lacking an ok-status schema in the composite.
+        """Untrusted servers in ``resolved`` with no ok-status schema in the composite.
 
         Used to decide whether to kick background discovery. A server with cached
         tools already appears in the composite; one without (pending/error/new)
@@ -682,18 +670,18 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             for name, tools in get_all().items():
                 if tools:
                     present_with_tools.add(name)
-        oauth_names = getattr(resolved, "oauth_status_by_name", {})
+        oauth_names = resolved.oauth_status_by_name
         return [
             s
             for s in resolved.servers
-            if is_user_server(s)
+            if is_untrusted_server(s)
             # OAuth servers are discovered host-side (the sandbox holds no
             # vendor token, so an in-sandbox probe can only fail). The status
             # map also covers DISCONNECTED ones, whose oauth_connection_id is
             # None — probing those would just cache junk error rows. A
             # workspace-local fork of the same name is not OAuth-bound.
-            and not getattr(s, "oauth_connection_id", None)
-            and not (getattr(s, "source", None) == "user" and s.name in oauth_names)
+            and not s.oauth_connection_id
+            and not (s.source == "user" and s.name in oauth_names)
             and s.name not in present_with_tools
         ]
 

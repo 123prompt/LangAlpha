@@ -18,9 +18,9 @@ from httpx import ASGITransport, AsyncClient
 
 from ptc_agent.config.core import MCPServerConfig
 from src.server.app.mcp_servers import _derive_status
-from src.server.services.mcp_config import ResolvedMCP
 from src.server.services.mcp_discovery import mcp_discovery_fingerprint
 from tests.conftest import create_test_app
+from tests.unit.server.mcp_builders import resolved_mcp
 
 NOW = datetime.now(timezone.utc)
 USER = "test-user-123"
@@ -42,13 +42,26 @@ def _builtin(name="builtin_search"):
     return MCPServerConfig(name=name, transport="stdio", command="npx", source="builtin")
 
 
-def _user_server(name="remote_server", **kw):
+def _workspace_server(name="remote_server", **kw):
+    """A workspace-LOCAL server (source='workspace')."""
     return MCPServerConfig(
         name=name,
         transport="http",
         url="https://api.example.com/mcp",
         headers=kw.pop("headers", {}),
         source="workspace",
+        **kw,
+    )
+
+
+def _inherited_server(name="robinhood", **kw):
+    """A user-level Connectors server, inherited into the workspace."""
+    return MCPServerConfig(
+        name=name,
+        transport="http",
+        url="https://api.example.com/mcp",
+        headers=kw.pop("headers", {}),
+        source="user",
         **kw,
     )
 
@@ -88,6 +101,11 @@ def _no_user_level_rows():
         ),
         patch(
             "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(return_value=None),
+        ),
+        # classify_server_name resolves the Connectors tier itself.
+        patch(
+            "src.server.database.mcp_servers.get_catalog_server",
             new=AsyncMock(return_value=None),
         ),
     ):
@@ -150,13 +168,8 @@ def test_status_pending_when_no_schema_row():
 async def test_list_effective_servers_masks_and_decorates(client):
     ws = _ws()
     base = _agent_config([_builtin()])
-    user_srv = _user_server(headers={"Authorization": "${vault:API_KEY}"})
-    resolved = ResolvedMCP(
-        servers=[_builtin(), user_srv],
-        builtin_names=frozenset({"builtin_search"}),
-        user_names=frozenset({"remote_server"}),
-        version=3,
-    )
+    user_srv = _workspace_server(headers={"Authorization": "${vault:API_KEY}"})
+    resolved = resolved_mcp(builtins=[_builtin()], local=[user_srv])
     schema_rows = [
         {"server_name": "remote_server", "status": "ok",
          "tools": [{"name": "search", "description": "d", "input_schema": {}}],
@@ -205,12 +218,7 @@ async def test_list_surfaces_applied_config_version(client):
     can show a version-accurate "synced/applying" state instead of a timer."""
     ws = _ws()
     base = _agent_config([_builtin()])
-    resolved = ResolvedMCP(
-        servers=[_builtin()],
-        builtin_names=frozenset({"builtin_search"}),
-        user_names=frozenset(),
-        version=3,
-    )
+    resolved = resolved_mcp(builtins=[_builtin()])
     wm = MagicMock()
     wm.get_applied_mcp_config_version.return_value = 2  # behind the saved version
     with (
@@ -238,12 +246,7 @@ async def test_list_surfaces_sandbox_warming(client):
     on a stale stopped state."""
     ws = _ws(status="starting")
     base = _agent_config([_builtin()])
-    resolved = ResolvedMCP(
-        servers=[_builtin()],
-        builtin_names=frozenset({"builtin_search"}),
-        user_names=frozenset(),
-        version=1,
-    )
+    resolved = resolved_mcp(builtins=[_builtin()], version=1)
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
@@ -268,12 +271,9 @@ async def test_list_reuses_cached_schema_across_unrelated_mutation(client):
     so any mutation orphaned every server's snapshot.)"""
     ws = _ws()
     base = _agent_config([])
-    user_srv = _user_server()
-    resolved = ResolvedMCP(
-        servers=[user_srv], builtin_names=frozenset(),
-        user_names=frozenset({"remote_server"}),
-        version=99,  # the version has long since moved on from when it was cached
-    )
+    user_srv = _workspace_server()
+    # The version has long since moved on from when the snapshot was cached.
+    resolved = resolved_mcp(local=[user_srv], version=99)
     schema_rows = [{
         "server_name": "remote_server", "status": "ok",
         "tools": [{"name": "search", "description": "d", "input_schema": {}}],
@@ -302,11 +302,8 @@ async def test_list_reverifies_when_server_own_config_changed(client):
     THAT server re-verifies — not the whole workspace."""
     ws = _ws()
     base = _agent_config([])
-    user_srv = _user_server()
-    resolved = ResolvedMCP(
-        servers=[user_srv], builtin_names=frozenset(),
-        user_names=frozenset({"remote_server"}), version=3,
-    )
+    user_srv = _workspace_server()
+    resolved = resolved_mcp(local=[user_srv])
     schema_rows = [{
         "server_name": "remote_server", "status": "ok",
         "tools": [{"name": "search", "description": "d", "input_schema": {}}],
@@ -333,12 +330,8 @@ async def test_list_keeps_disabled_builtin_visible(client):
     ws = _ws()
     disabled = _builtin("builtin_disabled")
     base = _agent_config([_builtin(), disabled])
-    resolved = ResolvedMCP(
-        servers=[_builtin()],
-        builtin_names=frozenset({"builtin_search"}),
-        user_names=frozenset(),
-        version=4,
-        disabled_builtin_names=frozenset({"builtin_disabled"}),
+    resolved = resolved_mcp(
+        builtins=[_builtin()], disabled_builtins=[disabled], version=4
     )
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
@@ -366,13 +359,9 @@ async def test_list_keeps_disabled_workspace_server_visible(client):
     # still render (greyed, with its toggle) so it can be re-enabled.
     ws = _ws()
     base = _agent_config([_builtin()])
-    disabled_srv = _user_server(name="disabled_remote")
-    resolved = ResolvedMCP(
-        servers=[_builtin()],
-        builtin_names=frozenset({"builtin_search"}),
-        user_names=frozenset(),
-        version=5,
-        disabled_workspace_servers=[disabled_srv],
+    disabled_srv = _workspace_server(name="disabled_remote")
+    resolved = resolved_mcp(
+        builtins=[_builtin()], disabled_local=[disabled_srv], version=5
     )
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
@@ -397,11 +386,8 @@ async def test_list_keeps_disabled_workspace_server_visible(client):
 async def test_list_needs_secret_surfaces_missing(client):
     ws = _ws()
     base = _agent_config([])
-    user_srv = _user_server(headers={"Authorization": "${vault:API_KEY}"})
-    resolved = ResolvedMCP(
-        servers=[user_srv], builtin_names=frozenset(),
-        user_names=frozenset({"remote_server"}), version=3,
-    )
+    user_srv = _workspace_server(headers={"Authorization": "${vault:API_KEY}"})
+    resolved = resolved_mcp(local=[user_srv])
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
@@ -424,16 +410,11 @@ async def test_list_surfaces_oauth_status_on_inherited_rows(client):
     workspace-origin rows never carry it."""
     ws = _ws()
     base = _agent_config([])
-    inherited = MCPServerConfig(
-        name="robinhood", transport="http",
-        url="https://api.example.com/mcp", source="user",
-    )
-    local = _user_server(name="local_fork")
-    resolved = ResolvedMCP(
-        servers=[inherited, local], builtin_names=frozenset(),
-        user_names=frozenset({"local_fork"}), version=3,
-        inherited_names=frozenset({"robinhood"}),
-        oauth_status_by_name={"robinhood": "revoked", "local_fork": "connected"},
+    inherited = _inherited_server()
+    local = _workspace_server(name="local_fork")
+    resolved = resolved_mcp(
+        inherited=[inherited], local=[local],
+        oauth_status={"robinhood": "revoked"},
     )
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
@@ -458,16 +439,9 @@ async def test_list_inherited_prefers_user_cache_over_workspace_cache(client):
     OAuth-blind and can outlive both — so the user cache must win."""
     ws = _ws()
     base = _agent_config([])
-    inherited = MCPServerConfig(
-        name="robinhood", transport="http",
-        url="https://api.example.com/mcp", source="user",
-    )
+    inherited = _inherited_server()
     fingerprint = mcp_discovery_fingerprint(inherited)
-    resolved = ResolvedMCP(
-        servers=[inherited], builtin_names=frozenset(),
-        user_names=frozenset(), version=3,
-        inherited_names=frozenset({"robinhood"}),
-    )
+    resolved = resolved_mcp(inherited=[inherited])
     ws_rows = [
         {"server_name": "robinhood", "status": "error", "tools": [],
          "error": "stale pre-connect probe", "config_hash": fingerprint,
@@ -658,79 +632,6 @@ async def test_add_server_rejects_bash_command(client):
             json={"name": "evil", "transport": "stdio", "command": "bash"},
         )
     assert resp.status_code == 422
-
-
-# ---------------------------------------------------------------------------
-# POST add — from template (validates + copies)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_add_from_template_copies_and_revalidates(client):
-    ws = _ws()
-    base = _agent_config([])
-    template = {
-        "name": "tmpl_server", "transport": "http",
-        "url": "https://api.example.com/mcp", "command": None, "args": [],
-        "env": {}, "headers": {"Authorization": "${vault:API_KEY}"},
-        "description": "d", "instruction": "i", "tool_exposure_mode": "summary",
-    }
-    row = {"name": "tmpl_server", "source": "workspace", "enabled": True}
-    with (
-        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
-        patch("src.server.app.setup.agent_config", base),
-        patch("src.server.app.mcp_servers.get_catalog_server", new=AsyncMock(return_value=template)),
-        patch("src.server.app.mcp_servers.insert_workspace_server", new=AsyncMock(return_value=row)) as ins,
-    ):
-        resp = await client.post(
-            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers",
-            json={"from_template": "tmpl_server"},
-        )
-    assert resp.status_code == 201
-    _, kwargs = ins.await_args
-    assert kwargs["config"]["url"] == "https://api.example.com/mcp"
-    assert kwargs["config"]["headers"] == {"Authorization": "${vault:API_KEY}"}
-
-
-@pytest.mark.asyncio
-async def test_add_from_template_revalidation_422_string_detail(client):
-    ws = _ws()
-    base = _agent_config([])
-    # A stored template that no longer passes the (tightened) URL policy.
-    template = {
-        "name": "tmpl_server", "transport": "http",
-        "url": "https://100.64.0.1/mcp", "command": None, "args": [],
-        "env": {}, "headers": {}, "description": "", "instruction": "",
-        "tool_exposure_mode": "summary",
-    }
-    with (
-        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
-        patch("src.server.app.setup.agent_config", base),
-        patch("src.server.app.mcp_servers.get_catalog_server", new=AsyncMock(return_value=template)),
-    ):
-        resp = await client.post(
-            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers",
-            json={"from_template": "tmpl_server"},
-        )
-    assert resp.status_code == 422
-    # Template re-validation 422 detail is a flat string, like the direct path.
-    assert isinstance(resp.json()["detail"], str)
-
-
-@pytest.mark.asyncio
-async def test_add_from_missing_template_404(client):
-    ws = _ws()
-    base = _agent_config([])
-    with (
-        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
-        patch("src.server.app.setup.agent_config", base),
-        patch("src.server.app.mcp_servers.get_catalog_server", new=AsyncMock(return_value=None)),
-    ):
-        resp = await client.post(
-            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers",
-            json={"from_template": "nope"},
-        )
-    assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -1247,7 +1148,7 @@ async def test_edit_workspace_row_happy(client):
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
-        patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=rows)),
+        patch("src.server.database.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=rows)),
         patch("src.server.app.mcp_servers.upsert_workspace_server", new=AsyncMock(return_value=out)) as up,
     ):
         resp = await client.put(
@@ -1308,7 +1209,7 @@ async def test_patch_workspace_row_404_when_absent(client):
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
-        patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=[])),
+        patch("src.server.database.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=[])),
         patch("src.server.app.mcp_servers.set_workspace_server_enabled", new=AsyncMock(return_value=False)),
     ):
         resp = await client.patch(
@@ -1345,7 +1246,7 @@ async def test_delete_workspace_row_happy(client):
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
-        patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=existing)),
+        patch("src.server.database.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=existing)),
         patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)),
     ):
         resp = await client.delete(
@@ -1378,11 +1279,8 @@ async def test_discover_builtin_409(client):
 async def test_discover_debounce_returns_cached(client):
     ws = _ws()
     base = _agent_config([])
-    user_srv = _user_server()
-    resolved = ResolvedMCP(
-        servers=[user_srv], builtin_names=frozenset(),
-        user_names=frozenset({"remote_server"}), version=3,
-    )
+    user_srv = _workspace_server()
+    resolved = resolved_mcp(local=[user_srv])
     fresh = {
         "server_name": "remote_server", "status": "ok", "tools": [], "error": "",
         "config_hash": mcp_discovery_fingerprint(user_srv),
@@ -1409,11 +1307,8 @@ async def test_discover_debounce_returns_cached(client):
 async def test_discover_runs_when_stale_and_stopped_yields_pending(client):
     ws = _ws(status="stopped")
     base = _agent_config([])
-    user_srv = _user_server()
-    resolved = ResolvedMCP(
-        servers=[user_srv], builtin_names=frozenset(),
-        user_names=frozenset({"remote_server"}), version=3,
-    )
+    user_srv = _workspace_server()
+    resolved = resolved_mcp(local=[user_srv])
     stale = {
         "server_name": "remote_server", "status": "ok", "tools": [], "error": "",
         "config_hash": mcp_discovery_fingerprint(user_srv),
@@ -1445,9 +1340,7 @@ async def test_discover_runs_when_stale_and_stopped_yields_pending(client):
 async def test_discover_unknown_server_404(client):
     ws = _ws()
     base = _agent_config([])
-    resolved = ResolvedMCP(
-        servers=[], builtin_names=frozenset(), user_names=frozenset(), version=3,
-    )
+    resolved = resolved_mcp()
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),

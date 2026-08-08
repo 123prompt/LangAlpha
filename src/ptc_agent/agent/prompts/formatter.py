@@ -8,7 +8,7 @@ import structlog
 from typing import Any
 
 from ptc_agent.core.mcp_sanitize import (
-    is_user_server,
+    is_untrusted_server,
     sanitize_tool_name,
     sanitize_tool_text,
 )
@@ -37,7 +37,7 @@ WORKSPACE_DETAILED_MAX_CHARS = 8000
 
 def _is_workspace_source(config: Any) -> bool:
     """True when ``config`` is an untrusted user-provided (workspace) server."""
-    return bool(config) and is_user_server(config)
+    return bool(config) and is_untrusted_server(config)
 
 
 def _safe_tool_name(name: Any, *, workspace: bool) -> str:

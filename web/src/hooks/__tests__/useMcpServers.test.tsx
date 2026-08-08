@@ -218,7 +218,7 @@ describe('mcp mutations — invalidation', () => {
 
     const { result } = renderHook(() => useAddWorkspaceMcpServer(WS), { wrapper: wrapperFor(client) });
     await act(async () => {
-      await result.current.mutateAsync({ from_template: 'tmpl' });
+      await result.current.mutateAsync({ name: 's2', transport: 'stdio', command: 'node' });
     });
 
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.workspace(WS) });
