@@ -16,11 +16,11 @@ Endpoints:
 
 from __future__ import annotations
 
-import json
 import logging
 
 from fastapi import APIRouter, HTTPException
 
+from ptc_agent.core.mcp_sanitize import vault_refs
 from src.server.app.vault import CreateSecretRequest, UpdateSecretRequest
 from src.server.database.mcp_servers import (
     bump_user_workspaces_mcp_version,
@@ -31,7 +31,7 @@ from src.server.database.user_vault_secrets import (
     create_user_secret,
     delete_user_secret,
     get_user_secrets,
-    get_user_secrets_decrypted,
+    reveal_user_secret,
     update_user_secret,
 )
 from src.server.database.workspace import get_running_workspace_ids_for_user
@@ -41,6 +41,23 @@ from src.server.utils.api import CurrentUserId, handle_api_exceptions
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/mcp", tags=["User Vault Secrets"])
+
+
+def _server_vault_refs(row: dict) -> set[str]:
+    """Vault names a user-server row actually references.
+
+    Only env/headers/args/url are substituted at resolve time, so those are the
+    only fields scanned — matching on the whole row would let a ``${vault:X}``
+    string sitting in free-text description/instruction force a config bump.
+    """
+    refs: set[str] = set()
+    for mapping in (row.get("env") or {}, row.get("headers") or {}):
+        for value in mapping.values():
+            refs.update(vault_refs(str(value)))
+    for arg in row.get("args") or []:
+        refs.update(vault_refs(str(arg)))
+    refs.update(vault_refs(str(row.get("url") or "")))
+    return refs
 
 
 async def _after_mutation(user_id: str, name: str, *, value_changed: bool) -> None:
@@ -65,13 +82,10 @@ async def _after_mutation(user_id: str, name: str, *, value_changed: bool) -> No
     if not value_changed:
         return
     try:
-        from ptc_agent.core.mcp_sanitize import vault_refs
-
-        referenced = False
-        for row in await list_enabled_user_servers(user_id):
-            if name in vault_refs(json.dumps(row, default=str)):
-                referenced = True
-                break
+        referenced = any(
+            name in _server_vault_refs(row)
+            for row in await list_enabled_user_servers(user_id)
+        )
         if referenced:
             await bump_user_workspaces_mcp_version(user_id)
             logger.info(
@@ -123,7 +137,7 @@ async def update_secret(name: str, body: UpdateSecretRequest, user_id: CurrentUs
 @router.get("/vault/secrets/{name}/reveal")
 @handle_api_exceptions("reveal user vault secret", logger)
 async def reveal_secret(name: str, user_id: CurrentUserId):
-    value = (await get_user_secrets_decrypted(user_id)).get(name)
+    value = await reveal_user_secret(user_id, name)
     if value is None:
         raise HTTPException(status_code=404, detail="Secret not found")
     return {"value": value}

@@ -10,6 +10,14 @@ user- not workspace-scoped), and sandbox_egress_grants — the contract of the
 egress relay: sandboxes reach credential-bearing remote servers only through
 a grant whose destination was captured server-side at creation.
 
+user_id is deliberately a bare VARCHAR(255) with NO foreign key to users, as
+in every user-scoped table added since the initial schema (user_oauth_tokens,
+user_mcp_servers). A users row is not guaranteed to exist: the request path
+resolves user_id from a JWT sub or a relayed X-User-Id header with no DB read
+and no get-or-create, so an FK would turn a first-touch connector write from
+a channel integration into an unhandled foreign-key violation. Cleanup on
+user deletion is therefore the deleter's job, not the schema's.
+
 Revision ID: 025
 Revises: 024
 """
@@ -141,7 +149,10 @@ def upgrade() -> None:
             status VARCHAR(16) NOT NULL DEFAULT 'active',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            UNIQUE(workspace_id, kind, connection_id)
+            -- NULLS NOT DISTINCT: connection_id is NULL for any non-'oauth_mcp'
+            -- kind, and the default NULLS DISTINCT would give those rows no
+            -- uniqueness at all.
+            UNIQUE NULLS NOT DISTINCT (workspace_id, kind, connection_id)
         )
     """)
     op.execute("DROP TRIGGER IF EXISTS update_sandbox_egress_grants_updated_at ON sandbox_egress_grants")
@@ -149,6 +160,12 @@ def upgrade() -> None:
         CREATE TRIGGER update_sandbox_egress_grants_updated_at
         BEFORE UPDATE ON sandbox_egress_grants
         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column()
+    """)
+    # Connection revoke/cascade scans grants by connection_id alone; the UNIQUE
+    # above leads with workspace_id and can't serve it.
+    op.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sandbox_egress_grants_connection
+        ON sandbox_egress_grants(connection_id)
     """)
 
 
