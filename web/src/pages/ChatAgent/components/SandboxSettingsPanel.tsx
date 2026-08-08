@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   X, Cpu, MemoryStick, HardDrive, MonitorCog, Play, Square,
   Package, Search, RefreshCw, ChevronDown, ChevronRight,
-  Server, BookOpen, Archive, KeyRound,
-  Plus, Trash2, Pencil, Eye, EyeOff, ExternalLink, Sparkles,
+  Server, BookOpen, Archive,
 } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import {
@@ -13,6 +13,7 @@ import {
 } from '../utils/api';
 import { api } from '@/api/client';
 import { McpTab } from './mcp/McpTab';
+import { SecretsManager } from './vault/SecretsManager';
 
 interface SandboxSettingsPanelProps {
   onClose: () => void;
@@ -951,7 +952,6 @@ function ToolsTab({ stats, refreshing, refreshResult, onRefresh }: ToolsTabProps
 // ---------------------------------------------------------------------------
 
 const MAX_SECRETS = 20;
-const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 
 interface VaultSecret {
   workspace_vault_secret_id: string;
@@ -970,39 +970,15 @@ interface SecretsTabProps {
 }
 
 function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: SecretsTabProps) {
+  const { t } = useTranslation();
   const [secrets, setSecrets] = useState<VaultSecret[]>([]);
   const [blueprints, setBlueprints] = useState<VaultBlueprint[]>([]);
   const [remainingSlots, setRemainingSlots] = useState<number>(MAX_SECRETS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Add form
-  const [showAdd, setShowAdd] = useState(false);
-  const [newName, setNewName] = useState('');
-  const [newValue, setNewValue] = useState('');
-  const [newDesc, setNewDesc] = useState('');
-  const [saving, setSaving] = useState(false);
-  // When opened via a blueprint "Set up" click, carry the docs link + regex
-  // for inline hint rendering. Cleared when the form closes or save succeeds.
-  const [presetBlueprint, setPresetBlueprint] = useState<VaultBlueprint | null>(null);
-
-  // Edit state
-  const [editingName, setEditingName] = useState<string | null>(null);
-  const [editValue, setEditValue] = useState('');
-  const [editDesc, setEditDesc] = useState('');
-  const [editSaving, setEditSaving] = useState(false);
-
-  // Delete confirmation
-  const [deletingName, setDeletingName] = useState<string | null>(null);
-
-  // Visibility toggles
-  const [showNewValue, setShowNewValue] = useState(false);
-  const [showEditValue, setShowEditValue] = useState(false);
-  const [revealedSecrets, setRevealedSecrets] = useState<Record<string, string>>({});
-  const [revealingName, setRevealingName] = useState<string | null>(null);
-
   // Generation counter: guards against a stale in-flight load clobbering state
-  // when workspaceId changes rapidly (A → B → A). Increment on entry, check on
+  // when workspaceId changes rapidly (A -> B -> A). Increment on entry, check on
   // every resolution path before writing state.
   const loadGenRef = useRef(0);
 
@@ -1028,7 +1004,7 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
       }
     } catch (err: any) {
       if (loadGenRef.current !== myGen) return;
-      setError(err?.response?.data?.detail || err.message || 'Failed to load secrets');
+      setError(err?.response?.data?.detail || err.message || t('vault.loadFailed'));
     } finally {
       if (loadGenRef.current === myGen) {
         setLoading(false);
@@ -1037,501 +1013,66 @@ function SecretsTab({ workspaceId, prefillSecretName, onPrefillConsumed }: Secre
   }
 
   useEffect(() => {
-    // Reset form state before reloading: a half-filled add form from the
-    // previous workspace must not carry over and silently target the new one.
-    closeAddForm();
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
 
-  // A deep-link from the MCP tab ("Set up NAME") opens the add form prefilled
-  // with the requested secret name, so the user lands ready to paste a value.
-  useEffect(() => {
-    if (!prefillSecretName) return;
-    setError(null);
-    setPresetBlueprint(null);
-    setNewName(prefillSecretName);
-    setNewValue('');
-    setNewDesc('');
-    setShowNewValue(false);
-    setShowAdd(true);
-    onPrefillConsumed?.();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [prefillSecretName]);
-
-  // Safe regex compile for the active preset blueprint. Invalid patterns from a
-  // misconfigured agent_config.yaml must not crash the UI — on failure we just
-  // skip the hint.
-  const presetRegex = useMemo<RegExp | null>(() => {
-    if (!presetBlueprint?.regex) return null;
-    try {
-      return new RegExp(presetBlueprint.regex);
-    } catch {
-      return null;
-    }
-  }, [presetBlueprint]);
-  const valueHintFailing =
-    presetRegex !== null && newValue.length > 0 && !presetRegex.test(newValue);
-
-  function openAddForBlueprint(bp: VaultBlueprint) {
-    setError(null);
-    setPresetBlueprint(bp);
-    setNewName(bp.name);
-    setNewValue('');
-    setNewDesc(bp.description || '');
-    setShowNewValue(false);
-    setShowAdd(true);
-  }
-
-  function closeAddForm() {
-    setShowAdd(false);
-    setNewName('');
-    setNewValue('');
-    setNewDesc('');
-    setShowNewValue(false);
-    setPresetBlueprint(null);
-  }
-
-  async function handleCreate() {
-    if (!newName || !newValue) return;
-    if (!NAME_RE.test(newName)) {
-      setError('Name must use letters, digits, underscores; start with letter or underscore');
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      await createVaultSecret(workspaceId, {
-        name: newName,
-        value: newValue,
-        description: newDesc,
-      });
-      closeAddForm();
-      await load();
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || err.message || 'Failed to create secret');
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleUpdate(name: string) {
-    setEditSaving(true);
-    setError(null);
-    try {
-      const body: { value?: string; description?: string } = {};
-      if (editValue) body.value = editValue;
-      body.description = editDesc;
-      await updateVaultSecret(workspaceId, name, body);
-      setEditingName(null);
-      setEditValue('');
-      setEditDesc('');
-      setShowEditValue(false);
-      setRevealedSecrets(prev => {
-        const next = { ...prev };
-        delete next[name];
-        return next;
-      });
-      await load();
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || err.message || 'Failed to update secret');
-    } finally {
-      setEditSaving(false);
-    }
-  }
-
-  const [deleteLoading, setDeleteLoading] = useState(false);
-
-  async function handleDelete(name: string) {
-    setDeleteLoading(true);
-    setError(null);
-    try {
-      await deleteVaultSecret(workspaceId, name);
-      setDeletingName(null);
-      await load();
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || err.message || 'Failed to delete secret');
-    } finally {
-      setDeleteLoading(false);
-    }
-  }
-
-  async function handleRevealToggle(name: string) {
-    if (revealedSecrets[name] !== undefined) {
-      setRevealedSecrets(prev => {
-        const next = { ...prev };
-        delete next[name];
-        return next;
-      });
-      return;
-    }
-    setRevealingName(name);
-    try {
-      const value = await revealVaultSecret(workspaceId, name);
-      setRevealedSecrets(prev => ({ ...prev, [name]: value }));
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || err.message || 'Failed to reveal secret');
-    } finally {
-      setRevealingName(null);
-    }
-  }
-
-  if (loading) {
-    return (
-      <div className="flex flex-col gap-3">
-        {[1, 2].map(i => (
-          <div key={i} className="h-14 rounded-lg animate-pulse" style={{ backgroundColor: 'var(--color-bg-card)' }} />
-        ))}
-      </div>
-    );
-  }
-
   return (
-    <div className="flex flex-col gap-4">
-      {/* Header + counter */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <KeyRound className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
-          <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-            Vault
-          </span>
-          <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-card)' }}>
-            {secrets.length} / {MAX_SECRETS}
-          </span>
+    <SecretsManager
+      // Remount on workspace switch: a half-filled add form from the previous
+      // workspace must not carry over and silently target the new one.
+      key={workspaceId}
+      title={t('vault.workspace.title')}
+      secrets={secrets.map((s) => ({
+        id: s.workspace_vault_secret_id,
+        name: s.name,
+        description: s.description,
+        masked_value: s.masked_value,
+      }))}
+      maxSecrets={secrets.length + remainingSlots}
+      loading={loading}
+      loadError={error}
+      emptyText={t('vault.workspace.empty')}
+      blueprints={blueprints}
+      prefillSecretName={prefillSecretName}
+      onPrefillConsumed={onPrefillConsumed}
+      onCreate={async (body) => { await createVaultSecret(workspaceId, body); await load(); }}
+      onUpdate={async (name, body) => { await updateVaultSecret(workspaceId, name, body); await load(); }}
+      onDelete={async (name) => { await deleteVaultSecret(workspaceId, name); await load(); }}
+      onReveal={(name) => revealVaultSecret(workspaceId, name)}
+      footer={<VaultInfoFooter />}
+    />
+  );
+}
+
+/** Usage + security explainer under the workspace vault list. */
+function VaultInfoFooter() {
+  const { t } = useTranslation();
+  const code = (text: string) => (
+    <code className="font-mono" style={{ color: 'var(--color-text-secondary)' }}>{text}</code>
+  );
+  return (
+    <div
+      className="flex flex-col gap-2.5 text-xs p-3 rounded-lg mt-1"
+      style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}
+    >
+      <div>
+        <span className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>{t('vault.workspace.usageTitle')}</span>
+        <div className="mt-1">
+          {t('vault.workspace.usageAccess')} {code('from vault import get; key = get("SECRET_NAME")')}
         </div>
-        {secrets.length < MAX_SECRETS && (
-          <button
-            onClick={() => { setShowAdd(!showAdd); setError(null); }}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors"
-            style={{
-              color: 'var(--color-btn-primary-text)',
-              backgroundColor: 'var(--color-btn-primary-bg)',
-            }}
-          >
-            <Plus className="h-3 w-3" />
-            Add Secret
-          </button>
-        )}
       </div>
-
-      {error && (
-        <div className="text-xs p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-loss)' }}>
-          {error}
-        </div>
-      )}
-
-      {/* Recommended credentials — blueprints declared by enabled MCP servers */}
-      {blueprints.length > 0 && !showAdd && (
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-1.5 text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-            <Sparkles className="h-3 w-3" />
-            Recommended credentials
-          </div>
-          {blueprints.map(bp => {
-            const disabled = remainingSlots <= 0;
-            return (
-              <button
-                key={bp.name}
-                type="button"
-                onClick={() => openAddForBlueprint(bp)}
-                disabled={disabled}
-                className="flex flex-col items-start gap-0.5 p-3 rounded-lg text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                style={{
-                  backgroundColor: 'var(--color-bg-card)',
-                  border: '1px dashed var(--color-border-default)',
-                }}
-                title={disabled ? `Vault at ${MAX_SECRETS}/${MAX_SECRETS} — remove a secret first` : undefined}
-              >
-                <div className="flex items-center justify-between w-full gap-2">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-                      {bp.label}
-                    </span>
-                    <span className="text-xs font-mono px-1.5 py-0.5 rounded flex-shrink-0" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-tag)' }}>
-                      {bp.name}
-                    </span>
-                  </div>
-                  <span className="text-xs flex items-center gap-1 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }}>
-                    <Plus className="h-3 w-3" />
-                    Set up
-                  </span>
-                </div>
-                {bp.description && (
-                  <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                    {bp.description}
-                  </div>
-                )}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Add form */}
-      {showAdd && (
-        <div
-          className="flex flex-col gap-2 p-3 rounded-lg"
-          style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
-        >
-          {presetBlueprint && (
-            <div className="flex items-center justify-between text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-              <span>
-                Setting up <span style={{ color: 'var(--color-text-primary)' }}>{presetBlueprint.label}</span>
-              </span>
-              {presetBlueprint.docs_url && (
-                <a
-                  href={presetBlueprint.docs_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 hover:underline"
-                  style={{ color: 'var(--color-accent-primary)' }}
-                >
-                  Docs <ExternalLink className="h-3 w-3" />
-                </a>
-              )}
-            </div>
-          )}
-          <input
-            type="text"
-            value={newName}
-            onChange={e => setNewName(e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '').replace(/^[0-9]+/, ''))}
-            placeholder="SECRET_NAME"
-            className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--color-accent-primary)] font-mono"
-            style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
-            maxLength={64}
-          />
-          <div className="relative">
-            <input
-              type={showNewValue ? 'text' : 'password'}
-              value={newValue}
-              onChange={e => setNewValue(e.target.value)}
-              placeholder="Secret value"
-              className="w-full px-3 py-2 pr-9 text-sm rounded-md bg-transparent outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--color-accent-primary)]"
-              style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
-              maxLength={4096}
-            />
-            <button
-              type="button"
-              onClick={() => setShowNewValue(!showNewValue)}
-              className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded transition-colors hover:bg-foreground/10"
-              style={{ color: 'var(--color-text-tertiary)' }}
-              tabIndex={-1}
-            >
-              {showNewValue ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-            </button>
-          </div>
-          {valueHintFailing && (
-            <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-              This doesn&apos;t look like a valid {presetBlueprint?.label ?? 'token'}
-              {presetBlueprint?.docs_url ? ' — check the docs link above.' : '.'}
-              <span className="ml-1 opacity-70">You can still save.</span>
-            </div>
-          )}
-          <input
-            type="text"
-            value={newDesc}
-            onChange={e => setNewDesc(e.target.value)}
-            placeholder="Description (optional)"
-            className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--color-accent-primary)]"
-            style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
-            maxLength={256}
-          />
-          <div className="flex justify-end gap-2 mt-1">
-            <button
-              onClick={closeAddForm}
-              className="px-3 py-1.5 text-xs rounded-md transition-colors hover:bg-foreground/10"
-              style={{ color: 'var(--color-text-tertiary)' }}
-            >
-              Cancel
-            </button>
-            <button
-              onClick={handleCreate}
-              disabled={saving || !newName || !newValue}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-              style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
-            >
-              {saving && <Loader size={12} className="text-current" />}
-              Save
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Secret list */}
-      {secrets.length === 0 ? (
-        <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-          No secrets stored. Add API keys or credentials for agent code to use.
-        </div>
-      ) : (
-        <div className="flex flex-col gap-1">
-          {secrets.map(secret => (
-            <div key={secret.workspace_vault_secret_id}>
-              {editingName === secret.name ? (
-                /* Edit form */
-                <div
-                  className="flex flex-col gap-2 p-3 rounded-lg"
-                  style={{ backgroundColor: 'var(--color-bg-card)', border: '1px solid var(--color-border-elevated)' }}
-                >
-                  <div className="text-sm font-mono font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                    {secret.name}
-                  </div>
-                  <div className="relative">
-                    <input
-                      type={showEditValue ? 'text' : 'password'}
-                      value={editValue}
-                      onChange={e => setEditValue(e.target.value)}
-                      placeholder="New value (leave empty to keep current)"
-                      className="w-full px-3 py-2 pr-9 text-sm rounded-md bg-transparent outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--color-accent-primary)]"
-                      style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
-                      maxLength={4096}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowEditValue(!showEditValue)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded transition-colors hover:bg-foreground/10"
-                      style={{ color: 'var(--color-text-tertiary)' }}
-                      tabIndex={-1}
-                    >
-                      {showEditValue ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                    </button>
-                  </div>
-                  <input
-                    type="text"
-                    value={editDesc}
-                    onChange={e => setEditDesc(e.target.value)}
-                    placeholder="Description"
-                    className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--color-accent-primary)]"
-                    style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
-                    maxLength={256}
-                  />
-                  <div className="flex justify-end gap-2 mt-1">
-                    <button
-                      onClick={() => { setEditingName(null); setEditValue(''); setEditDesc(''); setShowEditValue(false); }}
-                      className="px-3 py-1.5 text-xs rounded-md transition-colors hover:bg-foreground/10"
-                      style={{ color: 'var(--color-text-tertiary)' }}
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={() => handleUpdate(secret.name)}
-                      disabled={editSaving}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-                      style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
-                    >
-                      {editSaving && <Loader size={12} className="text-current" />}
-                      Update
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                /* Display row */
-                <div
-                  className="flex items-center justify-between py-2.5 px-3 rounded-lg"
-                  style={{ backgroundColor: 'var(--color-bg-card)' }}
-                >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-mono font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                        {secret.name}
-                      </span>
-                      <span className="text-xs font-mono" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {revealedSecrets[secret.name] !== undefined ? revealedSecrets[secret.name] : secret.masked_value}
-                      </span>
-                    </div>
-                    {secret.description && (
-                      <p className="text-xs mt-0.5 truncate" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {secret.description}
-                      </p>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-1 flex-shrink-0 ml-2">
-                    <button
-                      onClick={() => handleRevealToggle(secret.name)}
-                      disabled={revealingName === secret.name}
-                      className="p-1.5 rounded transition-colors hover:bg-foreground/10 disabled:opacity-50"
-                      style={{ color: 'var(--color-text-tertiary)' }}
-                      title={revealedSecrets[secret.name] !== undefined ? 'Hide value' : 'Reveal value'}
-                    >
-                      {revealingName === secret.name ? (
-                        <Loader size={14} className="text-current" />
-                      ) : revealedSecrets[secret.name] !== undefined ? (
-                        <EyeOff className="h-3.5 w-3.5" />
-                      ) : (
-                        <Eye className="h-3.5 w-3.5" />
-                      )}
-                    </button>
-                    <button
-                      onClick={() => {
-                        setEditingName(secret.name);
-                        setEditValue('');
-                        setEditDesc(secret.description);
-                        setError(null);
-                      }}
-                      className="p-1.5 rounded transition-colors hover:bg-foreground/10"
-                      style={{ color: 'var(--color-text-tertiary)' }}
-                      title="Edit"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                    {deletingName === secret.name ? (
-                      <div className="flex items-center gap-1">
-                        <button
-                          onClick={() => handleDelete(secret.name)}
-                          disabled={deleteLoading}
-                          className="px-2 py-1 text-xs rounded transition-colors disabled:opacity-50"
-                          style={{ color: 'var(--color-loss)', backgroundColor: 'var(--color-bg-card)' }}
-                        >
-                          {deleteLoading ? 'Deleting…' : 'Confirm'}
-                        </button>
-                        <button
-                          onClick={() => setDeletingName(null)}
-                          className="px-2 py-1 text-xs rounded transition-colors hover:bg-foreground/10"
-                          style={{ color: 'var(--color-text-tertiary)' }}
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={() => setDeletingName(secret.name)}
-                        className="p-1.5 rounded transition-colors hover:bg-foreground/10"
-                        style={{ color: 'var(--color-text-tertiary)' }}
-                        title="Delete"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Usage & Security info */}
       <div
-        className="flex flex-col gap-2.5 text-xs p-3 rounded-lg mt-1"
-        style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}
+        className="pt-2 flex flex-col gap-1.5"
+        style={{ borderTop: '1px solid var(--color-border-muted)' }}
       >
-        <div>
-          <span className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>Usage</span>
-          <div className="mt-1">
-            Access in code: <code className="font-mono" style={{ color: 'var(--color-text-secondary)' }}>{'from vault import get; key = get("SECRET_NAME")'}</code>
-          </div>
-        </div>
-        <div
-          className="pt-2 flex flex-col gap-1.5"
-          style={{ borderTop: '1px solid var(--color-border-muted)' }}
-        >
-          <span className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>Security</span>
-          <ul className="flex flex-col gap-1 pl-3" style={{ listStyleType: 'disc' }}>
-            <li>Secrets are encrypted at rest with AES (pgcrypto) and never stored in plaintext on our servers.</li>
-            <li>The AI agent cannot read secret values directly &mdash; it can only call <code className="font-mono" style={{ color: 'var(--color-text-secondary)' }}>vault.get()</code> inside sandboxed code.</li>
-            <li>All agent output is scanned by leak detection. Any secret value found in tool results is automatically redacted before reaching the model.</li>
-            <li>Direct file access to the internal secret store is blocked by code validation &mdash; only the <code className="font-mono" style={{ color: 'var(--color-text-secondary)' }}>vault</code> API is allowed.</li>
-          </ul>
-        </div>
+        <span className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>{t('vault.workspace.securityTitle')}</span>
+        <ul className="flex flex-col gap-1 pl-3" style={{ listStyleType: 'disc' }}>
+          <li>{t('vault.workspace.security1')}</li>
+          <li>{t('vault.workspace.security2a')} {code('vault.get()')} {t('vault.workspace.security2b')}</li>
+          <li>{t('vault.workspace.security3')}</li>
+          <li>{t('vault.workspace.security4a')} {code('vault')} {t('vault.workspace.security4b')}</li>
+        </ul>
       </div>
     </div>
   );

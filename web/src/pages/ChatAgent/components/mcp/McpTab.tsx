@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { AnimatePresence } from 'framer-motion';
-import { Plus, ServerCog, Download, Cable } from 'lucide-react';
+import { Plus, Server, Download, Cable } from 'lucide-react';
 import {
   useWorkspaceMcpServers,
   useAddWorkspaceMcpServer,
@@ -19,6 +20,14 @@ import { formatApiErrorDetail, getVaultSecrets, type EffectiveServer, type McpSe
 import { McpServerRow } from './McpServerRow';
 import { McpServerModal } from './McpServerModal';
 import { McpImportModal } from './McpImportModal';
+import {
+  ConfirmStrip,
+  HeaderButton,
+  ListEmpty,
+  ListError,
+  ListHeader,
+  ListSkeleton,
+} from './McpPrimitives';
 
 /**
  * The "MCP" tab in the workspace settings panel — the workspace-scoped view.
@@ -58,6 +67,7 @@ interface McpTabProps {
 }
 
 export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
 
   const { data, isLoading, error } = useWorkspaceMcpServers(workspaceId);
@@ -207,7 +217,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
       setModalOpen(false);
       setEditing(null);
       if (saved.warnings?.length) {
-        toast({ title: 'Server saved with warnings', description: saved.warnings.join('\n') });
+        toast({ title: t('mcp.tab.savedWithWarnings'), description: saved.warnings.join('\n') });
       }
     } catch (err) {
       setSubmitError(formatApiErrorDetail(err));
@@ -266,18 +276,18 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
       try {
         await promoteAsync({ name, overwrite });
         toast({
-          title: overwrite ? 'Template updated' : 'Saved as template',
-          description: `"${name}" is now in your Templates — add it to any workspace.`,
+          title: overwrite ? t('mcp.tab.promoteUpdatedTitle') : t('mcp.tab.promotedTitle'),
+          description: t('mcp.tab.promotedDesc', { name }),
         });
       } catch (err) {
         toast({
           variant: 'destructive',
-          title: 'Could not save template',
+          title: t('mcp.tab.promoteFailed'),
           description: formatApiErrorDetail(err),
         });
       }
     },
-    [promoteAsync],
+    [promoteAsync, t],
   );
 
   const handlePromote = useCallback(
@@ -308,112 +318,72 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <ServerCog className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
-              <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-                MCP servers
-              </span>
-              <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-card)' }}>
-                {workspaceCount} / {maxServers}
-              </span>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={handleManageInConnectors}
-                title="User-level servers, OAuth connections and shared secrets"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors hover:bg-foreground/10"
-                style={{ color: 'var(--color-text-tertiary)' }}
-              >
-                <Cable className="h-3 w-3" />
-                Connectors
-              </button>
-              <button
-                type="button"
-                onClick={() => setImportOpen(true)}
-                disabled={atCap}
-                title={atCap ? `At ${maxServers}/${maxServers} — remove one first` : 'Paste a standard mcpServers JSON config'}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-                style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
-              >
-                <Download className="h-3 w-3" />
-                Import JSON
-              </button>
-              <button
-                type="button"
-                onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
-                disabled={atCap}
-                title={atCap ? `At ${maxServers}/${maxServers} — remove one first` : undefined}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-                style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
-              >
-                <Plus className="h-3 w-3" />
-                Add server
-              </button>
-            </div>
-          </div>
+          <ListHeader icon={Server} title={t('mcp.list.title')} count={workspaceCount} max={maxServers}>
+            <HeaderButton variant="ghost" icon={Cable} onClick={handleManageInConnectors} title={t('mcp.tab.connectorsHint')}>
+              {t('mcp.tab.connectors')}
+            </HeaderButton>
+            <HeaderButton
+              variant="secondary"
+              icon={Download}
+              onClick={() => setImportOpen(true)}
+              disabled={atCap}
+              title={atCap ? t('mcp.list.atCap', { max: maxServers }) : t('mcp.list.importHint')}
+            >
+              {t('mcp.list.importJson')}
+            </HeaderButton>
+            <HeaderButton
+              variant="primary"
+              icon={Plus}
+              onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
+              disabled={atCap}
+              title={atCap ? t('mcp.list.atCap', { max: maxServers }) : undefined}
+            >
+              {t('mcp.list.addServer')}
+            </HeaderButton>
+          </ListHeader>
 
           {!sandboxRunning && sandboxWarming && (
             <div className="text-[0.6875rem] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
-              Starting workspace — your servers are checked automatically as soon as it&apos;s up.
+              {t('mcp.tab.startingWorkspace')}
             </div>
           )}
 
           {!sandboxRunning && !sandboxWarming && (
             <div className="text-[0.6875rem] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
-              Workspace is stopped — saving a server starts it back up and checks the server automatically.
+              {t('mcp.tab.workspaceStopped')}
             </div>
           )}
 
           {promoteConfirm && (
-            <div
-              className="flex items-center justify-between gap-3 text-[0.6875rem] p-2 rounded"
-              style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
-            >
-              <span className="min-w-0">
-                Template <span className="font-medium">{promoteConfirm}</span> already exists. Overwrite it with this server&apos;s current config?
-              </span>
-              <div className="flex items-center gap-1.5 flex-shrink-0">
-                <button
-                  type="button"
-                  onClick={async () => {
-                    const name = promoteConfirm;
-                    setPromoteConfirm(null);
-                    await doPromote(name, true);
-                  }}
-                  disabled={promoteMutation.isPending}
-                  className="px-2 py-1 rounded disabled:opacity-50"
-                  style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
-                >
-                  Overwrite
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setPromoteConfirm(null)}
-                  className="px-2 py-1 rounded hover:bg-foreground/10"
-                  style={{ color: 'var(--color-text-tertiary)' }}
-                >
-                  Cancel
-                </button>
-              </div>
-            </div>
+            <ConfirmStrip
+              message={
+                <>
+                  {t('mcp.tab.promoteExistsBefore')}
+                  <span className="font-medium">{promoteConfirm}</span>
+                  {t('mcp.tab.promoteExistsAfter')}
+                </>
+              }
+              confirmLabel={t('mcp.tab.overwrite')}
+              confirmVariant="primary"
+              cancelLabel={t('common.cancel')}
+              pending={promoteMutation.isPending}
+              onConfirm={async () => {
+                const name = promoteConfirm;
+                setPromoteConfirm(null);
+                await doPromote(name, true);
+              }}
+              onCancel={() => setPromoteConfirm(null)}
+            />
           )}
 
           {error ? (
-            <div className="text-xs p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-loss)' }}>
-              {(error as { message?: string })?.message || 'Failed to load MCP servers'}
-            </div>
+            <ListError>
+              {(error as { message?: string })?.message || t('mcp.list.loadFailed')}
+            </ListError>
           ) : isLoading ? (
-            <div className="flex flex-col gap-2">
-              {[1, 2, 3].map((i) => (
-                <div key={i} className="h-14 rounded-lg animate-pulse" style={{ backgroundColor: 'var(--color-bg-card)' }} />
-              ))}
-            </div>
+            <ListSkeleton />
           ) : servers.length === 0 ? (
-            <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-              No MCP servers. Add one or copy a template.
-            </div>
+            <ListEmpty>{t('mcp.list.empty')}</ListEmpty>
           ) : (
             <div className="flex flex-col gap-1.5">
               <AnimatePresence initial={false}>

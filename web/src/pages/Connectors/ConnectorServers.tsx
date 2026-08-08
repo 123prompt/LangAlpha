@@ -1,14 +1,10 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { motion } from 'framer-motion';
+import { AnimatePresence } from 'framer-motion';
 import {
-  AlertCircle,
-  CheckCircle2,
   Download,
   Link2,
   Link2Off,
-  MinusCircle,
-  MoreVertical,
   Pencil,
   Plus,
   RefreshCw,
@@ -36,6 +32,20 @@ import {
 import { useUserVaultSecrets, useCreateUserVaultSecret } from '@/hooks/useUserVault';
 import { McpServerModal } from '@/pages/ChatAgent/components/mcp/McpServerModal';
 import { McpImportModal } from '@/pages/ChatAgent/components/mcp/McpImportModal';
+import { McpOauthPill } from '@/pages/ChatAgent/components/mcp/McpStatusPill';
+import {
+  ConfirmStrip,
+  EnabledToggle,
+  HeaderButton,
+  KebabTrigger,
+  ListEmpty,
+  ListError,
+  ListHeader,
+  ListSkeleton,
+  ServerNameLine,
+  ServerRowShell,
+  TagBadge,
+} from '@/pages/ChatAgent/components/mcp/McpPrimitives';
 import {
   formatApiErrorDetail,
   startMcpOauth,
@@ -51,61 +61,11 @@ import {
  * template. Remote (http) servers carry the OAuth connect lifecycle — the
  * vendor bearer never leaves the host, so "Connect" here is all a sandbox
  * needs for the server to work.
+ *
+ * Row anatomy mirrors the workspace MCP tab (`McpServerRow`): identity line
+ * (icon + name + transport badge), then the status line (OAuth pill + scope
+ * text), then the description — same primitives, same rhythm.
  */
-
-// Matches the spring used by McpServerRow so the toggle feels identical.
-const SPRING_SNAPPY = { type: 'spring' as const, stiffness: 200, damping: 22 };
-
-interface OauthMeta {
-  labelKey: string;
-  color: string;
-  bg: string;
-  icon: React.ComponentType<{ className?: string }>;
-}
-
-const OAUTH_META: Record<McpOauthStatus, OauthMeta> = {
-  connected: {
-    labelKey: 'connectors.oauth.connected',
-    color: 'var(--color-profit)',
-    bg: 'var(--color-profit-soft)',
-    icon: CheckCircle2,
-  },
-  needs_reauth: {
-    labelKey: 'connectors.oauth.needsReauth',
-    color: 'var(--color-warning, #d97706)',
-    bg: 'var(--color-warning-soft)',
-    icon: AlertCircle,
-  },
-  refresh_ambiguous: {
-    labelKey: 'connectors.oauth.refreshAmbiguous',
-    color: 'var(--color-warning, #d97706)',
-    bg: 'var(--color-warning-soft)',
-    icon: AlertCircle,
-  },
-  revoked: {
-    labelKey: 'connectors.oauth.revoked',
-    color: 'var(--color-text-tertiary)',
-    bg: 'var(--color-bg-tag)',
-    icon: MinusCircle,
-  },
-};
-
-function OauthBadge({ status }: { status: McpOauthStatus }) {
-  const { t } = useTranslation();
-  const meta = OAUTH_META[status];
-  if (!meta) return null;
-  const Icon = meta.icon;
-  return (
-    <span
-      className="inline-flex items-center gap-1 text-[0.6875rem] px-1.5 py-0.5 rounded font-medium"
-      style={{ color: meta.color, backgroundColor: meta.bg }}
-      data-testid={`oauth-status-${status}`}
-    >
-      <Icon className="h-3 w-3" />
-      {t(meta.labelKey)}
-    </span>
-  );
-}
 
 /** Adapt a masked catalog row to the modal's `EffectiveServer`-shaped initial value. */
 function catalogToInitial(c: CatalogServer): EffectiveServer {
@@ -282,214 +242,151 @@ export function ConnectorServers() {
   }
 
   if (isLoading) {
-    return (
-      <div className="flex flex-col gap-2">
-        {[1, 2, 3].map((i) => (
-          <div key={i} className="h-14 rounded-lg animate-pulse" style={{ backgroundColor: 'var(--color-bg-card)' }} />
-        ))}
-      </div>
-    );
+    return <ListSkeleton />;
   }
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Server className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
-          <span className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-            {t('connectors.servers.title')}
-          </span>
-          <span className="text-xs px-1.5 py-0.5 rounded" style={{ color: 'var(--color-text-tertiary)', backgroundColor: 'var(--color-bg-card)' }}>
-            {servers.length} / {maxServers}
-          </span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            onClick={() => setImportOpen(true)}
-            disabled={atCap}
-            title={atCap ? t('connectors.servers.atCap', { max: maxServers }) : t('connectors.servers.importHint')}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-            style={{ color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
-          >
-            <Download className="h-3 w-3" />
-            {t('connectors.servers.importJson')}
-          </button>
-          <button
-            type="button"
-            onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
-            disabled={atCap}
-            title={atCap ? t('connectors.servers.atCap', { max: maxServers }) : undefined}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
-            style={{ color: 'var(--color-btn-primary-text)', backgroundColor: 'var(--color-btn-primary-bg)' }}
-          >
-            <Plus className="h-3 w-3" />
-            {t('connectors.servers.addServer')}
-          </button>
-        </div>
-      </div>
+      <ListHeader icon={Server} title={t('mcp.list.title')} count={servers.length} max={maxServers}>
+        <HeaderButton
+          variant="secondary"
+          icon={Download}
+          onClick={() => setImportOpen(true)}
+          disabled={atCap}
+          title={atCap ? t('mcp.list.atCap', { max: maxServers }) : t('mcp.list.importHint')}
+        >
+          {t('mcp.list.importJson')}
+        </HeaderButton>
+        <HeaderButton
+          variant="primary"
+          icon={Plus}
+          onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
+          disabled={atCap}
+          title={atCap ? t('mcp.list.atCap', { max: maxServers }) : undefined}
+        >
+          {t('mcp.list.addServer')}
+        </HeaderButton>
+      </ListHeader>
 
       <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
         {t('connectors.servers.inheritHint')}
       </p>
 
       {error ? (
-        <div className="text-xs p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-loss)' }}>
-          {(error as { message?: string })?.message || t('connectors.servers.loadFailed')}
-        </div>
+        <ListError>
+          {(error as { message?: string })?.message || t('mcp.list.loadFailed')}
+        </ListError>
       ) : servers.length === 0 ? (
-        <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-          {t('connectors.servers.empty')}
-        </div>
+        <ListEmpty>{t('connectors.servers.empty')}</ListEmpty>
       ) : (
         <div className="flex flex-col gap-1.5">
-          {servers.map((server) => {
-            const oauthEligible = server.transport === 'http';
-            const status = server.oauth_status ?? null;
-            return (
-              <div
-                key={server.name}
-                className="flex items-start justify-between gap-3 py-2.5 px-3 rounded-lg"
-                style={{ backgroundColor: 'var(--color-bg-card)' }}
-                data-testid={`connector-row-${server.name}`}
-              >
-                <div className="min-w-0 flex flex-col gap-1">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <Server className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
-                    <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-primary)' }}>
-                      {server.name}
-                    </span>
-                    <span
-                      className="text-[0.625rem] px-1.5 py-0.5 rounded uppercase tracking-wide"
-                      style={{
-                        color: 'var(--color-text-tertiary)',
-                        backgroundColor: 'var(--color-bg-tag)',
-                        border: '1px solid var(--color-border-muted)',
-                      }}
-                    >
-                      {server.transport}
-                    </span>
-                    {status && <OauthBadge status={status} />}
-                  </div>
-                  {server.description && (
-                    <p className="text-[0.6875rem] line-clamp-2" style={{ color: 'var(--color-text-tertiary)' }}>
-                      {server.description}
-                    </p>
-                  )}
-                  <span className="text-[0.6875rem]" style={{ color: server.enabled ? 'var(--color-text-secondary)' : 'var(--color-text-tertiary)' }}>
-                    {server.enabled
-                      ? t('connectors.servers.enabledState')
-                      : t('connectors.servers.disabledState')}
-                  </span>
-                </div>
+          <AnimatePresence initial={false}>
+            {servers.map((server) => {
+              const oauthEligible = server.transport === 'http';
+              const status = server.oauth_status ?? null;
+              return (
+                <ServerRowShell
+                  key={server.name}
+                  testid={`connector-row-${server.name}`}
+                  main={
+                    <>
+                      <ServerNameLine icon={Server} name={server.name}>
+                        <TagBadge>{server.transport}</TagBadge>
+                      </ServerNameLine>
 
-                <div className="flex items-center gap-2 flex-shrink-0">
-                  {oauthEligible && needsConnect(status) && (
-                    <button
-                      type="button"
-                      onClick={() => handleConnect(server.name)}
-                      disabled={connectingName === server.name}
-                      className="inline-flex items-center gap-1 px-2 py-1 text-[0.6875rem] rounded-md transition-colors disabled:opacity-50"
-                      style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
-                    >
-                      {connectingName === server.name
-                        ? <Loader size={12} className="text-current" />
-                        : <Link2 className="h-3 w-3" />}
-                      {status ? t('connectors.oauth.reconnect') : t('connectors.oauth.connect')}
-                    </button>
-                  )}
+                      {/* Status line: OAuth pill + inheritance scope */}
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {status && <McpOauthPill status={status} />}
+                        <span
+                          className="text-[0.6875rem]"
+                          style={{ color: server.enabled ? 'var(--color-text-secondary)' : 'var(--color-text-tertiary)' }}
+                        >
+                          {server.enabled
+                            ? t('connectors.servers.enabledState')
+                            : t('connectors.servers.disabledState')}
+                        </span>
+                      </div>
 
-                  {/* Enabled toggle — fans out to every workspace */}
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={!!server.enabled}
-                    aria-label={`${server.enabled ? 'Disable' : 'Enable'} ${server.name}`}
-                    disabled={togglingName === server.name}
-                    onClick={() => handleToggle(server, !server.enabled)}
-                    className="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
-                    style={{
-                      backgroundColor: server.enabled ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
-                    }}
-                  >
-                    <motion.span
-                      className="inline-block h-4 w-4 rounded-full bg-white"
-                      animate={{ x: server.enabled ? 18 : 2 }}
-                      transition={SPRING_SNAPPY}
-                    />
-                  </button>
-
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <button
-                        type="button"
-                        className="p-1.5 rounded transition-colors hover:bg-foreground/10"
-                        style={{ color: 'var(--color-text-tertiary)' }}
-                        aria-label={`Actions for ${server.name}`}
-                      >
-                        {refreshingName === server.name
-                          ? <Loader size={16} className="text-current" />
-                          : <MoreVertical className="h-4 w-4" />}
-                      </button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onSelect={() => { setEditing(server); setSubmitError(null); setModalOpen(true); }}>
-                        <Pencil className="h-3.5 w-3.5 mr-2" />
-                        {t('connectors.servers.edit')}
-                      </DropdownMenuItem>
-                      {oauthEligible && status === 'connected' && (
-                        <DropdownMenuItem onSelect={() => handleRefreshSchemas(server.name)}>
-                          <RefreshCw className="h-3.5 w-3.5 mr-2" />
-                          {t('connectors.oauth.refreshSchemas')}
-                        </DropdownMenuItem>
+                      {server.description && (
+                        <p className="text-[0.6875rem] line-clamp-2" style={{ color: 'var(--color-text-tertiary)' }}>
+                          {server.description}
+                        </p>
                       )}
-                      {oauthEligible && status && status !== 'revoked' && (
-                        <DropdownMenuItem onSelect={() => handleDisconnect(server.name)}>
-                          <Link2Off className="h-3.5 w-3.5 mr-2" />
-                          {t('connectors.oauth.disconnect')}
-                        </DropdownMenuItem>
+                    </>
+                  }
+                  actions={
+                    <>
+                      {oauthEligible && needsConnect(status) && (
+                        <button
+                          type="button"
+                          onClick={() => handleConnect(server.name)}
+                          disabled={connectingName === server.name}
+                          className="inline-flex items-center gap-1 px-2 py-1 text-[0.6875rem] rounded-md transition-colors disabled:opacity-50"
+                          style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
+                        >
+                          {connectingName === server.name
+                            ? <Loader size={12} className="text-current" />
+                            : <Link2 className="h-3 w-3" />}
+                          {status ? t('connectors.oauth.reconnect') : t('connectors.oauth.connect')}
+                        </button>
                       )}
-                      <DropdownMenuItem onSelect={() => setDeletingName(server.name)} variant="destructive">
-                        <Trash2 className="h-3.5 w-3.5 mr-2" />
-                        {t('connectors.servers.delete')}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              </div>
-            );
-          })}
+
+                      {/* Enabled toggle — fans out to every workspace */}
+                      <EnabledToggle
+                        enabled={!!server.enabled}
+                        name={server.name}
+                        disabled={togglingName === server.name}
+                        onToggle={() => handleToggle(server, !server.enabled)}
+                      />
+
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <KebabTrigger
+                            busy={refreshingName === server.name}
+                            aria-label={t('mcp.row.actionsAria', { name: server.name })}
+                          />
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onSelect={() => { setEditing(server); setSubmitError(null); setModalOpen(true); }}>
+                            <Pencil className="h-3.5 w-3.5 mr-2" />
+                            {t('mcp.row.edit')}
+                          </DropdownMenuItem>
+                          {oauthEligible && status === 'connected' && (
+                            <DropdownMenuItem onSelect={() => handleRefreshSchemas(server.name)}>
+                              <RefreshCw className="h-3.5 w-3.5 mr-2" />
+                              {t('connectors.oauth.refreshSchemas')}
+                            </DropdownMenuItem>
+                          )}
+                          {oauthEligible && status && status !== 'revoked' && (
+                            <DropdownMenuItem onSelect={() => handleDisconnect(server.name)}>
+                              <Link2Off className="h-3.5 w-3.5 mr-2" />
+                              {t('connectors.oauth.disconnect')}
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuItem onSelect={() => setDeletingName(server.name)} variant="destructive">
+                            <Trash2 className="h-3.5 w-3.5 mr-2" />
+                            {t('mcp.row.delete')}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </>
+                  }
+                />
+              );
+            })}
+          </AnimatePresence>
         </div>
       )}
 
       {deletingName && (
-        <div
-          className="flex items-center justify-between gap-3 text-[0.6875rem] p-2 rounded"
-          style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-secondary)', border: '1px solid var(--color-border-muted)' }}
-        >
-          <span className="min-w-0">
-            {t('connectors.servers.deleteConfirm', { server: deletingName })}
-          </span>
-          <div className="flex items-center gap-1.5 flex-shrink-0">
-            <button
-              type="button"
-              onClick={() => handleDelete(deletingName)}
-              disabled={deleteMutation.isPending}
-              className="px-2 py-1 rounded disabled:opacity-50"
-              style={{ color: 'var(--color-loss)' }}
-            >
-              {deleteMutation.isPending ? t('common.loading') : t('connectors.servers.deleteConfirmYes')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setDeletingName(null)}
-              className="px-2 py-1 rounded hover:bg-foreground/10"
-              style={{ color: 'var(--color-text-tertiary)' }}
-            >
-              {t('connectors.servers.deleteConfirmNo')}
-            </button>
-          </div>
-        </div>
+        <ConfirmStrip
+          message={t('connectors.servers.deleteConfirm', { server: deletingName })}
+          confirmLabel={deleteMutation.isPending ? t('common.loading') : t('connectors.servers.deleteConfirmYes')}
+          cancelLabel={t('connectors.servers.deleteConfirmNo')}
+          pending={deleteMutation.isPending}
+          onConfirm={() => handleDelete(deletingName)}
+          onCancel={() => setDeletingName(null)}
+        />
       )}
 
       {modalOpen && (

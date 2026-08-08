@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
 import { McpStatusPill } from './McpStatusPill';
 import type { McpStatus } from '../../utils/api';
@@ -41,6 +42,7 @@ interface McpLifecycleProps {
 }
 
 export function McpLifecycle({ status, enabled, origin, checking, synced, sandboxRunning, sandboxWarming = false }: McpLifecycleProps) {
+  const { t } = useTranslation();
   // Built-ins are process-global: always connected, no per-workspace discovery
   // or apply state to surface. They never show the verify/apply track.
   if (origin === 'builtin') return <McpStatusPill status={status} enabled={enabled} />;
@@ -66,11 +68,11 @@ export function McpLifecycle({ status, enabled, origin, checking, synced, sandbo
   const readyState: StepState = verified ? (synced ? 'done' : 'active') : 'todo';
 
   let label: string;
-  if (verifying) label = 'Verifying…';
-  else if (warmingUp) label = 'Starting workspace…';
-  else if (status === 'pending') label = 'Waiting for workspace to start';
-  else if (verified && !synced) label = sandboxRunning ? 'Applying to agent…' : 'Applies when workspace starts';
-  else label = 'Ready';
+  if (verifying) label = t('mcp.lifecycle.verifying');
+  else if (warmingUp) label = t('mcp.lifecycle.starting');
+  else if (status === 'pending') label = t('mcp.lifecycle.waiting');
+  else if (verified && !synced) label = sandboxRunning ? t('mcp.lifecycle.applying') : t('mcp.lifecycle.appliesOnStart');
+  else label = t('mcp.lifecycle.ready');
 
   const phase = verifying
     ? 'verifying'
