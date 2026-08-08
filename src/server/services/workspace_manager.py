@@ -514,7 +514,11 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         grants: dict[str, str],
     ) -> None:
         """Mint a fresh relay JWT and (re)write the sandbox credential file."""
-        from src.config.env import EGRESS_RELAY_BASE_URL, EGRESS_RELAY_SECRET
+        from src.config.env import EGRESS_RELAY_SECRET
+        from src.server.services.egress.reachability import (
+            effective_relay_base_url,
+            relay_reachability_warning,
+        )
         from src.server.services.egress.relay_jwt import (
             DEFAULT_TTL_SECONDS,
             mint_relay_jwt,
@@ -523,6 +527,11 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         sandbox = session.sandbox
         if sandbox is None:
             return
+        provider = self.config.sandbox.provider
+        relay_base = effective_relay_base_url(provider)
+        warning = relay_reachability_warning(provider, relay_base)
+        if warning:
+            logger.warning("[EGRESS] %s", warning)
         token = mint_relay_jwt(
             EGRESS_RELAY_SECRET,
             user_id=user_id,
@@ -532,7 +541,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         minted_at = time.time()
         await sandbox.upload_egress_relay_credentials(
             {
-                "relay_base_url": EGRESS_RELAY_BASE_URL.rstrip("/"),
+                "relay_base_url": relay_base.rstrip("/"),
                 "token": token,
                 "grants": grants,
             }

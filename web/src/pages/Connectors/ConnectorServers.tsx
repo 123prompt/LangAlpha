@@ -187,7 +187,13 @@ export function ConnectorServers() {
   async function handleToggle(server: CatalogServer, enabled: boolean) {
     setTogglingName(server.name);
     try {
-      await toggleMutation.mutateAsync({ name: server.name, enabled });
+      const result = await toggleMutation.mutateAsync({ name: server.name, enabled });
+      if (result.warnings?.length) {
+        toast({
+          title: t('connectors.servers.enabledWithWarnings'),
+          description: result.warnings.join('\n'),
+        });
+      }
     } catch (err) {
       toast({
         variant: 'destructive',

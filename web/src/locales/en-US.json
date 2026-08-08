@@ -2625,6 +2625,7 @@
       "empty": "No connectors yet. Add a server or import a JSON config.",
       "loadFailed": "Failed to load servers",
       "toggleFailed": "Could not change server state",
+      "enabledWithWarnings": "Server enabled with warnings",
       "deleteFailed": "Could not delete server",
       "deleteConfirm": "Delete \"{{server}}\" from your Connectors? Workspaces stop inheriting it immediately.",
       "deleteConfirmYes": "Delete",

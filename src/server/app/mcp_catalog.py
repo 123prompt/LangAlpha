@@ -328,6 +328,31 @@ async def import_servers(
     }
 
 
+async def _relay_execution_warning(user_id: str, name: str) -> str | None:
+    """OAuth-connected servers execute only via the egress relay — activation
+    is the moment to tell the user their deployment can't actually run them."""
+    from src.config.env import EGRESS_RELAY_SECRET
+    from src.server.app import setup
+    from src.server.database.mcp_oauth import get_connection
+    from src.server.services.egress.reachability import (
+        effective_relay_base_url,
+        relay_reachability_warning,
+    )
+
+    if setup.agent_config is None:
+        return None
+    if await get_connection(user_id, name) is None:
+        return None
+    if not EGRESS_RELAY_SECRET:
+        return (
+            "The egress relay is disabled (EGRESS_RELAY_SECRET is not set), so "
+            "this server's tools cannot run in sandboxes. Set a strong "
+            "EGRESS_RELAY_SECRET in the backend environment and restart."
+        )
+    provider = setup.agent_config.sandbox.provider
+    return relay_reachability_warning(provider, effective_relay_base_url(provider))
+
+
 @router.patch("/servers/{name}/enabled")
 @handle_api_exceptions("toggle MCP catalog server", logger)
 async def set_enabled(
@@ -338,7 +363,12 @@ async def set_enabled(
     found = await set_catalog_server_enabled(user_id, name, body.enabled)
     if not found:
         raise HTTPException(status_code=404, detail="MCP server not found")
-    return {"name": name, "enabled": body.enabled}
+    out: dict = {"name": name, "enabled": body.enabled}
+    if body.enabled:
+        warning = await _relay_execution_warning(user_id, name)
+        if warning:
+            out["warnings"] = [warning]
+    return out
 
 
 @router.delete("/servers/{name}")

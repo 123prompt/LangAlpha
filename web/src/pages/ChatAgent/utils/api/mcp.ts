@@ -282,7 +282,7 @@ export async function deleteMcpCatalogServer(name: string) {
 /** Enable/disable a catalog server for ALL the user's workspaces (inheritance). */
 export async function setMcpCatalogServerEnabled(name: string, enabled: boolean) {
   const { data } = await api.patch(`/api/v1/mcp/servers/${name}/enabled`, { enabled });
-  return data as { name: string; enabled: boolean };
+  return data as { name: string; enabled: boolean; warnings?: string[] };
 }
 
 /**

@@ -2604,6 +2604,7 @@
       "empty": "还没有连接器。添加一个服务器或导入 JSON 配置。",
       "loadFailed": "加载服务器失败",
       "toggleFailed": "无法更改服务器状态",
+      "enabledWithWarnings": "服务器已启用，但存在警告",
       "deleteFailed": "无法删除服务器",
       "deleteConfirm": "从连接器中删除“{{server}}”？所有工作区将立即停止继承它。",
       "deleteConfirmYes": "删除",
