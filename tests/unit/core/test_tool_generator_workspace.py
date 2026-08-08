@@ -32,10 +32,16 @@ def _write_vault(tmp_path, secrets: dict) -> str:
     return str(tmp_path)
 
 
-class TestBuiltinByteStability:
-    """Builtin-only codegen must not gain vault machinery."""
+class TestBuiltinConfigMinimal:
+    """Builtin config entries carry env key NAMES only — never values.
 
-    def test_no_vault_refs_in_builtin_client(self):
+    The client runtime is a static module (vault machinery always present but
+    inert without untrusted entries); the security contract lives in the
+    generated CONFIG: builtin entries must never embed env values, headers, or
+    untrusted-only flags.
+    """
+
+    def test_builtin_entries_embed_no_env_values(self):
         gen = ToolFunctionGenerator()
         servers = [
             MCPServerConfig(
@@ -43,21 +49,21 @@ class TestBuiltinByteStability:
                 transport="stdio",
                 command="node",
                 args=["srv.js"],
-                env={"PLACEHOLDER_KEY": "x"},
+                env={"PLACEHOLDER_KEY": "secret-value"},
             ),
             MCPServerConfig(
                 name="remote_srv", transport="sse", url="https://example.test/mcp"
             ),
         ]
-        code = gen.generate_mcp_client_code(servers)
-        # No vault resolution helpers leak into builtin-only output.
-        assert "_load_vault" not in code
-        assert "_VAULT_SECRETS_FILE" not in code
-        assert "_build_proc_env" not in code
-        assert "_resolve_cmd_args" not in code
-        assert "def discover(" not in code
-        # The stdio cmd stays the byte-identical raw-args form.
-        assert 'cmd = [config["command"]] + config["args"]' in code
+        config = gen.generate_client_config(servers)
+        stdio_entry = config["servers"]["data_srv"]
+        assert stdio_entry["env_keys"] == ["PLACEHOLDER_KEY"]
+        assert "env" not in stdio_entry
+        assert "source" not in stdio_entry
+        sse_entry = config["servers"]["remote_srv"]
+        assert sse_entry == {"transport": "sse", "url": "https://example.test/mcp"}
+        # And the composed module never embeds the value anywhere.
+        assert "secret-value" not in gen.generate_mcp_client_code(servers)
 
     def test_builtin_stdio_uses_os_environ(self):
         gen = ToolFunctionGenerator()
@@ -392,9 +398,9 @@ class TestDiscoveryUsesSecrets:
         )
         assert headers["Authorization"] == "Bearer real-secret"
 
-    def test_builtin_only_client_omits_flag_byte_stable(self):
-        """The new key only appears for workspace servers; a builtin-only config
-        must not gain it (or any vault machinery)."""
+    def test_builtin_entries_omit_flag(self):
+        """The flag only appears on untrusted entries; builtin config entries
+        never carry it."""
         gen = ToolFunctionGenerator()
         servers = [
             MCPServerConfig(
@@ -408,8 +414,9 @@ class TestDiscoveryUsesSecrets:
                 name="remote_srv", transport="sse", url="https://example.test/mcp"
             ),
         ]
-        code = gen.generate_mcp_client_code(servers)
-        assert "discovery_uses_secrets" not in code
+        config = gen.generate_client_config(servers)
+        for entry in config["servers"].values():
+            assert "discovery_uses_secrets" not in entry
 
 
 class TestDiscoverEntrypoint:
@@ -470,7 +477,7 @@ class TestWorkspaceToolTextSanitized:
             server_name="user_srv",
         )
         gen = ToolFunctionGenerator()
-        module = gen.generate_tool_module("user_srv", [tool], source="workspace")
+        module = gen.generate_tool_module("user_srv", [tool], untrusted=True)
         # The generated module must compile — the breakout is inert.
         ast.parse(module)
 
@@ -508,7 +515,7 @@ class TestToolNameInjection:
             server_name="user_srv",
         )
         gen = ToolFunctionGenerator()
-        module = gen.generate_tool_module("user_srv", [tool], source="workspace")
+        module = gen.generate_tool_module("user_srv", [tool], untrusted=True)
         tree = ast.parse(module)  # must parse — the breakout is inert
 
         # The hostile name survives ONLY as inert data inside a string literal
@@ -568,7 +575,7 @@ class TestParamNameInjection:
             server_name="user_srv",
         )
         gen = ToolFunctionGenerator()
-        module = gen.generate_tool_module("user_srv", [tool], source="workspace")
+        module = gen.generate_tool_module("user_srv", [tool], untrusted=True)
         tree = ast.parse(module)  # must parse cleanly
         # The hostile key was sanitized to an identifier — no os.system Call and
         # no `import os` statement was injected. (The module legitimately
@@ -601,7 +608,7 @@ class TestParamNameInjection:
             server_name="user_srv",
         )
         gen = ToolFunctionGenerator()
-        module = gen.generate_tool_module("user_srv", [tool], source="workspace")
+        module = gen.generate_tool_module("user_srv", [tool], untrusted=True)
         ast.parse(module)
         # Key emitted via repr (single-quoted), value references the identifier.
         assert "'sym': sym," in module
@@ -630,7 +637,7 @@ class TestParamTypeInjection:
         hostile = '"""x", __import__("os").system("touch /tmp/pwned") #'
         gen = ToolFunctionGenerator()
         module = gen.generate_tool_module(
-            "user_srv", [self._tool(hostile)], source="workspace"
+            "user_srv", [self._tool(hostile)], untrusted=True
         )
         tree = ast.parse(module)  # must parse — the breakout is inert
         assert not any(
@@ -642,7 +649,7 @@ class TestParamTypeInjection:
         # An unhashable `type` must neither crash codegen nor inject quotes.
         gen = ToolFunctionGenerator()
         module = gen.generate_tool_module(
-            "user_srv", [self._tool({"evil": '"""'})], source="workspace"
+            "user_srv", [self._tool({"evil": '"""'})], untrusted=True
         )
         ast.parse(module)
         # The closed type_map falls back to Any in the signature.
@@ -651,7 +658,7 @@ class TestParamTypeInjection:
     def test_hostile_param_type_sanitized_in_docs(self):
         hostile = '"""x"""'
         gen = ToolFunctionGenerator()
-        doc = gen.generate_tool_documentation(self._tool(hostile), source="workspace")
+        doc = gen.generate_tool_documentation(self._tool(hostile), untrusted=True)
         assert '"""' not in doc
 
     def test_builtin_param_type_byte_stable(self):

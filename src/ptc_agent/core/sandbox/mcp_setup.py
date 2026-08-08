@@ -18,6 +18,7 @@ from ptc_agent.core.sandbox._defaults import DEFAULT_DEPENDENCIES
 from ptc_agent.core.sandbox.retry import RetryPolicy
 
 from ..mcp_sanitize import (
+    is_user_server,
     sanitize_tool_name,
 )
 from typing import TYPE_CHECKING
@@ -163,11 +164,12 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
         )
     )
 
-    # Per-server source map (builtin vs untrusted workspace) drives codegen
-    # sanitization + neutral framing for user-server tools.
-    source_by_name = {
-        s.name: getattr(s, "source", "builtin")
-        for s in sandbox.config.mcp.servers
+    # Trust is computed ONCE here, per server, and passed across the codegen
+    # boundary as a bool — codegen never re-derives it from the raw source
+    # string (that duplication is how user-level servers once slipped through
+    # the workspace-only gates).
+    untrusted_by_name = {
+        s.name: is_user_server(s) for s in sandbox.config.mcp.servers
     }
 
     # 2. Tool modules and documentation
@@ -216,10 +218,10 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
         )
 
     for server_name, tools in tools_by_server.items():
-        source = source_by_name.get(server_name, "builtin")
+        untrusted = untrusted_by_name.get(server_name, False)
         # Generate Python module
         module_code = sandbox.tool_generator.generate_tool_module(
-            server_name, tools, source=source
+            server_name, tools, untrusted=untrusted
         )
         module_path = f"{work_dir}/tools/{server_name}.py"
         uploads.append(
@@ -240,13 +242,12 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
         # Generate documentation for each tool
         for tool in tools:
             doc = sandbox.tool_generator.generate_tool_documentation(
-                tool, source=source
+                tool, untrusted=untrusted
             )
-            # Untrusted workspace tool names could contain ``..`` or ``/`` and
-            # traverse out of the docs dir; use the sanitized identifier for
-            # the filename. Builtin names are already valid identifiers, so
-            # sanitize_tool_name leaves them unchanged (byte-identical path).
-            if source == "workspace":
+            # Untrusted tool names could contain ``..`` or ``/`` and traverse
+            # out of the docs dir; use the sanitized identifier for the
+            # filename. Builtin names are already valid identifiers.
+            if untrusted:
                 doc_name = sanitize_tool_name(tool.name) or "_invalid_tool"
             else:
                 doc_name = tool.name

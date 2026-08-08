@@ -1,11 +1,20 @@
-"""Tool Function Generator - Convert MCP tool schemas to Python functions."""
+"""Tool Function Generator - MCP tool schemas to sandbox wrapper modules.
 
+The sandbox MCP client itself is NOT generated: it ships verbatim from
+``sandbox/mcp_client_runtime.py`` (a static, lintable, directly-testable
+module). ``generate_mcp_client_code`` composes that source with a JSON
+config epilogue carrying all per-workspace variance; this module otherwise
+generates only the per-server wrapper functions and their docs.
+"""
+
+import hashlib
+import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import structlog
 
-from ptc_agent.agent.provenance import SNIPPET_MAX_CHARS
 from ptc_agent.agent.provenance.types import RESULT_BODY_MAX_BYTES
 from ptc_agent.config.core import MCPServerConfig
 
@@ -21,33 +30,41 @@ from .mcp_sanitize import (
 logger = structlog.get_logger(__name__)
 
 
-# Version of the generated mcp_client.py output. Bump whenever the generated
-# client *code* changes (e.g. the _trace_mcp_call template) in a way that should
-# reach existing sandboxes. The sandbox manifest hashes generation *inputs* (MCP
-# server files, tool schemas, user config) — not this generator's source — so a
-# pure codegen change is otherwise invisible to sync_sandbox_assets and never
-# re-uploaded to a reused sandbox. Folding this constant into the tool_modules
-# version makes a bump force the regenerated client onto every workspace on its
-# next sync. See sandbox/assets.py:_compute_sandbox_manifest.
-# "3": the backend runtime moved to Python 3.13, which dedents docstrings at
-# compile time. Tool docstrings are interpolated into the generated wrappers, so
-# 54 of the 61 agent-facing pins re-render with different leading whitespace —
-# content-identical, but a warm sandbox would otherwise keep serving the 3.12
-# spacing indefinitely, since the manifest hashes generation inputs and the
-# interpreter is not one of them.
-# "4": MCP 2026-07-28 client — server/discover negotiation with legacy
-# initialize fallback, per-request _meta, id-matched replies, structuredContent
-# preference, resultType handling, spec HTTP headers, legacy "sse" rejected;
-# relay-bound OAuth servers — vendor calls ride POST {base}/v1/egress/{id}.
-MCP_CLIENT_CODEGEN_VERSION = "4"
+_RUNTIME_FILE = Path(__file__).parent / "sandbox" / "mcp_client_runtime.py"
 
-# Aggregate per-execution ceiling on result_body bytes emitted BY THE GENERATED
-# CLIENT, interpolated into it. This keeps a cooperative run's trace small (per
-# call still capped at RESULT_BODY_MAX_BYTES; this bounds their sum to ~4 MiB).
-# It is NOT a host-memory security bound: MCP_TRACE_FILE is visible to agent
-# code, which can append to the JSONL directly and bypass this counter. The hard
-# host-side bound on what _collect_mcp_trace reads lives in ptc_sandbox (it sizes
-# the file and skips one far past any legit trace).
+
+@lru_cache(maxsize=1)
+def client_runtime_source() -> str:
+    """The static sandbox client runtime, uploaded verbatim (plus epilogue)."""
+    return _RUNTIME_FILE.read_text(encoding="utf-8")
+
+
+# Version of the uploaded mcp_client.py. The manifest hashes generation
+# *inputs* (MCP server files, tool schemas, user config) — not this package's
+# source — so a pure client/codegen change is otherwise invisible to
+# sync_sandbox_assets and never reaches a reused sandbox. Folding this value
+# into the tool_modules version forces the regenerated client onto every
+# workspace on its next sync (see sandbox/assets.py:_compute_sandbox_manifest).
+#
+# The hash suffix tracks mcp_client_runtime.py automatically, so editing the
+# runtime needs no manual bump. Bump the major only when the WRAPPER/composition
+# logic in this file changes in a way that must reach existing sandboxes.
+# "4": MCP 2026-07-28 client. "5": client extracted to the static runtime
+# module; per-workspace config moved to a JSON epilogue.
+_WRAPPER_CODEGEN_MAJOR = "5"
+
+MCP_CLIENT_CODEGEN_VERSION = "{}.{}".format(
+    _WRAPPER_CODEGEN_MAJOR,
+    hashlib.sha256(client_runtime_source().encode("utf-8")).hexdigest()[:12],
+)
+
+# Aggregate per-execution ceiling on result_body bytes emitted BY THE SANDBOX
+# CLIENT, shipped to it via the config epilogue. This keeps a cooperative run's
+# trace small (per call still capped at RESULT_BODY_MAX_BYTES; this bounds
+# their sum to ~4 MiB). It is NOT a host-memory security bound: MCP_TRACE_FILE
+# is visible to agent code, which can append to the JSONL directly and bypass
+# this counter. The hard host-side bound on what _collect_mcp_trace reads lives
+# in ptc_sandbox (it sizes the file and skips one far past any legit trace).
 RESULT_BODY_TRACE_BUDGET_BYTES = 4 * 1024 * 1024
 
 
@@ -61,113 +78,20 @@ def _safe_func_name(name: str) -> str:
     return sanitize_tool_name(name) or "_invalid_tool"
 
 
-# ---------------------------------------------------------------------------
-# Discovery source — substituted into the generated mcp_client.py f-string when
-# any workspace server is present. The constant is inserted VERBATIM via the
-# {discover_block} substitution (not f-string-interpolated), so braces are
-# single. Discovery runs tools/list over the server's own transport WITHOUT the
-# vault (refs resolve to inert placeholders) and writes its result to a file:
-# {"server": name, "status": "ok"|"error", "error": str,
-#  "tools": [{name, description, input_schema}]}.
-# ---------------------------------------------------------------------------
-_DISCOVER_SOURCE = '''
-
-def discover(server_name: str) -> dict:
-    """List a server's tools without requiring the vault (file-IPC caller writes JSON).
-
-    Returns {"server", "status", "error", "tools": [{name, description,
-    input_schema}]}. Never raises — failures are captured in ``status``/``error``.
-    """
-    config = _SERVER_CONFIGS.get(server_name)
-    if not config:
-        return {"server": server_name, "status": "error",
-                "error": "unknown server", "tools": []}
-    transport = config.get("transport", "stdio")
-    try:
-        if transport in ("sse", "http"):
-            raw = _discover_sse(server_name)
-        else:
-            raw = _discover_stdio(server_name)
-    except Exception as e:  # noqa: BLE001 - discovery must never crash the driver
-        return {"server": server_name, "status": "error",
-                "error": str(e), "tools": []}
-    tools = []
-    for t in raw or []:
-        if not isinstance(t, dict):
-            continue
-        tools.append({
-            "name": t.get("name", ""),
-            "description": t.get("description", "") or "",
-            "input_schema": t.get("inputSchema") or t.get("input_schema") or {},
-        })
-    return {"server": server_name, "status": "ok", "error": "", "tools": tools}
-
-
-def _discover_stdio(server_name: str) -> list:
-    """Negotiate with the stdio server in discovery mode and list its tools."""
-    proc, proto = _ensure_stdio_server(server_name, discovery=True)
-    if proto["mode"] == "modern":
-        req = _modern_request("tools/list", {}, proto["version"])
-    else:
-        req = _legacy_request("tools/list", {})
-    _send_message(server_name, proc, req)
-    resp = _read_reply(server_name, proc, req["id"], 30)
-    if "error" in resp:
-        raise RuntimeError(f"tools/list error: {resp['error']}")
-    return (resp.get("result") or {}).get("tools", [])
-
-
-def _discover_sse(server_name: str) -> list:
-    """Negotiate with the http server in discovery mode and list its tools."""
-    proto = _ensure_http_server(server_name, discovery=True)
-    config = _SERVER_CONFIGS.get(server_name)
-    url, headers = _resolve_sse(config, server_name, discovery=True)
-    if proto["mode"] == "modern":
-        req = _modern_request("tools/list", {}, proto["version"])
-    else:
-        req = _legacy_request("tools/list", {})
-    hdrs = _mcp_headers("tools/list", "", proto, headers)
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(url, json=req, headers=hdrs)
-        response.raise_for_status()
-        result = _parse_http_reply(response, req["id"], server_name)
-    if "error" in result:
-        raise RuntimeError(f"tools/list error: {result['error']}")
-    return (result.get("result") or {}).get("tools", [])
-'''
-
-
-# CLI: ``python mcp_client.py discover <server_name> <output_path>``. Inserted
-# verbatim (single braces). Writes the discover() dict to <output_path> as JSON.
-# Always exits 0 (errors go in the file) so the host driver reads structured
-# results, not exit codes.
-_MAIN_SOURCE = '''
-
-if __name__ == "__main__":
-    if len(sys.argv) >= 4 and sys.argv[1] == "discover":
-        _server, _out = sys.argv[2], sys.argv[3]
-        _result = discover(_server)
-        with open(_out, "w") as _f:
-            json.dump(_result, _f)
-        sys.exit(0)
-    print("usage: mcp_client.py discover <server_name> <output_path>", file=sys.stderr)  # noqa: T201
-    sys.exit(2)
-'''
-
-
 class ToolFunctionGenerator:
     """Generates Python function code from MCP tool schemas."""
 
     def generate_tool_module(
-        self, server_name: str, tools: list[MCPToolInfo], source: str = "builtin"
+        self, server_name: str, tools: list[MCPToolInfo], *, untrusted: bool = False
     ) -> str:
         """Generate a complete Python module for a server's tools.
 
         Args:
             server_name: Name of the MCP server
             tools: List of tools from this server
-            source: 'builtin' or 'workspace'. For workspace (untrusted) servers,
-                tool names are validated/de-collided and descriptions sanitized.
+            untrusted: True for user-configured servers (any non-builtin
+                source): tool names are validated/de-collided and descriptions
+                sanitized. Trusted builtins keep their text verbatim.
 
         Returns:
             Complete Python module code as string
@@ -202,14 +126,14 @@ except ImportError:
 
 '''
 
-        # For untrusted workspace servers, validate + de-collide tool names so
-        # one hostile/duplicate name can't break the module (builtins keep their
+        # For untrusted servers, validate + de-collide tool names so one
+        # hostile/duplicate name can't break the module (builtins keep their
         # historical behavior; they are trusted and already collision-free).
-        if source == "workspace":
+        if untrusted:
             sanitized = sanitize_tool_set(tools)
             if sanitized.skipped:
                 logger.warning(
-                    "Skipped invalid tools for workspace MCP server",
+                    "Skipped invalid tools for untrusted MCP server",
                     server=server_name,
                     skipped=sanitized.skipped,
                 )
@@ -217,21 +141,21 @@ except ImportError:
 
         # Generate functions for each tool
         for tool in tools:
-            code += self._generate_function(tool, server_name, source)
+            code += self._generate_function(tool, server_name, untrusted)
             code += "\n\n"
 
         return code
 
     def _generate_function(
-        self, tool: MCPToolInfo, server_name: str, source: str = "builtin"
+        self, tool: MCPToolInfo, server_name: str, untrusted: bool = False
     ) -> str:
         """Generate Python function for a single tool.
 
         Args:
             tool: Tool information from MCP server
             server_name: Name of the MCP server this tool belongs to
-            source: 'builtin' or 'workspace' (untrusted text is sanitized for
-                workspace servers; builtin output is unchanged)
+            untrusted: sanitize names/text for user-configured servers;
+                trusted builtin output is unchanged
 
         Returns:
             Python function code
@@ -240,17 +164,17 @@ except ImportError:
         func_name = _safe_func_name(tool.name)
         params = tool.get_parameters()
 
-        # For untrusted workspace servers, coerce each param NAME into a legal
+        # For untrusted servers, coerce each param NAME into a legal
         # identifier (a hostile schema key could otherwise inject code or break
         # the module); skip names that can't be salvaged. Builtins keep the raw
-        # key verbatim so their generated code stays byte-identical.
-        if source == "workspace":
+        # key verbatim.
+        if untrusted:
             usable: dict[str, dict[str, Any]] = {}
             for param_name, param_info in params.items():
                 safe_param = sanitize_tool_name(param_name)
                 if safe_param is None or safe_param in usable:
                     logger.warning(
-                        "Skipped invalid/colliding param for workspace MCP tool",
+                        "Skipped invalid/colliding param for untrusted MCP tool",
                         server=server_name,
                         tool=tool.name,
                         param=param_name,
@@ -282,12 +206,12 @@ except ImportError:
         param_str = ", ".join(param_list)
 
         # Generate docstring
-        docstring = self._generate_docstring(tool, params, source)
+        docstring = self._generate_docstring(tool, params, untrusted)
 
-        # Generate function body. For workspace servers the arg-dict KEY is
-        # emitted via repr (the param name is untrusted text); builtins keep the
-        # historical double-quoted literal so their output is byte-identical.
-        if source == "workspace":
+        # Generate function body. For untrusted servers the arg-dict KEY is
+        # emitted via repr (the param name is untrusted text); builtins keep
+        # the historical double-quoted literal.
+        if untrusted:
             arg_dict_entries = [
                 f"        {param_name!r}: {param_name}," for param_name in params
             ]
@@ -301,10 +225,10 @@ except ImportError:
         # Extract return type from description for better type hints
         return_type, _ = self._extract_return_info(tool.description)
 
-        # Workspace tool names are untrusted — emit server/tool via repr so a
-        # hostile name can't escape the string literal and inject code. Builtins
-        # keep the historical double-quoted literal (byte-identical).
-        if source == "workspace":
+        # Untrusted tool names are hostile-capable text — emit server/tool via
+        # repr so a hostile name can't escape the string literal and inject
+        # code. Builtins keep the historical double-quoted literal.
+        if untrusted:
             call_line = (
                 f"    return _call_mcp_tool({server_name!r}, {tool.name!r}, arguments)"
             )
@@ -325,25 +249,26 @@ except ImportError:
 {call_line}'''
 
     def _generate_docstring(
-        self, tool: MCPToolInfo, params: dict[str, Any], source: str = "builtin"
+        self, tool: MCPToolInfo, params: dict[str, Any], untrusted: bool = False
     ) -> str:
         """Generate docstring for a tool function.
 
         Args:
             tool: Tool information
             params: Parameter information
-            source: 'builtin' (escape backslashes only, byte-stable) or
-                'workspace' (full untrusted-text sanitization)
+            untrusted: full untrusted-text sanitization for user-configured
+                servers; trusted builtins keep the backslash-only escape
 
         Returns:
             Formatted docstring
         """
 
         def _escape(text: str) -> str:
-            # Workspace (untrusted) text is fully sanitized — triple-quote
-            # breakouts, control chars, length cap. Builtins keep the historical
-            # backslash-only escape so their generated code stays byte-identical.
-            if source == "workspace":
+            # Untrusted text is fully sanitized — triple-quote breakouts,
+            # control chars, length cap. Builtins keep the historical
+            # backslash-only escape (sanitization could truncate legitimate
+            # long builtin docstrings).
+            if untrusted:
                 return sanitize_tool_text(text)
             return text.replace("\\", "\\\\")
 
@@ -509,14 +434,14 @@ except ImportError:
         return (type_hint, returns_text)
 
     def generate_tool_documentation(
-        self, tool: MCPToolInfo, source: str = "builtin"
+        self, tool: MCPToolInfo, *, untrusted: bool = False
     ) -> str:
         """Generate markdown documentation for a tool.
 
         Args:
             tool: Tool information
-            source: 'builtin' or 'workspace' (untrusted description text is
-                sanitized for workspace servers; builtin output is unchanged)
+            untrusted: sanitize description text for user-configured servers;
+                trusted builtin output is unchanged
 
         Returns:
             Markdown documentation string
@@ -524,9 +449,7 @@ except ImportError:
         func_name = _safe_func_name(tool.name)
         params = tool.get_parameters()
         description = (
-            sanitize_tool_text(tool.description)
-            if source == "workspace"
-            else tool.description
+            sanitize_tool_text(tool.description) if untrusted else tool.description
         )
 
         # Build signature
@@ -555,7 +478,7 @@ except ImportError:
                 )
                 param_type = str(param_info["type"])
                 param_desc = param_info.get("description", "")
-                if source == "workspace":
+                if untrusted:
                     param_type = sanitize_tool_text(param_type)
                     param_desc = sanitize_tool_text(param_desc)
                 doc += f"- `{param_name}` ({param_type}) - {required_marker}\n"
@@ -567,7 +490,7 @@ except ImportError:
 
         doc += "## Returns\n\n"
         return_type, return_desc = self._extract_return_info(tool.description)
-        if source == "workspace":
+        if untrusted:
             return_desc = sanitize_tool_text(return_desc)
         doc += f"**Type:** `{return_type}`\n\n"
         doc += f"{return_desc}\n\n"
@@ -593,1290 +516,98 @@ except ImportError:
 
         return doc
 
-    def _vault_runtime_block(self, working_dir: str, *, has_relay: bool = False) -> str:
-        """Runtime helpers for vault-only secret resolution (workspace servers).
+    def generate_client_config(
+        self,
+        server_configs: list[MCPServerConfig],
+        working_dir: str = "/home/workspace",
+    ) -> dict[str, Any]:
+        """Build the per-workspace config dict the client runtime consumes.
 
-        Emitted into the generated client ONLY when at least one workspace
-        server is present. ``${vault:NAME}`` references resolve exclusively from
-        ``{working_dir}/_internal/.vault_secrets.json`` — never from host
-        os.environ — so a user-named platform env var resolves to nothing. The
-        regex MUST mirror ``mcp_sanitize.VAULT_REF_RE``. In discovery mode the
-        vault file is absent, so refs resolve to an inert placeholder.
+        Builtin servers embed only env key NAMES — never values (the sandbox
+        already has the resolved values in os.environ, injected at creation
+        time). Untrusted servers embed their full env/header mappings, whose
+        values are either non-secret literals or ``${vault:NAME}`` placeholders
+        resolved in-sandbox against the vault file only. OAuth-connected
+        servers are relay-bound: the config carries a grant reference and the
+        runtime dials the egress relay — the vendor URL and every token stay
+        host-side.
         """
-        # NOTE: keep this pattern byte-identical to mcp_sanitize.VAULT_REF_RE.
-        relay_route = (
-            '    if config.get("relay_bound"):\n'
-            "        return _resolve_relay(config, server_name)\n\n"
-            if has_relay
-            else ""
-        )
-        return f'''
-import re as _re
+        servers: dict[str, dict[str, Any]] = {}
+        for server in server_configs:
+            untrusted = is_user_server(server)
+            if server.oauth_connection_id:
+                servers[server.name] = {
+                    "transport": "http",
+                    "source": server.source,
+                    "relay_bound": True,
+                    "relay_grant_id": server.egress_grant_id,
+                }
+                continue
+            if server.transport in ("sse", "http"):
+                entry: dict[str, Any] = {
+                    "transport": server.transport,
+                    "url": server.url or "",
+                }
+                if untrusted:
+                    entry["source"] = server.source
+                    entry["headers"] = dict(server.headers or {})
+                    entry["discovery_uses_secrets"] = discovery_should_use_secrets(
+                        server
+                    )
+                servers[server.name] = entry
+                continue
 
-# Matches ${{vault:NAME}} — mirrors mcp_sanitize.VAULT_REF_RE. Only this exact
-# form resolves; a bare ${{VAR}} is intentionally NOT a vault reference.
-_VAULT_REF_RE = _re.compile(r"\\$\\{{vault:([A-Za-z_][A-Za-z0-9_]{{0,127}})\\}}")
-_WORK_DIR = "{working_dir}"
-_INTERNAL_ROOT = "{working_dir}/_internal"
-_VAULT_SECRETS_FILE = "{working_dir}/_internal/.vault_secrets.json"
+            # Stdio transport. `uv run python mcp_servers/<file>.py` paths are
+            # rewritten to the sandbox's copy of the server file.
+            command = server.command
+            args = [str(a) for a in server.args]
+            if (
+                command == "uv"
+                and len(args) >= 3
+                and args[0] == "run"
+                and args[1] == "python"
+            ):
+                filename = Path(args[2]).name
+                args = ["run", "python", f"{working_dir}/mcp_servers/{filename}"]
+                logger.debug(
+                    "Transformed MCP server command for sandbox",
+                    server=server.name,
+                    original_args=server.args,
+                    sandbox_args=args,
+                )
+            entry = {"transport": "stdio", "command": command, "args": args}
+            if untrusted:
+                entry["source"] = server.source
+                entry["env"] = dict(server.env or {})
+                entry["discovery_uses_secrets"] = discovery_should_use_secrets(server)
+            else:
+                entry["env_keys"] = list(server.env.keys()) if server.env else []
+            servers[server.name] = entry
 
-
-def _load_vault() -> dict:
-    """Load the workspace vault. Returns {{}} when the file is absent (discovery)."""
-    try:
-        with open(_VAULT_SECRETS_FILE) as _f:
-            return json.load(_f)
-    except (FileNotFoundError, ValueError, OSError):
-        return {{}}
-
-
-def _resolve_vault_refs(value, vault, *, missing, discovery=False):
-    """Substitute ${{vault:NAME}} refs in ``value`` against ``vault`` only.
-
-    Unresolvable refs are recorded in ``missing`` (by NAME, never value). In
-    discovery mode they become an inert empty string so tools/list still runs.
-    There is NO fallback to os.environ — that is the whole point.
-    """
-    def _sub(match):
-        name = match.group(1)
-        if name in vault:
-            return vault[name]
-        missing.append(name)
-        return "" if discovery else match.group(0)
-
-    return _VAULT_REF_RE.sub(_sub, value)
-
-
-def _build_proc_env(config, server_name="?", *, discovery=False):
-    """Build the stdio subprocess env.
-
-    Builtin servers inherit os.environ. Workspace/user (untrusted) servers get a
-    MINIMAL scoped env (PATH/HOME plus only their own declared env values), with
-    ${{vault:NAME}} refs resolved vault-only — never the sandbox's full
-    os.environ, never a host-env fallback.
-    """
-    if config.get("source") not in ("workspace", "user"):
-        proc_env = os.environ.copy()
-        for key in config.get("env_keys", []):
-            if key in os.environ:
-                proc_env[key] = os.environ[key]
-    else:
-        proc_env = {{}}
-        for _k in ("PATH", "HOME", "LANG", "LC_ALL"):
-            if _k in os.environ:
-                proc_env[_k] = os.environ[_k]
-        # Secret-less discovery (default): every ${{vault:NAME}} ref hits the
-        # inert path. Opt in per server via discovery_uses_secrets for servers
-        # that need auth even to list tools. Normal calls always resolve.
-        vault = _load_vault() if (not discovery or config.get("discovery_uses_secrets")) else {{}}
-        missing = []
-        for _name, _val in (config.get("env") or {{}}).items():
-            proc_env[_name] = _resolve_vault_refs(
-                str(_val), vault, missing=missing, discovery=discovery
-            )
-        if missing and not discovery:
-            raise RuntimeError(
-                "Missing vault secret(s) for server "
-                + repr(server_name) + ": "
-                + ", ".join(sorted(set(missing)))
-            )
-
-    internal_root = _INTERNAL_ROOT
-    existing_pythonpath = proc_env.get("PYTHONPATH", "")
-    extra_paths = [_WORK_DIR, internal_root + "/src", internal_root]
-    proc_env["PYTHONPATH"] = ":".join(
-        [p for p in [existing_pythonpath, *extra_paths] if p]
-    )
-    return proc_env
-
-
-def _resolve_cmd_args(config, server_name, *, discovery=False):
-    """Resolve ${{vault:NAME}} refs in a stdio server's args, vault-only.
-
-    Builtin servers pass args through unchanged. Workspace (untrusted) servers
-    resolve refs the same way env/headers do — so a credential moved into args
-    by import resolves at spawn instead of leaking as a literal — with no host
-    os.environ fallback. Missing refs raise (named, never valued) unless in
-    discovery, where they become inert placeholders.
-    """
-    args = list(config.get("args") or [])
-    if config.get("source") not in ("workspace", "user"):
-        return args
-    vault = _load_vault() if (not discovery or config.get("discovery_uses_secrets")) else {{}}
-    missing = []
-    resolved = [
-        _resolve_vault_refs(str(_a), vault, missing=missing, discovery=discovery)
-        for _a in args
-    ]
-    if missing and not discovery:
-        raise RuntimeError(
-            "Missing vault secret(s) for server "
-            + repr(server_name) + ": " + ", ".join(sorted(set(missing)))
-        )
-    return resolved
-
-
-def _resolve_sse(config, server_name, *, discovery=False):
-    """Return (url, headers) for an sse/http request.
-
-    Builtin servers keep the legacy ${{VAR}}-from-os.environ URL resolution and
-    send no extra headers. Workspace (untrusted) servers resolve ${{vault:NAME}}
-    refs in BOTH the URL and headers vault-only (no host-env fallback) and send
-    the resolved headers. Missing refs raise (named, never valued) unless in
-    discovery, where they become inert placeholders.
-    """
-{relay_route}    url = config.get("url", "") or ""
-    if config.get("source") not in ("workspace", "user"):
-        def _env_sub(match):
-            return os.environ.get(match.group(1), match.group(0))
-
-        return _re.sub(r"\\$\\{{([^}}]+)\\}}", _env_sub, url), {{}}
-
-    # Secret-less discovery (default): refs resolve inert. Opt in per server via
-    # discovery_uses_secrets. Normal calls (discovery=False) always resolve.
-    vault = _load_vault() if (not discovery or config.get("discovery_uses_secrets")) else {{}}
-    missing = []
-    url = _resolve_vault_refs(url, vault, missing=missing, discovery=discovery)
-    headers = {{}}
-    for _hname, _hval in (config.get("headers") or {{}}).items():
-        headers[_hname] = _resolve_vault_refs(
-            str(_hval), vault, missing=missing, discovery=discovery
-        )
-    if missing and not discovery:
-        raise RuntimeError(
-            "Missing vault secret(s) for server "
-            + repr(server_name) + ": " + ", ".join(sorted(set(missing)))
-        )
-    return url, headers
-'''
-
-    def _relay_runtime_block(self, working_dir: str) -> str:
-        """Egress-relay client runtime, emitted only when an OAuth-connected
-        server is present.
-
-        Credentials are read from the sandbox file at CALL time — never embedded
-        — so a host-side JWT remint or grant change needs zero codegen resync.
-        The vendor URL never appears in generated code; the relay is the only
-        destination an OAuth-bound server ever dials.
-        """
-        return f'''
-_EGRESS_RELAY_FILE = "{working_dir}/_internal/.egress_relay.json"
-
-# Relay rejection codes (X-Relay-Error header) -> actionable guidance.
-_RELAY_ERROR_HINTS = {{
-    "needs_reauth": "the OAuth connection needs re-authorization; reconnect the server in Connectors",
-    "relay_auth": "this sandbox's relay credentials are invalid or expired",
-    "tool_blocked": "the tool is not permitted by this connection's policy",
-    "refresh_in_progress": "the vendor token is being refreshed; retry in a few seconds",
-    "limited_rate": "rate limit reached for this connection; retry shortly",
-    "limited_concurrency": "too many concurrent calls for this connection; retry shortly",
-    "relay_disabled": "the egress relay is disabled on this deployment",
-    "wall_clock": "the call exceeded the relay's time budget",
-}}
-
-
-def _load_relay_credentials() -> dict:
-    """Read the relay credential file fresh (it is re-minted host-side)."""
-    for _attempt in (0, 1):
-        try:
-            with open(_EGRESS_RELAY_FILE) as _f:
-                return json.load(_f)
-        except ValueError:
-            time.sleep(0.2)  # caught mid-rewrite; one retry
-        except (FileNotFoundError, OSError):
-            break
-    return {{}}
-
-
-def _relay_error(response, server_name: str):
-    """Actionable message when the RELAY (not the vendor) rejected the call.
-
-    Returns None for vendor responses — the relay's response-header allowlist
-    guarantees X-Relay-Error only ever originates from the relay itself.
-    """
-    code = response.headers.get("x-relay-error")
-    if not code:
-        return None
-    hint = _RELAY_ERROR_HINTS.get(code, code)
-    return f"MCP server {{server_name}}: relay rejected the call [{{code}}]: {{hint}}"
-
-
-def _resolve_relay(config, server_name):
-    """(url, headers) for an OAuth-connected server: always the egress relay."""
-    creds = _load_relay_credentials()
-    grant_id = (creds.get("grants") or {{}}).get(server_name) or config.get("relay_grant_id")
-    base = (creds.get("relay_base_url") or "").rstrip("/")
-    token = creds.get("token") or ""
-    if not (grant_id and base and token):
-        raise RuntimeError(
-            f"MCP server {{server_name}} is OAuth-connected but this sandbox has "
-            "no relay credentials - the egress relay may be disabled, or the "
-            "binding failed at session start; check the connection in Connectors"
-        )
-    return base + "/v1/egress/" + str(grant_id), {{"Authorization": "Bearer " + token}}
-'''
+        return {
+            "working_dir": working_dir,
+            "servers": servers,
+            "result_body_max_bytes": RESULT_BODY_MAX_BYTES,
+            "result_body_trace_budget_bytes": RESULT_BODY_TRACE_BUDGET_BYTES,
+        }
 
     def generate_mcp_client_code(
         self,
         server_configs: list[MCPServerConfig],
         working_dir: str = "/home/workspace",
     ) -> str:
-        """Generate standalone MCP client code for sandbox.
+        """Compose the uploadable mcp_client.py: static runtime + config epilogue.
 
-        This generates a complete MCP client that can run inside the sandbox,
-        start MCP server processes, and communicate with them via JSON-RPC over stdio.
-
-        Args:
-            server_configs: List of MCP server configurations
-            working_dir: Sandbox working directory for path resolution
-
-        Returns:
-            Python code for complete MCP client
+        The double json.dumps makes the embedded config injection-safe by
+        construction: the inner call serializes the config, the outer one turns
+        that JSON text into a valid Python string literal with all quoting and
+        control characters escaped — hostile server names can never terminate
+        the literal.
         """
-        # Build server configuration dict for code generation.
-        #
-        # Builtin servers (source == "builtin"): only env key NAMES are
-        # embedded — never values. The sandbox already has the resolved values
-        # in os.environ (injected by _build_sandbox_env_vars at creation time),
-        # so the generated code resolves them from os.environ at runtime.
-        #
-        # Workspace/user servers (source == "workspace" | "user", untrusted):
-        # env/header values may hold ``${vault:NAME}`` references. Those resolve
-        # ONLY from _internal/.vault_secrets.json — never from host os.environ —
-        # and a stdio server's subprocess gets a minimal scoped env (PATH/HOME
-        # plus its own declared values). The vault machinery is emitted only when
-        # at least one such server is present, so a builtin-only config yields
-        # the byte-identical module it always has (no `vault` references appear).
-        #
-        # OAuth-connected servers (oauth_connection_id set) are relay-bound:
-        # their sandbox config carries a grant reference and the generated code
-        # dials the egress relay — the vendor URL and every token stay host-side.
-        has_workspace = any(is_user_server(s) for s in server_configs)
-        has_relay = any(
-            getattr(s, "oauth_connection_id", None) for s in server_configs
+        config = self.generate_client_config(server_configs, working_dir=working_dir)
+        config_json = json.dumps(config, sort_keys=True)
+        return (
+            client_runtime_source()
+            + "\n\n# --- Per-workspace configuration (generated epilogue). ---\n"
+            + f"_apply_config_dict(json.loads({json.dumps(config_json)}))\n"
         )
-
-        servers_dict = "{\n"
-        for server in server_configs:
-            is_workspace = is_user_server(server)
-            if getattr(server, "oauth_connection_id", None):
-                grant = getattr(server, "egress_grant_id", None)
-                servers_dict += f"""    "{server.name}": {{
-        "transport": "http",
-        "source": {server.source!r},
-        "relay_bound": True,
-        "relay_grant_id": {grant!r},
-    }},
-"""
-                continue
-            if server.transport in ("sse", "http"):
-                url = server.url or ""
-                if is_workspace:
-                    headers_repr = repr(dict(getattr(server, "headers", {}) or {}))
-                    dus = discovery_should_use_secrets(server)
-                    servers_dict += f"""    "{server.name}": {{
-        "transport": "{server.transport}",
-        "url": {url!r},
-        "source": {server.source!r},
-        "headers": {headers_repr},
-        "discovery_uses_secrets": {dus!r},
-    }},
-"""
-                else:
-                    servers_dict += f"""    \"{server.name}\": {{
-        \"transport\": \"{server.transport}\",
-        \"url\": {url!r},
-    }},
-"""
-            else:
-                # Stdio transport.
-                command = server.command
-                args = list(server.args)
-
-                if (
-                    command == "uv"
-                    and len(args) >= 3
-                    and args[0] == "run"
-                    and args[1] == "python"
-                ):
-                    # Extract the Python file path (e.g., "mcp_servers/yfinance_mcp_server.py")
-                    local_path = args[2]
-                    filename = Path(local_path).name
-                    # Keep uv run, just fix the path to sandbox
-                    command = "uv"
-                    args = ["run", "python", f"{working_dir}/mcp_servers/{filename}"]
-                    logger.debug(
-                        "Transformed MCP server command for sandbox",
-                        server=server.name,
-                        original_command=server.command,
-                        original_args=server.args,
-                        sandbox_command=command,
-                        sandbox_args=args,
-                    )
-
-                args_list = ", ".join([repr(str(arg)) for arg in args])
-                if is_workspace:
-                    # Embed the full env mapping (name -> literal | "${vault:NAME}").
-                    # Values are NOT secrets: vault refs are placeholders resolved
-                    # in-sandbox; literals are user-supplied non-secret config.
-                    env_repr = repr(dict(getattr(server, "env", {}) or {}))
-                    dus = discovery_should_use_secrets(server)
-                    servers_dict += f"""    "{server.name}": {{
-        "transport": "stdio",
-        "command": "{command}",
-        "args": [{args_list}],
-        "source": {server.source!r},
-        "env": {env_repr},
-        "discovery_uses_secrets": {dus!r},
-    }},
-"""
-                else:
-                    # Builtin: store only env key names, NOT values. The sandbox
-                    # already has the resolved values in os.environ.
-                    env_keys_repr = "[]"
-                    if hasattr(server, "env") and server.env:
-                        env_keys_repr = repr(list(server.env.keys()))
-                    servers_dict += f"""    "{server.name}": {{
-        "transport": "stdio",
-        "command": "{command}",
-        "args": [{args_list}],
-        "env_keys": {env_keys_repr},
-    }},
-"""
-        servers_dict += "}"
-
-        vault_block = (
-            self._vault_runtime_block(working_dir, has_relay=has_relay)
-            if has_workspace
-            else ""
-        )
-        relay_block = self._relay_runtime_block(working_dir) if has_relay else ""
-
-        # Relay error handling in the HTTP call/negotiate paths, emitted only
-        # when a relay-bound server exists so other configs stay noise-free.
-        if has_relay:
-            relay_call_handling = (
-                "            _msg = _relay_error(response, server_name)\n"
-                '            if _msg and response.headers.get("x-relay-error") == "relay_auth":\n'
-                "                # The credential file may have been re-minted between\n"
-                "                # our read and this call - re-read it and retry once.\n"
-                "                url, _headers = _resolve_sse(config, server_name)\n"
-                '                headers = _mcp_headers("tools/call", tool_name, proto, _headers)\n'
-                "                response = client.post(url, json=request, headers=headers)\n"
-                "                _msg = _relay_error(response, server_name)\n"
-                "            if _msg:\n"
-                "                # A relay rejection also invalidates the negotiated\n"
-                "                # vendor session (e.g. reconnect mints a new grant).\n"
-                "                _PROTO.pop(server_name, None)\n"
-                "                raise RuntimeError(_msg)\n"
-            )
-            relay_init_check = (
-                "            _msg = _relay_error(response, server_name)\n"
-                "            if _msg:\n"
-                "                raise RuntimeError(_msg)\n"
-            )
-        else:
-            relay_call_handling = ""
-            relay_init_check = ""
-        # Relay-bound configs carry no vendor URL by design — their URL comes
-        # from _resolve_relay at request time, so the no-URL guard must not fire.
-        relay_url_exempt = (
-            ' and not config.get("relay_bound")' if has_relay else ""
-        )
-
-        # The stdio env-setup section. For builtin-only configs it is the
-        # historical inline block (byte-identical). When any workspace server is
-        # present it delegates to ``_build_proc_env`` (emitted in vault_block),
-        # which scopes the subprocess env and does vault-only resolution.
-        if has_workspace:
-            proc_env_setup = (
-                "\n    proc_env = _build_proc_env("
-                "config, server_name, discovery=discovery)\n"
-            )
-        else:
-            proc_env_setup = (
-                "\n    # Start process with stdio pipes\n"
-                "    # Merge server env with current environment\n"
-                "    proc_env = os.environ.copy()\n"
-                "\n"
-                "    # Ensure sandbox-internal packages are importable by Python MCP servers.\n"
-                f"    # We upload them under {working_dir}/_internal/src and add paths to PYTHONPATH.\n"
-                "    # - _internal/src: allows `from data_client.fmp import ...` (bare package name)\n"
-                "    # - _internal:     allows `from src.data_client.fmp import ...` (qualified)\n"
-                f'    internal_root = "{working_dir}/_internal"\n'
-                '    existing_pythonpath = proc_env.get("PYTHONPATH", "")\n'
-                f'    extra_paths = ["{working_dir}", f"{{internal_root}}/src", internal_root]\n'
-                '    proc_env["PYTHONPATH"] = ":".join([p for p in [existing_pythonpath, *extra_paths] if p])\n'
-                "\n"
-                "    # Resolve env vars by key name from os.environ (values are injected\n"
-                "    # at sandbox creation time, never hardcoded in this file).\n"
-                '    for key in config.get("env_keys", []):\n'
-                "        if key in os.environ:\n"
-                "            proc_env[key] = os.environ[key]\n"
-            )
-
-        # stdio command args. Builtin-only stays byte-identical (raw args). With
-        # a workspace server present, resolve ${vault:NAME} refs in args
-        # vault-only (mirrors env/header resolution) so an imported secret can
-        # live in args without leaking as a literal at rest.
-        if has_workspace:
-            cmd_args_expr = "_resolve_cmd_args(config, server_name, discovery=discovery)"
-        else:
-            cmd_args_expr = 'config["args"]'
-
-        # SSE/HTTP URL+header resolution. Builtin-only configs keep the legacy
-        # inline os.environ URL substitution with no extra headers (byte-stable).
-        # With any workspace server present, both paths route through
-        # ``_resolve_sse`` (vault-only for workspace, os.environ for builtins) and
-        # send resolved headers.
-        if has_workspace:
-            sse_init_resolve = (
-                "\n    url, _headers = _resolve_sse("
-                "config, server_name, discovery=discovery)\n"
-            )
-            sse_call_resolve = (
-                "\n        url, _headers = _resolve_sse(config, server_name)\n"
-            )
-        else:
-            sse_init_resolve = (
-                "\n    # Resolve environment variables in URL\n"
-                "    import re\n"
-                "    def resolve_env(match):\n"
-                "        var_name = match.group(1)\n"
-                "        return os.environ.get(var_name, match.group(0))\n"
-                "\n"
-                "    url = re.sub(r'\\$\\{([^}]+)\\}', resolve_env, url)\n"
-                "    _headers = {}\n"
-            )
-            sse_call_resolve = (
-                "\n        # Resolve environment variables in URL\n"
-                "        def resolve_env(match):\n"
-                "            var_name = match.group(1)\n"
-                "            return os.environ.get(var_name, match.group(0))\n"
-                "\n"
-                "        url = re.sub(r'\\$\\{([^}]+)\\}', resolve_env, url)\n"
-                "        _headers = {}\n"
-            )
-
-        # Discovery entrypoint + CLI. Emitted only when a workspace server is
-        # present so builtin-only clients stay byte-identical. Discovery lists a
-        # server's tools WITHOUT requiring the vault file (refs -> placeholders)
-        # and writes its JSON result to a caller-specified file (stdout is
-        # polluted by npx/MCP server logs, so file IPC is the contract).
-        if has_workspace:
-            discover_block = _DISCOVER_SOURCE
-            main_block = _MAIN_SOURCE
-            # In discovery mode, unresolved secret refs in a workspace server's
-            # env resolve to an inert placeholder (secrets may be absent).
-            discovery_param = ", discovery: bool = False"
-            discovery_arg = ", discovery=discovery"
-        else:
-            discover_block = ""
-            main_block = ""
-            discovery_param = ""
-            discovery_arg = ""
-
-        return f'''"""
-MCP Client for sandbox environment.
-
-This module manages MCP server processes and provides tool calling functionality.
-It supports both stdio (subprocess) and SSE (HTTP) transports.
-"""
-
-import collections
-import datetime
-import hashlib
-import json
-import os
-import queue
-import subprocess
-import sys
-import threading
-from typing import Any
-import time
-import httpx
-
-# Global registry of MCP server processes (for stdio)
-_server_processes: dict[str, subprocess.Popen] = {{}}
-_server_locks: dict[str, threading.RLock] = {{}}
-_locks_guard = threading.Lock()
-_message_id_counter = 0
-_message_id_lock = threading.Lock()
-
-# Negotiated protocol state per server, published only after a spawn+negotiate
-# transaction completes: {{"mode": "modern"|"legacy", "version": str,
-# "session_id": str|None}}. Per-interpreter (each execute_code is a fresh
-# process), so a silent server pays one bounded probe per interpreter.
-_PROTO: dict[str, dict] = {{}}
-
-_CLIENT_INFO = {{"name": "open-ptc-client", "version": "2.0.0"}}
-# Modern spec revisions this client speaks, newest first.
-_MODERN_VERSIONS = ("2026-07-28",)
-# Version offered on the legacy initialize fallback — the latest handshake
-# revision, so pre-2026 servers negotiate the newest era they support.
-_LEGACY_OFFER = "2025-11-25"
-_PROBE_TIMEOUT = 10.0
-_CALL_TIMEOUT = 120.0
-
-# MCP server configurations
-_SERVER_CONFIGS = {servers_dict}
-{vault_block}{relay_block}
-# Per-execution running sum of emitted result_body bytes. Each execute_code runs
-# in a FRESH interpreter process — both the Daytona and Docker providers spawn a
-# new `python` per code_run (a one-shot run, NOT a persistent kernel/session), so
-# this module is re-imported and the counter resets to 0 every run. It therefore
-# accumulates only across the MCP calls within ONE execute_code, never session-
-# wide. Caps interpolated at codegen
-# time from agent/provenance/types.py (RESULT_BODY_MAX_BYTES = per-call body cap;
-# the budget is the aggregate ceiling): once the running sum crosses the budget
-# we stop emitting result_body (snippet/sha/size still recorded) to keep a
-# cooperative run's trace small. This is a courtesy bound only — agent code can
-# write MCP_TRACE_FILE directly; the hard host-memory bound is in
-# sandbox/execution.py:_collect_mcp_trace, which sizes the file before reading it.
-_RESULT_BODY_MAX_BYTES = {RESULT_BODY_MAX_BYTES}
-_RESULT_BODY_TRACE_BUDGET_BYTES = {RESULT_BODY_TRACE_BUDGET_BYTES}
-_result_body_emitted_bytes = 0
-
-
-def _trace_mcp_call(server: str, tool: str, args: Any, result: Any) -> None:
-    """Append one JSONL provenance line for an MCP call (best-effort, never raises).
-
-    No-op unless MCP_TRACE_FILE is set. The fingerprint (sha256/size/snippet) is
-    computed in-sandbox and must reproduce the host-side fingerprint_result
-    contract byte-for-byte.
-    """
-    global _result_body_emitted_bytes
-    try:
-        trace_file = os.environ.get("MCP_TRACE_FILE")
-        if not trace_file:
-            return
-        try:
-            if isinstance(result, (dict, list)):
-                canonical = json.dumps(
-                    result, sort_keys=True, default=str, ensure_ascii=False
-                )
-            else:
-                canonical = str(result)
-        except Exception:
-            try:
-                canonical = str(result)
-            except Exception:
-                canonical = ""
-        encoded = canonical.encode("utf-8")
-        entry = {{
-            "server": server,
-            "tool": tool,
-            "args": args if isinstance(args, dict) else {{}},
-            "result_sha256": hashlib.sha256(encoded).hexdigest(),
-            # TRUE full byte length — independent of the body cap below, so the
-            # host can derive truncation as byte_len > len(stored body).
-            "result_size": len(encoded),
-            # Cap interpolated from the canonical SNIPPET_MAX_CHARS in
-            # agent/provenance/types.py at codegen time, so host + sandbox
-            # snippets match byte-for-byte for dedup with no manual hardcode.
-            "result_snippet": canonical[:{SNIPPET_MAX_CHARS}],
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }}
-        # Per-call body = first RESULT_BODY_MAX_BYTES *bytes* of the canonical
-        # result (decode with errors="ignore" so a multibyte char split at the
-        # cap is dropped, not mojibake). Hash-consistent: the body is a prefix of
-        # the exact bytes that produced result_sha256. Skip once the aggregate
-        # per-execution budget is exhausted — snippet/sha/size always survive.
-        if _result_body_emitted_bytes < _RESULT_BODY_TRACE_BUDGET_BYTES:
-            body = encoded[:_RESULT_BODY_MAX_BYTES].decode("utf-8", errors="ignore")
-            entry["result_body"] = body
-            _result_body_emitted_bytes += len(body.encode("utf-8"))
-        os.makedirs(os.path.dirname(trace_file), exist_ok=True)
-        with open(trace_file, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, default=str, ensure_ascii=False) + "\\n")
-            fh.flush()
-    except Exception:
-        # Tracing must never break the agent's code.
-        pass
-
-
-def _is_error_result(envelope: Any, value: Any) -> bool:
-    """True when an MCP tools/call result is an error rather than data.
-
-    Honors the MCP ``isError`` flag (any spec-compliant server, including remote
-    HTTP MCP) and our servers' ``{{"error": ...}}`` return convention. Provenance
-    records only data the agent actually received, so error results are returned
-    to the caller unchanged but never traced. A falsy ``error`` field (e.g.
-    ``error: null`` on a success payload) is NOT treated as an error.
-    """
-    if isinstance(envelope, dict) and envelope.get("isError") is True:
-        return True
-    return isinstance(value, dict) and bool(value.get("error"))
-
-
-def _unwrap_mcp_content(envelope: Any) -> Any:
-    """Prefer structuredContent (unwrapping the SDK's single-``result``-key
-    convention for non-object returns); fall back to a single text content
-    block parsed as JSON / text; else passthrough."""
-    if isinstance(envelope, dict):
-        structured = envelope.get("structuredContent")
-        if isinstance(structured, dict):
-            if set(structured) == {{"result"}}:
-                return structured["result"]
-            return structured
-
-    if (isinstance(envelope, dict) and
-        isinstance(envelope.get("content"), list)):
-
-        content_blocks = envelope["content"]
-
-        if (len(content_blocks) == 1 and
-            isinstance(content_blocks[0], dict) and
-            content_blocks[0].get("type") == "text"):
-
-            unwrapped = content_blocks[0].get("text", "")
-
-            if unwrapped.startswith(("{{", "[")):
-                try:
-                    return json.loads(unwrapped)
-                except json.JSONDecodeError:
-                    return unwrapped
-
-            return unwrapped
-
-    return envelope
-
-
-def _finalize_mcp_result(
-    server_name: str, tool_name: str, arguments: dict[str, Any], envelope: Any
-) -> Any:
-    """Unwrap an MCP result and trace it iff it carries real data.
-
-    Shared by both transports — the single place that sees the raw envelope (so
-    the ``isError`` flag survives) and decides whether the call is recordable.
-    """
-    if isinstance(envelope, dict):
-        result_type = envelope.get("resultType")
-        if result_type not in (None, "complete"):
-            # input_required (or any future resultType) needs an interactive
-            # continuation this one-shot client can't provide — fail clearly,
-            # never retry-loop or hang.
-            msg = (
-                f"MCP tool {{server_name}}.{{tool_name}} returned "
-                f"resultType={{result_type!r}}, which this client cannot continue"
-            )
-            raise RuntimeError(msg)
-    value = _unwrap_mcp_content(envelope)
-    if not _is_error_result(envelope, value):
-        _trace_mcp_call(server_name, tool_name, arguments, value)
-    return value
-
-
-def _get_next_message_id() -> int:
-    """Get next message ID for JSON-RPC requests."""
-    global _message_id_counter
-    with _message_id_lock:
-        _message_id_counter += 1
-        return _message_id_counter
-
-
-def _get_server_lock(server_name: str) -> threading.RLock:
-    """Per-server RLock, created race-free before any process inspection."""
-    with _locks_guard:
-        lock = _server_locks.get(server_name)
-        if lock is None:
-            lock = threading.RLock()
-            _server_locks[server_name] = lock
-    return lock
-
-
-def _modern_request(method: str, params: dict, version: str) -> dict:
-    """Build a 2026-07-28 request: _meta must carry protocolVersion AND
-    clientCapabilities on EVERY request or the server rejects it."""
-    params = dict(params or {{}})
-    meta = dict(params.get("_meta") or {{}})
-    meta["io.modelcontextprotocol/protocolVersion"] = version
-    meta["io.modelcontextprotocol/clientCapabilities"] = {{}}
-    meta["io.modelcontextprotocol/clientInfo"] = _CLIENT_INFO
-    params["_meta"] = meta
-    return {{
-        "jsonrpc": "2.0",
-        "id": _get_next_message_id(),
-        "method": method,
-        "params": params,
-    }}
-
-
-def _legacy_request(method: str, params: dict) -> dict:
-    return {{
-        "jsonrpc": "2.0",
-        "id": _get_next_message_id(),
-        "method": method,
-        "params": params or {{}},
-    }}
-
-
-def _kill_server(server_name: str, proc: subprocess.Popen) -> None:
-    try:
-        proc.kill()
-    except OSError:
-        pass
-    _server_processes.pop(server_name, None)
-    _PROTO.pop(server_name, None)
-
-
-def _send_message(server_name: str, proc: subprocess.Popen, message: dict) -> None:
-    try:
-        proc.stdin.write(json.dumps(message) + "\\n")
-        proc.stdin.flush()
-    except OSError as e:
-        _kill_server(server_name, proc)
-        error_msg = f"Failed to send request to MCP server {{server_name}}: {{e}}"
-        print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-        raise RuntimeError(error_msg)
-
-
-def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout: float) -> dict:
-    """Read the reply matching ``want_id``.
-
-    Skips notifications and stale replies (abandoned ids from a prior timeout),
-    answers server-initiated requests with -32601 (server->client requests are
-    deprecated in 2026-07-28), and kills the process on timeout / EOF / invalid
-    framing so the next call restarts cleanly. Lines come from the pump
-    thread's queue, never select() — a burst of messages lands in Python's
-    stdio buffer where select() on the fd would block forever.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _kill_server(server_name, proc)
-            error_msg = f"MCP server {{server_name}} timed out after {{timeout:.0f}}s"
-            print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-            raise RuntimeError(error_msg)
-        try:
-            line = proc.mcp_stdout_queue.get(timeout=remaining)
-        except queue.Empty:
-            continue
-        if line is None:  # EOF sentinel from the pump thread
-            _kill_server(server_name, proc)
-            error_msg = f"MCP server {{server_name}} closed connection"
-            stderr_tail = "\\n".join(getattr(proc, "mcp_stderr_tail", ()))
-            if "No module named 'mcp." in stderr_tail:
-                error_msg += (
-                    " — the server crashed importing an MCP SDK module its"
-                    " runtime does not provide (incompatible mcp version in"
-                    " its environment); launch it isolated via uvx/npx with"
-                    " pinned versions"
-                )
-            if stderr_tail:
-                error_msg += f"\\nserver stderr tail:\\n{{stderr_tail}}"
-            print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-            raise RuntimeError(error_msg)
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError:
-            _kill_server(server_name, proc)
-            error_msg = f"Invalid JSON from MCP server {{server_name}}: {{line[:200]!r}}"
-            print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-            raise RuntimeError(error_msg)
-        if not isinstance(message, dict) or "id" not in message:
-            continue  # notification (or junk) — never the reply
-        if "method" in message:
-            refusal = {{
-                "jsonrpc": "2.0",
-                "id": message["id"],
-                "error": {{"code": -32601, "message": "Method not found"}},
-            }}
-            try:
-                proc.stdin.write(json.dumps(refusal) + "\\n")
-                proc.stdin.flush()
-            except OSError:
-                pass
-            continue
-        if message.get("id") != want_id:
-            continue  # stale reply from an abandoned request
-        return message
-
-
-def _spawn_mcp_process(server_name: str{discovery_param}) -> subprocess.Popen:
-    """Spawn the server subprocess (no handshake, no registry publication)."""
-    config = _SERVER_CONFIGS.get(server_name)
-    if not config:
-        msg = f"Unknown MCP server: {{server_name}}"
-        raise ValueError(msg)
-
-    # Build command
-    cmd = [config["command"]] + {cmd_args_expr}
-{proc_env_setup}
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=proc_env,
-        text=True,
-        bufsize=1,  # Line buffered
-    )
-
-    # Drain stderr in background to prevent pipe buffer deadlock.
-    # MCP servers log INFO to stderr; if the 64KB pipe buffer fills, the
-    # server blocks on write(stderr) and can't respond on stdout. A bounded
-    # tail is kept so a crash-on-spawn can report its cause.
-    err_tail = collections.deque(maxlen=40)
-
-    def _drain_stderr(p=proc, t=err_tail):
-        try:
-            for line in p.stderr:
-                t.append(line.rstrip("\\n"))
-        except (OSError, ValueError):
-            pass
-
-    threading.Thread(target=_drain_stderr, daemon=True).start()
-    proc.mcp_stderr_tail = err_tail
-
-    # Pump stdout lines onto a queue: readers wait on the queue, not
-    # select() on the fd, which goes quiet once a message burst has been
-    # slurped into Python's stdio buffer.
-    out_queue = queue.Queue()
-
-    def _pump(p=proc, q=out_queue):
-        try:
-            for line in p.stdout:
-                q.put(line)
-        except (OSError, ValueError):
-            pass
-        q.put(None)  # EOF sentinel
-
-    threading.Thread(target=_pump, daemon=True).start()
-    proc.mcp_stdout_queue = out_queue
-
-    return proc
-
-
-def _legacy_initialize(server_name: str, proc: subprocess.Popen) -> dict:
-    """Pre-2026 handshake; offer the newest legacy revision, adopt the reply's."""
-    request = _legacy_request("initialize", {{
-        "protocolVersion": _LEGACY_OFFER,
-        "capabilities": {{}},
-        "clientInfo": _CLIENT_INFO,
-    }})
-    _send_message(server_name, proc, request)
-    response = _read_reply(server_name, proc, request["id"], _PROBE_TIMEOUT)
-    if "error" in response:
-        _kill_server(server_name, proc)
-        msg = f"MCP initialization failed: {{response['error']}}"
-        raise RuntimeError(msg)
-    version = (response.get("result") or {{}}).get("protocolVersion") or _LEGACY_OFFER
-    _send_message(server_name, proc, {{
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized",
-    }})
-    return {{"mode": "legacy", "version": version, "session_id": None}}
-
-
-def _negotiate_stdio(server_name: str, proc: subprocess.Popen{discovery_param}) -> tuple:
-    """server/discover probe with a bounded fallback ladder.
-
-    Mutual modern version => modern. JSON-RPC method error => legacy initialize
-    on the SAME stream (a pre-2026 server answered politely; no era latch).
-    Discover ok but only legacy versions advertised => legacy initialize on a
-    FRESH stream (the v2 server era-latched this connection on first request).
-    Timeout / EOF / invalid framing => the probe may have crashed the server:
-    restart once, then legacy initialize. -32022 with a mutual version in its
-    data => retry discover once with that version.
-    """
-    version = _MODERN_VERSIONS[0]
-    error = None
-    for attempt in (1, 2):
-        request = _modern_request("server/discover", {{}}, version)
-        _send_message(server_name, proc, request)
-        try:
-            response = _read_reply(server_name, proc, request["id"], _PROBE_TIMEOUT)
-        except RuntimeError:
-            proc = _spawn_mcp_process(server_name{discovery_arg})
-            return proc, _legacy_initialize(server_name, proc)
-        error = response.get("error")
-        if error is None:
-            result = response.get("result") or {{}}
-            supported = result.get("supportedVersions") or []
-            mutual = [v for v in _MODERN_VERSIONS if v in supported]
-            if mutual:
-                return proc, {{"mode": "modern", "version": mutual[0], "session_id": None}}
-            _kill_server(server_name, proc)
-            proc = _spawn_mcp_process(server_name{discovery_arg})
-            return proc, _legacy_initialize(server_name, proc)
-        code = error.get("code") if isinstance(error, dict) else None
-        if code == -32022 and attempt == 1:
-            data = error.get("data") or {{}}
-            supported = data.get("supportedVersions") or []
-            mutual = [v for v in _MODERN_VERSIONS if v in supported]
-            if mutual:
-                version = mutual[0]
-                continue
-        return proc, _legacy_initialize(server_name, proc)
-    _kill_server(server_name, proc)
-    msg = f"MCP server {{server_name}} rejected protocol negotiation: {{error}}"
-    raise RuntimeError(msg)
-
-
-def _ensure_stdio_server(server_name: str{discovery_param}) -> tuple:
-    """Return (proc, proto); spawn + negotiate + publish is ONE lock-guarded
-    transaction, so two racing cold starts produce exactly one process."""
-    with _get_server_lock(server_name):
-        proc = _server_processes.get(server_name)
-        proto = _PROTO.get(server_name)
-        if proc is not None and proc.poll() is None and proto is not None:
-            return proc, proto
-        proc = _spawn_mcp_process(server_name{discovery_arg})
-        proc, proto = _negotiate_stdio(server_name, proc{discovery_arg})
-        _server_processes[server_name] = proc
-        _PROTO[server_name] = proto
-        return proc, proto
-
-
-def _mcp_headers(method: str, mcp_name: str, proto: dict, extra: dict) -> dict:
-    """Spec headers for one HTTP request. Modern adds Mcp-Method/Mcp-Name
-    (MCP-Protocol-Version must equal the body _meta); legacy echoes the
-    captured Mcp-Session-Id. Configured headers are applied last.
-    Tool-declared x-mcp-header params are not emitted — a known limitation
-    for third-party servers that rely on them."""
-    headers = {{"Accept": "application/json, text/event-stream"}}
-    headers["MCP-Protocol-Version"] = proto["version"]
-    if proto["mode"] == "modern":
-        headers["Mcp-Method"] = method
-        if mcp_name:
-            try:
-                mcp_name.encode("ascii")
-            except UnicodeEncodeError:
-                raise RuntimeError(
-                    f"Non-ASCII MCP name {{mcp_name!r}}: the base64 Mcp-Name "
-                    "sentinel form is not supported by this client"
-                )
-            headers["Mcp-Name"] = mcp_name
-    elif proto.get("session_id"):
-        headers["Mcp-Session-Id"] = proto["session_id"]
-    headers.update(extra or {{}})
-    return headers
-
-
-def _parse_http_reply(response, want_id: int, server_name: str) -> dict:
-    """Extract the JSON-RPC reply from a JSON or SSE-framed HTTP response.
-
-    SSE parsing joins multiline data: fields per the eventsource spec, skips
-    comment/priming frames and interleaved notifications, and returns the
-    message whose id matches.
-    """
-    ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-    if ctype != "text/event-stream":
-        return response.json()
-
-    def _frame_reply(payload):
-        try:
-            message = json.loads(payload)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(message, dict):
-            return None
-        if "method" in message and "id" in message:
-            # Server-initiated request (sampling/elicitation): unsupported —
-            # fail fast instead of scanning on until the stream times out.
-            msg = (
-                f"MCP server {{server_name}}: server-initiated request "
-                f"{{message['method']!r}} is not supported by this client "
-                "[unsupported_server_request]"
-            )
-            raise RuntimeError(msg)
-        if message.get("id") == want_id and "method" not in message:
-            return message
-        return None
-
-    data_lines = []
-    for raw in response.iter_lines():
-        line = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
-        if line == "":
-            if data_lines:
-                reply = _frame_reply("\\n".join(data_lines))
-                data_lines = []
-                if reply is not None:
-                    return reply
-            continue
-        if line.startswith(":"):
-            continue  # comment / keep-alive priming
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip(" "))
-        # other SSE fields (event:, id:, retry:) never carry the payload
-    if data_lines:
-        reply = _frame_reply("\\n".join(data_lines))
-        if reply is not None:
-            return reply
-    msg = f"MCP server {{server_name}}: SSE stream ended without a matching reply"
-    raise RuntimeError(msg)
-
-
-def _ensure_http_server(server_name: str{discovery_param}) -> dict:
-    """Negotiate (once per interpreter) and return the server's proto state.
-
-    HTTP is stateless per POST, so a failed discover probe needs no restart —
-    the legacy initialize simply goes out as a fresh request.
-    """
-    proto = _PROTO.get(server_name)
-    if proto is not None:
-        return proto
-
-    config = _SERVER_CONFIGS.get(server_name)
-    if not config:
-        msg = f"Unknown MCP server: {{server_name}}"
-        raise ValueError(msg)
-
-    url = config.get("url")
-    if not url{relay_url_exempt}:
-        msg = f"Remote MCP server {{server_name}} has no URL configured"
-        raise ValueError(msg)
-{sse_init_resolve}
-    version = _MODERN_VERSIONS[0]
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            probe = _modern_request("server/discover", {{}}, version)
-            probe_headers = {{
-                "Accept": "application/json, text/event-stream",
-                "MCP-Protocol-Version": version,
-                "Mcp-Method": "server/discover",
-            }}
-            probe_headers.update(_headers)
-            reply = None
-            try:
-                response = client.post(url, json=probe, headers=probe_headers)
-                if response.status_code < 400:
-                    reply = _parse_http_reply(response, probe["id"], server_name)
-            except (httpx.HTTPError, RuntimeError, ValueError):
-                reply = None
-            if isinstance(reply, dict) and "result" in reply:
-                supported = (reply["result"] or {{}}).get("supportedVersions") or []
-                mutual = [v for v in _MODERN_VERSIONS if v in supported]
-                if mutual:
-                    proto = {{"mode": "modern", "version": mutual[0], "session_id": None}}
-                    _PROTO[server_name] = proto
-                    return proto
-
-            init = _legacy_request("initialize", {{
-                "protocolVersion": _LEGACY_OFFER,
-                "capabilities": {{}},
-                "clientInfo": _CLIENT_INFO,
-            }})
-            init_headers = {{"Accept": "application/json, text/event-stream"}}
-            init_headers.update(_headers)
-            response = client.post(url, json=init, headers=init_headers)
-{relay_init_check}            response.raise_for_status()
-            reply = _parse_http_reply(response, init["id"], server_name)
-            if "error" in reply:
-                msg = f"MCP SSE initialization failed: {{reply['error']}}"
-                raise RuntimeError(msg)
-            adopted = (reply.get("result") or {{}}).get("protocolVersion") or _LEGACY_OFFER
-            session_id = response.headers.get("mcp-session-id")
-            proto = {{"mode": "legacy", "version": adopted, "session_id": session_id}}
-            notif_headers = _mcp_headers("notifications/initialized", "", proto, _headers)
-            client.post(
-                url,
-                json={{"jsonrpc": "2.0", "method": "notifications/initialized"}},
-                headers=notif_headers,
-            )
-        _PROTO[server_name] = proto
-        return proto
-
-    except Exception as e:  # noqa: BLE001 - Re-raising as RuntimeError with context
-        msg = f"Failed to initialize remote MCP server {{server_name}}: {{e}}"
-        raise RuntimeError(msg) from e
-
-
-def _call_mcp_tool_http(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
-    """Call an MCP tool via streamable HTTP transport.
-
-    Args:
-        server_name: Name of the MCP server
-        tool_name: Name of the tool
-        arguments: Tool arguments
-
-    Returns:
-        Tool result
-    """
-    import traceback
-    import re
-
-    try:
-        # Negotiate once per interpreter, then speak the agreed era
-        proto = _ensure_http_server(server_name)
-
-        config = _SERVER_CONFIGS.get(server_name)
-        url = config.get("url", "")
-{sse_call_resolve}
-        params = {{"name": tool_name, "arguments": arguments}}
-        if proto["mode"] == "modern":
-            request = _modern_request("tools/call", params, proto["version"])
-        else:
-            request = _legacy_request("tools/call", params)
-        headers = _mcp_headers("tools/call", tool_name, proto, _headers)
-
-        # Send request via HTTP POST. The 65s outer timeout sits strictly above
-        # the egress relay's 55s hard wall so relay budget errors stay typed.
-        with httpx.Client(timeout=65.0) as client:
-            response = client.post(url, json=request, headers=headers)
-{relay_call_handling}            if (
-                response.status_code == 404
-                and proto.get("mode") == "legacy"
-                and proto.get("session_id")
-            ):
-                # 2025-11-25 session expiry: the server dropped our session id.
-                # Reinitialize once and retry with the fresh session.
-                _PROTO.pop(server_name, None)
-                proto = _ensure_http_server(server_name)
-                if proto["mode"] == "modern":
-                    request = _modern_request("tools/call", params, proto["version"])
-                else:
-                    request = _legacy_request("tools/call", params)
-                headers = _mcp_headers("tools/call", tool_name, proto, _headers)
-                response = client.post(url, json=request, headers=headers)
-            response.raise_for_status()
-            result = _parse_http_reply(response, request["id"], server_name)
-
-        # Check for errors
-        if "error" in result:
-            error = result["error"]
-            error_msg = f"MCP SSE tool call failed: {{error}}"
-            print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-            raise RuntimeError(error_msg)
-
-        # Return result
-        if "result" in result:
-            return _finalize_mcp_result(
-                server_name, tool_name, arguments, result["result"]
-            )
-        else:
-            raise RuntimeError("MCP SSE response missing result field")
-
-    except Exception as e:  # noqa: BLE001 - Top-level error handler for MCP tool call
-        error_type = type(e).__name__
-        error_msg = str(e)
-        print(f"\\n{{'='*60}}", file=sys.stderr)  # noqa: T201
-        print(f"ERROR in _call_mcp_tool_http", file=sys.stderr)  # noqa: T201
-        print(f"{{'='*60}}", file=sys.stderr)  # noqa: T201
-        print(f"Error Type: {{error_type}}", file=sys.stderr)  # noqa: T201
-        print(f"Error Message: {{error_msg}}", file=sys.stderr)  # noqa: T201
-        print(f"Server: {{server_name}}", file=sys.stderr)  # noqa: T201
-        print(f"Tool: {{tool_name}}", file=sys.stderr)  # noqa: T201
-        print(f"Arguments: {{arguments}}", file=sys.stderr)  # noqa: T201
-        print(f"\\nFull Traceback:", file=sys.stderr)  # noqa: T201
-        traceback.print_exc(file=sys.stderr)
-        print(f"{{'='*60}}\\n", file=sys.stderr)  # noqa: T201
-        raise
-
-
-def _call_mcp_tool_stdio(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
-    """Call an MCP tool via stdio transport (subprocess).
-
-    Args:
-        server_name: Name of the MCP server
-        tool_name: Name of the tool
-        arguments: Tool arguments
-
-    Returns:
-        Tool result
-    """
-    import traceback
-
-    try:
-        # The whole exchange holds the server lock: ensure (spawn+negotiate on
-        # cold start — RLock, so re-entry is fine), then write+read serialized.
-        with _get_server_lock(server_name):
-            proc, proto = _ensure_stdio_server(server_name)
-
-            params = {{"name": tool_name, "arguments": arguments}}
-            if proto["mode"] == "modern":
-                request = _modern_request("tools/call", params, proto["version"])
-            else:
-                request = _legacy_request("tools/call", params)
-
-            _send_message(server_name, proc, request)
-            response = _read_reply(server_name, proc, request["id"], _CALL_TIMEOUT)
-
-            # Check for errors
-            if "error" in response:
-                error = response["error"]
-                error_msg = f"MCP tool call failed: {{error}}"
-                print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-                print(f"Tool: {{server_name}}.{{tool_name}}", file=sys.stderr)  # noqa: T201
-                print(f"Arguments: {{arguments}}", file=sys.stderr)  # noqa: T201
-                raise RuntimeError(error_msg)
-
-            # Return result
-            if "result" in response:
-                return _finalize_mcp_result(
-                    server_name, tool_name, arguments, response["result"]
-                )
-            else:
-                error_msg = "MCP response missing result field"
-                print(f"ERROR: {{error_msg}}", file=sys.stderr)  # noqa: T201
-                print(f"Response: {{response}}", file=sys.stderr)  # noqa: T201
-                raise RuntimeError(error_msg)
-
-    except Exception as e:  # noqa: BLE001 - Top-level error handler for MCP tool call
-        error_type = type(e).__name__
-        error_msg = str(e)
-        print(f"\\n{{'='*60}}", file=sys.stderr)  # noqa: T201
-        print(f"ERROR in _call_mcp_tool_stdio", file=sys.stderr)  # noqa: T201
-        print(f"{{'='*60}}", file=sys.stderr)  # noqa: T201
-        print(f"Error Type: {{error_type}}", file=sys.stderr)  # noqa: T201
-        print(f"Error Message: {{error_msg}}", file=sys.stderr)  # noqa: T201
-        print(f"Server: {{server_name}}", file=sys.stderr)  # noqa: T201
-        print(f"Tool: {{tool_name}}", file=sys.stderr)  # noqa: T201
-        print(f"Arguments: {{arguments}}", file=sys.stderr)  # noqa: T201
-        print(f"\\nFull Traceback:", file=sys.stderr)  # noqa: T201
-        traceback.print_exc(file=sys.stderr)
-        print(f"{{'='*60}}\\n", file=sys.stderr)  # noqa: T201
-        raise
-
-
-def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
-    """Call an MCP tool via the appropriate transport.
-
-    Routes to SSE or stdio transport based on server configuration.
-
-    Args:
-        server_name: Name of the MCP server
-        tool_name: Name of the tool
-        arguments: Tool arguments
-
-    Returns:
-        Tool result (unwraps MCP content format for easier use)
-    """
-    config = _SERVER_CONFIGS.get(server_name)
-    if not config:
-        msg = f"Unknown MCP server: {{server_name}}"
-        raise ValueError(msg)
-
-    transport = config.get("transport", "stdio")
-
-    # Tracing happens in the transport via _finalize_mcp_result, where the raw
-    # envelope (incl. the MCP isError flag) is still visible — so failed calls
-    # and error payloads are returned to the agent but never recorded as sources.
-    if transport == "http":
-        return _call_mcp_tool_http(server_name, tool_name, arguments)
-    if transport == "sse":
-        # The old client POSTed plain JSON-RPC, which never satisfied a real
-        # legacy-SSE server's GET->endpoint-event->POST flow — nothing working
-        # breaks by refusing outright.
-        msg = (
-            f"MCP server {{server_name}} uses legacy transport 'sse', which this "
-            "client does not support; change the server's transport to 'http' "
-            "(streamable HTTP)."
-        )
-        raise RuntimeError(msg)
-    return _call_mcp_tool_stdio(server_name, tool_name, arguments)
-
-
-def cleanup_mcp_servers():
-    """Clean up all MCP server processes."""
-    for server_name, proc in _server_processes.items():
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (OSError, TimeoutError) as e:
-            print(f"Error cleaning up MCP server {{server_name}}: {{e}}", file=sys.stderr)  # noqa: T201
-    _server_processes.clear()
-    _PROTO.clear()
-{discover_block}{main_block}'''
