@@ -33,6 +33,15 @@ _MAX_BULK_URLS = 10
 _BROWSER_CONCURRENCY = 2
 _FAST_CONCURRENCY = 8
 _MAX_CONTENT_CHARS = 400_000
+_MAX_DETAIL_CHARS = 300
+
+# Process-wide, not per-call. A semaphore built inside the handler bounds only
+# its own batch, so N concurrent tool calls could still open 2N browsers and
+# blow the memory budget the limit exists to protect. Safe to build at import:
+# asyncio binds the loop on first contended acquire, and the stdio server runs
+# a single loop for the life of the process.
+_BROWSER_SEM = asyncio.Semaphore(_BROWSER_CONCURRENCY)
+_FAST_SEM = asyncio.Semaphore(_FAST_CONCURRENCY)
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -91,8 +100,32 @@ _OUT_PAGES = output_model(
 )
 
 
+def _clean_detail(detail: str) -> str:
+    """Collapse to one capped line — upstream exception text can carry a whole
+    response body or driver dump, and the agent only needs the cause."""
+    collapsed = re.sub(r"\s+", " ", detail).strip()
+    if len(collapsed) <= _MAX_DETAIL_CHARS:
+        return collapsed
+    return collapsed[:_MAX_DETAIL_CHARS] + "..."
+
+
 def _error(code: str, detail: str, **echo: Any) -> dict:
-    return {"error": code, "detail": detail, **echo}
+    return {"error": code, "detail": _clean_detail(detail), **echo}
+
+
+def _as_entry(url: str, result: Any) -> dict:
+    """Per-URL row for one gather slot.
+
+    ``return_exceptions=True`` hands back the exception object rather than
+    failing the batch, so anything that still escaped _scrape_one owes the
+    caller a row — not an MCP isError over the other nine URLs. Cancellation
+    is not ours to convert into a result.
+    """
+    if isinstance(result, BaseException):
+        if not isinstance(result, Exception):
+            raise result
+        return _error("scrape_failed", f"{type(result).__name__}: {result}", url=url)
+    return result
 
 
 def _extract_title(html: str) -> str:
@@ -177,17 +210,28 @@ async def _scrape_one(
 ) -> dict:
     if not url.startswith(("http://", "https://")):
         return _error("invalid_url", f"URL must be http(s), got: {url[:200]}", url=url)
-    try:
-        html, status = await _fetch_html(url, mode, timeout_s, solve_cloudflare)
-    except Exception as e:  # noqa: BLE001 - per-URL failures become error dicts
-        return _error("fetch_failed", f"{type(e).__name__}: {e}", url=url)
+    # Gate held across the fetch only: the extraction below is thread work
+    # holding no browser, so releasing early lets the next URL start sooner.
+    async with (_FAST_SEM if mode == "fast" else _BROWSER_SEM):
+        try:
+            html, status = await _fetch_html(url, mode, timeout_s, solve_cloudflare)
+        except Exception as e:  # noqa: BLE001 - per-URL failures become error dicts
+            return _error("fetch_failed", f"{type(e).__name__}: {e}", url=url)
 
-    if extraction == "html":
-        content = html
-    elif extraction == "text":
-        content = await asyncio.to_thread(_to_text, html)
-    else:
-        content = await asyncio.to_thread(_to_markdown, html)
+    # Extraction is as failure-prone as the fetch — trafilatura and
+    # html_to_markdown exhaust the recursion limit on deeply nested or
+    # malformed markup — and an unguarded raise here sinks the whole batch.
+    try:
+        if extraction == "html":
+            content = html
+        elif extraction == "text":
+            content = await asyncio.to_thread(_to_text, html)
+        else:
+            content = await asyncio.to_thread(_to_markdown, html)
+    except Exception as e:  # noqa: BLE001 - same per-URL envelope as a fetch failure
+        return _error(
+            "extract_failed", f"{type(e).__name__}: {e}", url=url, status=status
+        )
 
     return {
         "url": url,
@@ -284,15 +328,13 @@ async def scrape_pages(
             "invalid_urls", f"max {_MAX_BULK_URLS} URLs per call, got {len(urls)}"
         )
 
-    limit = _FAST_CONCURRENCY if mode == "fast" else _BROWSER_CONCURRENCY
-    sem = asyncio.Semaphore(limit)
-
-    async def bounded(u: str) -> dict:
-        async with sem:
-            return await _scrape_one(u, mode, extraction, timeout, solve_cloudflare)
-
-    results = await asyncio.gather(*(bounded(u) for u in urls))
-    return {"results": list(results), "count": len(results)}
+    # _scrape_one holds the concurrency gate itself, so the batch just fans out.
+    results = await asyncio.gather(
+        *(_scrape_one(u, mode, extraction, timeout, solve_cloudflare) for u in urls),
+        return_exceptions=True,
+    )
+    entries = [_as_entry(u, r) for u, r in zip(urls, results)]
+    return {"results": entries, "count": len(entries)}
 
 
 if __name__ == "__main__":
