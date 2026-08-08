@@ -11,8 +11,8 @@ Seams patched here:
   * ``relay.fetch_grant_for_relay`` — the authorization read
   * ``relay.pin_public_url`` — the SSRF guard (real one in ``TestSsrfPosture``)
   * ``relay.get_relay_client`` — the shared upstream client (httpx.MockTransport)
-  * ``mcp_oauth.lifecycle.ensure_fresh_access_token`` / ``database.mcp_oauth`` —
-    the vendor credential + 401 disambiguation reads
+  * ``mcp_oauth.lifecycle`` — the vendor credential, the 401 re-read, and the
+    needs_reauth report (the relay never writes connection status itself)
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from starlette.requests import Request
 from src.server.services.egress.jsonrpc import MAX_BODY_BYTES
 from src.server.services.egress.limits import RelayLimited
 from src.server.services.egress.relay_jwt import mint_relay_jwt
+from src.server.services.mcp_oauth.lifecycle import AccessToken
 from src.server.utils.egress_guard import PinnedTarget
 from src.server.utils.egress_guard import pin_public_url as real_pin_public_url
 from tests.conftest import create_test_app
@@ -66,26 +67,20 @@ RELAY_PATH = f"/v1/egress/{GRANT_ID}"
 
 
 def _grant(**overrides) -> dict:
-    """The row shape ``fetch_grant_for_relay`` hands the relay."""
+    """The row shape ``fetch_grant_for_relay`` hands the relay.
+
+    Authorization columns only — no credential. The vendor token comes from the
+    OAuth lifecycle, so a drift back to a decrypting grant read shows up here.
+    """
     row = {
-        "grant_id": GRANT_ID,
         "user_id": USER_ID,
         "workspace_id": WORKSPACE_ID,
-        "kind": "oauth_mcp",
         "connection_id": CONNECTION_ID,
         "destination_url": DESTINATION,
         "allowed_methods": ["POST"],
         "tool_allowlist": None,
-        "policy_version": 1,
-        "limits": {},
-        "rate_class": "default",
         "grant_status": "active",
         "connection_status": "connected",
-        "server_name": "vendor_under_test",
-        "token_type": "Bearer",
-        "expires_at": None,
-        "token_generation": 1,
-        "access_token": ACCESS_TOKEN,
     }
     row.update(overrides)
     return row
@@ -209,10 +204,14 @@ class RelayEnv:
     def __init__(self):
         self.grant: dict | None = _grant()
         self.grant_lookups: list[str] = []
-        self.token: dict = {"access_token": ACCESS_TOKEN, "token_type": "Bearer"}
+        self.token = AccessToken(
+            access_token=ACCESS_TOKEN, token_type="Bearer", generation=1
+        )
         self.token_error: Exception | None = None
-        self.connection: dict | None = None  # get_connection_by_id on a vendor 401
-        self.status_marks: list[tuple[str, str]] = []
+        # What a re-read after a vendor 401 finds stored right now.
+        self.connection: AccessToken | None = None
+        # (connection_id, generation) the relay reported as vendor-rejected.
+        self.reauth_reports: list[tuple[str, int]] = []
         self.pin = PinnedTarget(url=DESTINATION, host=VENDOR_HOST, ip=PINNED_IP)
         self._vendors: list[_Vendor] = []
         self.vendor = self.set_vendor(_vendor_json())
@@ -242,13 +241,13 @@ async def env():
     async def _ensure_token(connection_id: str):
         if e.token_error is not None:
             raise e.token_error
-        return dict(e.token)
+        return e.token
 
-    async def _get_connection(connection_id: str, *, decrypt: bool = False):
-        return dict(e.connection) if e.connection is not None else None
+    async def _current_token(connection_id: str):
+        return e.connection
 
-    async def _mark_status(connection_id: str, status: str) -> bool:
-        e.status_marks.append((connection_id, status))
+    async def _mark_needs_reauth(connection_id: str, *, seen_token_generation: int):
+        e.reauth_reports.append((connection_id, seen_token_generation))
         return True
 
     with ExitStack() as stack:
@@ -263,8 +262,18 @@ async def env():
                 _ensure_token,
             )
         )
-        p(patch("src.server.database.mcp_oauth.get_connection_by_id", _get_connection))
-        p(patch("src.server.database.mcp_oauth.mark_status", _mark_status))
+        p(
+            patch(
+                "src.server.services.mcp_oauth.lifecycle.current_access_token",
+                _current_token,
+            )
+        )
+        p(
+            patch(
+                "src.server.services.mcp_oauth.lifecycle.mark_connection_needs_reauth",
+                _mark_needs_reauth,
+            )
+        )
         # Real acquire_slot with an unreachable cache → the documented fail-open.
         p(
             patch(
@@ -744,19 +753,13 @@ class TestOutboundHeaders:
 
     @pytest.mark.asyncio
     async def test_vendor_token_type_from_the_bundle_is_honoured(self, env, client):
-        env.token = {"access_token": ACCESS_TOKEN, "token_type": "DPoP"}
+        env.token = AccessToken(
+            access_token=ACCESS_TOKEN, token_type="DPoP", generation=1
+        )
 
         await _post(client, token=_jwt())
 
         assert env.vendor.last.headers["authorization"] == f"DPoP {ACCESS_TOKEN}"
-
-    @pytest.mark.asyncio
-    async def test_missing_token_type_defaults_to_bearer(self, env, client):
-        env.token = {"access_token": ACCESS_TOKEN, "token_type": None}
-
-        await _post(client, token=_jwt())
-
-        assert env.vendor.last.headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
 
     @pytest.mark.asyncio
     async def test_mcp_transport_headers_pass_through(self, env, client):
@@ -925,12 +928,9 @@ class TestVendor401Disambiguation:
         self, env, client
     ):
         env.set_vendor(_vendor_json(status=401), _vendor_json(status=200))
-        env.connection = {
-            "connection_id": CONNECTION_ID,
-            "status": "connected",
-            "access_token": ROTATED_TOKEN,
-            "token_type": "Bearer",
-        }
+        env.connection = AccessToken(
+            access_token=ROTATED_TOKEN, token_type="Bearer", generation=2
+        )
 
         resp = await _post(client, token=_jwt())
 
@@ -939,59 +939,58 @@ class TestVendor401Disambiguation:
         assert env.vendor.requests[0].headers["authorization"] == f"Bearer {ACCESS_TOKEN}"
         assert env.vendor.requests[1].headers["authorization"] == f"Bearer {ROTATED_TOKEN}"
         # A live rotation is not a reauth event.
-        assert env.status_marks == []
+        assert env.reauth_reports == []
 
     @pytest.mark.asyncio
     async def test_retry_that_also_401s_stops_and_reports_needs_reauth(self, env, client):
         env.set_vendor(_vendor_json(status=401))
-        env.connection = {
-            "connection_id": CONNECTION_ID,
-            "status": "connected",
-            "access_token": ROTATED_TOKEN,
-            "token_type": "Bearer",
-        }
+        env.connection = AccessToken(
+            access_token=ROTATED_TOKEN, token_type="Bearer", generation=2
+        )
 
         resp = await _post(client, token=_jwt())
 
         assert resp.status_code == 401
         assert _error(resp) == "needs_reauth"
         assert env.vendor.sends == 2  # one retry, then stop — never a loop
-        assert env.status_marks == [(CONNECTION_ID, "needs_reauth")]
+        # Generation 2 is the one the vendor turned down — reporting the stale
+        # generation 1 would let the CAS silently swallow the flip.
+        assert env.reauth_reports == [(CONNECTION_ID, 2)]
 
     @pytest.mark.asyncio
     async def test_401_with_no_newer_bundle_is_needs_reauth_without_a_retry(
         self, env, client
     ):
         env.set_vendor(_vendor_json(status=401))
-        env.connection = {
-            "connection_id": CONNECTION_ID,
-            "status": "connected",
-            "access_token": ACCESS_TOKEN,  # unchanged since our read
-            "token_type": "Bearer",
-        }
+        env.connection = AccessToken(
+            access_token=ACCESS_TOKEN, token_type="Bearer", generation=1
+        )  # unchanged since our read
 
         resp = await _post(client, token=_jwt())
 
         assert resp.status_code == 401
         assert _error(resp) == "needs_reauth"
         assert env.vendor.sends == 1
-        assert env.status_marks == [(CONNECTION_ID, "needs_reauth")]
+        assert env.reauth_reports == [(CONNECTION_ID, 1)]
 
     @pytest.mark.asyncio
-    async def test_already_flipped_connection_is_not_marked_twice(self, env, client):
+    async def test_a_vanished_connection_is_still_reported_against_our_bundle(
+        self, env, client
+    ):
+        """The re-read finding nothing must not skip the report.
+
+        Whether that report lands is the lifecycle's CAS to decide; the relay's
+        job is only to name the generation the vendor rejected.
+        """
         env.set_vendor(_vendor_json(status=401))
-        env.connection = {
-            "connection_id": CONNECTION_ID,
-            "status": "needs_reauth",
-            "access_token": ACCESS_TOKEN,
-            "token_type": "Bearer",
-        }
+        env.connection = None
 
         resp = await _post(client, token=_jwt())
 
         assert resp.status_code == 401
         assert _error(resp) == "needs_reauth"
-        assert env.status_marks == []
+        assert env.vendor.sends == 1
+        assert env.reauth_reports == [(CONNECTION_ID, 1)]
 
     @pytest.mark.asyncio
     async def test_vendor_403_is_not_a_reauth_signal(self, env, client):
@@ -1002,7 +1001,7 @@ class TestVendor401Disambiguation:
         assert resp.status_code == 403
         assert _error(resp) is None
         assert env.vendor.sends == 1
-        assert env.status_marks == []
+        assert env.reauth_reports == []
 
     @pytest.mark.asyncio
     async def test_unreachable_vendor_is_a_502_not_a_reauth_prompt(self, env, client):
@@ -1139,7 +1138,7 @@ def _slot_spy(record: dict[str, int]):
     the slot spans the whole exchange and is never leaked on a failure path."""
 
     @asynccontextmanager
-    async def _acquire(grant_id: str, rate_class: str):
+    async def _acquire(grant_id: str):
         record["entered"] += 1
         try:
             yield
@@ -1157,7 +1156,7 @@ class TestLimits:
     ):
         with patch(
             "src.server.app.egress_relay.acquire_slot",
-            lambda grant_id, rate_class: _RefusedSlot(kind),
+            lambda grant_id: _RefusedSlot(kind),
         ):
             resp = await _post(client, token=_jwt())
 
@@ -1168,24 +1167,20 @@ class TestLimits:
         assert env.vendor.sends == 0
 
     @pytest.mark.asyncio
-    async def test_the_slot_is_keyed_by_grant_and_rate_class(self, env, client):
-        env.grant = _grant(rate_class="premium")
-        seen: list[tuple[str, str]] = []
-
-        real_acquire = None
-
-        def _spy(grant_id, rate_class):
-            seen.append((grant_id, rate_class))
-            return real_acquire(grant_id, rate_class)
+    async def test_the_slot_is_keyed_by_grant(self, env, client):
+        seen: list[str] = []
 
         from src.server.services.egress.limits import acquire_slot as real
 
-        real_acquire = real
+        def _spy(grant_id):
+            seen.append(grant_id)
+            return real(grant_id)
+
         with patch("src.server.app.egress_relay.acquire_slot", _spy):
             resp = await _post(client, token=_jwt())
 
         assert resp.status_code == 200
-        assert seen == [(GRANT_ID, "premium")]
+        assert seen == [GRANT_ID]
 
     @pytest.mark.asyncio
     async def test_limits_fail_open_when_redis_is_unavailable(self, env, client):
@@ -1202,12 +1197,10 @@ class TestLimits:
         # concurrency ceiling until the 120s Redis TTL expired.
         record = {"entered": 0, "exited": 0}
         env.set_vendor(_vendor_json(status=401))
-        env.connection = {
-            "connection_id": CONNECTION_ID,
-            "status": "connected",
-            "access_token": ACCESS_TOKEN,  # unchanged → no retry, straight to reject
-            "token_type": "Bearer",
-        }
+        # Unchanged generation → no retry, straight to reject.
+        env.connection = AccessToken(
+            access_token=ACCESS_TOKEN, token_type="Bearer", generation=1
+        )
 
         with patch("src.server.app.egress_relay.acquire_slot", _slot_spy(record)):
             resp = await _post(client, token=_jwt())

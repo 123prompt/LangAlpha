@@ -339,12 +339,12 @@ class TestFreezeAndGlobalRegistry:
         assert registry.connectors == {}
 
     @pytest.mark.asyncio
-    async def test_call_tool_raises_when_frozen(self):
-        """A frozen registry has no live sessions; call_tool must fail loud
-        instead of dispatching to a connector with session=None."""
+    async def test_freezing_leaves_no_execution_surface(self):
+        """A frozen registry keeps schemas and drops sessions — and there is no
+        host-side execution path that could dispatch to one anyway."""
         registry = self._make_registry_with_servers({"alpha": ["a1"]})
         registry.connectors["alpha"].__aexit__ = AsyncMock(return_value=None)
         await registry.freeze()
 
-        with pytest.raises(RuntimeError, match="frozen"):
-            await registry.call_tool("alpha", "a1", {})
+        assert not hasattr(registry, "call_tool")
+        assert registry.connectors["alpha"].session is None

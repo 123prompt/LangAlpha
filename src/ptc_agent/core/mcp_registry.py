@@ -4,7 +4,6 @@ import asyncio
 import os
 import threading
 from collections import deque
-from contextlib import AbstractAsyncContextManager
 from types import TracebackType
 from typing import Any
 
@@ -61,24 +60,6 @@ def classify_startup_failure(error: BaseException, stderr_tail: str) -> str | No
         "server process exited before completing the MCP handshake, "
         "with no stderr output"
     )
-
-
-class _StreamsTransport:
-    """Adapt an async CM yielding ``(read, write)`` streams to the Client Transport protocol.
-
-    Lets ``Client`` drive transports the SDK exposes only as stream factories —
-    notably ``stdio_client`` with our ``errlog`` capture, which no built-in
-    Transport class carries.
-    """
-
-    def __init__(self, streams_cm: AbstractAsyncContextManager) -> None:
-        self._cm = streams_cm
-
-    async def __aenter__(self):
-        return await self._cm.__aenter__()
-
-    async def __aexit__(self, *exc_info) -> bool | None:
-        return await self._cm.__aexit__(*exc_info)
 
 
 class _StderrTail:
@@ -383,10 +364,9 @@ class MCPServerConnector:
                 # Custom headers ride on a preconfigured httpx client;
                 # streamable_http_client takes no headers of its own.
                 async with create_mcp_http_client(headers=self._resolve_headers()) as http_client:
-                    transport = _StreamsTransport(
+                    async with Client(
                         streamable_http_client(url, http_client=http_client)
-                    )
-                    async with Client(transport) as client:
+                    ) as client:
                         await self._serve(client)
 
             elif self.config.transport == "sse":
@@ -396,7 +376,7 @@ class MCPServerConnector:
                     raise ValueError(msg)
 
                 # SSE connections need discovery retry due to endpoint event timing.
-                async with Client(_StreamsTransport(sse_client(url))) as client:
+                async with Client(sse_client(url)) as client:
                     await self._serve(client, retry_discovery=True)
 
             else:
@@ -410,10 +390,9 @@ class MCPServerConnector:
                 )
 
                 stderr_capture = _StderrTail()
-                transport = _StreamsTransport(
+                async with Client(
                     stdio_client(server_params, errlog=stderr_capture.writer)
-                )
-                async with Client(transport) as client:
+                ) as client:
                     await self._serve(client)
 
         except Exception as e:
@@ -527,48 +506,6 @@ class MCPServerConnector:
                     error=str(e),
                 )
                 await asyncio.sleep(wait_time)
-
-    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call a tool on this server.
-
-        Args:
-            tool_name: Name of the tool
-            arguments: Tool arguments
-
-        Returns:
-            Tool result
-        """
-        logger.debug(
-            "Calling MCP tool",
-            server=self.config.name,
-            tool=tool_name,
-            arguments=arguments,
-        )
-
-        try:
-            if not self.session:
-                raise RuntimeError("Not connected to server")
-
-            result = await self.session.call_tool(tool_name, arguments)
-
-            logger.debug("MCP tool call completed", server=self.config.name, tool=tool_name)
-
-            if result.content:
-                content_item = result.content[0]
-                if hasattr(content_item, "text"):
-                    return content_item.text
-                return str(content_item)
-
-            return str(result)
-
-        except Exception as e:
-            logger.error(
-                "MCP tool call failed",
-                server=self.config.name,
-                tool=tool_name,
-                error=str(e),
-            )
-            raise
 
     async def __aexit__(
         self,
@@ -784,34 +721,6 @@ class MCPRegistry:
 
         return None
 
-    async def call_tool(
-        self,
-        server_name: str,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> Any:
-        """Call a tool on a specific server.
-
-        Args:
-            server_name: Name of the server
-            tool_name: Name of the tool
-            arguments: Tool arguments
-
-        Returns:
-            Tool result
-        """
-        if self._frozen:
-            raise RuntimeError(
-                "call_tool unsupported on frozen MCPRegistry; "
-                "route MCP calls via the sandbox-side cohort."
-            )
-        connector = self.connectors.get(server_name)
-        if not connector:
-            msg = f"Server not found: {server_name}"
-            raise ValueError(msg)
-
-        return await connector.call_tool(tool_name, arguments)
-
     async def __aenter__(self) -> "MCPRegistry":
         """Async context manager entry."""
         await self.connect_all()
@@ -868,8 +777,8 @@ def clear_global_registry() -> None:
 # A workspace's effective MCP set = the process-global built-ins (taken
 # verbatim, never round-tripped through the discovery cache) PLUS the
 # workspace's user-configured servers, whose tool schemas come from the
-# sanitized discovery snapshot. User servers have NO host code path: their
-# tools execute only inside the sandbox, so any host-side ``call_tool`` raises.
+# sanitized discovery snapshot. Nothing here executes a tool: the registry is
+# a schema surface, and every MCP call happens sandbox-side.
 #
 # A zero-user-server workspace short-circuits to the built-in registry object
 # itself (identity), which is what keeps such workspaces byte-identical to the
@@ -900,8 +809,7 @@ class SchemaOnlyRegistry:
 
     Read-only: built-in tools come straight from the frozen global registry's
     connectors; user-server tools are wrapped ``MCPToolInfo`` from the sanitized
-    discovery cache. Host-side execution (``call_tool``) of a user server is
-    never permitted — those tools run only inside the sandbox.
+    discovery cache.
     """
 
     def __init__(
@@ -912,7 +820,6 @@ class SchemaOnlyRegistry:
         disabled_builtin_names: frozenset[str] = frozenset(),
     ) -> None:
         self._builtin_registry = builtin_registry
-        self._user_names = frozenset(s.name for s in user_servers)
         # Built-ins a workspace turned off: excluded from get_all_tools(),
         # connectors, and the effective config so the agent neither sees nor can
         # call them (a disable-marker must take effect at runtime, not just in
@@ -990,26 +897,6 @@ class SchemaOnlyRegistry:
                     return tool
             return None
         return self._builtin_registry.get_tool_info(server_name, tool_name)
-
-    async def call_tool(
-        self,
-        server_name: str,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> Any:
-        """Reject host-side execution of user-server tools; delegate built-ins."""
-        if server_name in self._disabled_builtin_names:
-            raise RuntimeError(
-                f"Built-in MCP server {server_name!r} is disabled for this workspace."
-            )
-        if server_name in self._user_names:
-            raise RuntimeError(
-                f"Host-side call_tool is not supported for user MCP server "
-                f"{server_name!r}; user-server tools execute only inside the "
-                f"sandbox."
-            )
-        return await self._builtin_registry.call_tool(server_name, tool_name, arguments)
-
 
 def build_composite_registry(
     builtin_registry: "MCPRegistry",

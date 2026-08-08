@@ -222,11 +222,19 @@ def _resolve_sse(config, server_name, *, discovery=False):
 
 
 # Relay rejection codes (X-Relay-Error header) -> actionable guidance.
+# Must cover every member of src.server.services.egress.RelayError. This module
+# runs inside the sandbox and cannot import server code, so the duplication is
+# structural; tests/unit/core/test_relay_error_hints.py fails on any drift.
 _RELAY_ERROR_HINTS = {
     "needs_reauth": "the OAuth connection needs re-authorization; reconnect the server in Connectors",
     "relay_auth": "this sandbox's relay credentials are invalid or expired",
+    "bad_request": "the relay rejected this JSON-RPC frame as malformed or oversized",
+    "not_found": "no active grant for this server; reconnect it in Connectors",
+    "method_blocked": "the HTTP method is not permitted by this connection's policy",
     "tool_blocked": "the tool is not permitted by this connection's policy",
     "refresh_in_progress": "the vendor token is being refreshed; retry in a few seconds",
+    "destination_blocked": "the relay refused to dial this server's address",
+    "upstream_unreachable": "the relay could not reach the vendor's server",
     "limited_rate": "rate limit reached for this connection; retry shortly",
     "limited_concurrency": "too many concurrent calls for this connection; retry shortly",
     "relay_disabled": "the egress relay is disabled on this deployment",

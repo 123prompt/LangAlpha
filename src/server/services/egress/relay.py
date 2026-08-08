@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import httpx
 
 from src.config.env import EGRESS_RELAY_SECRET
 from src.server.database.egress_grants import fetch_grant_for_relay
+from src.server.services.egress import RelayError
 from src.server.services.egress.jsonrpc import (
     CanonicalRequest,
     JsonRpcRejected,
@@ -33,6 +35,9 @@ from src.server.services.egress.relay_jwt import (
 )
 from src.server.utils.egress_guard import EgressBlockedError, pin_public_url
 
+if TYPE_CHECKING:
+    from src.server.services.mcp_oauth.lifecycle import AccessToken
+
 logger = logging.getLogger(__name__)
 
 # Timeout ladder (spec §D): the read timeout is per-chunk idle, not total —
@@ -42,9 +47,28 @@ WRITE_TIMEOUT_S = 10.0
 READ_IDLE_TIMEOUT_S = 45.0
 WALL_CLOCK_S = 55.0
 
+# Connection pool. httpx defaults keepalive_expiry to 5s, which is shorter than
+# the model latency between two execute_code blocks — so every burst of MCP
+# calls would re-pay a TCP+TLS handshake (~2 RTT) to the vendor. Holding idle
+# connections across a turn is the whole point of pooling here.
+KEEPALIVE_EXPIRY_S = 300.0
+MAX_KEEPALIVE_CONNECTIONS = 40
+MAX_UPSTREAM_CONNECTIONS = 200
+
 # Sandbox → vendor: only what the generated MCP client legitimately sends.
+# mcp-method / mcp-name carry the 2026-07-28 stateless negotiation (server/
+# discover, per-call routing); without them a modern server can't negotiate
+# through the relay and every OAuth connector silently pins to the legacy
+# handshake.
 REQUEST_HEADER_ALLOWLIST = frozenset(
-    {"accept", "content-type", "mcp-protocol-version", "mcp-session-id"}
+    {
+        "accept",
+        "content-type",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "mcp-method",
+        "mcp-name",
+    }
 )
 # Vendor → sandbox: transport essentials plus the vendor's backoff hint.
 RESPONSE_HEADER_ALLOWLIST = frozenset(
@@ -60,10 +84,10 @@ class RelayRejection(Exception):
     from vendor-auth failures without parsing bodies.
     """
 
-    def __init__(self, status: int, code: str, detail: str = ""):
+    def __init__(self, status: int, code: RelayError, detail: str = ""):
         self.status = status
-        self.code = code
-        self.detail = detail or code
+        self.code = RelayError(code)
+        self.detail = detail or str(self.code)
         super().__init__(self.detail)
 
 
@@ -72,8 +96,7 @@ class PreparedRelay:
     claims: RelayClaims
     grant: dict
     canonical: CanonicalRequest
-    access_token: str
-    token_type: str
+    token: AccessToken
 
 
 _client: httpx.AsyncClient | None = None
@@ -93,6 +116,11 @@ def get_relay_client() -> httpx.AsyncClient:
                 read=READ_IDLE_TIMEOUT_S,
                 pool=CONNECT_TIMEOUT_S,
             ),
+            limits=httpx.Limits(
+                max_connections=MAX_UPSTREAM_CONNECTIONS,
+                max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+                keepalive_expiry=KEEPALIVE_EXPIRY_S,
+            ),
         )
     return _client
 
@@ -104,29 +132,36 @@ async def close_relay_client() -> None:
     _client = None
 
 
-async def prepare_relay(
-    grant_id: str,
-    *,
-    authorization: str | None,
-    raw_body: bytes,
-) -> PreparedRelay:
-    """Authenticate the sandbox, authorize the grant, ready the vendor token."""
-    if not EGRESS_RELAY_SECRET:
-        raise RelayRejection(503, "relay_disabled")
+def authenticate_relay(authorization: str | None) -> RelayClaims:
+    """Validate the sandbox's relay JWT — no body required.
 
+    Callers authenticate BEFORE buffering the request body, so an
+    unauthenticated client can never stream an arbitrary payload into worker
+    memory (the grant lookup and body read both come after this returns).
+    """
+    if not EGRESS_RELAY_SECRET:
+        raise RelayRejection(503, RelayError.RELAY_DISABLED)
     if not authorization or not authorization.lower().startswith("bearer "):
-        raise RelayRejection(401, "relay_auth")
+        raise RelayRejection(401, RelayError.RELAY_AUTH)
     try:
-        claims = validate_relay_jwt(
+        return validate_relay_jwt(
             EGRESS_RELAY_SECRET, authorization.split(" ", 1)[1].strip()
         )
     except RelayJwtError:
-        raise RelayRejection(401, "relay_auth")
+        raise RelayRejection(401, RelayError.RELAY_AUTH)
 
+
+async def prepare_relay(
+    grant_id: str,
+    *,
+    claims: RelayClaims,
+    raw_body: bytes,
+) -> PreparedRelay:
+    """Authorize the grant + ready the vendor token (sandbox already authed)."""
     try:
         canonical = canonicalize_request(raw_body)
     except JsonRpcRejected as e:
-        raise RelayRejection(400, "bad_request", str(e))
+        raise RelayRejection(400, RelayError.BAD_REQUEST, str(e))
 
     grant = await fetch_grant_for_relay(grant_id)
     # Absent, revoked, and wrong-scope all answer the same 404 — the relay is
@@ -139,15 +174,17 @@ async def prepare_relay(
         or grant["workspace_id"] != claims.workspace_id
         or grant["user_id"] != claims.user_id
     ):
-        raise RelayRejection(404, "not_found")
+        raise RelayRejection(404, RelayError.NOT_FOUND)
 
-    if grant["connection_status"] not in ("connected", "refresh_ambiguous"):
-        raise RelayRejection(401, "needs_reauth")
+    from src.server.services.mcp_oauth import SERVABLE
+
+    if grant["connection_status"] not in SERVABLE:
+        raise RelayRejection(401, RelayError.NEEDS_REAUTH)
 
     # HTTP-verb grant policy (defaults to ["POST"]). The route is POST-only
     # today, so this bites only when a grant is deliberately narrowed to [].
     if "POST" not in (grant.get("allowed_methods") or []):
-        raise RelayRejection(403, "method_blocked", "POST not in grant policy")
+        raise RelayRejection(403, RelayError.METHOD_BLOCKED, "POST not in grant policy")
 
     allowlist = grant.get("tool_allowlist")
     if (
@@ -155,7 +192,7 @@ async def prepare_relay(
         and canonical.method == "tools/call"
         and canonical.tool_name not in allowlist
     ):
-        raise RelayRejection(403, "tool_blocked", "tool not in grant policy")
+        raise RelayRejection(403, RelayError.TOOL_BLOCKED, "tool not in grant policy")
 
     from src.server.services.mcp_oauth.lifecycle import (
         TokenUnavailable,
@@ -166,15 +203,11 @@ async def prepare_relay(
         token = await ensure_fresh_access_token(grant["connection_id"])
     except TokenUnavailable as e:
         if e.reason == "refresh_in_progress":
-            raise RelayRejection(503, "refresh_in_progress")
-        raise RelayRejection(401, "needs_reauth", e.reason)
+            raise RelayRejection(503, RelayError.REFRESH_IN_PROGRESS)
+        raise RelayRejection(401, RelayError.NEEDS_REAUTH, e.reason)
 
     return PreparedRelay(
-        claims=claims,
-        grant=grant,
-        canonical=canonical,
-        access_token=token["access_token"],
-        token_type=token.get("token_type") or "Bearer",
+        claims=claims, grant=grant, canonical=canonical, token=token
     )
 
 
@@ -190,7 +223,7 @@ def _vendor_headers(
     }
     headers.setdefault("accept", "application/json, text/event-stream")
     headers.setdefault("content-type", "application/json")
-    headers["authorization"] = f"{prepared.token_type} {prepared.access_token}"
+    headers["authorization"] = prepared.token.header()
     return headers
 
 
@@ -205,11 +238,17 @@ async def open_upstream(
     except EgressBlockedError as e:
         # The destination was validated at grant creation; a failure here is
         # DNS trouble or a rebinding attempt — refuse, never resolve privately.
-        raise RelayRejection(502, "destination_blocked", str(e))
+        # The reason (which names the vendor host and is a DNS-resolution
+        # oracle) stays host-side; the sandbox gets only the X-Relay-Error code.
+        logger.warning(
+            "[egress_relay] destination pin failed for connection %s: %s",
+            prepared.grant["connection_id"], e,
+        )
+        raise RelayRejection(502, RelayError.DESTINATION_BLOCKED)
 
     client = get_relay_client()
     headers = _vendor_headers(prepared, incoming_headers)
-    headers["Host"] = target.host
+    headers["Host"] = target.authority
 
     async def _send(hdrs: dict[str, str]) -> httpx.Response:
         request = client.build_request(
@@ -224,7 +263,11 @@ async def open_upstream(
     try:
         response = await _send(headers)
     except httpx.HTTPError as e:
-        raise RelayRejection(502, "upstream_unreachable", str(e))
+        logger.warning(
+            "[egress_relay] upstream unreachable for connection %s: %s",
+            prepared.grant["connection_id"], e,
+        )
+        raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
 
     if response.status_code != 401:
         return response
@@ -233,34 +276,34 @@ async def open_upstream(
     # stored bundle rotated since our read, retry once with the new token;
     # otherwise the vendor is rejecting a current token → needs_reauth.
     await response.aclose()
-    from src.server.database.mcp_oauth import get_connection_by_id, mark_status
-
-    current = await get_connection_by_id(
-        prepared.grant["connection_id"], decrypt=True
+    from src.server.services.mcp_oauth.lifecycle import (
+        current_access_token,
+        mark_connection_needs_reauth,
     )
-    if (
-        current is not None
-        and current.get("access_token")
-        and current["access_token"] != prepared.access_token
-    ):
-        headers["authorization"] = (
-            f"{current.get('token_type') or 'Bearer'} {current['access_token']}"
-        )
+
+    connection_id = prepared.grant["connection_id"]
+    rejected = prepared.token
+    current = await current_access_token(connection_id)
+    if current is not None and current.generation > rejected.generation:
+        headers["authorization"] = current.header()
         try:
             retry = await _send(headers)
         except httpx.HTTPError as e:
-            raise RelayRejection(502, "upstream_unreachable", str(e))
+            logger.warning(
+                "[egress_relay] upstream unreachable on retry for connection %s: %s",
+                prepared.grant["connection_id"], e,
+            )
+            raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
         if retry.status_code != 401:
             return retry
         await retry.aclose()
-    if current is not None and current["status"] == "connected":
-        await mark_status(prepared.grant["connection_id"], "needs_reauth")
-        logger.warning(
-            "[egress_relay] vendor rejected a current token; connection %s "
-            "flipped to needs_reauth",
-            prepared.grant["connection_id"],
-        )
-    raise RelayRejection(401, "needs_reauth", "vendor rejected the token")
+        rejected = current
+    # The connection owns its own status: this only reports which bundle the
+    # vendor turned down, and a rotation since then makes that report moot.
+    await mark_connection_needs_reauth(
+        connection_id, seen_token_generation=rejected.generation
+    )
+    raise RelayRejection(401, RelayError.NEEDS_REAUTH, "vendor rejected the token")
 
 
 def sandbox_response_headers(upstream: httpx.Response) -> dict[str, str]:

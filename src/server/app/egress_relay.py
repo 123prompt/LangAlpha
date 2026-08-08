@@ -17,16 +17,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
 
+import anyio
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
+from src.server.services.egress import RelayError
+from src.server.services.egress.jsonrpc import MAX_BODY_BYTES
 from src.server.services.egress.limits import RelayLimited, acquire_slot
 from src.server.services.egress.relay import (
     WALL_CLOCK_S,
     RelayRejection,
+    authenticate_relay,
     open_upstream,
     prepare_relay,
     sandbox_response_headers,
@@ -46,52 +51,92 @@ def _reject(e: RelayRejection) -> Response:
     )
 
 
+async def _read_capped_body(request: Request) -> bytes:
+    """Buffer the body, refusing anything past the canonical cap.
+
+    Content-Length (when present and parseable) is rejected up front; the
+    streaming read then enforces the same bound so a chunked or lying-length
+    body can't slip a huge payload into memory. Same 400/"exceeds" contract the
+    canonicalizer would raise — only now the bytes are never all held at once.
+    """
+    cap = MAX_BODY_BYTES
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = None
+        if declared is not None and declared > cap:
+            raise RelayRejection(
+                400, RelayError.BAD_REQUEST, f"body exceeds {cap} bytes"
+            )
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > cap:
+            raise RelayRejection(
+                400, RelayError.BAD_REQUEST, f"body exceeds {cap} bytes"
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/v1/egress/{grant_id}")
 async def relay(grant_id: str, request: Request) -> Response:
-    raw_body = await request.body()
-    try:
-        prepared = await prepare_relay(
-            grant_id,
-            authorization=request.headers.get("authorization"),
-            raw_body=raw_body,
-        )
-    except RelayRejection as e:
-        return _reject(e)
-
-    # One wall-clock budget covers token-to-last-byte; the concurrency slot is
-    # held for the same span, so a slow vendor can pin a slot for at most
-    # WALL_CLOCK_S, never minutes.
+    # One wall-clock budget covers authenticate-to-last-byte, and the
+    # concurrency slot is entered BEFORE the expensive grant read + token
+    # decrypt so those run throttled — never after, where a flood would drive
+    # unbounded key derivations and DB connections past the limiter.
     loop = asyncio.get_running_loop()
     deadline = loop.time() + WALL_CLOCK_S
 
     resources = AsyncExitStack()
     try:
+        # A malformed grant id answers the same uniform 404 as an unknown one
+        # (the column is a uuid) — never a 500 with a stack trace.
+        try:
+            uuid.UUID(grant_id)
+        except ValueError:
+            raise RelayRejection(404, RelayError.NOT_FOUND)
         async with asyncio.timeout_at(deadline):
-            await resources.enter_async_context(
-                acquire_slot(grant_id, prepared.grant["rate_class"])
+            # Authenticate first — before the body read and before a slot is
+            # taken — so an unauthenticated caller spends neither worker memory
+            # nor a concurrency slot.
+            claims = authenticate_relay(request.headers.get("authorization"))
+            await resources.enter_async_context(acquire_slot(grant_id))
+            raw_body = await _read_capped_body(request)
+            prepared = await prepare_relay(
+                grant_id, claims=claims, raw_body=raw_body
             )
             upstream = await open_upstream(prepared, dict(request.headers))
     except RelayRejection as e:
-        await resources.aclose()
+        with anyio.CancelScope(shield=True):
+            await resources.aclose()
         return _reject(e)
     except RelayLimited as e:
-        await resources.aclose()
+        with anyio.CancelScope(shield=True):
+            await resources.aclose()
         return Response(
             status_code=429,
             content=f"relay limit: {e.kind}",
             media_type="text/plain",
-            headers={"X-Relay-Error": f"limited_{e.kind}", "Retry-After": "5"},
+            headers={"X-Relay-Error": e.code, "Retry-After": "5"},
         )
     except TimeoutError:
-        await resources.aclose()
+        with anyio.CancelScope(shield=True):
+            await resources.aclose()
         return Response(
             status_code=504,
             content="relay wall clock exceeded",
             media_type="text/plain",
-            headers={"X-Relay-Error": "wall_clock"},
+            headers={"X-Relay-Error": RelayError.WALL_CLOCK},
         )
     except BaseException:
-        await resources.aclose()
+        # Shield the release: a cancellation here (client gone during setup)
+        # would otherwise skip aclose and leak the slot + connection.
+        with anyio.CancelScope(shield=True):
+            await resources.aclose()
         raise
 
     async def stream() -> AsyncIterator[bytes]:
@@ -122,8 +167,15 @@ async def relay(grant_id: str, request: Request) -> Response:
                     break
                 yield chunk
         finally:
-            await upstream.aclose()
-            await resources.aclose()
+            # Starlette runs this generator inside an anyio cancel scope that
+            # re-delivers CancelledError at EVERY await, so an unshielded first
+            # close would take the cancellation and skip the slot + connection
+            # release — leaking a concurrency slot that never ages out (each new
+            # request re-EXPIREs the key) and an upstream connection. Shield so
+            # both closes run to completion.
+            with anyio.CancelScope(shield=True):
+                await upstream.aclose()
+                await resources.aclose()
 
     return StreamingResponse(
         stream(),

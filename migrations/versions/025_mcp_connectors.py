@@ -32,6 +32,21 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # sandbox_egress_grants below uses UNIQUE NULLS NOT DISTINCT, which requires
+    # PostgreSQL 15+. Dev runs pg18 and prod Aurora is >=15, so this is met — but
+    # fail with a message that names the requirement rather than a bare syntax
+    # error if this migration is ever applied to an older server.
+    op.execute("""
+        DO $$
+        BEGIN
+            IF current_setting('server_version_num')::int < 150000 THEN
+                RAISE EXCEPTION
+                    'migration 025 requires PostgreSQL 15+ (UNIQUE NULLS NOT '
+                    'DISTINCT); server is %', current_setting('server_version');
+            END IF;
+        END $$;
+    """)
+
     # Existing template rows stay inert (enabled=false) until the user
     # activates them in the Connectors UI.
     op.execute("""
@@ -144,8 +159,6 @@ def upgrade() -> None:
             allowed_methods JSONB NOT NULL DEFAULT '["POST"]',
             tool_allowlist JSONB NULL,
             policy_version INTEGER NOT NULL DEFAULT 1,
-            limits JSONB NOT NULL DEFAULT '{}',
-            rate_class VARCHAR(32) NOT NULL DEFAULT 'default',
             status VARCHAR(16) NOT NULL DEFAULT 'active',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

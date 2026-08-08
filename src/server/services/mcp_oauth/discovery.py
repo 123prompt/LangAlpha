@@ -1,10 +1,10 @@
 """Host-side tool discovery for OAuth-connected user servers.
 
 OAuth servers are never probed from a sandbox (no token exists there); a
-short-lived SDK session runs here instead — on connect, on manual refresh,
-and from the sweeper when the snapshot ages out. The cache row lives in
-``user_mcp_tool_schemas``; a schema-digest change fans out a version bump so
-sessions re-resolve, while an unchanged re-discovery stays silent.
+short-lived SDK session runs here instead — on connect and on manual refresh.
+The cache row lives in ``user_mcp_tool_schemas``; a schema-digest change fans
+out a version bump so sessions re-resolve, while an unchanged re-discovery
+stays silent.
 """
 
 from __future__ import annotations
@@ -34,24 +34,6 @@ logger = logging.getLogger(__name__)
 
 DISCOVERY_TIMEOUT_S = 30
 
-# Snapshots older than this are re-discovered by the sweeper: sandbox
-# reconnects and ignored notifications can't invalidate a host-side cache, so
-# age is the backstop.
-SCHEMA_MAX_AGE_SECONDS = 6 * 3600
-
-
-class _StreamsTransport:
-    """Adapter: the stream context manager pair as a Client transport."""
-
-    def __init__(self, streams_cm):
-        self._cm = streams_cm
-
-    async def __aenter__(self):
-        return await self._cm.__aenter__()
-
-    async def __aexit__(self, *exc):
-        return await self._cm.__aexit__(*exc)
-
 
 def _schema_digest(tools: list[dict]) -> str:
     canonical = json.dumps(tools, sort_keys=True, separators=(",", ":"))
@@ -66,6 +48,7 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
     """
     from src.server.services.mcp_config import user_row_to_server_config
     from src.server.services.mcp_discovery import (
+        ToolSnapshotIndex,
         mcp_discovery_fingerprint,
         sanitize_discovered_tools,
     )
@@ -97,23 +80,26 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
     url = row["url"]
     parsed = urlparse(url)
     try:
-        # Pre-connect SSRF check. The SDK session then dials the hostname
-        # itself (TLS against the real name); the rebinding residual between
-        # check and connect is accepted for this authenticated, read-only hop
-        # — the load-bearing pinning is on the token/DCR hops and the relay.
+        # Pre-connect SSRF check on the original hostname. The SDK session then
+        # dials the hostname itself (TLS against the real name); the DNS-
+        # rebinding residual between check and connect is accepted for this
+        # authenticated, read-only hop — the load-bearing pinning is on the
+        # token/DCR hops and the relay.
         await resolve_public_ips(parsed.hostname or "", port=parsed.port or 443)
     except Exception as e:
         return await _fail(f"blocked url: {e}")
 
-    headers = {
-        "Authorization": f"{token['token_type']} {token['access_token']}"
-    }
+    headers = {"Authorization": token.header()}
     try:
         async with asyncio.timeout(DISCOVERY_TIMEOUT_S):
             async with create_mcp_http_client(headers=headers) as http_client:
-                transport = _StreamsTransport(
-                    streamable_http_client(url, http_client=http_client)
-                )
+                # Refuse redirects: create_mcp_http_client defaults them ON, and
+                # a redirect is the one hop the pre-check above can't cover — a
+                # hostile server would 30x to an internal address (link-local
+                # metadata, RFC1918) that never faced resolve_public_ips.
+                http_client.follow_redirects = False
+                # The streams context manager IS the SDK's Transport protocol.
+                transport = streamable_http_client(url, http_client=http_client)
                 async with Client(transport) as client:
                     result = await client.list_tools(cache_mode="refresh")
     except Exception as e:
@@ -137,11 +123,11 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
         )
 
     digest = _schema_digest(kept)
-    previous = {
-        r["config_hash"]: r for r in await get_user_tool_schemas(user_id)
-        if r["server_name"] == server_name
-    }
-    prior = previous.get(fingerprint)
+    # Same acceptance rule as every other consumer: only a snapshot taken under
+    # this server's CURRENT fingerprint is comparable.
+    prior = ToolSnapshotIndex(
+        user_rows=await get_user_tool_schemas(user_id)
+    ).snapshot(server)
     cached = await upsert_user_tool_schemas(
         user_id,
         server_name,

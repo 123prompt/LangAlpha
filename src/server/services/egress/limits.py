@@ -11,13 +11,14 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
+from src.server.services.egress import RelayError
+
 logger = logging.getLogger(__name__)
 
-# Per-grant budgets by rate class. "default" is deliberately generous — a
-# single agent turn fans out at most a handful of concurrent tool calls.
-RATE_CLASSES: dict[str, dict[str, int]] = {
-    "default": {"rpm": 120, "concurrency": 4},
-}
+# Per-grant budgets, deliberately generous — a single agent turn fans out at
+# most a handful of concurrent tool calls.
+RATE_LIMIT_RPM = 120
+CONCURRENCY_LIMIT = 4
 
 # TTLs bound leak windows if a worker dies mid-request. The concurrency TTL
 # must exceed the relay's 55s wall clock: a live request outliving its key
@@ -29,15 +30,12 @@ _CONC_KEY_TTL = 120
 class RelayLimited(Exception):
     def __init__(self, kind: str):
         self.kind = kind  # "rate" | "concurrency"
+        self.code = RelayError(f"limited_{kind}")
         super().__init__(kind)
 
 
-def _limits_for(rate_class: str) -> dict[str, int]:
-    return RATE_CLASSES.get(rate_class) or RATE_CLASSES["default"]
-
-
 @asynccontextmanager
-async def acquire_slot(grant_id: str, rate_class: str):
+async def acquire_slot(grant_id: str):
     """Hold one concurrency slot for the duration of a relayed request."""
     from src.utils.cache.redis_cache import get_cache_client
 
@@ -47,7 +45,6 @@ async def acquire_slot(grant_id: str, rate_class: str):
         yield
         return
     redis = cache.client
-    limits = _limits_for(rate_class)
 
     minute = int(time.time() // 60)
     rate_key = f"egress:rate:{grant_id}:{minute}"
@@ -62,7 +59,7 @@ async def acquire_slot(grant_id: str, rate_class: str):
         logger.warning("[egress_limits] rate check failed; failing open", exc_info=True)
         yield
         return
-    if int(count) > limits["rpm"]:
+    if int(count) > RATE_LIMIT_RPM:
         raise RelayLimited("rate")
 
     try:
@@ -78,7 +75,7 @@ async def acquire_slot(grant_id: str, rate_class: str):
         return
 
     try:
-        if int(inflight) > limits["concurrency"]:
+        if int(inflight) > CONCURRENCY_LIMIT:
             raise RelayLimited("concurrency")
         yield
     finally:

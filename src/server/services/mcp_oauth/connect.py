@@ -12,11 +12,14 @@ is an allowlisted relative path.
 
 from __future__ import annotations
 
-import json
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
+from ipaddress import ip_address
+from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
+
+from pydantic import BaseModel, ValidationError
 
 from mcp.client.auth import PKCEParameters
 from mcp.client.auth.oauth2 import OAuthContext
@@ -42,7 +45,7 @@ from mcp.shared.auth import (
 )
 
 from src.config.env import SERVER_BASE_URL
-from src.server.database.mcp_oauth import get_connection, upsert_connection
+from src.server.database.mcp_oauth import Secrets, get_connection, upsert_connection
 from src.server.database.mcp_servers import (
     bump_user_workspaces_mcp_version,
     get_catalog_server,
@@ -74,29 +77,109 @@ class McpOAuthError(Exception):
     """A connect-flow step failed in a way the caller should surface."""
 
 
+class ConnectState(BaseModel):
+    """The bridge record phase 1 parks in Redis and phase 2 claims.
+
+    It crosses worker — and, across a deploy, build — boundaries as JSON, so it
+    is validated on the way back in: a truncated or older-shaped record must
+    fail like an expired one, not KeyError partway through the token exchange.
+    Field names are the wire format; do not rename them.
+
+    Only the presentation fields carry defaults. Everything the exchange
+    depends on (identity, the PKCE verifier, the endpoints) is required,
+    because a record missing any of it cannot produce a correct token request.
+    """
+
+    user_id: str
+    server_name: str
+    server_url: str
+    code_verifier: str
+    redirect_uri: str
+    token_endpoint: str
+    issuer: str
+    resource: str | None = None
+    scope: str | None = None
+    client_info: dict[str, Any]
+    as_metadata: dict[str, Any]
+    resource_metadata: dict[str, Any] | None = None
+    return_to: str = DEFAULT_RETURN_TO
+    web_origin: str = ""
+    # DCR confidential-client secret, carried out-of-band from client_info so it
+    # never lands in the plaintext client_info JSONB column at persist. Empty
+    # for public clients. Phase 2 re-attaches it for the token exchange and
+    # stores it in its own encrypted column.
+    client_secret: str = ""
+    # High-entropy value mirrored into an HttpOnly cookie on the initiating
+    # browser; the callback must present it back. Binds the callback to the
+    # browser that started the flow so a stolen (state, code) pair replayed in
+    # a victim's browser has no matching cookie and is refused. Defaulted so an
+    # older-shaped record still validates (its callback simply skips the check).
+    browser_nonce: str = ""
+
+
 def _redirect_uri() -> str:
     return f"{SERVER_BASE_URL.rstrip('/')}/api/v1/mcp/oauth/callback"
 
 
+def _host_is_loopback(host: str | None) -> bool:
+    host = (host or "").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _server_origin() -> str:
+    parts = urlsplit(SERVER_BASE_URL)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+
+
+def callback_is_loopback() -> bool:
+    """Whether the browser-nonce binding can be honored at all here.
+
+    The cookie only returns if the origin the user browses shares a *host* with
+    this callback (cookies ignore port, not host). A loopback callback means a
+    local dev box, where the UI is routinely served from some other host — a
+    ``*.localhost`` dev proxy — while an AS will only accept a loopback literal
+    for an ``http`` redirect_uri. Those two demands can't both be met, so
+    requiring the cookie there rejects every connect. A deployed instance never
+    has a loopback callback, so the binding stays mandatory in production.
+    """
+    return _host_is_loopback(urlsplit(SERVER_BASE_URL).hostname or "")
+
+
 def sanitize_return_to(value: str | None) -> str:
-    """Allowlist: a same-app relative path only ('/x', never '//x' or a URL)."""
-    if value and value.startswith("/") and not value.startswith("//"):
+    """Allowlist: a same-app relative path only ('/x', never '//x' or '/\\x').
+
+    A leading '/' followed by '/' or '\\' is protocol-relative once the browser
+    normalizes backslashes ('/\\evil.com' → '//evil.com'), which would redirect
+    off-site — so the second character must be a normal path char.
+    """
+    if value and value.startswith("/") and value[1:2] not in ("/", "\\"):
         return value
     return DEFAULT_RETURN_TO
 
 
 def sanitize_web_origin(value: str | None) -> str:
-    """An http(s) origin (scheme://host[:port]) or "".
+    """A vouched-for http(s) origin (scheme://host[:port]) or "".
 
     Captured from the browser's Origin header on the authenticated start
     request — it is where the UI actually lives, which the callback's own
-    origin is not when the frontend and API run on split dev ports. Anything
-    beyond a bare origin (path, query, userinfo, "null") is dropped.
+    origin is not when the frontend and API run on split dev ports. It becomes
+    the prefix of the post-connect redirect, so it must never be an
+    attacker-forged Origin: only a local dev host (the one case where the
+    callback's origin legitimately differs from the UI's) or this deployment's
+    own base URL is honored. Anything else — including a well-formed but foreign
+    public origin — is dropped, and the callback falls back to a relative path
+    on its own origin. Anything beyond a bare origin (path, query, userinfo,
+    "null") is dropped up front.
     """
     if not value:
         return ""
     parts = urlsplit(value)
-    if (
+    if not (
         parts.scheme in ("http", "https")
         and parts.netloc
         and "@" not in parts.netloc
@@ -104,7 +187,10 @@ def sanitize_web_origin(value: str | None) -> str:
         and not parts.query
         and not parts.fragment
     ):
-        return f"{parts.scheme}://{parts.netloc}"
+        return ""
+    origin = f"{parts.scheme}://{parts.netloc}"
+    if _host_is_loopback(parts.hostname) or origin == _server_origin():
+        return origin
     return ""
 
 
@@ -222,7 +308,7 @@ async def _register_client(
     auth_base_url: str,
 ) -> OAuthClientInformationFull:
     """Reuse the stored DCR registration when the issuer matches; else register."""
-    existing = await get_connection(user_id, server_name, decrypt=True)
+    existing = await get_connection(user_id, server_name, secrets=Secrets.FULL)
     if existing and existing.get("client_info"):
         try:
             stored = OAuthClientInformationFull.model_validate(
@@ -262,7 +348,10 @@ async def start_connect(
     if row is None:
         raise McpOAuthError("MCP server not found")
     server_url = row.get("url")
-    if row.get("transport") not in ("http", "sse") or not server_url:
+    # http only: the generated sandbox client rejects legacy `sse` transport
+    # (it never implemented the real GET→endpoint-event→POST flow), so an
+    # sse-bound OAuth connection could never be used through the relay.
+    if row.get("transport") != "http" or not server_url:
         raise McpOAuthError("OAuth connect requires a remote (http) MCP server")
 
     redirect_uri = _redirect_uri()
@@ -309,6 +398,9 @@ async def start_connect(
 
     pkce = PKCEParameters.generate()
     state = secrets.token_urlsafe(32)
+    # Empty on a loopback callback: the record then takes the same skip path as
+    # a pre-control record, so the verification logic needs no dev branch.
+    browser_nonce = "" if callback_is_loopback() else secrets.token_urlsafe(32)
 
     params: dict[str, str] = {
         "response_type": "code",
@@ -331,28 +423,36 @@ async def start_connect(
         if "offline_access" in effective_scope.split():
             params["prompt"] = "consent"
 
-    record = {
-        "user_id": user_id,
-        "server_name": server_name,
-        "server_url": server_url,
-        "code_verifier": pkce.code_verifier,
-        "redirect_uri": redirect_uri,
-        "token_endpoint": str(as_metadata.token_endpoint),
-        "issuer": str(as_metadata.issuer),
-        "resource": params.get("resource"),
-        "scope": effective_scope,
-        "client_info": client_info.model_dump(mode="json", exclude_none=True),
-        "as_metadata": as_metadata.model_dump(mode="json", exclude_none=True),
-        "resource_metadata": (
+    record = ConnectState(
+        user_id=user_id,
+        server_name=server_name,
+        server_url=server_url,
+        code_verifier=pkce.code_verifier,
+        redirect_uri=redirect_uri,
+        token_endpoint=str(as_metadata.token_endpoint),
+        issuer=str(as_metadata.issuer),
+        resource=params.get("resource"),
+        scope=effective_scope,
+        # client_secret is excluded here and carried in its own field — see
+        # ConnectState.client_secret. Keeping it out of this blob is what stops
+        # a confidential secret from being written plaintext to the client_info
+        # JSONB column when phase 2 persists the connection.
+        client_info=client_info.model_dump(
+            mode="json", exclude_none=True, exclude={"client_secret"}
+        ),
+        as_metadata=as_metadata.model_dump(mode="json", exclude_none=True),
+        resource_metadata=(
             prm.model_dump(mode="json", exclude_none=True) if prm else None
         ),
-        "return_to": sanitize_return_to(return_to),
-        "web_origin": sanitize_web_origin(web_origin),
-    }
+        return_to=sanitize_return_to(return_to),
+        web_origin=sanitize_web_origin(web_origin),
+        browser_nonce=browser_nonce,
+        client_secret=client_info.client_secret or "",
+    )
     redis = _cache_client()
     stored = await redis.set(
         f"{_STATE_KEY_PREFIX}{state}",
-        json.dumps(record),
+        record.model_dump_json(),
         nx=True,
         ex=STATE_TTL_SECONDS,
     )
@@ -362,12 +462,19 @@ async def start_connect(
     authorize_url = f"{authorize_endpoint}?{urlencode(params)}"
     logger.info(
         "[mcp_oauth] connect started user=%s server=%s issuer=%s",
-        user_id, server_name, record["issuer"],
+        user_id, server_name, record.issuer,
     )
-    return {"authorize_url": authorize_url, "state": state}
+    # browser_nonce is for the caller to set as an HttpOnly cookie only — it
+    # must never reach the JSON body (that would defeat HttpOnly and hand it to
+    # any XSS on the page).
+    return {
+        "authorize_url": authorize_url,
+        "state": state,
+        "browser_nonce": browser_nonce,
+    }
 
 
-async def _claim_state(state: str) -> dict | None:
+async def _claim_state(state: str) -> ConnectState | None:
     """Atomic single-use claim: at most one callback wins a given state."""
     redis = _cache_client()
     key = f"{_STATE_KEY_PREFIX}{state}"
@@ -377,7 +484,13 @@ async def _claim_state(state: str) -> dict | None:
         raw, _ = await pipe.execute()
     if not raw:
         return None
-    return json.loads(raw)
+    try:
+        return ConnectState.model_validate_json(raw)
+    except ValidationError as e:
+        # The key is already consumed, so an unusable record is spent — same
+        # outcome as an expired one, and the caller must not leak the shape.
+        logger.warning("[mcp_oauth] unusable state record discarded: %s", e)
+        return None
 
 
 async def complete_callback(
@@ -387,12 +500,17 @@ async def complete_callback(
     iss: str | None = None,
     error: str | None = None,
     error_description: str | None = None,
+    browser_nonce: str | None = None,
 ) -> str:
     """Phase 2: claim state, exchange the code, persist the bundle.
 
     Returns the redirect target for the browser — absolute when the start
     request captured a web origin, relative otherwise. Never raises for
     user-visible outcomes — errors are encoded in the redirect.
+
+    ``browser_nonce`` is the value from the initiating browser's HttpOnly
+    cookie; it must match the one minted into the state record, so a callback
+    replayed in a different browser (which carries no such cookie) is refused.
     """
     if not state:
         return f"{DEFAULT_RETURN_TO}?mcp_error=missing_state"
@@ -401,18 +519,33 @@ async def complete_callback(
         # Unknown, expired, or already used — uniform answer, no oracle.
         return f"{DEFAULT_RETURN_TO}?mcp_error=invalid_state"
 
+    # CSRF binding: the state is single-use and now claimed, so a mismatch here
+    # spends it (no retry oracle). An older-shaped record has an empty nonce and
+    # skips the check — it predates this control and can't be forged into one.
+    if record.browser_nonce and not secrets.compare_digest(
+        record.browser_nonce, browser_nonce or ""
+    ):
+        logger.warning(
+            "[mcp_oauth] callback browser-nonce mismatch user=%s server=%s",
+            record.user_id, record.server_name,
+        )
+        return_to = sanitize_web_origin(record.web_origin) + sanitize_return_to(
+            record.return_to
+        )
+        return f"{return_to}?mcp_error=state_mismatch&server={quote(record.server_name)}"
+
     # Absolute when the start request carried a browser Origin (split-port
     # dev: the callback's own origin is the API, which has no UI routes);
     # relative otherwise, resolving on the unified proxy/prod origin.
-    return_to = sanitize_web_origin(record.get("web_origin")) + sanitize_return_to(
-        record.get("return_to")
+    return_to = sanitize_web_origin(record.web_origin) + sanitize_return_to(
+        record.return_to
     )
-    server_name = record["server_name"]
+    server_name = record.server_name
 
     def _fail(reason: str) -> str:
         logger.warning(
             "[mcp_oauth] callback failed user=%s server=%s reason=%s",
-            record["user_id"], server_name, reason,
+            record.user_id, server_name, reason,
         )
         return f"{return_to}?mcp_error={reason}&server={quote(server_name)}"
 
@@ -426,23 +559,27 @@ async def complete_callback(
     if not code:
         return _fail("missing_code")
 
-    as_metadata = OAuthMetadata.model_validate(record["as_metadata"])
+    as_metadata = OAuthMetadata.model_validate(record.as_metadata)
     try:
         validate_authorization_response_iss(iss, as_metadata)
     except Exception:
         return _fail("issuer_mismatch")
 
-    client_info = OAuthClientInformationFull.model_validate(record["client_info"])
+    client_info = OAuthClientInformationFull.model_validate(record.client_info)
+    # Re-attach the out-of-band secret (stripped from the blob at persist) so a
+    # confidential client authenticates its token exchange below.
+    if record.client_secret:
+        client_info.client_secret = record.client_secret
     prm = (
-        ProtectedResourceMetadata.model_validate(record["resource_metadata"])
-        if record.get("resource_metadata")
+        ProtectedResourceMetadata.model_validate(record.resource_metadata)
+        if record.resource_metadata
         else None
     )
     context = _build_context(
-        record["server_url"],
+        record.server_url,
         client_metadata=OAuthClientMetadata(
             client_name=CLIENT_NAME,
-            redirect_uris=[record["redirect_uri"]],  # type: ignore[list-item]
+            redirect_uris=[record.redirect_uri],  # type: ignore[list-item]
         ),
         prm=prm,
         as_metadata=as_metadata,
@@ -453,12 +590,12 @@ async def complete_callback(
     token_data: dict[str, str] = {
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": record["redirect_uri"],
+        "redirect_uri": record.redirect_uri,
         "client_id": client_info.client_id or "",
-        "code_verifier": record["code_verifier"],
+        "code_verifier": record.code_verifier,
     }
-    if record.get("resource"):
-        token_data["resource"] = record["resource"]
+    if record.resource:
+        token_data["resource"] = record.resource
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     token_data, headers = context.prepare_token_auth(token_data, headers)
 
@@ -467,7 +604,7 @@ async def complete_callback(
             response = await pinned_request(
                 client,
                 "POST",
-                record["token_endpoint"],
+                record.token_endpoint,
                 headers=headers,
                 data=token_data,
             )
@@ -492,27 +629,29 @@ async def complete_callback(
         else None
     )
     connection_id = await upsert_connection(
-        record["user_id"],
+        record.user_id,
         server_name,
-        server_url=record["server_url"],
+        server_url=record.server_url,
         access_token=token.access_token,
-        refresh_token=token.refresh_token,
+        # "" and None both mean "no refresh token"; store NULL for both so the
+        # column's NOT NULL-ness is the single answer to "can this refresh?".
+        refresh_token=token.refresh_token or None,
         client_secret=client_info.client_secret,
         token_type=token.token_type or "Bearer",
-        scope=token.scope or record.get("scope"),
+        scope=token.scope or record.scope,
         expires_at=expires_at,
-        client_info=record["client_info"],
-        as_metadata=record["as_metadata"],
-        resource_metadata=record.get("resource_metadata"),
+        client_info=record.client_info,
+        as_metadata=record.as_metadata,
+        resource_metadata=record.resource_metadata,
     )
     logger.info(
         "[mcp_oauth] connected user=%s server=%s connection=%s has_refresh=%s",
-        record["user_id"], server_name,
+        record.user_id, server_name,
         connection_id, token.refresh_token is not None,
     )
 
     # Sessions must re-resolve: the server is now relay-bound.
-    await bump_user_workspaces_mcp_version(record["user_id"])
+    await bump_user_workspaces_mcp_version(record.user_id)
 
     # Best-effort host-side discovery so tools show up immediately; failure
     # leaves a pending/error schema row, never a broken connection.
@@ -521,7 +660,7 @@ async def complete_callback(
             refresh_user_tool_schemas,
         )
 
-        await refresh_user_tool_schemas(record["user_id"], server_name)
+        await refresh_user_tool_schemas(record.user_id, server_name)
     except Exception:
         logger.warning(
             "[mcp_oauth] post-connect discovery failed for %s",

@@ -30,9 +30,11 @@ import httpx2
 import pytest
 
 from src.server.database import mcp_oauth as mcp_oauth_db
+from src.server.database.mcp_oauth import Secrets
 from src.server.services.mcp_oauth import lifecycle
 from src.server.services.mcp_oauth.http import OAuthHopBlocked
 from src.server.services.mcp_oauth.lifecycle import (
+    AccessToken,
     TokenUnavailable,
     ensure_fresh_access_token,
 )
@@ -99,17 +101,35 @@ class FakeStore:
         self.read_count = 0
         self.marks: list[str] = []
         self.commits: list[dict] = []
+        self.reads: list[Secrets] = []
+        # The connection each write/read was handed — None means it acquired
+        # its own from the pool. The refresh winner must thread the held,
+        # advisory-locked connection through so it never nests a second acquire.
+        self.read_conns: list = []
+        self.commit_conns: list = []
 
-    async def get_connection_by_id(self, connection_id, *, decrypt=False):
+    async def get_connection_by_id(self, connection_id, *, secrets=Secrets.NONE, conn=None):
         assert connection_id == CONNECTION_ID
-        # The lifecycle needs the plaintext bundle; a summary read is a bug.
-        assert decrypt is True
+        # The lifecycle always needs at least the bearer; a summary read is a bug.
+        assert secrets is not Secrets.NONE
+        self.reads.append(secrets)
+        self.read_conns.append(conn)
         self.read_count += 1
         if self.read_count in self.script:
             self.row = self.script[self.read_count]
-        return copy.deepcopy(self.row) if self.row is not None else None
+        if self.row is None:
+            return None
+        row = copy.deepcopy(self.row)
+        # Mirror the real read exactly: a BEARER row carries the flag but not
+        # the refresh token or client secret, so code that needs those while
+        # asking for BEARER fails here the same way it would against Postgres.
+        row["has_refresh_token"] = bool(row.get("refresh_token"))
+        if secrets is not Secrets.FULL:
+            row.pop("refresh_token", None)
+            row.pop("client_secret", None)
+        return row
 
-    async def mark_status(self, connection_id, status):
+    async def mark_status(self, connection_id, status, *, conn=None):
         self.marks.append(status)
         if self.row is not None:
             self.row["status"] = status
@@ -124,7 +144,9 @@ class FakeStore:
         refresh_token,
         expires_at,
         scope=None,
+        conn=None,
     ):
+        self.commit_conns.append(conn)
         self.commits.append(
             {
                 "connection_id": connection_id,
@@ -174,11 +196,13 @@ class FakeLockDb:
         self.acquired = acquired
         self.statements: list[tuple[str, tuple | None]] = []
         self.opened = 0
+        self.last_conn = None
 
     @asynccontextmanager
     async def connection(self):
         self.opened += 1
-        yield SimpleNamespace(cursor=lambda *a, **k: _FakeCursor(self))
+        self.last_conn = SimpleNamespace(cursor=lambda *a, **k: _FakeCursor(self))
+        yield self.last_conn
 
     def _keys(self, fn: str) -> list[int]:
         return [
@@ -280,18 +304,63 @@ class TestHotPath:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token == {
-            "access_token": "access-old",
-            "token_type": "Bearer",
-            "server_name": SERVER_NAME,
-            "status": "connected",
-        }
+        assert token == AccessToken(
+            access_token="access-old", token_type="Bearer", generation=3
+        )
         # The whole point of the margin: one read, and the lock manager is
         # never consulted.
         assert store.read_count == 1
         assert db.opened == 0
         assert db.lock_attempts == []
         assert token_endpoint.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_relayed_call_path_decrypts_the_bearer_only(
+        self, store, db, token_endpoint
+    ):
+        # Every relayed tool call lands here, and each decrypted column re-runs
+        # OpenPGP S2K on the DB. The refresh token and client secret are not
+        # needed to serve a valid bearer, and the refresh path re-reads the full
+        # bundle under the lock anyway — so widening this read back to FULL is a
+        # pure regression, and this is the only place that would notice.
+        store.row = _row(expires_in=3600)
+
+        await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.reads == [Secrets.BEARER]
+
+    @pytest.mark.asyncio
+    async def test_no_refresh_token_is_decided_without_decrypting_one(
+        self, store, db, token_endpoint
+    ):
+        # The "can this connection refresh?" question is answered by the
+        # column's NOT NULL-ness, so it survives a bearer-only read.
+        store.row = _row(expires_in=120, refresh_token=None)
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        # Inside the refresh margin, but with nothing to refresh with: ride the
+        # old token to expiry rather than attempting a doomed refresh.
+        assert token.access_token == "access-old"
+        assert store.reads == [Secrets.BEARER]
+        assert token_endpoint.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_missing_token_type_is_defaulted_here_not_at_the_caller(
+        self, store, db, token_endpoint
+    ):
+        """Vendors may omit token_type; every holder must still get a header.
+
+        The default belongs on this side of the boundary — an AccessToken that
+        can be constructed without a scheme is one every consumer has to
+        re-defend against.
+        """
+        store.row = _row(token_type=None)
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.token_type == "Bearer"
+        assert token.header() == "Bearer access-old"
 
     @pytest.mark.asyncio
     async def test_non_expiring_token_is_never_refreshed(
@@ -301,7 +370,7 @@ class TestHotPath:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         assert db.lock_attempts == []
         assert token_endpoint.calls == []
 
@@ -315,7 +384,7 @@ class TestHotPath:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         assert db.lock_attempts == []
 
     @pytest.mark.asyncio
@@ -362,7 +431,7 @@ class TestHotPath:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         assert db.lock_attempts == []
         assert token_endpoint.calls == []
         assert store.marks == []
@@ -395,12 +464,10 @@ class TestWinner:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token == {
-            "access_token": "access-new",
-            "token_type": "Bearer",
-            "server_name": SERVER_NAME,
-            "status": "connected",
-        }
+        # generation 4: the CAS committed exactly one bump over the row we read.
+        assert token == AccessToken(
+            access_token="access-new", token_type="Bearer", generation=4
+        )
         [call] = token_endpoint.calls
         assert call["method"] == "POST"
         assert call["url"] == f"{ISSUER}/token"
@@ -419,6 +486,36 @@ class TestWinner:
         assert store.row["token_generation"] == 4
 
     @pytest.mark.asyncio
+    async def test_the_under_lock_re_read_is_the_one_that_takes_the_full_bundle(
+        self, store, db, token_endpoint
+    ):
+        # The counterpart to the bearer-only hot path: the refresh actually
+        # spends the refresh token and client secret, so its re-read — and only
+        # its re-read — pays for the full decrypt.
+        store.row = _row(expires_in=120)
+
+        await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.reads == [Secrets.BEARER, Secrets.FULL]
+
+    @pytest.mark.asyncio
+    async def test_under_lock_work_reuses_the_held_connection(
+        self, store, db, token_endpoint
+    ):
+        # The refresh winner holds one advisory-locked pool connection and must
+        # run its FULL re-read and commit on THAT connection — never nest a
+        # second pool acquire inside the first (which stalls every winner on
+        # pool timeout under a many-connection refresh storm). The hot-path
+        # bearer read, by contrast, acquires its own (conn is None).
+        store.row = _row(expires_in=120)
+
+        await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.read_conns[0] is None  # hot-path bearer read
+        assert store.read_conns[1] is db.last_conn  # under-lock FULL re-read
+        assert store.commit_conns == [db.last_conn]
+
+    @pytest.mark.asyncio
     async def test_an_unrotated_refresh_token_is_kept(
         self, store, db, token_endpoint
     ):
@@ -433,7 +530,7 @@ class TestWinner:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-new"
+        assert token.access_token == "access-new"
         assert store.commits[0]["refresh_token"] is None
         assert store.row["refresh_token"] == "refresh-old"
 
@@ -494,7 +591,7 @@ class TestWinner:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-newer"
+        assert token.access_token == "access-newer"
         assert token_endpoint.calls == []
         assert store.commits == []
         assert db.unlocks == [LOCK_KEY]
@@ -525,7 +622,7 @@ class TestWinner:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         # A 5xx is transient: the connection stays connected and retryable.
         assert store.marks == []
         assert store.commits == []
@@ -548,7 +645,7 @@ class TestWinner:
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
         assert [c["expected_generation"] for c in store.commits] == [3]
-        assert token["access_token"] == "access-rival"
+        assert token.access_token == "access-rival"
 
     @pytest.mark.asyncio
     async def test_missing_token_endpoint_needs_reauth(
@@ -586,7 +683,7 @@ class TestLoser:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         assert db.lock_attempts == [LOCK_KEY]
         assert db.unlocks == []  # a loser holds nothing to release
         assert token_endpoint.calls == []
@@ -604,7 +701,7 @@ class TestLoser:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-new"
+        assert token.access_token == "access-new"
         assert store.read_count == 2
         assert token_endpoint.calls == []
 
@@ -617,7 +714,7 @@ class TestLoser:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         assert token_endpoint.calls == []
 
     @pytest.mark.asyncio
@@ -670,7 +767,7 @@ class TestAmbiguousRefresh:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         assert store.marks == ["refresh_ambiguous"]
         assert store.commits == []
         assert len(token_endpoint.calls) == 1
@@ -687,9 +784,9 @@ class TestAmbiguousRefresh:
         second = await ensure_fresh_access_token(CONNECTION_ID)
         third = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert first["access_token"] == "access-old"
-        assert second["access_token"] == "access-old"
-        assert third["access_token"] == "access-old"
+        assert first.access_token == "access-old"
+        assert second.access_token == "access-old"
+        assert third.access_token == "access-old"
         # The refresh token may already be consumed server-side: one attempt,
         # ever. Later calls do not even reach for the lock.
         assert len(token_endpoint.calls) == 1
@@ -720,13 +817,13 @@ class TestAmbiguousRefresh:
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
+        assert token.access_token == "access-old"
         assert store.marks == []  # status untouched — the next call may retry
 
         token_endpoint.raises = None
         again = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert again["access_token"] == "access-new"
+        assert again.access_token == "access-new"
         assert len(token_endpoint.calls) == 2
 
     @pytest.mark.asyncio
@@ -751,9 +848,10 @@ class TestAmbiguousRefresh:
 class _CasCursor:
     """Mimics the UPDATE's WHERE clause: rowcount 1 only on a generation hit."""
 
-    def __init__(self, state: dict, log: list[str]):
+    def __init__(self, state: dict, log: list[str], params_log: list[tuple]):
         self._state = state
         self._log = log
+        self._params_log = params_log
         self.rowcount = 0
 
     async def __aenter__(self) -> "_CasCursor":
@@ -764,17 +862,20 @@ class _CasCursor:
 
     async def execute(self, sql, params=None):
         self._log.append(" ".join(sql.split()))
+        self._params_log.append(params)
         access_token = params[0]
-        connection_id, expected_generation = params[-2], params[-1]
+        # Trailing params, in SQL order: the status to set, then the three the
+        # WHERE clause reads.
+        new_status, connection_id, expected_generation, servable = params[-4:]
         state = self._state
         if (
             connection_id == state["connection_id"]
             and expected_generation == state["token_generation"]
-            and state["status"] in ("connected", "refresh_ambiguous")
+            and state["status"] in servable
         ):
             state["token_generation"] += 1
             state["access_token"] = access_token
-            state["status"] = "connected"
+            state["status"] = new_status
             self.rowcount = 1
         else:
             self.rowcount = 0
@@ -791,13 +892,16 @@ class TestGenerationCas:
             "status": "connected",
         }
         log: list[str] = []
+        params_log: list[tuple] = []
 
         @asynccontextmanager
         async def _conn():
-            yield SimpleNamespace(cursor=lambda *a, **k: _CasCursor(state, log))
+            yield SimpleNamespace(
+                cursor=lambda *a, **k: _CasCursor(state, log, params_log)
+            )
 
         monkeypatch.setattr(mcp_oauth_db, "get_db_connection", _conn)
-        return SimpleNamespace(state=state, sql=log)
+        return SimpleNamespace(state=state, sql=log, params=params_log)
 
     async def _commit(self, generation: int, access_token: str) -> bool:
         return await mcp_oauth_db.commit_refresh(
@@ -848,7 +952,9 @@ class TestGenerationCas:
         [sql] = cas.sql
         assert "token_generation = token_generation + 1" in sql
         assert "AND token_generation = %s" in sql
-        assert "AND status IN ('connected', 'refresh_ambiguous')" in sql
+        # The servable set rides in as a parameter, not as inlined literals.
+        assert "AND status = ANY(%s)" in sql
+        assert cas.params[-1][-1] == ["connected", "refresh_ambiguous"]
 
     @pytest.mark.asyncio
     async def test_a_null_refresh_token_keeps_the_stored_one(self, cas):
@@ -865,6 +971,117 @@ class TestGenerationCas:
         assert landed is True
         [sql] = cas.sql
         assert "refresh_token = CASE WHEN %s::text IS NULL THEN refresh_token" in sql
+
+
+# ---------------------------------------------------------------------------
+# Reporting a vendor 401 — the other compare-and-swap
+# ---------------------------------------------------------------------------
+
+
+class _ReauthCursor:
+    """Mimics the needs_reauth UPDATE's WHERE clause."""
+
+    def __init__(self, state: dict, log: list[str]):
+        self._state = state
+        self._log = log
+        self.rowcount = 0
+
+    async def __aenter__(self) -> "_ReauthCursor":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def execute(self, sql, params=None):
+        self._log.append(" ".join(sql.split()))
+        new_status, connection_id, expected_generation, required_status = params
+        state = self._state
+        if (
+            connection_id == state["connection_id"]
+            and expected_generation == state["token_generation"]
+            and state["status"] == required_status
+        ):
+            state["status"] = new_status
+            self.rowcount = 1
+        else:
+            self.rowcount = 0
+
+
+class TestNeedsReauthCas:
+    """The relay reports which bundle a vendor rejected; this decides if it lands.
+
+    Moving the decision here is the point: the relay observed a 401 at some
+    instant, and by the time the write runs that observation may already be
+    stale — only the row itself can adjudicate that.
+    """
+
+    @pytest.fixture
+    def cas(self, monkeypatch):
+        state = {
+            "connection_id": CONNECTION_ID,
+            "token_generation": 7,
+            "status": "connected",
+        }
+        log: list[str] = []
+
+        @asynccontextmanager
+        async def _conn():
+            yield SimpleNamespace(cursor=lambda *a, **k: _ReauthCursor(state, log))
+
+        monkeypatch.setattr(mcp_oauth_db, "get_db_connection", _conn)
+        return SimpleNamespace(state=state, sql=log)
+
+    @pytest.mark.asyncio
+    async def test_the_rejected_generation_flips_the_connection(self, cas):
+        assert await lifecycle.mark_connection_needs_reauth(
+            CONNECTION_ID, seen_token_generation=7
+        ) is True
+        assert cas.state["status"] == "needs_reauth"
+
+    @pytest.mark.asyncio
+    async def test_a_rotation_since_the_401_makes_the_report_moot(self, cas):
+        """Another worker refreshed after the vendor said no: the stored bundle
+        is not the one that was rejected, so it must survive."""
+        cas.state["token_generation"] = 8
+
+        assert await lifecycle.mark_connection_needs_reauth(
+            CONNECTION_ID, seen_token_generation=7
+        ) is False
+        assert cas.state["status"] == "connected"
+
+    @pytest.mark.asyncio
+    async def test_a_terminal_status_is_not_overwritten(self, cas):
+        # refresh_ambiguous carries strictly more information (never retry the
+        # refresh token) than needs_reauth; downgrading it would lose that.
+        cas.state["status"] = "refresh_ambiguous"
+
+        assert await lifecycle.mark_connection_needs_reauth(
+            CONNECTION_ID, seen_token_generation=7
+        ) is False
+        assert cas.state["status"] == "refresh_ambiguous"
+
+    @pytest.mark.asyncio
+    async def test_a_second_report_of_the_same_generation_is_a_no_op(self, cas):
+        first = await lifecycle.mark_connection_needs_reauth(
+            CONNECTION_ID, seen_token_generation=7
+        )
+        second = await lifecycle.mark_connection_needs_reauth(
+            CONNECTION_ID, seen_token_generation=7
+        )
+
+        assert (first, second) == (True, False)
+        assert cas.state["status"] == "needs_reauth"
+
+    @pytest.mark.asyncio
+    async def test_both_guards_ride_in_one_statement(self, cas):
+        """A read-then-write would reopen the window this exists to close."""
+        await lifecycle.mark_connection_needs_reauth(
+            CONNECTION_ID, seen_token_generation=7
+        )
+
+        [sql] = cas.sql
+        assert "AND token_generation = %s" in sql
+        assert "AND status = %s" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -938,7 +1155,7 @@ class TestRowShapeContract:
 
     @pytest.mark.asyncio
     async def test_expires_at_survives_as_a_datetime(self, db_row):
-        out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, decrypt=True)
+        out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, secrets=Secrets.FULL)
 
         assert isinstance(out["expires_at"], datetime)
         assert out["expires_at"] == db_row["expires_at"]
@@ -954,21 +1171,21 @@ class TestRowShapeContract:
         # The two layers joined: the row the DB helper really produces, handed
         # to the lifecycle unmodified. This is the exact call that used to
         # raise AttributeError before the row shape was fixed.
-        store.row = await mcp_oauth_db.get_connection_by_id(
-            CONNECTION_ID, decrypt=True
-        )
+        store.row = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, secrets=Secrets.FULL)
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
-        assert token["access_token"] == "access-old"
-        assert token["server_name"] == SERVER_NAME
+        assert token.access_token == "access-old"
+        # The generation rides across the layer boundary as an int — it is what
+        # a later rotation check compares against.
+        assert token.generation == db_row["token_generation"]
         # 900s left is outside the 600s margin, so this is the no-lock path.
         assert db.lock_attempts == []
         assert token_endpoint.calls == []
 
     @pytest.mark.asyncio
     async def test_decrypted_plaintext_is_mapped_and_raw_columns_dropped(self, db_row):
-        out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, decrypt=True)
+        out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, secrets=Secrets.FULL)
 
         assert out["access_token"] == "access-old"
         assert out["refresh_token"] == "refresh-old"
@@ -986,7 +1203,7 @@ class TestRowShapeContract:
 
     @pytest.mark.asyncio
     async def test_connection_id_is_stringified(self, db_row):
-        out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, decrypt=True)
+        out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, secrets=Secrets.FULL)
 
         # Callers interpolate it into advisory-lock keys and log lines.
         assert out["connection_id"] == CONNECTION_ID

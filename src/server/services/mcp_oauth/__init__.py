@@ -11,13 +11,20 @@ token is attached by the egress relay per request — neither ever reaches a
 sandbox in any form.
 """
 
+from src.server.database.mcp_oauth import (  # noqa: F401
+    SERVABLE,
+    ConnectionStatus,
+)
 from src.server.services.mcp_oauth.connect import (  # noqa: F401
     McpOAuthError,
     complete_callback,
     start_connect,
 )
 from src.server.services.mcp_oauth.lifecycle import (  # noqa: F401
+    AccessToken,
     TokenUnavailable,
+    current_access_token,
     disconnect_server,
     ensure_fresh_access_token,
+    mark_connection_needs_reauth,
 )

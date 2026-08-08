@@ -15,7 +15,8 @@ import pytest
 
 from src.server.services.egress import limits as limits_mod
 from src.server.services.egress.limits import (
-    RATE_CLASSES,
+    CONCURRENCY_LIMIT,
+    RATE_LIMIT_RPM,
     RelayLimited,
     acquire_slot,
 )
@@ -24,12 +25,11 @@ from tests.unit.redis_mock_pipeline import attach_pipeline
 GRANT_A = "grant-egress-a"
 GRANT_B = "grant-egress-b"
 
-# Two deliberately tiny classes so boundary arms stay cheap and each one
-# isolates a single dimension (a low rpm would otherwise trip first in the
-# concurrency arms). The real "default" budgets are exercised separately by
-# reading them out of RATE_CLASSES.
-TIGHT = "unit-tight-rate"
-NARROW = "unit-narrow-concurrency"
+# Two deliberately tiny budgets so boundary arms stay cheap, each applied by a
+# fixture that isolates a single dimension (a low rpm would otherwise trip
+# first in the concurrency arms). The shipped budgets get their own test.
+TIGHT_RPM = 2
+NARROW_CONCURRENCY = 2
 
 
 class _FakeRedis:
@@ -80,9 +80,21 @@ def redis(monkeypatch):
     monkeypatch.setattr(
         "src.utils.cache.redis_cache.get_cache_client", lambda: cache
     )
-    monkeypatch.setitem(RATE_CLASSES, TIGHT, {"rpm": 2, "concurrency": 8})
-    monkeypatch.setitem(RATE_CLASSES, NARROW, {"rpm": 1000, "concurrency": 2})
     return client
+
+
+@pytest.fixture
+def tight_rate(monkeypatch):
+    """A 2/minute budget, with concurrency left generous so rate trips first."""
+    monkeypatch.setattr(limits_mod, "RATE_LIMIT_RPM", TIGHT_RPM)
+    monkeypatch.setattr(limits_mod, "CONCURRENCY_LIMIT", 8)
+
+
+@pytest.fixture
+def narrow_concurrency(monkeypatch):
+    """A 2-slot cap, with rpm left high so concurrency trips first."""
+    monkeypatch.setattr(limits_mod, "RATE_LIMIT_RPM", 1000)
+    monkeypatch.setattr(limits_mod, "CONCURRENCY_LIMIT", NARROW_CONCURRENCY)
 
 
 @pytest.fixture
@@ -106,64 +118,53 @@ def _conc_key(grant_id: str) -> str:
 
 class TestRateLimit:
     @pytest.mark.asyncio
-    async def test_allows_up_to_the_budget_then_denies(self, redis, frozen_clock):
-        for _ in range(RATE_CLASSES[TIGHT]["rpm"]):
-            async with acquire_slot(GRANT_A, TIGHT):
+    async def test_allows_up_to_the_budget_then_denies(self, redis, frozen_clock, tight_rate):
+        for _ in range(TIGHT_RPM):
+            async with acquire_slot(GRANT_A):
                 pass
 
         with pytest.raises(RelayLimited) as excinfo:
-            async with acquire_slot(GRANT_A, TIGHT):
+            async with acquire_slot(GRANT_A):
                 pass
         assert excinfo.value.kind == "rate"
 
     @pytest.mark.asyncio
-    async def test_default_class_budget_is_honored(self, redis, frozen_clock):
-        rpm = RATE_CLASSES["default"]["rpm"]
-        for _ in range(rpm):
-            async with acquire_slot(GRANT_A, "default"):
+    async def test_the_shipped_budget_is_the_one_enforced(self, redis, frozen_clock):
+        """No fixture override: the constants the relay actually runs with."""
+        for _ in range(RATE_LIMIT_RPM):
+            async with acquire_slot(GRANT_A):
                 pass
 
         with pytest.raises(RelayLimited) as excinfo:
-            async with acquire_slot(GRANT_A, "default"):
+            async with acquire_slot(GRANT_A):
                 pass
         assert excinfo.value.kind == "rate"
-
-    @pytest.mark.asyncio
-    async def test_unknown_rate_class_falls_back_to_default(self, redis, frozen_clock):
-        rpm = RATE_CLASSES["default"]["rpm"]
-        for _ in range(rpm):
-            async with acquire_slot(GRANT_A, "no-such-class"):
-                pass
-
-        with pytest.raises(RelayLimited):
-            async with acquire_slot(GRANT_A, "no-such-class"):
-                pass
 
     @pytest.mark.asyncio
     async def test_a_denied_request_takes_no_concurrency_slot(
-        self, redis, frozen_clock
+        self, redis, frozen_clock, tight_rate
     ):
-        for _ in range(RATE_CLASSES[TIGHT]["rpm"]):
-            async with acquire_slot(GRANT_A, TIGHT):
+        for _ in range(TIGHT_RPM):
+            async with acquire_slot(GRANT_A):
                 pass
         assert redis.values[_conc_key(GRANT_A)] == 0
 
         with pytest.raises(RelayLimited):
-            async with acquire_slot(GRANT_A, TIGHT):
+            async with acquire_slot(GRANT_A):
                 pass
         assert redis.values[_conc_key(GRANT_A)] == 0
 
     @pytest.mark.asyncio
-    async def test_budget_resets_on_the_next_minute_bucket(self, redis, frozen_clock):
-        for _ in range(RATE_CLASSES[TIGHT]["rpm"]):
-            async with acquire_slot(GRANT_A, TIGHT):
+    async def test_budget_resets_on_the_next_minute_bucket(self, redis, frozen_clock, tight_rate):
+        for _ in range(TIGHT_RPM):
+            async with acquire_slot(GRANT_A):
                 pass
         with pytest.raises(RelayLimited):
-            async with acquire_slot(GRANT_A, TIGHT):
+            async with acquire_slot(GRANT_A):
                 pass
 
         frozen_clock.now += 60
-        async with acquire_slot(GRANT_A, TIGHT):
+        async with acquire_slot(GRANT_A):
             pass
 
         rate_keys = {k for k in redis.values if k.startswith("egress:rate:")}
@@ -171,7 +172,7 @@ class TestRateLimit:
 
     @pytest.mark.asyncio
     async def test_counters_carry_a_ttl(self, redis, frozen_clock):
-        async with acquire_slot(GRANT_A, TIGHT):
+        async with acquire_slot(GRANT_A):
             pass
 
         assert set(redis.ttls) == {
@@ -189,22 +190,34 @@ class TestRateLimit:
 class TestConcurrencyLimit:
     @pytest.mark.asyncio
     async def test_holds_a_slot_for_the_body_and_releases_on_exit(
-        self, redis, frozen_clock
+        self, redis, frozen_clock, narrow_concurrency
     ):
-        async with acquire_slot(GRANT_A, NARROW):
+        async with acquire_slot(GRANT_A):
             assert redis.values[_conc_key(GRANT_A)] == 1
         assert redis.values[_conc_key(GRANT_A)] == 0
 
     @pytest.mark.asyncio
-    async def test_over_limit_acquisition_is_denied(self, redis, frozen_clock):
-        cap = RATE_CLASSES[NARROW]["concurrency"]
+    async def test_the_shipped_cap_is_the_one_enforced(self, redis, frozen_clock):
+        """No fixture override: the constants the relay actually runs with."""
+        async with AsyncExitStack() as held:
+            for _ in range(CONCURRENCY_LIMIT):
+                await held.enter_async_context(acquire_slot(GRANT_A))
+
+            with pytest.raises(RelayLimited) as excinfo:
+                async with acquire_slot(GRANT_A):
+                    pass
+            assert excinfo.value.kind == "concurrency"
+
+    @pytest.mark.asyncio
+    async def test_over_limit_acquisition_is_denied(self, redis, frozen_clock, narrow_concurrency):
+        cap = NARROW_CONCURRENCY
         async with AsyncExitStack() as held:
             for _ in range(cap):
-                await held.enter_async_context(acquire_slot(GRANT_A, NARROW))
+                await held.enter_async_context(acquire_slot(GRANT_A))
             assert redis.values[_conc_key(GRANT_A)] == cap
 
             with pytest.raises(RelayLimited) as excinfo:
-                async with acquire_slot(GRANT_A, NARROW):
+                async with acquire_slot(GRANT_A):
                     pass
             assert excinfo.value.kind == "concurrency"
             # The refused attempt gives its own increment back, so a burst of
@@ -212,25 +225,25 @@ class TestConcurrencyLimit:
             assert redis.values[_conc_key(GRANT_A)] == cap
 
     @pytest.mark.asyncio
-    async def test_a_released_slot_frees_capacity(self, redis, frozen_clock):
-        cap = RATE_CLASSES[NARROW]["concurrency"]
+    async def test_a_released_slot_frees_capacity(self, redis, frozen_clock, narrow_concurrency):
+        cap = NARROW_CONCURRENCY
         async with AsyncExitStack() as held:
             for _ in range(cap - 1):
-                await held.enter_async_context(acquire_slot(GRANT_A, NARROW))
+                await held.enter_async_context(acquire_slot(GRANT_A))
 
-            async with acquire_slot(GRANT_A, NARROW):
+            async with acquire_slot(GRANT_A):
                 with pytest.raises(RelayLimited):
-                    async with acquire_slot(GRANT_A, NARROW):
+                    async with acquire_slot(GRANT_A):
                         pass
 
             # The cap-th holder exited; the next caller fits again.
-            async with acquire_slot(GRANT_A, NARROW):
+            async with acquire_slot(GRANT_A):
                 assert redis.values[_conc_key(GRANT_A)] == cap
 
     @pytest.mark.asyncio
-    async def test_slot_is_released_when_the_body_raises(self, redis, frozen_clock):
+    async def test_slot_is_released_when_the_body_raises(self, redis, frozen_clock, narrow_concurrency):
         with pytest.raises(RuntimeError):
-            async with acquire_slot(GRANT_A, NARROW):
+            async with acquire_slot(GRANT_A):
                 raise RuntimeError("relayed request blew up")
 
         assert redis.values[_conc_key(GRANT_A)] == 0
@@ -243,28 +256,28 @@ class TestConcurrencyLimit:
 
 class TestPerGrantIsolation:
     @pytest.mark.asyncio
-    async def test_a_saturated_grant_does_not_block_another(self, redis, frozen_clock):
-        cap = RATE_CLASSES[NARROW]["concurrency"]
+    async def test_a_saturated_grant_does_not_block_another(self, redis, frozen_clock, narrow_concurrency):
+        cap = NARROW_CONCURRENCY
         async with AsyncExitStack() as held:
             for _ in range(cap):
-                await held.enter_async_context(acquire_slot(GRANT_A, NARROW))
+                await held.enter_async_context(acquire_slot(GRANT_A))
             with pytest.raises(RelayLimited):
-                async with acquire_slot(GRANT_A, NARROW):
+                async with acquire_slot(GRANT_A):
                     pass
 
-            async with acquire_slot(GRANT_B, NARROW):
+            async with acquire_slot(GRANT_B):
                 assert redis.values[_conc_key(GRANT_B)] == 1
 
     @pytest.mark.asyncio
-    async def test_rate_budgets_are_counted_per_grant(self, redis, frozen_clock):
-        for _ in range(RATE_CLASSES[TIGHT]["rpm"]):
-            async with acquire_slot(GRANT_A, TIGHT):
+    async def test_rate_budgets_are_counted_per_grant(self, redis, frozen_clock, tight_rate):
+        for _ in range(TIGHT_RPM):
+            async with acquire_slot(GRANT_A):
                 pass
         with pytest.raises(RelayLimited):
-            async with acquire_slot(GRANT_A, TIGHT):
+            async with acquire_slot(GRANT_A):
                 pass
 
-        async with acquire_slot(GRANT_B, TIGHT):
+        async with acquire_slot(GRANT_B):
             pass
 
         minute = int(frozen_clock.now // 60)
@@ -291,7 +304,7 @@ class TestFailsOpen:
             "src.utils.cache.redis_cache.get_cache_client", lambda: cache
         )
         entered = False
-        async with acquire_slot(GRANT_A, "default"):
+        async with acquire_slot(GRANT_A):
             entered = True
         assert entered is True
 
@@ -300,7 +313,7 @@ class TestFailsOpen:
         redis.fail.add("incr")
 
         entered = False
-        async with acquire_slot(GRANT_A, TIGHT):
+        async with acquire_slot(GRANT_A):
             entered = True
 
         assert entered is True
@@ -314,7 +327,7 @@ class TestFailsOpen:
         redis.fail_incr_from = 1  # rate incr succeeds, concurrency incr dies
 
         entered = False
-        async with acquire_slot(GRANT_A, TIGHT):
+        async with acquire_slot(GRANT_A):
             entered = True
 
         assert entered is True
@@ -325,7 +338,7 @@ class TestFailsOpen:
     async def test_failed_release_does_not_surface_to_the_caller(
         self, redis, frozen_clock
     ):
-        async with acquire_slot(GRANT_A, TIGHT):
+        async with acquire_slot(GRANT_A):
             redis.fail.add("decr")
 
         assert ("decr", _conc_key(GRANT_A)) in redis.calls

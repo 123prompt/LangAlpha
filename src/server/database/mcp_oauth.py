@@ -14,7 +14,9 @@ access token stays in use until expiry, then the connection needs re-auth.
 """
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -25,7 +27,55 @@ from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
 
-CONNECTION_STATUSES = ("connected", "needs_reauth", "refresh_ambiguous", "revoked")
+
+@asynccontextmanager
+async def _acquire(conn):
+    """Yield the caller's connection when given one, else one from the pool.
+
+    The refresh winner holds a session advisory lock on its own connection and
+    must run its under-lock re-read and commit on that same session. Passing the
+    held connection in keeps those statements off a *second* pool slot — nesting
+    a fresh acquire inside the first ties up two slots per in-flight refresh and,
+    under a many-connection refresh storm, stalls every winner on pool timeout.
+    """
+    if conn is not None:
+        yield conn
+    else:
+        async with get_db_connection() as owned:
+            yield owned
+
+
+class ConnectionStatus(StrEnum):
+    """The stored ``status`` values, verbatim — this is the wire/DB vocabulary."""
+
+    CONNECTED = "connected"
+    NEEDS_REAUTH = "needs_reauth"
+    REFRESH_AMBIGUOUS = "refresh_ambiguous"
+    REVOKED = "revoked"
+
+
+class Secrets(StrEnum):
+    """How much of the encrypted bundle a read decrypts.
+
+    Each ``pgp_sym_decrypt`` re-runs OpenPGP S2K key derivation, so the column
+    count — not the row count — dominates this read's cost. The relayed-call
+    path needs only the bearer; the refresh token and client secret are read
+    exclusively by the refresh winner and by DCR re-registration, both rare.
+    """
+
+    NONE = "none"
+    BEARER = "bearer"
+    FULL = "full"
+
+
+# Statuses a token may still be served for. refresh_ambiguous is in: its
+# refresh token must never be retried, but the old access token stays valid
+# until expiry.
+SERVABLE: frozenset[ConnectionStatus] = frozenset(
+    {ConnectionStatus.CONNECTED, ConnectionStatus.REFRESH_AMBIGUOUS}
+)
+# Deterministic list form for `= ANY(%s)`; StrEnum members adapt as plain text.
+_SERVABLE_PARAM = sorted(s.value for s in SERVABLE)
 
 
 def _row_summary(r: dict[str, Any]) -> dict[str, Any]:
@@ -80,11 +130,19 @@ async def upsert_connection(
                         %s, %s, %s,
                         0, %s,
                         CASE WHEN %s::text IS NULL THEN NULL ELSE pgp_sym_encrypt(%s, %s) END,
-                        %s, %s, 'connected', NOW(), NOW())
+                        %s, %s, %s, NOW(), NOW())
                 ON CONFLICT (user_id, server_name) DO UPDATE SET
                     server_url = EXCLUDED.server_url,
                     access_token = EXCLUDED.access_token,
-                    refresh_token = EXCLUDED.refresh_token,
+                    -- Keep the stored refresh token when the re-auth exchange
+                    -- returned none (many AS omit it if the prior grant is
+                    -- still valid). EXCLUDED.refresh_token is NULL exactly in
+                    -- that case, so COALESCE preserves the surviving token
+                    -- instead of nulling it. Mirrors commit_refresh.
+                    refresh_token = COALESCE(
+                        EXCLUDED.refresh_token,
+                        user_mcp_oauth_connections.refresh_token
+                    ),
                     token_type = EXCLUDED.token_type,
                     scope = EXCLUDED.scope,
                     expires_at = EXCLUDED.expires_at,
@@ -93,7 +151,7 @@ async def upsert_connection(
                     client_secret = EXCLUDED.client_secret,
                     as_metadata = EXCLUDED.as_metadata,
                     resource_metadata = EXCLUDED.resource_metadata,
-                    status = 'connected',
+                    status = EXCLUDED.status,
                     updated_at = NOW()
                 RETURNING connection_id
                 """,
@@ -106,6 +164,7 @@ async def upsert_connection(
                     client_secret, client_secret, enc_key,
                     Json(as_metadata) if as_metadata is not None else None,
                     Json(resource_metadata) if resource_metadata is not None else None,
+                    ConnectionStatus.CONNECTED.value,
                 ),
             )
             row = await cur.fetchone()
@@ -116,42 +175,51 @@ async def upsert_connection(
 
 
 async def get_connection(
-    user_id: str, server_name: str, *, decrypt: bool = False
+    user_id: str, server_name: str, *, secrets: Secrets = Secrets.NONE
 ) -> dict[str, Any] | None:
-    """Fetch one connection; decrypt=True adds the token bundle plaintext."""
+    """Fetch one connection; ``secrets`` selects how much bundle to decrypt."""
     return await _fetch_one(
-        "user_id = %s AND server_name = %s", (user_id, server_name), decrypt=decrypt
+        "user_id = %s AND server_name = %s", (user_id, server_name), secrets=secrets
     )
 
 
 async def get_connection_by_id(
-    connection_id: str, *, decrypt: bool = False
+    connection_id: str, *, secrets: Secrets = Secrets.NONE, conn=None
 ) -> dict[str, Any] | None:
-    return await _fetch_one("connection_id = %s", (connection_id,), decrypt=decrypt)
+    return await _fetch_one(
+        "connection_id = %s", (connection_id,), secrets=secrets, conn=conn
+    )
+
+
+# Decrypted columns per mode, in SELECT order. The row always carries
+# has_refresh_token, so a BEARER reader can still tell whether a refresh is
+# possible without paying to decrypt the token it would use.
+_SECRET_COLUMNS: dict[Secrets, tuple[str, ...]] = {
+    Secrets.NONE: (),
+    Secrets.BEARER: ("access_token",),
+    Secrets.FULL: ("access_token", "refresh_token", "client_secret"),
+}
 
 
 async def _fetch_one(
-    where: str, params: tuple, *, decrypt: bool
+    where: str, params: tuple, *, secrets: Secrets, conn=None
 ) -> dict[str, Any] | None:
-    enc_key = _get_encryption_key()
-    secret_cols = (
-        """,
-               pgp_sym_decrypt(access_token, %s) AS access_token_plain,
-               pgp_sym_decrypt(refresh_token, %s) AS refresh_token_plain,
-               pgp_sym_decrypt(client_secret, %s) AS client_secret_plain
-        """
-        if decrypt
-        else ""
+    columns = _SECRET_COLUMNS[secrets]
+    secret_cols = "".join(
+        f",\n                       pgp_sym_decrypt({c}, %s) AS {c}_plain"
+        for c in columns
     )
-    query_params = ((enc_key, enc_key, enc_key) if decrypt else ()) + params
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+    enc_key = _get_encryption_key()
+    query_params = tuple(enc_key for _ in columns) + params
+    async with _acquire(conn) as db:
+        async with db.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 SELECT connection_id, user_id, server_name, server_url, status,
                        token_type, scope, expires_at, token_generation,
                        client_info, as_metadata, resource_metadata,
-                       last_refresh_at, created_at, updated_at{secret_cols}
+                       last_refresh_at, created_at, updated_at,
+                       (refresh_token IS NOT NULL) AS has_refresh_token{secret_cols}
                 FROM user_mcp_oauth_connections
                 WHERE {where}
                 """,
@@ -164,12 +232,10 @@ async def _fetch_one(
             # expires_at; the ISO-string form is list_connections' concern.
             out = dict(row)
             out["connection_id"] = str(row["connection_id"])
-            for plain in ("access_token_plain", "refresh_token_plain", "client_secret_plain"):
-                out.pop(plain, None)
-            if decrypt:
-                out["access_token"] = row["access_token_plain"]
-                out["refresh_token"] = row["refresh_token_plain"]
-                out["client_secret"] = row["client_secret_plain"]
+            for column in ("access_token", "refresh_token", "client_secret"):
+                out.pop(f"{column}_plain", None)
+            for column in columns:
+                out[column] = row[f"{column}_plain"]
             return out
 
 
@@ -200,6 +266,7 @@ async def commit_refresh(
     refresh_token: str | None,
     expires_at: datetime | None,
     scope: str | None = None,
+    conn=None,
 ) -> bool:
     """Atomically commit a refresh iff the generation hasn't moved.
 
@@ -208,8 +275,8 @@ async def commit_refresh(
     the caller must discard its result and re-read.
     """
     enc_key = _get_encryption_key()
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
+    async with _acquire(conn) as db:
+        async with db.cursor() as cur:
             await cur.execute(
                 """
                 UPDATE user_mcp_oauth_connections SET
@@ -220,18 +287,19 @@ async def commit_refresh(
                     expires_at = %s,
                     scope = COALESCE(%s, scope),
                     token_generation = token_generation + 1,
-                    status = 'connected',
+                    status = %s,
                     last_refresh_at = NOW(),
                     updated_at = NOW()
                 WHERE connection_id = %s
                   AND token_generation = %s
-                  AND status IN ('connected', 'refresh_ambiguous')
+                  AND status = ANY(%s)
                 """,
                 (
                     access_token, enc_key,
                     refresh_token, refresh_token, enc_key,
                     expires_at, scope,
-                    connection_id, expected_generation,
+                    ConnectionStatus.CONNECTED.value,
+                    connection_id, expected_generation, _SERVABLE_PARAM,
                 ),
             )
             committed = cur.rowcount == 1
@@ -243,21 +311,22 @@ async def commit_refresh(
             return committed
 
 
-async def mark_status(connection_id: str, status: str) -> bool:
+async def mark_status(
+    connection_id: str, status: ConnectionStatus | str, *, conn=None
+) -> bool:
     """Transition durable status. Tokens are left in place: refresh_ambiguous
     keeps serving the old access token until expiry, and needs_reauth keeps
     metadata for the reconnect flow."""
-    if status not in CONNECTION_STATUSES:
-        raise ValueError(f"invalid connection status {status!r}")
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
+    status = ConnectionStatus(status)  # rejects anything outside the vocabulary
+    async with _acquire(conn) as db:
+        async with db.cursor() as cur:
             await cur.execute(
                 """
                 UPDATE user_mcp_oauth_connections
                 SET status = %s, updated_at = NOW()
                 WHERE connection_id = %s
                 """,
-                (status, connection_id),
+                (status.value, connection_id),
             )
             if cur.rowcount == 1:
                 logger.info(
@@ -267,26 +336,32 @@ async def mark_status(connection_id: str, status: str) -> bool:
             return False
 
 
-async def delete_connection(user_id: str, server_name: str) -> str | None:
-    """Full disconnect. Cascade removes the connection's egress grants.
-    Returns the deleted connection_id, or None."""
+async def mark_needs_reauth(connection_id: str, *, expected_generation: int) -> bool:
+    """CAS a still-connected connection into needs_reauth. Returns whether it moved.
+
+    Both guards are load-bearing for the caller that observed a vendor 401: a
+    bundle that rotated since that observation says nothing about the token now
+    stored, and refresh_ambiguous/revoked are terminal states this must not
+    overwrite. Doing it in one statement leaves no read-then-write window.
+    """
     async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with conn.cursor() as cur:
             await cur.execute(
                 """
-                DELETE FROM user_mcp_oauth_connections
-                WHERE user_id = %s AND server_name = %s
-                RETURNING connection_id
+                UPDATE user_mcp_oauth_connections
+                SET status = %s, updated_at = NOW()
+                WHERE connection_id = %s
+                  AND token_generation = %s
+                  AND status = %s
                 """,
-                (user_id, server_name),
+                (
+                    ConnectionStatus.NEEDS_REAUTH.value,
+                    connection_id,
+                    expected_generation,
+                    ConnectionStatus.CONNECTED.value,
+                ),
             )
-            row = await cur.fetchone()
-            if row:
-                logger.info(
-                    f"[mcp_oauth_db] delete_connection user_id={user_id} server={server_name}"
-                )
-                return str(row["connection_id"])
-            return None
+            return cur.rowcount == 1
 
 
 async def list_due_refresh(margin_seconds: int, limit: int = 25) -> list[dict[str, Any]]:
@@ -297,14 +372,14 @@ async def list_due_refresh(margin_seconds: int, limit: int = 25) -> list[dict[st
                 """
                 SELECT connection_id, user_id, server_name, token_generation, expires_at
                 FROM user_mcp_oauth_connections
-                WHERE status = 'connected'
+                WHERE status = %s
                   AND refresh_token IS NOT NULL
                   AND expires_at IS NOT NULL
                   AND expires_at < NOW() + make_interval(secs => %s)
                 ORDER BY expires_at
                 LIMIT %s
                 """,
-                (margin_seconds, limit),
+                (ConnectionStatus.CONNECTED.value, margin_seconds, limit),
             )
             rows = await cur.fetchall()
             return [
