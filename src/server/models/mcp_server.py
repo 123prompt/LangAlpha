@@ -519,6 +519,11 @@ class EffectiveServer(BaseModel):
     # the same name (the local-fork affordance) — deleting the local row
     # reveals the inherited one again.
     shadows_inherited: bool = False
+    # Inherited (origin='user') rows only: the owner's OAuth connection status
+    # for this server, INCLUDING 'revoked' — so the UI can say "Disconnected,
+    # reconnect in Connectors" instead of waiting on a discovery that can
+    # never run. None = the server has no OAuth connection at all.
+    oauth_status: Optional[str] = None
 
 
 class EffectiveServerList(BaseModel):
@@ -552,6 +557,10 @@ class CatalogServer(BaseModel):
     transport: str
     enabled: bool = False
     oauth_status: Optional[str] = None
+    # Host-side discovered tool count for the server's CURRENT config (OAuth
+    # servers only today — that's the only user-level discovery path). None =
+    # no current snapshot; the UI omits the count rather than showing 0.
+    tool_count: Optional[int] = None
     command: Optional[str] = None
     args: list[str] = Field(default_factory=list)
     url: Optional[str] = None
@@ -590,7 +599,10 @@ def collect_vault_refs(mapping: dict[str, str] | None) -> list[str]:
 
 
 def catalog_row_to_response(
-    row: dict[str, Any], *, oauth_status: str | None = None
+    row: dict[str, Any],
+    *,
+    oauth_status: str | None = None,
+    tool_count: int | None = None,
 ) -> CatalogServer:
     """Mask a DB catalog row: drop env/header literals, expose vault refs only."""
     return CatalogServer(
@@ -598,6 +610,7 @@ def catalog_row_to_response(
         transport=row["transport"],
         enabled=bool(row.get("enabled", False)),
         oauth_status=oauth_status,
+        tool_count=tool_count,
         command=row.get("command"),
         args=row.get("args") or [],
         url=row.get("url"),

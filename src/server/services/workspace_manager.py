@@ -682,13 +682,18 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             for name, tools in get_all().items():
                 if tools:
                     present_with_tools.add(name)
+        oauth_names = getattr(resolved, "oauth_status_by_name", {})
         return [
             s
             for s in resolved.servers
             if is_user_server(s)
-            # OAuth-bound servers are discovered host-side (the sandbox holds
-            # no vendor token, so an in-sandbox probe can only fail).
+            # OAuth servers are discovered host-side (the sandbox holds no
+            # vendor token, so an in-sandbox probe can only fail). The status
+            # map also covers DISCONNECTED ones, whose oauth_connection_id is
+            # None — probing those would just cache junk error rows. A
+            # workspace-local fork of the same name is not OAuth-bound.
             and not getattr(s, "oauth_connection_id", None)
+            and not (getattr(s, "source", None) == "user" and s.name in oauth_names)
             and s.name not in present_with_tools
         ]
 

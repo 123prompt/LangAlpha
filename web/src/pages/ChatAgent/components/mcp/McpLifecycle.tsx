@@ -1,8 +1,8 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
-import { McpStatusPill } from './McpStatusPill';
-import type { McpStatus } from '../../utils/api';
+import { McpOauthPill, McpStatusPill } from './McpStatusPill';
+import type { McpOauthStatus, McpStatus } from '../../utils/api';
 
 /**
  * The end-to-end lifecycle indicator for one effective MCP server row.
@@ -39,9 +39,11 @@ interface McpLifecycleProps {
   sandboxRunning: boolean;
   /** The sandbox is warming up toward running (a background apply kicked it). */
   sandboxWarming?: boolean;
+  /** Inherited rows: the owner's OAuth connection status (incl. 'revoked'). */
+  oauthStatus?: McpOauthStatus | null;
 }
 
-export function McpLifecycle({ status, enabled, origin, checking, synced, sandboxRunning, sandboxWarming = false }: McpLifecycleProps) {
+export function McpLifecycle({ status, enabled, origin, checking, synced, sandboxRunning, sandboxWarming = false, oauthStatus = null }: McpLifecycleProps) {
   const { t } = useTranslation();
   // Built-ins are process-global: always connected, no per-workspace discovery
   // or apply state to surface. They never show the verify/apply track.
@@ -50,6 +52,12 @@ export function McpLifecycle({ status, enabled, origin, checking, synced, sandbo
   // always enabled=false (the optimistic toggle writes enabled+status coherently
   // at the source), so this guard alone covers it.
   if (!enabled) return <McpStatusPill status={status} enabled={false} />;
+  // OAuth rows are discovered host-side, never probed from this workspace —
+  // the verify track would be a promise nothing can keep. A broken connection
+  // is the dominant truth (the fix is reconnecting in Connectors, not
+  // waiting); a connected one without a snapshot yet reads as plain Pending.
+  if (oauthStatus && oauthStatus !== 'connected') return <McpOauthPill status={oauthStatus} />;
+  if (oauthStatus && status === 'pending') return <McpStatusPill status="pending" enabled />;
   if (status === 'error') return <McpStatusPill status="error" enabled />;
   if (status === 'needs_secret') return <McpStatusPill status="needs_secret" enabled />;
   if (status === 'unknown') return <McpStatusPill status="unknown" enabled />;

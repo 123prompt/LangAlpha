@@ -191,10 +191,12 @@ def _effective_server(
     missing_secrets: list[str] | None = None,
     env_refs: list[str] | None = None,
     header_refs: list[str] | None = None,
+    oauth_status: str | None = None,
 ) -> EffectiveServer:
     """Build one effective-list row; editable/deletable derive from origin."""
     tools = tools or []
     return EffectiveServer(
+        oauth_status=oauth_status,
         name=srv.name,
         origin=origin,
         transport=srv.transport,
@@ -259,15 +261,14 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
         A stale-hash row (the server's own config changed but it hasn't been
         re-discovered yet) reads as pending → re-verify; an unrelated mutation
         leaves the hash untouched → the row stays a valid hit. Inherited
-        servers check the per-workspace cache first (in-sandbox discovery),
-        then the user-level cache (host-side OAuth discovery).
+        servers prefer the user-level cache (host-side OAuth discovery — it is
+        purged on disconnect and refreshed on connect, so it tracks the OAuth
+        lifecycle) over the per-workspace cache (in-sandbox discovery), whose
+        fingerprint is OAuth-blind and can outlive a disconnect/reconnect.
         """
         if origin == "builtin":
             return None
         fingerprint = mcp_discovery_fingerprint(srv)
-        row = schema_by_name.get(srv.name)
-        if row is not None and row.get("config_hash") == fingerprint:
-            return row
         if origin == "user":
             for user_row in user_schema_rows:
                 if (
@@ -275,6 +276,9 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
                     and user_row.get("config_hash") == fingerprint
                 ):
                     return user_row
+        row = schema_by_name.get(srv.name)
+        if row is not None and row.get("config_hash") == fingerprint:
+            return row
         return None
 
     def _row_for(srv: Any, origin: str, *, enabled: bool) -> EffectiveServer:
@@ -305,6 +309,11 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
             env_refs=env_refs,
             header_refs=header_refs,
             config_version=resolved.version,
+            oauth_status=(
+                resolved.oauth_status_by_name.get(srv.name)
+                if origin == "user"
+                else None
+            ),
         )
         if origin == "workspace" and srv.name in resolved.shadowed_inherited_names:
             row.shadows_inherited = True
@@ -911,13 +920,18 @@ async def discover_server(
         name not in resolved.user_names and name not in resolved.inherited_names
     ):
         raise HTTPException(status_code=404, detail="MCP server not found")
-    if getattr(server, "oauth_connection_id", None):
-        # OAuth-connected servers are discovered host-side (on connect and via
-        # the Connectors refresh) — never probed from the sandbox.
+    if getattr(server, "oauth_connection_id", None) or (
+        name in resolved.inherited_names
+        and name in resolved.oauth_status_by_name
+    ):
+        # OAuth servers are discovered host-side (on connect and via the
+        # Connectors refresh) — never probed from the sandbox. This covers
+        # disconnected ones too (oauth_connection_id is None once revoked):
+        # a token-less probe can only fail; reconnecting is the fix.
         raise HTTPException(
             status_code=409,
-            detail="OAuth-connected servers are discovered host-side; refresh "
-            "from Connectors instead.",
+            detail="OAuth servers are discovered host-side; manage the "
+            "connection from Connectors instead.",
         )
 
     # Debounce: if the cached snapshot is for this server's CURRENT config and is

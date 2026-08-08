@@ -30,6 +30,7 @@ from src.server.database.mcp_servers import (
     create_catalog_server,
     delete_catalog_server,
     get_catalog_server,
+    get_user_tool_schemas,
     list_catalog_servers,
     set_catalog_server_enabled,
     update_catalog_server,
@@ -83,14 +84,55 @@ async def _oauth_status_by_server(user_id: str) -> dict[str, str]:
         return {}
 
 
+async def _tool_counts_by_server(
+    user_id: str, rows: list[dict]
+) -> dict[str, int]:
+    """server_name → discovered tool count, hash-gated to the CURRENT config.
+
+    Same acceptance rule as the workspace effective list: a snapshot only
+    counts if it was discovered under the server's current fingerprint and
+    succeeded — so the number shown here always matches what workspaces serve.
+    Pure decoration: any failure degrades to no counts, never a 500.
+    """
+    from src.server.services.mcp_config import user_row_to_server_config
+    from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+
+    try:
+        schema_rows = await get_user_tool_schemas(user_id)
+    except Exception:
+        logger.warning(
+            "[mcp_catalog] tool-schema lookup failed for %s", user_id,
+            exc_info=True,
+        )
+        return {}
+    counts: dict[str, int] = {}
+    by_name = {s["server_name"]: s for s in schema_rows}
+    for row in rows:
+        snapshot = by_name.get(row["name"])
+        if snapshot is None or snapshot.get("status") != "ok":
+            continue
+        try:
+            fingerprint = mcp_discovery_fingerprint(user_row_to_server_config(row))
+        except Exception:  # noqa: BLE001 — malformed row: just omit the count
+            continue
+        if snapshot.get("config_hash") == fingerprint:
+            counts[row["name"]] = len(snapshot.get("tools") or [])
+    return counts
+
+
 @router.get("/servers")
 @handle_api_exceptions("list MCP catalog servers", logger)
 async def list_servers(user_id: CurrentUserId) -> CatalogServerList:
     rows = await list_catalog_servers(user_id)
     oauth = await _oauth_status_by_server(user_id)
+    tool_counts = await _tool_counts_by_server(user_id, rows)
     return CatalogServerList(
         servers=[
-            catalog_row_to_response(r, oauth_status=oauth.get(r["name"]))
+            catalog_row_to_response(
+                r,
+                oauth_status=oauth.get(r["name"]),
+                tool_count=tool_counts.get(r["name"]),
+            )
             for r in rows
         ],
         max_servers=MAX_CATALOG_SERVERS_PER_USER,

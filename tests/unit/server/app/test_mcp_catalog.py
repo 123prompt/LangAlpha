@@ -63,6 +63,43 @@ async def test_list_masks_literals_and_reports_max(client):
 
 
 @pytest.mark.asyncio
+async def test_list_reports_hash_gated_tool_counts(client):
+    """tool_count mirrors the workspace rule: only an ok snapshot discovered
+    under the server's CURRENT fingerprint counts; stale/error/missing ⇒ null
+    (never 0 — the UI hides null, and 0 would claim a discovery that isn't
+    current)."""
+    from src.server.services.mcp_config import user_row_to_server_config
+    from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+
+    rows = [_row(), _row(name="stale_server"), _row(name="never_discovered")]
+    current_fp = mcp_discovery_fingerprint(user_row_to_server_config(rows[0]))
+    schemas = [
+        {"server_name": "remote_server", "status": "ok", "error": "",
+         "config_hash": current_fp,
+         "tools": [{"name": "a"}, {"name": "b"}]},
+        {"server_name": "stale_server", "status": "ok", "error": "",
+         "config_hash": "not-the-current-fingerprint",
+         "tools": [{"name": "a"}]},
+    ]
+    with (
+        patch(
+            "src.server.app.mcp_catalog.list_catalog_servers",
+            new=AsyncMock(return_value=rows),
+        ),
+        patch(
+            "src.server.app.mcp_catalog.get_user_tool_schemas",
+            new=AsyncMock(return_value=schemas),
+        ),
+    ):
+        resp = await client.get("/api/v1/mcp/servers")
+    assert resp.status_code == 200
+    by_name = {s["name"]: s for s in resp.json()["servers"]}
+    assert by_name["remote_server"]["tool_count"] == 2
+    assert by_name["stale_server"]["tool_count"] is None
+    assert by_name["never_discovered"]["tool_count"] is None
+
+
+@pytest.mark.asyncio
 async def test_create_happy(client):
     with patch(
         "src.server.app.mcp_catalog.create_catalog_server",
@@ -167,16 +204,32 @@ async def test_update_missing_404(client):
 
 @pytest.mark.asyncio
 async def test_delete_happy_and_404(client):
-    with patch(
-        "src.server.app.mcp_catalog.delete_catalog_server",
-        new=AsyncMock(return_value=True),
+    # Delete must revoke any OAuth connection + its grants (no catalog FK), so
+    # the handler routes through disconnect_server before dropping the row.
+    disconnect = AsyncMock(return_value=True)
+    with (
+        patch(
+            "src.server.services.mcp_oauth.lifecycle.disconnect_server",
+            new=disconnect,
+        ),
+        patch(
+            "src.server.app.mcp_catalog.delete_catalog_server",
+            new=AsyncMock(return_value=True),
+        ),
     ):
         ok = await client.delete("/api/v1/mcp/servers/remote_server")
     assert ok.status_code == 200 and ok.json() == {"ok": True}
+    disconnect.assert_awaited_once_with("test-user-123", "remote_server")
 
-    with patch(
-        "src.server.app.mcp_catalog.delete_catalog_server",
-        new=AsyncMock(return_value=False),
+    with (
+        patch(
+            "src.server.services.mcp_oauth.lifecycle.disconnect_server",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "src.server.app.mcp_catalog.delete_catalog_server",
+            new=AsyncMock(return_value=False),
+        ),
     ):
         missing = await client.delete("/api/v1/mcp/servers/ghost")
     assert missing.status_code == 404

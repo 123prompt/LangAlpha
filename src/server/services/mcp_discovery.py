@@ -101,25 +101,49 @@ async def _stale_server_names(
 ) -> set[str]:
     """Servers whose CURRENT DB config no longer matches their kick-time state.
 
-    A name is stale when its row is gone (deleted mid-discovery) or its
-    recomputed fingerprint differs (edited mid-discovery). Malformed rows
+    A name is stale when its row is gone (deleted/disabled mid-discovery) or
+    its recomputed fingerprint differs (edited mid-discovery). Malformed rows
     count as stale — dropping a result is always safe; clobbering is not.
+    Workspace-origin servers check ``workspace_mcp_servers``; inherited
+    (``source='user'``) servers check the owner's Connectors catalog — their
+    results cache under this workspace like any other, so the guard must know
+    both tiers or every inherited discovery would be dropped as "deleted".
     """
-    from src.server.services.mcp_config import workspace_row_to_server_config
+    from src.server.database.workspace import get_workspace
+    from src.server.services.mcp_config import (
+        user_row_to_server_config,
+        workspace_row_to_server_config,
+    )
 
     rows = {
         r["name"]: r
         for r in await mcp_db.list_workspace_servers(workspace_id)
         if r.get("source") == "workspace"
     }
+    user_rows: dict[str, dict[str, Any]] = {}
+    if any(getattr(s, "source", None) == "user" for s in servers):
+        workspace = await get_workspace(workspace_id)
+        user_id = (workspace or {}).get("user_id")
+        if user_id:
+            user_rows = {
+                r["name"]: r
+                for r in await mcp_db.list_enabled_user_servers(str(user_id))
+            }
     stale: set[str] = set()
     for server in servers:
-        row = rows.get(server.name)
+        inherited = getattr(server, "source", None) == "user"
+        row = (user_rows if inherited else rows).get(server.name)
         if row is None:
             stale.add(server.name)
             continue
         try:
-            current_fp = mcp_discovery_fingerprint(workspace_row_to_server_config(row))
+            current = (
+                # oauth_connection_id is fingerprint-exempt, so None is fine.
+                user_row_to_server_config(row)
+                if inherited
+                else workspace_row_to_server_config(row)
+            )
+            current_fp = mcp_discovery_fingerprint(current)
         except Exception:  # noqa: BLE001
             stale.add(server.name)
             continue

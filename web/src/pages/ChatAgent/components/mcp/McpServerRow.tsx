@@ -96,6 +96,9 @@ function McpServerRowImpl({
   const { t } = useTranslation();
   const isBuiltin = server.origin === 'builtin';
   const isInherited = server.origin === 'user';
+  // The user-level OAuth connection is broken (revoked / needs reauth) — the
+  // only fix is reconnecting in Connectors, so the row leads with that.
+  const oauthBroken = !!server.oauth_status && server.oauth_status !== 'connected';
 
   return (
     <ServerRowShell
@@ -123,19 +126,40 @@ function McpServerRowImpl({
               synced={synced}
               sandboxRunning={sandboxRunning}
               sandboxWarming={sandboxWarming}
+              oauthStatus={server.oauth_status}
             />
-            {server.enabled && server.status === 'connected' && server.tool_count > 0 && (
+            {server.enabled && !oauthBroken && server.status === 'connected' && server.tool_count > 0 && (
               <span className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
                 {t('mcp.row.toolCount', { count: server.tool_count })}
               </span>
             )}
           </div>
 
-          {/* Error text */}
-          {server.enabled && server.status === 'error' && server.error && (
+          {/* Error text — silenced when the OAuth pill already names the real
+              problem (any cached error predates the disconnect). */}
+          {server.enabled && !oauthBroken && server.status === 'error' && server.error && (
             <p className="text-[0.6875rem] break-words" style={{ color: 'var(--color-loss)' }}>
               {server.error}
             </p>
+          )}
+
+          {/* Broken OAuth → "Reconnect in Connectors" affordance */}
+          {server.enabled && oauthBroken && onManageInConnectors && (
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                type="button"
+                onClick={onManageInConnectors}
+                className="inline-flex items-center gap-1 text-[0.6875rem] px-2 py-0.5 rounded"
+                style={{
+                  color: 'var(--color-warning, #d97706)',
+                  backgroundColor: 'var(--color-bg-tag)',
+                  border: '1px dashed var(--color-border-default)',
+                }}
+              >
+                <Cable className="h-3 w-3" />
+                {t('mcp.row.reconnectInConnectors')}
+              </button>
+            </div>
           )}
 
           {/* needs_secret → "Set up NAME" affordance(s) */}
@@ -185,7 +209,12 @@ function McpServerRowImpl({
                 <Pencil className="h-3.5 w-3.5 mr-2" />
                 {t('mcp.row.edit')}
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={isBuiltin || !server.enabled} onSelect={() => onDiscover(server)}>
+              {/* OAuth rows are discovered host-side — the backend 409s an
+                  in-sandbox probe, so don't offer one. */}
+              <DropdownMenuItem
+                disabled={isBuiltin || !server.enabled || !!server.oauth_status}
+                onSelect={() => onDiscover(server)}
+              >
                 <Zap className="h-3.5 w-3.5 mr-2" />
                 {t('mcp.row.testConnection')}
               </DropdownMenuItem>

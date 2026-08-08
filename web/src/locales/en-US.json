@@ -2641,6 +2641,7 @@
       "toolCount_other": "{{count}} tools",
       "setupSecret": "Set up {{name}}",
       "manageInConnectors": "Manage in Connectors",
+      "reconnectInConnectors": "Reconnect in Connectors",
       "edit": "Edit",
       "testConnection": "Test connection",
       "saveToConnectors": "Save to Connectors",

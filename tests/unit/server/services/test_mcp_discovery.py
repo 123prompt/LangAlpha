@@ -390,6 +390,49 @@ class TestStaleServerNames:
         stale = await _real_stale_server_names("ws", [_cfg("bad")])
         assert stale == {"bad"}
 
+    async def test_inherited_servers_check_the_user_catalog(self, monkeypatch):
+        """Inherited (source='user') results must validate against the owner's
+        Connectors catalog — the old workspace-only lookup dropped EVERY
+        inherited discovery as "deleted", so they never left pending."""
+        monkeypatch.setattr(
+            mcp_discovery.mcp_db, "list_workspace_servers",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            mcp_discovery.mcp_db, "list_enabled_user_servers",
+            AsyncMock(return_value=[
+                {"name": "kept", "transport": "stdio", "command": "npx"},
+                {"name": "edited", "transport": "stdio", "command": "uvx"},
+            ]),
+        )
+        monkeypatch.setattr(
+            "src.server.database.workspace.get_workspace",
+            AsyncMock(return_value={"workspace_id": "ws", "user_id": "u1"}),
+        )
+        stale = await _real_stale_server_names(
+            "ws",
+            [
+                _cfg("kept", source="user"),
+                _cfg("edited", source="user"),
+                _cfg("deleted", source="user"),
+            ],
+        )
+        assert stale == {"edited", "deleted"}
+
+    async def test_inherited_falls_back_stale_without_an_owner(self, monkeypatch):
+        """No workspace row (or no user_id on it) ⇒ the catalog can't be
+        checked; dropping the result is the safe arm."""
+        monkeypatch.setattr(
+            mcp_discovery.mcp_db, "list_workspace_servers",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            "src.server.database.workspace.get_workspace",
+            AsyncMock(return_value=None),
+        )
+        stale = await _real_stale_server_names("ws", [_cfg("inh", source="user")])
+        assert stale == {"inh"}
+
 
 @pytest.mark.asyncio
 class TestDiscoverAndCacheStaleGuard:

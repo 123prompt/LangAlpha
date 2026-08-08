@@ -294,9 +294,17 @@ export function ConnectorServers() {
                         <TagBadge>{server.transport}</TagBadge>
                       </ServerNameLine>
 
-                      {/* Status line: OAuth pill + inheritance scope */}
+                      {/* Status line: OAuth pill + tool count + inheritance scope */}
                       <div className="flex items-center gap-2 flex-wrap">
                         {status && <McpOauthPill status={status} />}
+                        {status === 'connected' && typeof server.tool_count === 'number' && server.tool_count > 0 && (
+                          <span
+                            className="text-[0.6875rem]"
+                            style={{ color: 'var(--color-text-tertiary)' }}
+                          >
+                            {t('mcp.row.toolCount', { count: server.tool_count })}
+                          </span>
+                        )}
                         <span
                           className="text-[0.6875rem]"
                           style={{ color: server.enabled ? 'var(--color-text-secondary)' : 'var(--color-text-tertiary)' }}

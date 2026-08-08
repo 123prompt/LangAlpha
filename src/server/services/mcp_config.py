@@ -69,6 +69,12 @@ class ResolvedMCP:
     inherited_names: frozenset[str] = frozenset()
     tombstoned_inherited_servers: list[MCPServerConfig] = field(default_factory=list)
     shadowed_inherited_names: frozenset[str] = frozenset()
+    # server_name → OAuth connection status, INCLUDING revoked (unlike the
+    # per-server ``oauth_connection_id``, which only binds live connections).
+    # Lets consumers tell "never OAuth" from "OAuth but disconnected" — the
+    # effective-list API surfaces it and discovery skips such servers (an
+    # in-sandbox probe of a token-less OAuth server can only fail).
+    oauth_status_by_name: dict[str, str] = field(default_factory=dict)
 
 
 def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
@@ -168,6 +174,7 @@ async def resolve_mcp_config(
     connection_by_server = {
         c["server_name"]: c for c in connections if c["status"] != "revoked"
     }
+    oauth_status_by_name = {c["server_name"]: str(c["status"]) for c in connections}
 
     disabled_builtins: set[str] = set()
     tombstoned_user_names: set[str] = set()
@@ -266,4 +273,5 @@ async def resolve_mcp_config(
         inherited_names=frozenset(s.name for s in inherited_servers),
         tombstoned_inherited_servers=tombstoned_inherited,
         shadowed_inherited_names=frozenset(shadowed_inherited),
+        oauth_status_by_name=oauth_status_by_name,
     )

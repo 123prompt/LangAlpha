@@ -191,13 +191,15 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   // Auto-resolve pending servers: instead of leaving a freshly-added server on a
   // static "Pending", probe it once so the user sees Checking → Connected/Error.
   // Only when the sandbox is running (discovery needs it) and only enabled
-  // workspace servers (disabled rows read as "Disabled"; builtins are always
-  // connected). The backend's 15s debounce backs up the once-per-mount guard.
+  // workspace + inherited servers (disabled rows read as "Disabled"; builtins
+  // are always connected; OAuth rows are discovered host-side — a sandbox
+  // probe would 409). The backend's 15s debounce backs up the mount guard.
   useEffect(() => {
     if (!sandboxRunning) return;
     for (const s of servers) {
       if (
-        s.origin === 'workspace' &&
+        (s.origin === 'workspace' || s.origin === 'user') &&
+        !s.oauth_status &&
         s.enabled &&
         s.status === 'pending' &&
         !autoCheckedRef.current.has(s.name)

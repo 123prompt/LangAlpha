@@ -2619,6 +2619,7 @@
       "toolCount_other": "{{count}} 个工具",
       "setupSecret": "设置 {{name}}",
       "manageInConnectors": "在连接器中管理",
+      "reconnectInConnectors": "在连接器中重新连接",
       "edit": "编辑",
       "testConnection": "测试连接",
       "saveToConnectors": "保存到连接器",

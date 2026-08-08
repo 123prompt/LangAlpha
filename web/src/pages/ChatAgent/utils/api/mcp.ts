@@ -39,6 +39,13 @@ export type McpStatus =
   | 'pending'
   | 'unknown';
 
+/** Lifecycle of a server's OAuth connection (absent = never connected). */
+export type McpOauthStatus =
+  | 'connected'
+  | 'needs_reauth'
+  | 'refresh_ambiguous'
+  | 'revoked';
+
 /** One row in the effective per-workspace MCP list. */
 export interface EffectiveServer {
   name: string;
@@ -73,6 +80,12 @@ export interface EffectiveServer {
   args: string[];
   url: string | null;
   config_version: number;
+  /**
+   * Inherited (origin='user') rows only: the owner's OAuth connection status,
+   * including 'revoked'. Absent/null = the server has no OAuth connection.
+   * OAuth rows are discovered host-side, never probed from the workspace.
+   */
+  oauth_status?: McpOauthStatus | null;
 }
 
 export interface EffectiveServerList {
@@ -95,13 +108,6 @@ export interface EffectiveServerList {
   sandbox_warming?: boolean;
 }
 
-/** Lifecycle of a server's OAuth connection (absent = never connected). */
-export type McpOauthStatus =
-  | 'connected'
-  | 'needs_reauth'
-  | 'refresh_ambiguous'
-  | 'revoked';
-
 /** A user catalog template row (masked — only vault refs surfaced). */
 export interface CatalogServer {
   name: string;
@@ -119,6 +125,8 @@ export interface CatalogServer {
   enabled?: boolean;
   /** OAuth connection status, when one exists for this server. */
   oauth_status?: McpOauthStatus | null;
+  /** Host-side discovered tool count for the current config (OAuth servers). */
+  tool_count?: number | null;
   /** Non-blocking policy nudges — present on create/update responses only. */
   warnings?: string[] | null;
   created_at: string | null;

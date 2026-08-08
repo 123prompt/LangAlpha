@@ -102,8 +102,14 @@ function isSettling(data: EffectiveServerList | undefined): boolean {
   const applyingBehind =
     data.applied_config_version != null &&
     data.applied_config_version < data.config_version;
+  // OAuth rows (`oauth_status` set) never verify in-workspace — discovery is
+  // host-side — so counting them would poll forever on a disconnected server.
   const verifying = data.servers.some(
-    (s) => s.origin === 'workspace' && s.enabled && s.status === 'pending',
+    (s) =>
+      (s.origin === 'workspace' || s.origin === 'user') &&
+      !s.oauth_status &&
+      s.enabled &&
+      s.status === 'pending',
   );
   return applyingBehind || verifying;
 }

@@ -416,6 +416,84 @@ async def test_list_needs_secret_surfaces_missing(client):
     assert s["missing_secrets"] == ["API_KEY"]
 
 
+@pytest.mark.asyncio
+async def test_list_surfaces_oauth_status_on_inherited_rows(client):
+    """A disconnected OAuth server must say so — not sit on 'pending' while
+    the UI shows a Verifying state nothing can ever resolve. The status map
+    includes 'revoked' (unlike oauth_connection_id, which is None by then);
+    workspace-origin rows never carry it."""
+    ws = _ws()
+    base = _agent_config([])
+    inherited = MCPServerConfig(
+        name="robinhood", transport="http",
+        url="https://api.example.com/mcp", source="user",
+    )
+    local = _user_server(name="local_fork")
+    resolved = ResolvedMCP(
+        servers=[inherited, local], builtin_names=frozenset(),
+        user_names=frozenset({"local_fork"}), version=3,
+        inherited_names=frozenset({"robinhood"}),
+        oauth_status_by_name={"robinhood": "revoked", "local_fork": "connected"},
+    )
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.resolve_mcp_config", new=AsyncMock(return_value=resolved)),
+        patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
+        patch("src.server.app.mcp_servers.get_tool_schemas", new=AsyncMock(return_value=[])),
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers")
+
+    by_name = {s["name"]: s for s in resp.json()["servers"]}
+    assert by_name["robinhood"]["origin"] == "user"
+    assert by_name["robinhood"]["oauth_status"] == "revoked"
+    assert by_name["robinhood"]["status"] == "pending"
+    assert by_name["local_fork"]["oauth_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_inherited_prefers_user_cache_over_workspace_cache(client):
+    """The user-level snapshot tracks the OAuth lifecycle (purged on
+    disconnect, refreshed on connect); a workspace snapshot's fingerprint is
+    OAuth-blind and can outlive both — so the user cache must win."""
+    ws = _ws()
+    base = _agent_config([])
+    inherited = MCPServerConfig(
+        name="robinhood", transport="http",
+        url="https://api.example.com/mcp", source="user",
+    )
+    fingerprint = mcp_discovery_fingerprint(inherited)
+    resolved = ResolvedMCP(
+        servers=[inherited], builtin_names=frozenset(),
+        user_names=frozenset(), version=3,
+        inherited_names=frozenset({"robinhood"}),
+    )
+    ws_rows = [
+        {"server_name": "robinhood", "status": "error", "tools": [],
+         "error": "stale pre-connect probe", "config_hash": fingerprint,
+         "discovered_at": NOW.isoformat()},
+    ]
+    user_rows = [
+        {"server_name": "robinhood", "status": "ok",
+         "tools": [{"name": "get_positions", "description": "", "input_schema": {}}],
+         "error": "", "config_hash": fingerprint,
+         "discovered_at": NOW.isoformat()},
+    ]
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.resolve_mcp_config", new=AsyncMock(return_value=resolved)),
+        patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
+        patch("src.server.app.mcp_servers.get_tool_schemas", new=AsyncMock(return_value=ws_rows)),
+        patch("src.server.app.mcp_servers.get_user_tool_schemas", new=AsyncMock(return_value=user_rows)),
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers")
+
+    s = resp.json()["servers"][0]
+    assert s["status"] == "connected"
+    assert s["tool_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # POST add — collision + cap + happy
 # ---------------------------------------------------------------------------
