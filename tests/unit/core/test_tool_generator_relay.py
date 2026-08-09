@@ -50,17 +50,36 @@ class TestCodegenVersion:
         # deliberate wrapper/composition-logic bump ("5" = runtime extraction).
         assert re.fullmatch(r"5\.[0-9a-f]{12}", MCP_CLIENT_CODEGEN_VERSION)
 
-    def test_version_tracks_runtime_content(self):
-        # The suffix is a content hash of mcp_client_runtime.py — editing the
-        # runtime reaches warm sandboxes with no manual bump.
+    def test_emission_probe_matches_golden(self):
+        # Emission drift must be a reviewed diff, not a silent hash move.
+        # On an intentional emitter change, regenerate with:
+        #   uv run python -c "from ptc_agent.core.tool_generator import \
+        #     _emission_probe_text; import pathlib; pathlib.Path( \
+        #     'tests/unit/core/emission_probe_golden.txt').write_text( \
+        #     _emission_probe_text())"
+        from pathlib import Path
+
+        from ptc_agent.core.tool_generator import _emission_probe_text
+
+        golden = (Path(__file__).parent / "emission_probe_golden.txt").read_text()
+        assert _emission_probe_text() == golden
+
+    def test_version_derives_from_committed_emission(self):
+        # Non-tautological version guard: the hash is recomputed from the
+        # COMMITTED golden bytes, not the live probe — an emitter change fails
+        # here (and above) until the golden is regenerated, at which point the
+        # version moves and warm sandboxes resync. The runtime half still
+        # tracks mcp_client_runtime.py directly.
         import hashlib
+        from pathlib import Path
 
         from ptc_agent.core.tool_generator import client_runtime_source
 
+        golden = (Path(__file__).parent / "emission_probe_golden.txt").read_text()
         expected = hashlib.sha256(
-            client_runtime_source().encode("utf-8")
+            (client_runtime_source() + golden).encode("utf-8")
         ).hexdigest()[:12]
-        assert MCP_CLIENT_CODEGEN_VERSION.endswith(expected)
+        assert MCP_CLIENT_CODEGEN_VERSION == f"5.{expected}"
 
 
 class TestRelayBoundEmission:

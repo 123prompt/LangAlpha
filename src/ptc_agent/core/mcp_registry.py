@@ -5,7 +5,7 @@ import os
 import threading
 from collections import deque
 from types import TracebackType
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from mcp import StdioServerParameters
@@ -108,6 +108,52 @@ class _StderrTail:
             pass
 
 
+class _ResolvedType(NamedTuple):
+    type: str
+    nullable: bool
+    enum: list[Any] | None
+    items_type: str | None
+
+
+def _resolve_schema_type(prop: dict[str, Any]) -> _ResolvedType:
+    """Resolve a property schema to a base JSON type + the facts wrappers need.
+
+    Handles the two shapes real servers actually emit for optionality —
+    pydantic's ``anyOf [T, null]`` and the ``type: [T, "null"]`` list form —
+    so a nullable string surfaces as ``string`` + nullable instead of
+    degrading to ``any``. Anything more exotic still falls back to ``any``.
+    """
+    t = prop.get("type")
+    node = prop
+    nullable = False
+    if t is None:
+        variants = prop.get("anyOf") or prop.get("oneOf")
+        if isinstance(variants, list):
+            typed = [
+                v for v in variants
+                if isinstance(v, dict) and v.get("type") != "null"
+            ]
+            nullable = len(typed) != len(variants)
+            if len(typed) == 1:
+                node = typed[0]
+                t = node.get("type")
+    if isinstance(t, list):
+        non_null = [x for x in t if x != "null"]
+        nullable = nullable or len(non_null) != len(t)
+        t = non_null[0] if len(non_null) == 1 else None
+    if not isinstance(t, str):
+        t = "any"
+    enum = node.get("enum")
+    if not (isinstance(enum, list) and enum):
+        enum = None
+    items_type = None
+    if t == "array":
+        items = node.get("items")
+        if isinstance(items, dict) and isinstance(items.get("type"), str):
+            items_type = items["type"]
+    return _ResolvedType(t, nullable, enum, items_type)
+
+
 class MCPToolInfo:
     """Snapshot of a single tool's schema as reported by its MCP server."""
 
@@ -124,18 +170,31 @@ class MCPToolInfo:
         self.server_name = server_name
 
     def get_parameters(self) -> dict[str, Any]:
-        """Return ``{param_name: {type, description, required, default}}`` from input_schema."""
+        """Return ``{param_name: {type, description, required, default, ...}}``.
+
+        Beyond the historical keys, each entry carries ``has_default`` (a
+        stored ``default: null`` is not the same as no default), ``nullable``,
+        ``enum`` and ``items_type`` — resolved by :func:`_resolve_schema_type`
+        so wrappers and docs can show real types and allowed values.
+        """
         params = {}
 
         if "properties" in self.input_schema:
             required_params = self.input_schema.get("required", [])
 
             for param_name, param_info in self.input_schema["properties"].items():
+                if not isinstance(param_info, dict):
+                    param_info = {}
+                resolved = _resolve_schema_type(param_info)
                 params[param_name] = {
-                    "type": param_info.get("type", "any"),
+                    "type": resolved.type,
                     "description": param_info.get("description", ""),
                     "required": param_name in required_params,
                     "default": param_info.get("default"),
+                    "has_default": "default" in param_info,
+                    "nullable": resolved.nullable,
+                    "enum": resolved.enum,
+                    "items_type": resolved.items_type,
                 }
 
         return params

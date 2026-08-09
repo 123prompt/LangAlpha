@@ -9,6 +9,7 @@ generates only the per-server wrapper functions and their docs.
 
 import hashlib
 import json
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -39,24 +40,21 @@ def client_runtime_source() -> str:
     return _RUNTIME_FILE.read_text(encoding="utf-8")
 
 
-# Version of the uploaded mcp_client.py. The manifest hashes generation
-# *inputs* (MCP server files, tool schemas, user config) — not this package's
-# source — so a pure client/codegen change is otherwise invisible to
-# sync_sandbox_assets and never reaches a reused sandbox. Folding this value
-# into the tool_modules version forces the regenerated client onto every
-# workspace on its next sync (see sandbox/assets.py:_compute_sandbox_manifest).
+# Version of the uploaded mcp_client.py + generated wrapper modules. The
+# manifest hashes generation *inputs* (MCP server files, tool schemas, user
+# config) — not this package's source — so a pure client/codegen change is
+# otherwise invisible to sync_sandbox_assets and never reaches a reused
+# sandbox. Folding this value into the tool_modules version forces the
+# regenerated client onto every workspace on its next sync (see
+# sandbox/assets.py:_compute_sandbox_manifest).
 #
-# The hash suffix tracks mcp_client_runtime.py automatically, so editing the
-# runtime needs no manual bump. Bump the major only when the WRAPPER/composition
-# logic in this file changes in a way that must reach existing sandboxes.
+# The hash suffix tracks mcp_client_runtime.py AND a deterministic sample of
+# this module's wrapper/doc emission (see MCP_CLIENT_CODEGEN_VERSION at the
+# bottom of this file), so neither a runtime edit nor an emission change needs
+# a manual bump. The major marks deliberate architecture shifts only.
 # "4": MCP 2026-07-28 client. "5": client extracted to the static runtime
 # module; per-workspace config moved to a JSON epilogue.
 _WRAPPER_CODEGEN_MAJOR = "5"
-
-MCP_CLIENT_CODEGEN_VERSION = "{}.{}".format(
-    _WRAPPER_CODEGEN_MAJOR,
-    hashlib.sha256(client_runtime_source().encode("utf-8")).hexdigest()[:12],
-)
 
 # Aggregate per-execution ceiling on result_body bytes emitted BY THE SANDBOX
 # CLIENT, shipped to it via the config epilogue. This keeps a cooperative run's
@@ -76,6 +74,39 @@ def _safe_func_name(name: str) -> str:
     in :func:`mcp_sanitize.sanitize_tool_set`).
     """
     return sanitize_tool_name(name) or "_invalid_tool"
+
+
+@dataclass(frozen=True)
+class _ParamBinding:
+    """One parameter's two names plus its resolved schema facts.
+
+    ``wire`` is the schema key — the only name the server accepts. ``py`` is
+    the wrapper-signature identifier the agent types. They differ exactly when
+    sanitization renamed a keyword/illegal name (``type`` -> ``type_``); the
+    arg dict must always emit ``wire``, everything agent-facing shows ``py``.
+    """
+
+    wire: str
+    py: str
+    info: dict[str, Any]
+
+
+_JSON_TO_PY = {
+    "string": "str",
+    "number": "float",
+    "integer": "int",
+    "boolean": "bool",
+    "array": "list",
+    "object": "dict",
+    "null": "None",
+}
+
+# Enums render as Literal[...] only while they stay readable as a signature;
+# a hostile or bloated enum falls back to the base type (values still appear,
+# capped, in the docstring).
+_MAX_LITERAL_VALUES = 8
+_MAX_LITERAL_CHARS = 200
+_MAX_DOC_ENUM_VALUES = 12
 
 
 class ToolFunctionGenerator:
@@ -109,7 +140,7 @@ This module provides Python functions that call tools on the {server_name} MCP s
 Functions are automatically generated from the MCP tool schemas.
 """
 
-from typing import Any, List, Dict
+from typing import Any, Literal  # noqa: F401 - Literal used only by enum params
 import json
 
 # Import MCP client
@@ -162,62 +193,23 @@ except ImportError:
         """
         # Generate function signature
         func_name = _safe_func_name(tool.name)
-        params = tool.get_parameters()
-
-        # For untrusted servers, coerce each param NAME into a legal
-        # identifier (a hostile schema key could otherwise inject code or break
-        # the module); skip names that can't be salvaged. Builtins keep the raw
-        # key verbatim.
-        if untrusted:
-            usable: dict[str, dict[str, Any]] = {}
-            for param_name, param_info in params.items():
-                safe_param = sanitize_tool_name(param_name)
-                if safe_param is None or safe_param in usable:
-                    logger.warning(
-                        "Skipped invalid/colliding param for untrusted MCP tool",
-                        server=server_name,
-                        tool=tool.name,
-                        param=param_name,
-                    )
-                    continue
-                usable[safe_param] = param_info
-            params = usable
-
-        # Build parameter list - required parameters must come before optional
-        param_list = []
-
-        # First add required parameters
-        for param_name, param_info in params.items():
-            if param_info["required"]:
-                param_type = self._map_json_type_to_python(param_info["type"])
-                param_list.append(f"{param_name}: {param_type}")
-
-        # Then add optional parameters
-        for param_name, param_info in params.items():
-            if not param_info["required"]:
-                param_type = self._map_json_type_to_python(param_info["type"])
-                default = param_info.get("default")
-                if default is None:
-                    param_list.append(f"{param_name}: {param_type} | None = None")
-                else:
-                    default_repr = repr(default)
-                    param_list.append(f"{param_name}: {param_type} = {default_repr}")
-
-        param_str = ", ".join(param_list)
+        bindings = self._bind_params(tool, server_name, untrusted)
+        param_str = self._render_signature_params(bindings)
 
         # Generate docstring
-        docstring = self._generate_docstring(tool, params, untrusted)
+        docstring = self._generate_docstring(tool, bindings, untrusted)
 
-        # Generate function body. For untrusted servers the arg-dict KEY is
-        # emitted via repr (the param name is untrusted text); builtins keep
-        # the historical double-quoted literal.
+        # Generate function body: the arg-dict KEY is always the WIRE name —
+        # the server rejects a sanitized rename like ``type_``. For untrusted
+        # servers the key is emitted via repr (the name is untrusted text);
+        # builtins keep the historical double-quoted literal.
         if untrusted:
             arg_dict_entries = [
-                f"        {param_name!r}: {param_name}," for param_name in params
+                f"        {b.wire!r}: {b.py}," for b in bindings
             ]
         else:
             arg_dict_entries = [
-                f'        "{param_name}": {param_name},' for param_name in params
+                f'        "{b.wire}": {b.py},' for b in bindings
             ]
 
         args_dict = "\n".join(arg_dict_entries)
@@ -248,14 +240,91 @@ except ImportError:
 
 {call_line}'''
 
+    def _bind_params(
+        self, tool: MCPToolInfo, server_name: str, untrusted: bool
+    ) -> list[_ParamBinding]:
+        """Resolve each schema param to a (wire, py) name pair, schema order.
+
+        For untrusted servers the Python name is the sanitized identifier (a
+        hostile schema key could otherwise inject code or break the module);
+        unsalvageable or colliding names are skipped. Builtins keep the raw
+        key verbatim on both sides.
+        """
+        bindings: list[_ParamBinding] = []
+        seen: set[str] = set()
+        for wire, info in tool.get_parameters().items():
+            if untrusted:
+                py = sanitize_tool_name(wire)
+                if py is None or py in seen:
+                    logger.warning(
+                        "Skipped invalid/colliding param for untrusted MCP tool",
+                        server=server_name,
+                        tool=tool.name,
+                        param=wire,
+                    )
+                    continue
+                seen.add(py)
+            else:
+                py = wire
+            bindings.append(_ParamBinding(wire, py, info))
+        return bindings
+
+    def _render_signature_params(self, bindings: list[_ParamBinding]) -> str:
+        """Render the wrapper parameter list, required params first."""
+        rendered = []
+        ordered = [b for b in bindings if b.info["required"]] + [
+            b for b in bindings if not b.info["required"]
+        ]
+        for b in ordered:
+            annotation = self._annotation(b.info)
+            if b.info["required"]:
+                rendered.append(f"{b.py}: {annotation}")
+            elif b.info.get("has_default") and b.info.get("default") is not None:
+                rendered.append(f"{b.py}: {annotation} = {b.info['default']!r}")
+            else:
+                if not annotation.endswith("| None"):
+                    annotation = f"{annotation} | None"
+                rendered.append(f"{b.py}: {annotation} = None")
+        return ", ".join(rendered)
+
+    def _annotation(self, info: dict[str, Any]) -> str:
+        """Python type annotation for a resolved param schema.
+
+        Enums become ``Literal[...]`` (repr'd values — safe literals by
+        construction) while they stay small enough to read as a signature;
+        arrays pick up their item type; ``nullable`` appends ``| None``.
+        """
+        annotation = self._base_annotation(info)
+        if info.get("nullable") and annotation != "Any" and not annotation.endswith("| None"):
+            annotation = f"{annotation} | None"
+        return annotation
+
+    def _base_annotation(self, info: dict[str, Any]) -> str:
+        enum = info.get("enum")
+        if (
+            enum
+            and len(enum) <= _MAX_LITERAL_VALUES
+            and all(isinstance(v, (str, int, bool)) for v in enum)
+        ):
+            literal = "Literal[{}]".format(", ".join(repr(v) for v in enum))
+            if len(literal) <= _MAX_LITERAL_CHARS:
+                return literal
+        json_type = info.get("type")
+        if json_type == "array":
+            item = _JSON_TO_PY.get(info.get("items_type") or "")
+            return f"list[{item}]" if item else "list"
+        if not isinstance(json_type, str):
+            return "Any"
+        return _JSON_TO_PY.get(json_type, "Any")
+
     def _generate_docstring(
-        self, tool: MCPToolInfo, params: dict[str, Any], untrusted: bool = False
+        self, tool: MCPToolInfo, bindings: list[_ParamBinding], untrusted: bool = False
     ) -> str:
         """Generate docstring for a tool function.
 
         Args:
             tool: Tool information
-            params: Parameter information
+            bindings: Parameter bindings (py names are what the agent types)
             untrusted: full untrusted-text sanitization for user-configured
                 servers; trusted builtins keep the backslash-only escape
 
@@ -265,12 +334,14 @@ except ImportError:
 
         def _escape(text: str) -> str:
             # Untrusted text is fully sanitized — triple-quote breakouts,
-            # control chars, length cap. Builtins keep the historical
-            # backslash-only escape (sanitization could truncate legitimate
-            # long builtin docstrings).
+            # control chars, length cap. Builtins keep a lighter escape
+            # (sanitization could truncate legitimate long builtin docstrings)
+            # but still neutralize the ``\"\"\"`` delimiter: trust labels
+            # servers, not strings, and a mislabeled server must not get a
+            # docstring breakout for free.
             if untrusted:
                 return sanitize_tool_text(text)
-            return text.replace("\\", "\\\\")
+            return text.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
 
         lines = []
 
@@ -280,23 +351,27 @@ except ImportError:
             lines.append("")
 
         # Add parameters
-        if params:
+        if bindings:
             lines.append("Args:")
-            for param_name, param_info in params.items():
-                param_desc = param_info.get("description", "")
-                escaped_desc = _escape(param_desc)
+            for b in bindings:
+                escaped_desc = _escape(b.info.get("description", ""))
                 # The schema `type` field is untrusted text like the
                 # description — escape it (and coerce non-str values) so it
                 # can't terminate the docstring.
-                param_type = _escape(str(param_info["type"]))
-                required = " (required)" if param_info["required"] else ""
+                param_type = _escape(str(b.info["type"]))
+                required = " (required)" if b.info["required"] else ""
+                suffix = _escape(self._facts_suffix(b.info))
                 lines.append(
-                    f"    {param_name} ({param_type}){required}: {escaped_desc}"
+                    f"    {b.py} ({param_type}){required}: {escaped_desc}{suffix}"
                 )
             lines.append("")
 
-        # Add returns - extract from description if available
+        # Add returns - extract from description if available. The description
+        # is untrusted, so the extracted text gets the same escape as every
+        # other embedded field; return_type is a constant from the pattern
+        # map, never raw input.
         return_type, return_desc = self._extract_return_info(tool.description)
+        return_desc = _escape(return_desc)
         lines.append("Returns:")
         # Format multiline return descriptions properly
         return_lines = return_desc.split("\n")
@@ -313,56 +388,62 @@ except ImportError:
         lines.append("")
 
         # Add example
-        example_args = []
-        for param_name, param_info in params.items():
-            if param_info["required"]:
-                example_val = self._generate_example_value(param_info["type"])
-                example_args.append(f"{param_name}={example_val}")
-
-        if example_args:
-            func_name = _safe_func_name(tool.name)
-            example_call = (
-                f"{func_name}({', '.join(example_args[:2])})"  # Limit to 2 args
-            )
+        example_call = self._render_example_call(tool, bindings, untrusted, limit=2)
+        if example_call:
             lines.append("Example:")
             lines.append(f"    result = {example_call}")
 
         return "\n    ".join(lines)
 
-    def _map_json_type_to_python(self, json_type: str) -> str:
-        """Map JSON schema type to Python type hint.
+    def _facts_suffix(self, info: dict[str, Any]) -> str:
+        """Schema facts worth surfacing beside a param description.
 
-        Args:
-            json_type: JSON schema type
-
-        Returns:
-            Python type hint string
+        Allowed values and real defaults are what agents otherwise guess at
+        (and guess wrong — enum-typed params fail with opaque server errors).
         """
-        type_map = {
-            "string": "str",
-            "number": "float",
-            "integer": "int",
-            "boolean": "bool",
-            "array": "List",
-            "object": "Dict",
-            "null": "None",
-        }
+        parts = []
+        enum = info.get("enum")
+        if enum:
+            shown = ", ".join(repr(v) for v in enum[:_MAX_DOC_ENUM_VALUES])
+            if len(enum) > _MAX_DOC_ENUM_VALUES:
+                shown += ", ..."
+            parts.append(f"[allowed: {shown}]")
+        if info.get("has_default") and info.get("default") is not None:
+            parts.append(f"[default: {info['default']!r}]")
+        return (" " + " ".join(parts)) if parts else ""
 
-        # A hostile schema may carry a non-str (unhashable) `type`.
-        if not isinstance(json_type, str):
-            return "Any"
-        return type_map.get(json_type, "Any")
+    def _render_example_call(
+        self,
+        tool: MCPToolInfo,
+        bindings: list[_ParamBinding],
+        untrusted: bool,
+        limit: int | None = None,
+    ) -> str:
+        """One-line example call with schema-true values where the schema
+        offers them (default, then first enum value) — a placeholder example
+        like ``mode="example"`` fails on every enum-typed param."""
+        example_args = []
+        for b in bindings:
+            if not b.info["required"]:
+                continue
+            value = self._example_value(b.info)
+            # Schema-derived values are untrusted text; neutralize docstring/
+            # fence breakouts before embedding in agent-facing docs.
+            if untrusted:
+                value = sanitize_tool_text(value)
+            example_args.append(f"{b.py}={value}")
+        if not example_args:
+            return ""
+        func_name = _safe_func_name(tool.name)
+        return f"{func_name}({', '.join(example_args[:limit])})"
 
-    def _generate_example_value(self, param_type: str) -> str:
-        """Generate example value for a parameter type.
-
-        Args:
-            param_type: Parameter type
-
-        Returns:
-            Example value as string
-        """
-        examples = {
+    def _example_value(self, info: dict[str, Any]) -> str:
+        if info.get("has_default") and info.get("default") is not None:
+            return repr(info["default"])
+        enum = info.get("enum")
+        if enum:
+            return repr(enum[0])
+        placeholders = {
             "string": '"example"',
             "number": "42.0",
             "integer": "42",
@@ -370,11 +451,10 @@ except ImportError:
             "array": "[]",
             "object": "{}",
         }
-
-        # A hostile schema may carry a non-str (unhashable) `type`.
-        if not isinstance(param_type, str):
+        json_type = info.get("type")
+        if not isinstance(json_type, str):
             return '""'
-        return examples.get(param_type, '""')
+        return placeholders.get(json_type, '""')
 
     def _extract_return_info(self, description: str) -> tuple[str, str]:
         """Extract return type info from tool description's Returns: section.
@@ -447,22 +527,22 @@ except ImportError:
             Markdown documentation string
         """
         func_name = _safe_func_name(tool.name)
-        params = tool.get_parameters()
+        # Same bindings as the generated wrapper: the documented signature is
+        # the exact callable — sanitized names included. Docs that show the
+        # wire name (`type`) for a wrapper whose param is `type_` send the
+        # agent straight into a TypeError.
+        bindings = self._bind_params(tool, tool.server_name, untrusted)
         description = (
             sanitize_tool_text(tool.description) if untrusted else tool.description
         )
 
-        # Build signature
-        param_list = []
-        for param_name, param_info in params.items():
-            param_type = self._map_json_type_to_python(param_info["type"])
-            if param_info["required"]:
-                param_list.append(f"{param_name}: {param_type}")
-            else:
-                default = param_info.get("default", "None")
-                param_list.append(f"{param_name}: {param_type} = {default}")
-
-        signature = f"{func_name}({', '.join(param_list)})"
+        signature = f"{func_name}({self._render_signature_params(bindings)})"
+        if untrusted:
+            # The rendered signature embeds repr'd schema values (enum
+            # literals, defaults) — untrusted text like every other field on
+            # this page. Identity for honest schemas, so parity with the
+            # wrapper signature holds except under active hostility.
+            signature = sanitize_tool_text(signature)
 
         # Build documentation
         doc = f"# {signature}\n\n"
@@ -471,17 +551,19 @@ except ImportError:
             doc += f"{description}\n\n"
 
         doc += "## Parameters\n\n"
-        if params:
-            for param_name, param_info in params.items():
+        if bindings:
+            for b in bindings:
                 required_marker = (
-                    "**Required**" if param_info["required"] else "Optional"
+                    "**Required**" if b.info["required"] else "Optional"
                 )
-                param_type = str(param_info["type"])
-                param_desc = param_info.get("description", "")
+                param_type = str(b.info["type"])
+                param_desc = b.info.get("description", "")
+                facts = self._facts_suffix(b.info)
                 if untrusted:
                     param_type = sanitize_tool_text(param_type)
                     param_desc = sanitize_tool_text(param_desc)
-                doc += f"- `{param_name}` ({param_type}) - {required_marker}\n"
+                    facts = sanitize_tool_text(facts)
+                doc += f"- `{b.py}` ({param_type}) - {required_marker}{facts}\n"
                 if param_desc:
                     doc += f"  {param_desc}\n"
                 doc += "\n"
@@ -499,18 +581,8 @@ except ImportError:
         doc += "```python\n"
         doc += f"from tools.{tool.server_name} import {func_name}\n\n"
 
-        # Generate example call
-        example_args = []
-        for param_name, param_info in params.items():
-            if param_info["required"]:
-                example_val = self._generate_example_value(param_info["type"])
-                example_args.append(f"{param_name}={example_val}")
-
-        if example_args:
-            doc += f"result = {func_name}({', '.join(example_args)})\n"
-        else:
-            doc += f"result = {func_name}()\n"
-
+        example_call = self._render_example_call(tool, bindings, untrusted)
+        doc += f"result = {example_call or f'{func_name}()'}\n"
         doc += "print(result)  # noqa: T201\n"
         doc += "```\n"
 
@@ -614,3 +686,89 @@ except ImportError:
             + f"_apply_config_dict(json.loads({json.dumps(config_json)}))\n"
             + '\nif __name__ == "__main__":\n    _cli_main()\n'
         )
+
+
+# Covers every emission shape that matters to deployed sandboxes: a renamed
+# soft-keyword param (wire-key mapping), a hard-keyword param, an enum, a
+# typed array, a nullable anyOf, and a default.
+_EMISSION_PROBE_TOOL = MCPToolInfo(
+    name="probe_tool",
+    description="Emission probe.\n\nReturns:\n    dict: probe result",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["market", "limit"]},
+            "class": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "note": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": "hi",
+            },
+        },
+        "required": ["type", "class"],
+    },
+    server_name="probe",
+)
+
+# Second probe: the knobs the first can't reach — numeric/boolean/object
+# placeholder examples, an enum past the doc cap, a boolean default, a
+# multiline Returns section, and hostile quoting/control chars that must be
+# neutralized on BOTH trust branches. Hash-relevant only; never uploaded.
+_EMISSION_PROBE_TOOL_2 = MCPToolInfo(
+    name="probe_tool_2",
+    description=(
+        'Second probe with a breakout attempt: """ and a backslash \\.\n'
+        "\n"
+        "Returns:\n"
+        "    list[dict]: first line of a multiline return\n"
+        '    second line with \\ and """ and \'\'\' inside'
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "count": {
+                "type": "integer",
+                "description": "Count.\x07 Ends with \\ and ''' fence",
+            },
+            "ratio": {"type": "number"},
+            "flag": {"type": "boolean", "default": False},
+            "payload": {"type": "object"},
+            "mode": {
+                "type": "string",
+                "enum": [f"m{i}" for i in range(_MAX_DOC_ENUM_VALUES + 2)],
+            },
+        },
+        "required": ["count", "ratio", "payload"],
+    },
+    server_name="probe",
+)
+
+
+def _emission_probe_text() -> str:
+    """Deterministic sample of this module's wrapper/doc emission.
+
+    Folded into ``MCP_CLIENT_CODEGEN_VERSION`` so an emission change reaches
+    warm sandboxes automatically — without this, only runtime-file edits would
+    invalidate their cached wrapper modules. Pinned by the committed golden in
+    ``tests/unit/core/emission_probe_golden.txt`` so emission drift is a
+    visible diff, never a silent hash move.
+    """
+    gen = ToolFunctionGenerator()
+    probes = [_EMISSION_PROBE_TOOL, _EMISSION_PROBE_TOOL_2]
+    return (
+        gen.generate_tool_module("probe", probes)
+        + gen.generate_tool_module("probe", probes, untrusted=True)
+        + "".join(
+            gen.generate_tool_documentation(tool, untrusted=untrusted)
+            for tool in probes
+            for untrusted in (False, True)
+        )
+    )
+
+
+MCP_CLIENT_CODEGEN_VERSION = "{}.{}".format(
+    _WRAPPER_CODEGEN_MAJOR,
+    hashlib.sha256(
+        (client_runtime_source() + _emission_probe_text()).encode("utf-8")
+    ).hexdigest()[:12],
+)

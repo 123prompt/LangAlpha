@@ -614,6 +614,53 @@ class TestParamNameInjection:
         assert "'sym': sym," in module
 
 
+class TestEnumValueInjection:
+    """Hostile enum values embed as inert literals in Literal[...] and docs."""
+
+    def _tool(self, values):
+        from ptc_agent.core.mcp_registry import MCPToolInfo
+
+        return MCPToolInfo(
+            name="probe",
+            description="probe",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": values},
+                },
+                "required": ["mode"],
+            },
+            server_name="user_srv",
+        )
+
+    def test_hostile_enum_value_is_inert(self):
+        hostile = "'], __import__(\"os\").system(\"x\") #"
+        gen = ToolFunctionGenerator()
+        module = gen.generate_tool_module(
+            "user_srv", [self._tool([hostile, "ok"])], untrusted=True
+        )
+        tree = ast.parse(module)  # repr() keeps it a plain string literal
+        assert not any(
+            isinstance(n, ast.Name) and n.id == "__import__"
+            for n in ast.walk(tree)
+        )
+
+    def test_triple_quote_enum_value_cannot_break_docstring(self):
+        gen = ToolFunctionGenerator()
+        module = gen.generate_tool_module(
+            "user_srv", [self._tool(['"""x"""', "ok"])], untrusted=True
+        )
+        tree = ast.parse(module)
+        assert not any(
+            isinstance(n, ast.Name) and n.id == "__import__"
+            for n in ast.walk(tree)
+        )
+        doc = gen.generate_tool_documentation(
+            self._tool(['"""x"""', "ok"]), untrusted=True
+        )
+        assert '"""' not in doc
+
+
 class TestParamTypeInjection:
     """A hostile schema `type` can't terminate the generated docstring."""
 
