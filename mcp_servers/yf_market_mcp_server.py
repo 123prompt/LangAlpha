@@ -20,7 +20,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 import yfinance as yf
 
 from mcp_servers._envelope import make_error, make_response
-from mcp_servers._schemas import OBJECT, RECORDS, envelope_schema, output_model
+from mcp_servers._schemas import OBJECT, RECORDS, STR, envelope_schema, output_model
 from mcp_servers._yf_common import clean_value, safe_detail, serialize_records
 
 SOURCE = "yfinance"
@@ -81,7 +81,7 @@ def search_tickers(query: str, max_results: int = 8, news_count: int = 5) -> _OU
 
 _OUT_GET_MARKET_STATUS = output_model(
     "GetMarketStatusOut",
-    envelope_schema(OBJECT, echo={"market": {"type": "string"}}),
+    envelope_schema(OBJECT, echo={"market": STR}),
 )
 
 
@@ -165,7 +165,7 @@ def screen_stocks(
 
 _OUT_GET_PREDEFINED_SCREEN = output_model(
     "GetPredefinedScreenOut",
-    envelope_schema(OBJECT, echo={"screen_name": {"type": "string"}}),
+    envelope_schema(OBJECT, echo={"screen_name": STR}),
 )
 
 
@@ -204,10 +204,7 @@ def get_predefined_screen(screen_name: str) -> _OUT_GET_PREDEFINED_SCREEN:
 
 _OUT_GET_EARNINGS_CALENDAR = output_model(
     "GetEarningsCalendarOut",
-    envelope_schema(
-        RECORDS,
-        echo={"start": {"type": "string"}, "end": {"type": "string"}},
-    ),
+    envelope_schema(RECORDS, echo={"start": STR, "end": STR}),
 )
 
 
@@ -242,7 +239,7 @@ def get_earnings_calendar(start: str, end: str) -> _OUT_GET_EARNINGS_CALENDAR:
 
 _OUT_GET_SECTOR_INFO = output_model(
     "GetSectorInfoOut",
-    envelope_schema(OBJECT, echo={"sector": {"type": "string"}}),
+    envelope_schema(OBJECT, echo={"sector": STR}),
 )
 
 
@@ -287,7 +284,7 @@ def get_sector_info(sector_key: str) -> _OUT_GET_SECTOR_INFO:
 
 _OUT_GET_INDUSTRY_INFO = output_model(
     "GetIndustryInfoOut",
-    envelope_schema(OBJECT, echo={"industry": {"type": "string"}}),
+    envelope_schema(OBJECT, echo={"industry": STR}),
 )
 
 

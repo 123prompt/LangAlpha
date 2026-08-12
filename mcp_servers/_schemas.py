@@ -1,4 +1,4 @@
-"""Published output schemas for the market-data MCP servers.
+"""Published output schemas for the builtin MCP servers.
 
 Each tool's return annotation is an ``output_model()`` subclass of
 ``RootModel[dict]``: any mapping validates (both ``make_response`` and
@@ -43,13 +43,65 @@ OBJECTS_BY_KEY: dict[str, Any] = {
 #: Shape branches on an argument — documented in the tool docstring instead.
 ANY: dict[str, Any] = {}
 
+# ── property vocabulary (echo and tool-specific keys) ─────────────────────────
+
+STR: dict[str, Any] = {"type": "string"}
+INT: dict[str, Any] = {"type": "integer"}
+BOOL: dict[str, Any] = {"type": "boolean"}
+
+#: Echoed verbatim, so null when the caller omitted the value.
+NULLABLE_STR: dict[str, Any] = {"type": ["string", "null"]}
+
+STR_LIST: dict[str, Any] = {"type": "array", "items": STR}
+
+
+def described(prop: dict[str, Any], description: str) -> dict[str, Any]:
+    """A vocabulary entry under a call-site-specific description."""
+    return {**prop, "description": description}
+
+
+#: Per-symbol error envelopes carried alongside a partial-success payload.
+#: Two wordings are published today (``described(ERRORS, ...)`` keeps each
+#: server's bytes stable); unify them the next time the schemas may move.
+ERRORS: dict[str, Any] = described(RECORDS, "Error envelopes for symbols that failed.")
+
+#: The error arm's properties. Servers off the market-data envelope override
+#: ``detail`` — its wording and type drifted before the contract settled.
+ERROR_PROPS: dict[str, dict[str, Any]] = {
+    "error": described(STR, "Machine-readable error code (error responses only)."),
+    "detail": described(STR, "Human-readable error detail (error responses only)."),
+}
+
 # Standard envelope echo keys (make_response keyword arguments).
 _FRAME_PROPS: dict[str, dict[str, Any]] = {
-    "symbol": {"type": "string", "description": "Echoed ticker or identifier."},
-    "interval": {"type": "string", "description": "Canonical interval echoed back."},
-    "currency": {"type": "string", "description": "ISO 4217 currency of price fields."},
-    "timezone": {"type": "string", "description": "IANA timezone of timestamps."},
+    "symbol": described(STR, "Echoed ticker or identifier."),
+    "interval": described(STR, "Canonical interval echoed back."),
+    "currency": described(STR, "ISO 4217 currency of price fields."),
+    "timezone": described(STR, "IANA timezone of timestamps."),
 }
+
+
+def union_schema(
+    properties: dict[str, Any],
+    success_required: tuple[str, ...],
+    *,
+    error_props: dict[str, dict[str, Any]] = ERROR_PROPS,
+    error_required: tuple[str, ...] = ("error", "detail"),
+) -> dict[str, Any]:
+    """The published frame: root object plus a sibling ``anyOf`` of required-key sets.
+
+    ``additionalProperties`` stays true so open-ended echo keys and vendor
+    drift never hard-fail a tool. The error properties always land last.
+    """
+    return {
+        "type": "object",
+        "additionalProperties": True,
+        "properties": {**properties, **error_props},
+        "anyOf": [
+            {"required": list(success_required)},
+            {"required": list(error_required)},
+        ],
+    }
 
 
 def envelope_schema(
@@ -59,40 +111,21 @@ def envelope_schema(
     echo: dict[str, dict[str, Any]] | None = None,
     data_description: str | None = None,
 ) -> dict[str, Any]:
-    """Published schema for the success∪error envelope of one tool.
+    """Published schema for the success∪error envelope of one market-data tool.
 
     ``frame`` selects the standard echo keys (symbol/interval/currency/
-    timezone); ``echo`` adds tool-specific properties. ``additionalProperties``
-    stays true so open-ended echo keys and vendor drift never hard-fail a tool.
+    timezone); ``echo`` adds tool-specific properties.
     """
-    props: dict[str, Any] = {}
-    for key in frame:
-        props[key] = _FRAME_PROPS[key]
+    props: dict[str, Any] = {key: _FRAME_PROPS[key] for key in frame}
     data = dict(data_shape)
     if data_description:
         data["description"] = data_description
-    props["count"] = {"type": "integer", "description": "Number of records in data."}
+    props["count"] = described(INT, "Number of records in data.")
     props["data"] = data
-    props["source"] = {"type": "string", "description": "Upstream data source."}
+    props["source"] = described(STR, "Upstream data source.")
     if echo:
         props.update(echo)
-    props["error"] = {
-        "type": "string",
-        "description": "Machine-readable error code (error responses only).",
-    }
-    props["detail"] = {
-        "type": "string",
-        "description": "Human-readable error detail (error responses only).",
-    }
-    return {
-        "type": "object",
-        "additionalProperties": True,
-        "properties": props,
-        "anyOf": [
-            {"required": ["count", "data", "source"]},
-            {"required": ["error", "detail"]},
-        ],
-    }
+    return union_schema(props, ("count", "data", "source"))
 
 
 class _EnvelopeBase(RootModel[dict[str, Any]]):
@@ -100,5 +133,9 @@ class _EnvelopeBase(RootModel[dict[str, Any]]):
 
 
 def output_model(name: str, schema: dict[str, Any]) -> type[_EnvelopeBase]:
-    """RootModel[dict] subclass publishing ``schema`` as the tool's outputSchema."""
+    """RootModel[dict] subclass publishing ``schema`` as the tool's outputSchema.
+
+    ``name`` is passed rather than derived because it lands on the wire as the
+    published schema's ``title`` — renaming a model is a contract change.
+    """
     return type(name, (_EnvelopeBase,), {"model_config": {"json_schema_extra": schema}})

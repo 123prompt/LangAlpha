@@ -36,8 +36,11 @@ from data_client.fmp import get_fmp_client, fmp_lifespan
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from mcp_servers._schemas import (
     ANY,
+    INT,
     RECORDS,
     RECORDS_BY_KEY,
+    STR,
+    described,
     envelope_schema,
     output_model,
 )
@@ -64,11 +67,7 @@ _OUT_GET_FINANCIAL_STATEMENTS = output_model(
     envelope_schema(
         ANY,
         frame=("symbol",),
-        echo={
-            "data_type": {"type": "string"},
-            "statement_type": {"type": "string"},
-            "period": {"type": "string"},
-        },
+        echo={"data_type": STR, "statement_type": STR, "period": STR},
     ),
 )
 
@@ -138,7 +137,7 @@ _OUT_GET_FINANCIAL_RATIOS = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": {"type": "string"}, "period": {"type": "string"}},
+        echo={"data_type": STR, "period": STR},
     ),
 )
 
@@ -193,7 +192,7 @@ _OUT_GET_GROWTH_METRICS = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": {"type": "string"}, "period": {"type": "string"}},
+        echo={"data_type": STR, "period": STR},
     ),
 )
 
@@ -252,7 +251,7 @@ _OUT_GET_HISTORICAL_VALUATION = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": {"type": "string"}, "period": {"type": "string"}},
+        echo={"data_type": STR, "period": STR},
     ),
 )
 
@@ -313,7 +312,7 @@ _OUT_GET_INSIDER_TRADES = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": {"type": "string"}},
+        echo={"data_type": STR},
     ),
 )
 
@@ -366,7 +365,7 @@ _OUT_GET_DIVIDENDS_AND_SPLITS = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": {"type": "string"}},
+        echo={"data_type": STR},
     ),
 )
 
@@ -416,7 +415,7 @@ _OUT_GET_SHARES_FLOAT = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol",),
-        echo={"data_type": {"type": "string"}},
+        echo={"data_type": STR},
     ),
 )
 
@@ -463,7 +462,7 @@ _OUT_GET_KEY_EXECUTIVES = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol",),
-        echo={"data_type": {"type": "string"}},
+        echo={"data_type": STR},
     ),
 )
 
@@ -511,10 +510,10 @@ _OUT_GET_TECHNICAL_INDICATOR = output_model(
         RECORDS,
         frame=("symbol",),
         echo={
-            "data_type": {"type": "string"},
-            "indicator": {"type": "string"},
-            "period": {"type": "integer", "description": "Indicator lookback length."},
-            "timeframe": {"type": "string", "description": "FMP-native bar size."},
+            "data_type": STR,
+            "indicator": STR,
+            "period": described(INT, "Indicator lookback length."),
+            "timeframe": described(STR, "FMP-native bar size."),
         },
     ),
 )

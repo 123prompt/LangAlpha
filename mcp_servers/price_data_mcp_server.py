@@ -62,7 +62,15 @@ except ModuleNotFoundError:  # imported as a package module (tests)
         normalize_interval,
     )
 
-from mcp_servers._schemas import RECORDS, RECORDS_BY_KEY, envelope_schema, output_model
+from mcp_servers._schemas import (
+    OBJECT,
+    RECORDS,
+    RECORDS_BY_KEY,
+    STR,
+    described,
+    envelope_schema,
+    output_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +286,7 @@ _OUT_GET_ASSET_DATA = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "interval", "currency", "timezone"),
-        echo={"asset_type": {"type": "string"}},
+        echo={"asset_type": STR},
     ),
 )
 
@@ -394,11 +402,10 @@ _OUT_GET_SHORT_DATA = output_model(
         RECORDS_BY_KEY,
         frame=("symbol", "timezone"),
         echo={
-            "data_type": {"type": "string"},
-            "errors": {
-                "type": "object",
-                "description": "Per-section upstream errors on partial success.",
-            },
+            "data_type": STR,
+            "errors": described(
+                OBJECT, "Per-section upstream errors on partial success."
+            ),
         },
     ),
 )

@@ -29,9 +29,12 @@ import yfinance as yf
 
 from mcp_servers._envelope import make_error, make_response, normalize_interval
 from mcp_servers._schemas import (
+    ERRORS,
+    INT,
     OBJECT,
     OBJECTS_BY_KEY,
     RECORDS,
+    STR,
     envelope_schema,
     output_model,
 )
@@ -200,7 +203,7 @@ _OUT_GET_STOCK_HISTORY = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "interval", "currency", "timezone"),
-        echo={"period": {"type": "string"}},
+        echo={"period": STR},
     ),
 )
 
@@ -266,14 +269,7 @@ _OUT_GET_MULTIPLE_STOCKS_HISTORY = output_model(
     envelope_schema(
         OBJECTS_BY_KEY,
         frame=("interval",),
-        echo={
-            "period": {"type": "string"},
-            "errors": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "Error envelopes for symbols that failed.",
-            },
-        },
+        echo={"period": STR, "errors": ERRORS},
     ),
 )
 
@@ -352,10 +348,7 @@ _OUT_GET_DIVIDENDS_AND_SPLITS = output_model(
     envelope_schema(
         OBJECT,
         frame=("symbol", "currency", "timezone"),
-        echo={
-            "dividend_count": {"type": "integer"},
-            "split_count": {"type": "integer"},
-        },
+        echo={"dividend_count": INT, "split_count": INT},
     ),
 )
 
@@ -414,16 +407,7 @@ def get_dividends_and_splits(ticker: str) -> _OUT_GET_DIVIDENDS_AND_SPLITS:
 
 _OUT_GET_MULTIPLE_STOCKS_DIVIDENDS = output_model(
     "GetMultipleStocksDividendsOut",
-    envelope_schema(
-        OBJECTS_BY_KEY,
-        echo={
-            "errors": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "Error envelopes for symbols that failed.",
-            }
-        },
-    ),
+    envelope_schema(OBJECTS_BY_KEY, echo={"errors": ERRORS}),
 )
 
 

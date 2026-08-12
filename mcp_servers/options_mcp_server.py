@@ -49,7 +49,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
         normalize_interval,
     )
 
-from mcp_servers._schemas import RECORDS, envelope_schema, output_model
+from mcp_servers._schemas import RECORDS, STR, envelope_schema, output_model
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ _OUT_GET_OPTIONS_CHAIN = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "currency", "timezone"),
-        echo={"underlying_ticker": {"type": "string"}},
+        echo={"underlying_ticker": STR},
     ),
 )
 

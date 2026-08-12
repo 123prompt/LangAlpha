@@ -23,7 +23,16 @@ try:
 except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._bootstrap import MCPServer
 
-from mcp_servers._schemas import output_model
+from mcp_servers._schemas import (
+    ERROR_PROPS,
+    INT,
+    NULLABLE_STR,
+    OBJECT,
+    RECORDS,
+    described,
+    output_model,
+    union_schema,
+)
 
 X_API_BASE = "https://api.x.com/2"
 _HTTP_TIMEOUT = 30.0
@@ -71,15 +80,12 @@ async def _lifespan(app):
 mcp = MCPServer("XApiMCP", lifespan=_lifespan)
 
 # Published output schemas. X tools are off the market-data envelope contract:
-# their success shapes are tool-specific, so the schemas are literal dicts with
-# the same construction rules (root object + sibling anyOf of required-key sets).
-# The error arm requires only `error`: rate_limited replies carry no detail,
-# and auth/http errors carry a structured (or null) detail from the API.
+# their success shapes are tool-specific, so each frame is built by hand from
+# ``union_schema``. The error arm requires only `error`: rate_limited replies
+# carry no detail, and auth/http errors carry a structured (or null) detail
+# from the API — hence an untyped ``detail`` rather than the shared string one.
 _ERROR_PROPS = {
-    "error": {
-        "type": "string",
-        "description": "Machine-readable error code (error responses only).",
-    },
+    **ERROR_PROPS,
     "detail": {
         "description": (
             "Error detail — string or structured payload from the upstream API "
@@ -87,51 +93,40 @@ _ERROR_PROPS = {
         ),
     },
 }
-_ERROR_ARM = {"required": ["error"]}
+
+
+def _x_schema(
+    properties: dict[str, Any], success_required: tuple[str, ...]
+) -> dict[str, Any]:
+    return union_schema(
+        properties,
+        success_required,
+        error_props=_ERROR_PROPS,
+        error_required=("error",),
+    )
+
 
 _OUT_SEARCH = output_model(
     "XSearchOut",
-    {
-        "type": "object",
-        "additionalProperties": True,
-        "properties": {
-            "posts": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "Posts with author fields merged in.",
-            },
-            "next_token": {
-                "type": ["string", "null"],
-                "description": "Pagination cursor; null when no more pages.",
-            },
-            "result_count": {"type": "integer"},
-            **_ERROR_PROPS,
+    _x_schema(
+        {
+            "posts": described(RECORDS, "Posts with author fields merged in."),
+            "next_token": described(
+                NULLABLE_STR, "Pagination cursor; null when no more pages."
+            ),
+            "result_count": INT,
         },
-        "anyOf": [{"required": ["posts", "result_count"]}, _ERROR_ARM],
-    },
+        ("posts", "result_count"),
+    ),
 )
 
-_OUT_USER = output_model(
-    "XUserOut",
-    {
-        "type": "object",
-        "additionalProperties": True,
-        "properties": {"user": {"type": "object"}, **_ERROR_PROPS},
-        "anyOf": [{"required": ["user"]}, _ERROR_ARM],
-    },
-)
+_OUT_USER = output_model("XUserOut", _x_schema({"user": OBJECT}, ("user",)))
 
 _OUT_POST = output_model(
     "XPostOut",
-    {
-        "type": "object",
-        "additionalProperties": True,
-        "properties": {
-            "post": {"type": "object", "description": "Post with author fields merged in."},
-            **_ERROR_PROPS,
-        },
-        "anyOf": [{"required": ["post"]}, _ERROR_ARM],
-    },
+    _x_schema(
+        {"post": described(OBJECT, "Post with author fields merged in.")}, ("post",)
+    ),
 )
 
 

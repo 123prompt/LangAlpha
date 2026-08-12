@@ -6,6 +6,10 @@ mcp 1.x-only ``mcp.server.fastmcp`` and dies in any 2.x environment. Importing
 scrapling's fetchers directly decouples the server from the SDK era the
 scrapling CLI was built against; ``_bootstrap`` handles our own era split.
 
+Fetching and extraction live in ``_browser``/``_extract``, shared with the
+in-process crawler; this file owns the tool contract — argument validation,
+per-URL error envelopes and the process-wide concurrency gates.
+
 Tools: scrape_page, scrape_pages.
 """
 
@@ -20,7 +24,16 @@ try:
 except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._bootstrap import MCPServer
 
-from mcp_servers._schemas import output_model
+from mcp_servers._browser import fetch_fast, fetch_with_session, make_session
+from mcp_servers._extract import to_markdown, to_text
+from mcp_servers._schemas import (
+    ERROR_PROPS,
+    INT,
+    STR,
+    described,
+    output_model,
+    union_schema,
+)
 
 mcp = MCPServer("ScrapeMCP")
 
@@ -45,58 +58,47 @@ _FAST_SEM = asyncio.Semaphore(_FAST_CONCURRENCY)
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
+# Wording drift from the shared error contract, pinned so the published bytes
+# stay stable; unify with ERROR_PROPS the next time schemas may move.
 _ERROR_PROPS = {
-    "error": {
-        "type": "string",
-        "description": "Machine-readable error code (error responses only).",
-    },
-    "detail": {
-        "type": "string",
-        "description": "Human-readable cause (error responses only).",
-    },
+    **ERROR_PROPS,
+    "detail": described(STR, "Human-readable cause (error responses only)."),
 }
-_ERROR_ARM = {"required": ["error", "detail"]}
 
-_PAGE_PROPS = {
-    "url": {"type": "string"},
-    "status": {"type": "integer", "description": "HTTP status of the final response."},
-    "title": {"type": "string"},
-    "content": {"type": "string", "description": "Extracted content, truncated to 400k chars."},
-    "extraction": {"type": "string", "enum": list(_EXTRACTIONS)},
-    "mode": {"type": "string", "enum": list(_MODES)},
-    **_ERROR_PROPS,
+_PAGE_FIELDS = {
+    "url": STR,
+    "status": described(INT, "HTTP status of the final response."),
+    "title": STR,
+    "content": described(STR, "Extracted content, truncated to 400k chars."),
+    "extraction": {**STR, "enum": list(_EXTRACTIONS)},
+    "mode": {**STR, "enum": list(_MODES)},
 }
+# Bulk rows carry a per-URL error in place of the page fields.
+_PAGE_ROW = {**_PAGE_FIELDS, **_ERROR_PROPS}
 
 _OUT_PAGE = output_model(
     "ScrapePageOut",
-    {
-        "type": "object",
-        "additionalProperties": True,
-        "properties": _PAGE_PROPS,
-        "anyOf": [{"required": ["url", "status", "content"]}, _ERROR_ARM],
-    },
+    union_schema(_PAGE_FIELDS, ("url", "status", "content"), error_props=_ERROR_PROPS),
 )
 
 _OUT_PAGES = output_model(
     "ScrapePagesOut",
-    {
-        "type": "object",
-        "additionalProperties": True,
-        "properties": {
+    union_schema(
+        {
             "results": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": True,
-                    "properties": _PAGE_PROPS,
+                    "properties": _PAGE_ROW,
                 },
                 "description": "One entry per input URL, in input order.",
             },
-            "count": {"type": "integer"},
-            **_ERROR_PROPS,
+            "count": INT,
         },
-        "anyOf": [{"required": ["results", "count"]}, _ERROR_ARM],
-    },
+        ("results", "count"),
+        error_props=_ERROR_PROPS,
+    ),
 )
 
 
@@ -133,76 +135,17 @@ def _extract_title(html: str) -> str:
     return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
 
 
-def _to_markdown(html: str) -> str:
-    import html_to_markdown
-    import trafilatura
-
-    extracted = trafilatura.extract(
-        html,
-        favor_recall=True,
-        output_format="markdown",
-        include_links=True,
-        include_images=True,
-        include_formatting=True,
-        include_tables=True,
-        with_metadata=True,
-    )
-    if extracted and len(extracted) > 200:
-        return extracted
-    full = html_to_markdown.convert(
-        html, html_to_markdown.ConversionOptions(extract_metadata=False)
-    ).content
-    return full if full.strip() else (extracted or "")
-
-
-def _to_text(html: str) -> str:
-    import trafilatura
-
-    return trafilatura.extract(html, output_format="txt") or ""
-
-
 async def _fetch_html(
     url: str, mode: str, timeout_s: float, solve_cloudflare: bool
 ) -> tuple[str, int]:
     if mode == "fast":
-        from scrapling.fetchers import AsyncFetcher
+        _, html, status = await fetch_fast(url, timeout_s=timeout_s)
+        return html, status
 
-        page = await AsyncFetcher.get(
-            url, stealthy_headers=True, follow_redirects=True, timeout=timeout_s
-        )
-        return page.body.decode(page.encoding or "utf-8", errors="replace"), page.status
-
-    if mode == "browser":
-        from scrapling.engines._browsers._controllers import AsyncDynamicSession
-
-        session = AsyncDynamicSession(
-            headless=True, disable_resources=True, network_idle=True, timeout=timeout_s * 1000
-        )
-        fetch_kwargs: dict[str, Any] = {}
-    else:  # stealth
-        from scrapling.engines._browsers._stealth import AsyncStealthySession
-
-        session = AsyncStealthySession(
-            headless=True, network_idle=True, timeout=timeout_s * 1000
-        )
-        fetch_kwargs = {"solve_cloudflare": solve_cloudflare}
-
-    try:
-        await session.start()
-        page = await session.fetch(url, **fetch_kwargs)
-        return page.body.decode(page.encoding or "utf-8", errors="replace"), page.status
-    finally:
-        # Cancel-during-start leaves _is_alive False while the playwright
-        # driver is up; close() would early-return and leak it (same forcing
-        # the in-process crawler applies).
-        if getattr(session, "playwright", None) is not None and not getattr(
-            session, "_is_alive", True
-        ):
-            session._is_alive = True
-        try:
-            await session.close()
-        except Exception:  # noqa: BLE001 - teardown must never mask the fetch result
-            pass
+    session = make_session(mode, timeout_ms=timeout_s * 1000)
+    fetch_kwargs = {"solve_cloudflare": solve_cloudflare} if mode == "stealth" else {}
+    _, html, status = await fetch_with_session(session, url, **fetch_kwargs)
+    return html, status
 
 
 async def _scrape_one(
@@ -225,9 +168,9 @@ async def _scrape_one(
         if extraction == "html":
             content = html
         elif extraction == "text":
-            content = await asyncio.to_thread(_to_text, html)
+            content = await asyncio.to_thread(to_text, html)
         else:
-            content = await asyncio.to_thread(_to_markdown, html)
+            content = await asyncio.to_thread(to_markdown, html)
     except Exception as e:  # noqa: BLE001 - same per-URL envelope as a fetch failure
         return _error(
             "extract_failed", f"{type(e).__name__}: {e}", url=url, status=status

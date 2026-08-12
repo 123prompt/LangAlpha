@@ -23,7 +23,9 @@ _LOCK_VOLATILE_KEYS: frozenset[str] = frozenset({"installedAt", "updatedAt"})
 # servers crash on import in synced sandboxes (and prune would delete them).
 _MCP_SHARED_RUNTIME_FILES: tuple[str, ...] = (
     "_bootstrap.py",
+    "_browser.py",
     "_envelope.py",
+    "_extract.py",
     "_schemas.py",
     "_yf_common.py",
 )

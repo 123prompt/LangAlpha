@@ -30,7 +30,14 @@ from typing import Optional
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
 from mcp_servers._envelope import error_from_exception, make_error, make_response
-from mcp_servers._schemas import RECORDS, envelope_schema, output_model
+from mcp_servers._schemas import (
+    NULLABLE_STR,
+    RECORDS,
+    STR,
+    described,
+    envelope_schema,
+    output_model,
+)
 
 
 mcp = MCPServer("MacroMCP", lifespan=fmp_lifespan)
@@ -45,8 +52,8 @@ _OUT_GET_ECONOMIC_INDICATOR = output_model(
     envelope_schema(
         RECORDS,
         echo={
-            "data_type": {"type": "string"},
-            "indicator": {"type": "string", "description": "Echoed indicator name."},
+            "data_type": STR,
+            "indicator": described(STR, "Echoed indicator name."),
         },
     ),
 )
@@ -97,10 +104,9 @@ _OUT_GET_ECONOMIC_CALENDAR = output_model(
     envelope_schema(
         RECORDS,
         echo={
-            "data_type": {"type": "string"},
-            # Echoed verbatim, so null when the caller omitted the bound.
-            "from_date": {"type": ["string", "null"]},
-            "to_date": {"type": ["string", "null"]},
+            "data_type": STR,
+            "from_date": NULLABLE_STR,
+            "to_date": NULLABLE_STR,
         },
     ),
 )
@@ -152,10 +158,9 @@ _OUT_GET_TREASURY_RATES = output_model(
     envelope_schema(
         RECORDS,
         echo={
-            "data_type": {"type": "string"},
-            # Echoed verbatim, so null when the caller omitted the bound.
-            "from_date": {"type": ["string", "null"]},
-            "to_date": {"type": ["string", "null"]},
+            "data_type": STR,
+            "from_date": NULLABLE_STR,
+            "to_date": NULLABLE_STR,
         },
     ),
 )
@@ -205,7 +210,7 @@ async def get_treasury_rates(
 
 _OUT_GET_MARKET_RISK_PREMIUM = output_model(
     "GetMarketRiskPremiumOut",
-    envelope_schema(RECORDS, echo={"data_type": {"type": "string"}}),
+    envelope_schema(RECORDS, echo={"data_type": STR}),
 )
 
 
@@ -243,11 +248,7 @@ _OUT_GET_EARNINGS_CALENDAR = output_model(
     "GetEarningsCalendarOut",
     envelope_schema(
         RECORDS,
-        echo={
-            "data_type": {"type": "string"},
-            "from_date": {"type": "string"},
-            "to_date": {"type": "string"},
-        },
+        echo={"data_type": STR, "from_date": STR, "to_date": STR},
     ),
 )
 

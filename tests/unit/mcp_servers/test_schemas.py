@@ -13,10 +13,12 @@ from mcp_servers._bootstrap import MCPServer
 from mcp_servers._envelope import make_error, make_response
 from mcp_servers._schemas import (
     ANY,
+    INT,
     OBJECT,
     RECORDS,
     envelope_schema,
     output_model,
+    union_schema,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,26 @@ def test_envelope_schema_frame_and_echo():
     assert props["data"]["description"] == "Quote fields keyed by name."
     # ANY leaves data unconstrained apart from the description.
     assert envelope_schema(ANY)["properties"]["data"] == {}
+
+
+def test_union_schema_error_override():
+    """The off-contract servers (scrape, x_mcp) reach the same frame through
+    ``error_props``/``error_required`` — including x_mcp's one-key error arm."""
+    detail = {"description": "String or structured payload."}
+    schema = union_schema(
+        {"posts": RECORDS, "result_count": INT},
+        ("posts", "result_count"),
+        error_props={"error": {"type": "string"}, "detail": detail},
+        error_required=("error",),
+    )
+    assert schema["type"] == "object" and schema["additionalProperties"] is True
+    # Error properties land last, whatever the success shape.
+    assert list(schema["properties"]) == ["posts", "result_count", "error", "detail"]
+    assert schema["properties"]["detail"] == detail
+    assert schema["anyOf"] == [
+        {"required": ["posts", "result_count"]},
+        {"required": ["error"]},
+    ]
 
 
 def test_output_model_validates_both_arms_and_dumps_unpadded():

@@ -316,9 +316,13 @@ class TestManifestRegression:
         assert "_schemas.py" in mcp_files
 
     def test_shared_runtime_files_cover_all_sibling_imports(self):
-        """Every ``_x`` sibling a server file imports must be in
+        """Every ``_x`` sibling a shipped file imports must itself be in
         ``_MCP_SHARED_RUNTIME_FILES`` — an unshipped sibling crashes the
-        server on import in synced sandboxes (and prune would delete it)."""
+        server on import in synced sandboxes (and prune would delete it).
+
+        Scans the shared files too, not just the entry points: they import each
+        other, so a missing leaf is just as fatal one level down.
+        """
         import re
         from pathlib import Path
 
@@ -331,11 +335,14 @@ class TestManifestRegression:
             re.MULTILINE,
         )
         shipped = set(_MCP_SHARED_RUNTIME_FILES)
-        for server_file in sorted(root.glob("*_mcp_server.py")):
-            for match in pattern.finditer(server_file.read_text()):
+        importers = sorted(root.glob("*_mcp_server.py")) + [
+            root / name for name in _MCP_SHARED_RUNTIME_FILES
+        ]
+        for source_file in importers:
+            for match in pattern.finditer(source_file.read_text()):
                 module = next(g for g in match.groups() if g)
                 assert f"{module}.py" in shipped, (
-                    f"{server_file.name} imports {module} but {module}.py is "
+                    f"{source_file.name} imports {module} but {module}.py is "
                     f"not in _MCP_SHARED_RUNTIME_FILES"
                 )
 

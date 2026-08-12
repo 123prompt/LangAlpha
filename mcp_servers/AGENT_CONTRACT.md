@@ -94,9 +94,9 @@ Construction rules (both SDK eras derive these identically):
   construction rules; its docstring conventions remain exempt.
 
 Return annotations are **not** prompt surface: the docstring lock does not
-cover them, wrapper return types stay docstring-derived, and schema edits need
-no `MCP_CLIENT_CODEGEN_VERSION` bump (server files resync to warm sandboxes by
-content hash, `_schemas.py` ships via `_MCP_SHARED_RUNTIME_FILES`).
+cover them and wrapper return types stay docstring-derived. Warm sandboxes pick
+schema edits up on their own — server files resync by content hash and
+`_schemas.py` ships via `_MCP_SHARED_RUNTIME_FILES`.
 
 ## Docstring standard
 
@@ -126,8 +126,9 @@ Codegen constraints behind the pattern (`src/ptc_agent/core/tool_generator.py`):
 - Ordering, timestamp format/timezone, currency semantics, and the error shape live
   *inside* the `Returns:` block — that is the text that survives extraction.
 - No `Example:`/`Note:` sections — they terminate the Returns capture and rot.
-- Any docstring change requires an `MCP_CLIENT_CODEGEN_VERSION` bump to reach warm
-  sandboxes.
+- A docstring change needs no version bump to reach warm sandboxes:
+  `MCP_CLIENT_CODEGEN_VERSION` is derived (runtime source + emission-probe hash,
+  under a hand-set major), and server files resync by content hash regardless.
 
 ## Content pinning
 

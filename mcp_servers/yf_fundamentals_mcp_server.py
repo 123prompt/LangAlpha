@@ -33,15 +33,24 @@ import yfinance as yf
 
 from mcp_servers._envelope import make_error, make_response
 from mcp_servers._schemas import (
+    BOOL,
+    ERRORS,
     OBJECT,
     OBJECTS_BY_KEY,
     RECORDS,
+    STR,
+    STR_LIST,
+    described,
     envelope_schema,
     output_model,
 )
 from mcp_servers._yf_common import boundary, format_datetime, safe_detail, serialize_records
 
 SOURCE = "yfinance"
+
+# Wording drift from the shared ``ERRORS`` descriptor, pinned here so the
+# published bytes stay stable; unify the two the next time schemas may move.
+_ERRORS = described(ERRORS, "Error envelopes for symbols omitted from data.")
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +87,7 @@ _OUT_GET_INCOME_STATEMENT = output_model(
     envelope_schema(
         OBJECTS_BY_KEY,
         frame=("symbol",),
-        echo={"quarterly": {"type": "boolean"}},
+        echo={"quarterly": BOOL},
     ),
 )
 
@@ -125,7 +134,7 @@ _OUT_GET_BALANCE_SHEET = output_model(
     envelope_schema(
         OBJECTS_BY_KEY,
         frame=("symbol",),
-        echo={"quarterly": {"type": "boolean"}},
+        echo={"quarterly": BOOL},
     ),
 )
 
@@ -170,7 +179,7 @@ _OUT_GET_CASH_FLOW = output_model(
     envelope_schema(
         OBJECTS_BY_KEY,
         frame=("symbol",),
-        echo={"quarterly": {"type": "boolean"}},
+        echo={"quarterly": BOOL},
     ),
 )
 
@@ -346,14 +355,10 @@ _OUT_COMPARE_FINANCIALS = output_model(
     envelope_schema(
         OBJECTS_BY_KEY,
         echo={
-            "statement_type": {"type": "string"},
-            "quarterly": {"type": "boolean"},
-            "successful_tickers": {"type": "array", "items": {"type": "string"}},
-            "errors": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "Error envelopes for symbols omitted from data.",
-            },
+            "statement_type": STR,
+            "quarterly": BOOL,
+            "successful_tickers": STR_LIST,
+            "errors": _ERRORS,
         },
     ),
 )
@@ -442,14 +447,7 @@ _OUT_COMPARE_VALUATIONS = output_model(
     "CompareValuationsOut",
     envelope_schema(
         OBJECTS_BY_KEY,
-        echo={
-            "successful_tickers": {"type": "array", "items": {"type": "string"}},
-            "errors": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "Error envelopes for symbols omitted from data.",
-            },
-        },
+        echo={"successful_tickers": STR_LIST, "errors": _ERRORS},
     ),
 )
 
@@ -529,14 +527,7 @@ _OUT_GET_MULTIPLE_STOCKS_EARNINGS = output_model(
     "GetMultipleStocksEarningsOut",
     envelope_schema(
         OBJECTS_BY_KEY,
-        echo={
-            "successful_tickers": {"type": "array", "items": {"type": "string"}},
-            "errors": {
-                "type": "array",
-                "items": {"type": "object"},
-                "description": "Error envelopes for symbols omitted from data.",
-            },
-        },
+        echo={"successful_tickers": STR_LIST, "errors": _ERRORS},
     ),
 )
 
