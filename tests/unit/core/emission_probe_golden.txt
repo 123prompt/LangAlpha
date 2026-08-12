@@ -20,15 +20,15 @@ except ImportError:
         )
 
 
-def probe_tool(type: Literal['market', 'limit'], class: str, tags: list[str] | None = None, note: str | None = 'hi') -> dict:
+def probe_tool(type_: Literal['market', 'limit'], class_: str, tags: list[str] | None = None, note: str | None = 'hi') -> dict:
     """Emission probe.
 
 Returns:
     dict: probe result
     
     Args:
-        type (string) (required):  [allowed: 'market', 'limit']
-        class (string) (required): 
+        type_ (string) (required):  [allowed: 'market', 'limit']
+        class_ (string) (required): 
         tags (array): 
         note (string):  [default: 'hi']
     
@@ -36,10 +36,10 @@ Returns:
         dict: dict: probe result
     
     Example:
-        result = probe_tool(type='market', class="example")"""
+        result = probe_tool(type_='market', class_="example")"""
     arguments = {
-        "type": type,
-        "class": class,
+        "type": type_,
+        "class": class_,
         "tags": tags,
         "note": note,
     }
@@ -166,7 +166,7 @@ Returns:
 
     return _call_mcp_tool('probe', 'probe_tool_2', arguments)
 
-# probe_tool(type: Literal['market', 'limit'], class: str, tags: list[str] | None = None, note: str | None = 'hi')
+# probe_tool(type_: Literal['market', 'limit'], class_: str, tags: list[str] | None = None, note: str | None = 'hi')
 
 Emission probe.
 
@@ -175,9 +175,9 @@ Returns:
 
 ## Parameters
 
-- `type` (string) - **Required** [allowed: 'market', 'limit']
+- `type_` (string) - **Required** [allowed: 'market', 'limit']
 
-- `class` (string) - **Required**
+- `class_` (string) - **Required**
 
 - `tags` (array) - Optional
 
@@ -194,7 +194,7 @@ dict: probe result
 ```python
 from tools.probe import probe_tool
 
-result = probe_tool(type='market', class="example")
+result = probe_tool(type_='market', class_="example")
 print(result)  # noqa: T201
 ```
 # probe_tool(type_: Literal['market', 'limit'], class_: str, tags: list[str] | None = None, note: str | None = 'hi')

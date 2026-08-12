@@ -10,6 +10,8 @@ import ast
 import json
 import re
 
+import pytest
+
 from ptc_agent.config.core import MCPServerConfig
 from ptc_agent.core.tool_generator import (
     MCP_CLIENT_CODEGEN_VERSION,
@@ -32,7 +34,6 @@ def _oauth_server(name: str = "rh_srv") -> MCPServerConfig:
         url="https://vendor.example.com/mcp",
         source="user",
         oauth_connection_id="conn-1",
-        egress_grant_id="grant-abc",
     )
 
 
@@ -64,6 +65,21 @@ class TestCodegenVersion:
         golden = (Path(__file__).parent / "emission_probe_golden.txt").read_text()
         assert _emission_probe_text() == golden
 
+    def test_emitted_probe_modules_are_valid_python(self):
+        # The golden once shipped `def probe_tool(..., class: str, ...)` — a
+        # SyntaxError pinned only by text compare, because name sanitization
+        # was gated on trust. Parsing the live emission is a golden guarantee:
+        # the test above holds the golden byte-equal to it.
+        from ptc_agent.core.tool_generator import (
+            _EMISSION_PROBE_TOOL,
+            _EMISSION_PROBE_TOOL_2,
+        )
+
+        gen = ToolFunctionGenerator()
+        probes = [_EMISSION_PROBE_TOOL, _EMISSION_PROBE_TOOL_2]
+        for untrusted in (False, True):
+            ast.parse(gen.generate_tool_module("probe", probes, untrusted=untrusted))
+
     def test_version_derives_from_committed_emission(self):
         # Non-tautological version guard: the hash is recomputed from the
         # COMMITTED golden bytes, not the live probe — an emitter change fails
@@ -87,12 +103,12 @@ class TestRelayBoundEmission:
         gen = ToolFunctionGenerator()
         config = gen.generate_client_config([_oauth_server()], working_dir="/work")
         entry = config["servers"]["rh_srv"]
-        # The vendor destination lives host-side only.
+        # The vendor destination AND the grant id live host-side only: the
+        # entry says "relay-bound", the credential file says which grant.
         assert entry == {
             "transport": "http",
-            "source": "user",
+            "untrusted": True,
             "relay_bound": True,
-            "relay_grant_id": "grant-abc",
         }
         code = gen.generate_mcp_client_code([_oauth_server()], working_dir="/work")
         assert "vendor.example.com" not in code
@@ -126,6 +142,7 @@ class TestRelayBoundEmission:
         assert "relay_bound" not in entry
         assert "source" not in entry
         assert "env" not in entry
+        assert entry["untrusted"] is False
 
 
 class TestRelayResolution:
@@ -142,9 +159,7 @@ class TestRelayResolution:
         ns = _exec_client(
             gen.generate_mcp_client_code([_oauth_server()], working_dir=workdir)
         )
-        url, headers = ns["_resolve_relay"](
-            ns["_SERVER_CONFIGS"]["rh_srv"], "rh_srv"
-        )
+        url, headers = ns["_resolve_relay"](ns["_SERVER_CONFIGS"]["rh_srv"])
         assert url == "https://app.example.test/v1/egress/grant-abc"
         assert headers["Authorization"] == "Bearer relay-jwt-token"
 
@@ -157,11 +172,30 @@ class TestRelayResolution:
             gen.generate_mcp_client_code([_oauth_server()], working_dir=workdir)
         )
         try:
-            ns["_resolve_relay"](ns["_SERVER_CONFIGS"]["rh_srv"], "rh_srv")
+            ns["_resolve_relay"](ns["_SERVER_CONFIGS"]["rh_srv"])
         except Exception as e:
             assert "rh_srv" in str(e)
         else:  # pragma: no cover
             raise AssertionError("expected a binding error")
+
+    def test_grant_absent_from_the_map_raises_rather_than_guessing(self, tmp_path):
+        # The credential file is the ONLY grant channel: credentials present but
+        # no entry for this server means the grant was retired, so the call must
+        # fail actionably instead of dialing a stale id.
+        workdir = _write_relay_creds(
+            tmp_path,
+            {
+                "relay_base_url": "https://app.example.test",
+                "token": "relay-jwt-token",
+                "grants": {"other_srv": "grant-other"},
+            },
+        )
+        gen = ToolFunctionGenerator()
+        ns = _exec_client(
+            gen.generate_mcp_client_code([_oauth_server()], working_dir=workdir)
+        )
+        with pytest.raises(RuntimeError, match="no relay credentials"):
+            ns["_resolve_relay"](ns["_SERVER_CONFIGS"]["rh_srv"])
 
 
 class TestUserSourceTreatment:
@@ -180,12 +214,10 @@ class TestUserSourceTreatment:
         )
         gen = ToolFunctionGenerator()
         config = gen.generate_client_config([srv], working_dir=str(tmp_path))
-        assert config["servers"]["plain_user_srv"]["source"] == "user"
+        assert config["servers"]["plain_user_srv"]["untrusted"] is True
         ns = _exec_client(
             gen.generate_mcp_client_code([srv], working_dir=str(tmp_path))
         )
-        url, headers = ns["_resolve_sse"](
-            ns["_SERVER_CONFIGS"]["plain_user_srv"], "plain_user_srv"
-        )
+        url, headers = ns["_resolve_http"](ns["_SERVER_CONFIGS"]["plain_user_srv"])
         assert url == "https://api.example.test/mcp"
         assert headers["Authorization"] == "Bearer sekret"

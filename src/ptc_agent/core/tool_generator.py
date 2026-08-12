@@ -193,7 +193,7 @@ except ImportError:
         """
         # Generate function signature
         func_name = _safe_func_name(tool.name)
-        bindings = self._bind_params(tool, server_name, untrusted)
+        bindings = self._bind_params(tool, server_name)
         param_str = self._render_signature_params(bindings)
 
         # Generate docstring
@@ -240,32 +240,28 @@ except ImportError:
 
 {call_line}'''
 
-    def _bind_params(
-        self, tool: MCPToolInfo, server_name: str, untrusted: bool
-    ) -> list[_ParamBinding]:
+    def _bind_params(self, tool: MCPToolInfo, server_name: str) -> list[_ParamBinding]:
         """Resolve each schema param to a (wire, py) name pair, schema order.
 
-        For untrusted servers the Python name is the sanitized identifier (a
-        hostile schema key could otherwise inject code or break the module);
-        unsalvageable or colliding names are skipped. Builtins keep the raw
-        key verbatim on both sides.
+        Names are sanitized for EVERY server: a Python name must be a legal
+        non-keyword identifier or the module is a SyntaxError, and the
+        sanitizer is the identity on names that already are. Trust gates
+        untrusted *text* (descriptions, enum values), never identifiers.
+        Unsalvageable or colliding names are skipped.
         """
         bindings: list[_ParamBinding] = []
         seen: set[str] = set()
         for wire, info in tool.get_parameters().items():
-            if untrusted:
-                py = sanitize_tool_name(wire)
-                if py is None or py in seen:
-                    logger.warning(
-                        "Skipped invalid/colliding param for untrusted MCP tool",
-                        server=server_name,
-                        tool=tool.name,
-                        param=wire,
-                    )
-                    continue
-                seen.add(py)
-            else:
-                py = wire
+            py = sanitize_tool_name(wire)
+            if py is None or py in seen:
+                logger.warning(
+                    "Skipped invalid/colliding MCP tool param",
+                    server=server_name,
+                    tool=tool.name,
+                    param=wire,
+                )
+                continue
+            seen.add(py)
             bindings.append(_ParamBinding(wire, py, info))
         return bindings
 
@@ -531,7 +527,7 @@ except ImportError:
         # the exact callable — sanitized names included. Docs that show the
         # wire name (`type`) for a wrapper whose param is `type_` send the
         # agent straight into a TypeError.
-        bindings = self._bind_params(tool, tool.server_name, untrusted)
+        bindings = self._bind_params(tool, tool.server_name)
         description = (
             sanitize_tool_text(tool.description) if untrusted else tool.description
         )
@@ -600,28 +596,30 @@ except ImportError:
         time). Untrusted servers embed their full env/header mappings, whose
         values are either non-secret literals or ``${vault:NAME}`` placeholders
         resolved in-sandbox against the vault file only. OAuth-connected
-        servers are relay-bound: the config carries a grant reference and the
-        runtime dials the egress relay — the vendor URL and every token stay
-        host-side.
+        servers are only marked relay-bound: the runtime dials the egress relay
+        and reads the grant id from the sandbox's credential file, so the
+        vendor URL, the grant and every token stay host-side.
+
+        Trust ships as the ``untrusted`` bool computed here — never as a raw
+        ``source`` tag the runtime would have to re-interpret.
         """
         servers: dict[str, dict[str, Any]] = {}
         for server in server_configs:
             untrusted = is_untrusted_server(server)
-            if server.oauth_connection_id:
+            if server.oauth_connection_id is not None:
                 servers[server.name] = {
                     "transport": "http",
-                    "source": server.source,
+                    "untrusted": untrusted,
                     "relay_bound": True,
-                    "relay_grant_id": server.egress_grant_id,
                 }
                 continue
             if server.transport in ("sse", "http"):
                 entry: dict[str, Any] = {
                     "transport": server.transport,
+                    "untrusted": untrusted,
                     "url": server.url or "",
                 }
                 if untrusted:
-                    entry["source"] = server.source
                     entry["headers"] = dict(server.headers or {})
                     entry["discovery_uses_secrets"] = discovery_should_use_secrets(
                         server
@@ -647,9 +645,13 @@ except ImportError:
                     original_args=server.args,
                     sandbox_args=args,
                 )
-            entry = {"transport": "stdio", "command": command, "args": args}
+            entry = {
+                "transport": "stdio",
+                "untrusted": untrusted,
+                "command": command,
+                "args": args,
+            }
             if untrusted:
-                entry["source"] = server.source
                 entry["env"] = dict(server.env or {})
                 entry["discovery_uses_secrets"] = discovery_should_use_secrets(server)
             else:

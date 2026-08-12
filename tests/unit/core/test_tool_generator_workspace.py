@@ -60,8 +60,13 @@ class TestBuiltinConfigMinimal:
         assert stdio_entry["env_keys"] == ["PLACEHOLDER_KEY"]
         assert "env" not in stdio_entry
         assert "source" not in stdio_entry
+        assert stdio_entry["untrusted"] is False
         sse_entry = config["servers"]["remote_srv"]
-        assert sse_entry == {"transport": "sse", "url": "https://example.test/mcp"}
+        assert sse_entry == {
+            "transport": "sse",
+            "untrusted": False,
+            "url": "https://example.test/mcp",
+        }
         # And the composed module never embeds the value anywhere.
         assert "secret-value" not in gen.generate_mcp_client_code(servers)
 
@@ -75,7 +80,38 @@ class TestBuiltinConfigMinimal:
         code = gen.generate_mcp_client_code(servers)
         # Builtin env resolution still reads os.environ.
         assert "os.environ.copy()" in code
-        assert 'for key in config.get("env_keys", []):' in code
+        assert "for key in cfg.env_keys:" in code
+
+
+class TestTrustFailsClosed:
+    """Trust is the host's ``untrusted`` bool; the runtime never re-derives it.
+
+    A config entry that arrives without the flag (version skew, a hand-edited
+    client) must get the UNTRUSTED treatment — the opposite default is how a
+    user-configured server would inherit the sandbox's whole environment.
+    """
+
+    def test_entry_without_the_flag_gets_the_untrusted_treatment(self, tmp_path):
+        gen = ToolFunctionGenerator()
+        ns = _exec_client(gen.generate_mcp_client_code([], working_dir=str(tmp_path)))
+        ns["_apply_config_dict"](
+            {
+                "working_dir": str(tmp_path),
+                "servers": {
+                    "drifted": {
+                        "transport": "stdio",
+                        "command": "npx",
+                        "env": {"TOKEN": "${vault:MISSING}"},
+                    }
+                },
+            }
+        )
+        cfg = ns["_SERVER_CONFIGS"]["drifted"]
+        assert cfg.untrusted is True
+        # And that is what it is actually treated as: vault-only resolution,
+        # which raises on the unresolvable ref instead of reaching os.environ.
+        with pytest.raises(RuntimeError, match="MISSING"):
+            ns["_build_proc_env"](cfg)
 
 
 class TestVaultOnlyResolution:
@@ -102,7 +138,7 @@ class TestVaultOnlyResolution:
 
         os.environ["PLATFORM_TOKEN"] = "must-not-leak"
         try:
-            env = ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
+            env = ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"])
         finally:
             del os.environ["PLATFORM_TOKEN"]
 
@@ -125,7 +161,7 @@ class TestVaultOnlyResolution:
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
         with pytest.raises(RuntimeError) as exc:
-            ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
+            ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"])
         assert "NEEDED_NAME" in str(exc.value)
 
     def test_args_vault_ref_resolved_at_spawn(self, tmp_path):
@@ -141,7 +177,7 @@ class TestVaultOnlyResolution:
             source="workspace",
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
-        resolved = ns["_resolve_cmd_args"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
+        resolved = ns["_resolve_cmd_args"](ns["_SERVER_CONFIGS"]["user_srv"])
         assert resolved == ["-y", "@scope/pkg", "--api-key=resolved-secret"]
 
     def test_args_missing_secret_raises_naming_secret_not_value(self, tmp_path):
@@ -156,7 +192,7 @@ class TestVaultOnlyResolution:
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
         with pytest.raises(RuntimeError) as exc:
-            ns["_resolve_cmd_args"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
+            ns["_resolve_cmd_args"](ns["_SERVER_CONFIGS"]["user_srv"])
         assert "NEEDED_ARG_SECRET" in str(exc.value)
 
     def test_args_discovery_secretless_does_not_raise(self, tmp_path):
@@ -173,7 +209,7 @@ class TestVaultOnlyResolution:
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
         out = ns["_resolve_cmd_args"](
-            ns["_SERVER_CONFIGS"]["user_srv"], "user_srv", discovery=True
+            ns["_SERVER_CONFIGS"]["user_srv"], discovery=True
         )
         assert isinstance(out, list) and len(out) == 1
 
@@ -196,7 +232,7 @@ class TestPerServerScoping:
 
         os.environ["SOME_UNRELATED_HOST_VAR"] = "secret-host-value"
         try:
-            env = ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"], "user_srv")
+            env = ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"])
         finally:
             del os.environ["SOME_UNRELATED_HOST_VAR"]
 
@@ -225,9 +261,7 @@ class TestHeaderInjection:
             source="workspace",
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
-        url, headers = ns["_resolve_sse"](
-            ns["_SERVER_CONFIGS"]["user_http"], "user_http"
-        )
+        url, headers = ns["_resolve_http"](ns["_SERVER_CONFIGS"]["user_http"])
         assert url == "https://example.test/abc123"
         assert headers["Authorization"] == "Bearer abc123"
 
@@ -250,7 +284,7 @@ class TestNoVaultDiscovery:
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
         env = ns["_build_proc_env"](
-            ns["_SERVER_CONFIGS"]["user_srv"], "user_srv", discovery=True
+            ns["_SERVER_CONFIGS"]["user_srv"], discovery=True
         )
         # Discovery substitutes inert empty string, never raises.
         assert env["TOKEN"] == ""
@@ -267,8 +301,8 @@ class TestNoVaultDiscovery:
             source="workspace",
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
-        _url, headers = ns["_resolve_sse"](
-            ns["_SERVER_CONFIGS"]["user_http"], "user_http", discovery=True
+        _url, headers = ns["_resolve_http"](
+            ns["_SERVER_CONFIGS"]["user_http"], discovery=True
         )
         assert headers["Authorization"] == "Bearer "
 
@@ -292,15 +326,13 @@ class TestDiscoveryUsesSecrets:
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
         env = ns["_build_proc_env"](
-            ns["_SERVER_CONFIGS"]["user_srv"], "user_srv", discovery=True
+            ns["_SERVER_CONFIGS"]["user_srv"], discovery=True
         )
         # Secret-less posture: the present secret is NOT resolved during discovery.
         assert env["TOKEN"] == ""
         assert "real-secret" not in json.dumps(env)
         # Normal (non-discovery) calls still resolve the real secret.
-        env_call = ns["_build_proc_env"](
-            ns["_SERVER_CONFIGS"]["user_srv"], "user_srv"
-        )
+        env_call = ns["_build_proc_env"](ns["_SERVER_CONFIGS"]["user_srv"])
         assert env_call["TOKEN"] == "real-secret"
 
     def test_opt_in_discovery_resolves_present_stdio_secret(self, tmp_path):
@@ -317,7 +349,7 @@ class TestDiscoveryUsesSecrets:
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
         env = ns["_build_proc_env"](
-            ns["_SERVER_CONFIGS"]["user_srv"], "user_srv", discovery=True
+            ns["_SERVER_CONFIGS"]["user_srv"], discovery=True
         )
         # Explicit opt-in: discovery resolves the real secret (today's behavior).
         assert env["TOKEN"] == "real-secret"
@@ -336,14 +368,12 @@ class TestDiscoveryUsesSecrets:
             source="workspace",
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
-        _url, headers = ns["_resolve_sse"](
-            ns["_SERVER_CONFIGS"]["user_http"], "user_http", discovery=True
+        _url, headers = ns["_resolve_http"](
+            ns["_SERVER_CONFIGS"]["user_http"], discovery=True
         )
         assert headers["Authorization"] == "Bearer real-secret"
         # Normal call also resolves the real secret.
-        _u2, headers2 = ns["_resolve_sse"](
-            ns["_SERVER_CONFIGS"]["user_http"], "user_http"
-        )
+        _u2, headers2 = ns["_resolve_http"](ns["_SERVER_CONFIGS"]["user_http"])
         assert headers2["Authorization"] == "Bearer real-secret"
 
     def test_opt_in_discovery_resolves_present_http_secret(self, tmp_path):
@@ -358,8 +388,8 @@ class TestDiscoveryUsesSecrets:
             discovery_uses_secrets=True,
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
-        _url, headers = ns["_resolve_sse"](
-            ns["_SERVER_CONFIGS"]["user_http"], "user_http", discovery=True
+        _url, headers = ns["_resolve_http"](
+            ns["_SERVER_CONFIGS"]["user_http"], discovery=True
         )
         assert headers["Authorization"] == "Bearer real-secret"
 
@@ -375,7 +405,7 @@ class TestDiscoveryUsesSecrets:
             discovery_uses_secrets=True,
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
-        assert ns["_SERVER_CONFIGS"]["user_srv"]["discovery_uses_secrets"] is True
+        assert ns["_SERVER_CONFIGS"]["user_srv"].discovery_uses_secrets is True
 
     def test_remote_vault_header_auto_enables_discovery_secrets(self, tmp_path):
         """A workspace remote server whose header references a vault secret is
@@ -392,9 +422,9 @@ class TestDiscoveryUsesSecrets:
             # NOT set — defaults to False; the vault-ref header forces it on.
         )
         ns = _exec_client(gen.generate_mcp_client_code([server], working_dir=workdir))
-        assert ns["_SERVER_CONFIGS"]["user_http"]["discovery_uses_secrets"] is True
-        _url, headers = ns["_resolve_sse"](
-            ns["_SERVER_CONFIGS"]["user_http"], "user_http", discovery=True
+        assert ns["_SERVER_CONFIGS"]["user_http"].discovery_uses_secrets is True
+        _url, headers = ns["_resolve_http"](
+            ns["_SERVER_CONFIGS"]["user_http"], discovery=True
         )
         assert headers["Authorization"] == "Bearer real-secret"
 
