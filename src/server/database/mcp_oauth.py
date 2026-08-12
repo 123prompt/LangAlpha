@@ -14,7 +14,7 @@ access token stays in use until expiry, then the connection needs re-auth.
 """
 
 import logging
-from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -26,23 +26,6 @@ from src.server.database.encryption import get_encryption_key as _get_encryption
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def _acquire(conn):
-    """Yield the caller's connection when given one, else one from the pool.
-
-    The refresh winner holds a session advisory lock on its own connection and
-    must run its under-lock re-read and commit on that same session. Passing the
-    held connection in keeps those statements off a *second* pool slot — nesting
-    a fresh acquire inside the first ties up two slots per in-flight refresh and,
-    under a many-connection refresh storm, stalls every winner on pool timeout.
-    """
-    if conn is not None:
-        yield conn
-    else:
-        async with get_db_connection() as owned:
-            yield owned
 
 
 class ConnectionStatus(StrEnum):
@@ -76,6 +59,47 @@ SERVABLE: frozenset[ConnectionStatus] = frozenset(
 )
 # Deterministic list form for `= ANY(%s)`; StrEnum members adapt as plain text.
 _SERVABLE_PARAM = sorted(s.value for s in SERVABLE)
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionSummary:
+    """One connection, decrypting nothing — what :class:`Secrets.NONE` reads.
+
+    ``has_refresh_token`` rides on every mode so "can this refresh?" is
+    answerable without paying to decrypt the token it would use.
+    """
+
+    connection_id: str
+    user_id: str
+    server_name: str
+    server_url: str
+    status: ConnectionStatus
+    token_type: str | None
+    scope: str | None
+    expires_at: datetime | None
+    token_generation: int
+    client_info: dict[str, Any]
+    as_metadata: dict[str, Any]
+    resource_metadata: dict[str, Any] | None
+    has_refresh_token: bool
+    last_refresh_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class BearerBundle(ConnectionSummary):
+    """Adds the vendor bearer — the relayed-call path's read."""
+
+    access_token: str
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshBundle(BearerBundle):
+    """Adds the credentials only a refresh (or DCR reuse) may spend."""
+
+    refresh_token: str | None
+    client_secret: str | None
 
 
 def _row_summary(r: dict[str, Any]) -> dict[str, Any]:
@@ -176,7 +200,7 @@ async def upsert_connection(
 
 async def get_connection(
     user_id: str, server_name: str, *, secrets: Secrets = Secrets.NONE
-) -> dict[str, Any] | None:
+) -> ConnectionSummary | None:
     """Fetch one connection; ``secrets`` selects how much bundle to decrypt."""
     return await _fetch_one(
         "user_id = %s AND server_name = %s", (user_id, server_name), secrets=secrets
@@ -185,25 +209,59 @@ async def get_connection(
 
 async def get_connection_by_id(
     connection_id: str, *, secrets: Secrets = Secrets.NONE, conn=None
-) -> dict[str, Any] | None:
+) -> ConnectionSummary | None:
     return await _fetch_one(
         "connection_id = %s", (connection_id,), secrets=secrets, conn=conn
     )
 
 
-# Decrypted columns per mode, in SELECT order. The row always carries
-# has_refresh_token, so a BEARER reader can still tell whether a refresh is
-# possible without paying to decrypt the token it would use.
+# Decrypted columns per mode, in SELECT order, and the record each mode hands
+# back — the concrete class IS the mode, so a reader can only reach a secret it
+# actually paid to decrypt.
 _SECRET_COLUMNS: dict[Secrets, tuple[str, ...]] = {
     Secrets.NONE: (),
     Secrets.BEARER: ("access_token",),
     Secrets.FULL: ("access_token", "refresh_token", "client_secret"),
 }
+_RECORD: dict[Secrets, type[ConnectionSummary]] = {
+    Secrets.NONE: ConnectionSummary,
+    Secrets.BEARER: BearerBundle,
+    Secrets.FULL: RefreshBundle,
+}
+
+
+def _to_record(r: dict[str, Any], secrets: Secrets) -> ConnectionSummary:
+    """Normalize one raw row into its mode's record — the only place that runs.
+
+    Native types throughout: the lifecycle does expiry math on ``expires_at``,
+    and the ISO-string form is ``list_connections``' concern alone.
+    """
+    fields: dict[str, Any] = {
+        "connection_id": str(r["connection_id"]),
+        "user_id": r["user_id"],
+        "server_name": r["server_name"],
+        "server_url": r["server_url"],
+        "status": ConnectionStatus(r["status"]),
+        "token_type": r["token_type"],
+        "scope": r["scope"],
+        "expires_at": r["expires_at"],
+        "token_generation": r["token_generation"],
+        "client_info": r["client_info"] or {},
+        "as_metadata": r["as_metadata"] or {},
+        "resource_metadata": r["resource_metadata"],
+        "has_refresh_token": bool(r["has_refresh_token"]),
+        "last_refresh_at": r["last_refresh_at"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+    for column in _SECRET_COLUMNS[secrets]:
+        fields[column] = r[f"{column}_plain"]
+    return _RECORD[secrets](**fields)
 
 
 async def _fetch_one(
     where: str, params: tuple, *, secrets: Secrets, conn=None
-) -> dict[str, Any] | None:
+) -> ConnectionSummary | None:
     columns = _SECRET_COLUMNS[secrets]
     secret_cols = "".join(
         f",\n                       pgp_sym_decrypt({c}, %s) AS {c}_plain"
@@ -211,7 +269,7 @@ async def _fetch_one(
     )
     enc_key = _get_encryption_key()
     query_params = tuple(enc_key for _ in columns) + params
-    async with _acquire(conn) as db:
+    async with get_db_connection(conn) as db:
         async with db.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
@@ -226,17 +284,7 @@ async def _fetch_one(
                 query_params,
             )
             row = await cur.fetchone()
-            if not row:
-                return None
-            # Native types throughout — lifecycle does expiry math on
-            # expires_at; the ISO-string form is list_connections' concern.
-            out = dict(row)
-            out["connection_id"] = str(row["connection_id"])
-            for column in ("access_token", "refresh_token", "client_secret"):
-                out.pop(f"{column}_plain", None)
-            for column in columns:
-                out[column] = row[f"{column}_plain"]
-            return out
+            return _to_record(row, secrets) if row else None
 
 
 async def list_connections(user_id: str) -> list[dict[str, Any]]:
@@ -275,7 +323,7 @@ async def commit_refresh(
     the caller must discard its result and re-read.
     """
     enc_key = _get_encryption_key()
-    async with _acquire(conn) as db:
+    async with get_db_connection(conn) as db:
         async with db.cursor() as cur:
             await cur.execute(
                 """
@@ -318,7 +366,7 @@ async def mark_status(
     keeps serving the old access token until expiry, and needs_reauth keeps
     metadata for the reconnect flow."""
     status = ConnectionStatus(status)  # rejects anything outside the vocabulary
-    async with _acquire(conn) as db:
+    async with get_db_connection(conn) as db:
         async with db.cursor() as cur:
             await cur.execute(
                 """

@@ -14,6 +14,8 @@ import logging
 import random
 from typing import Optional
 
+from src.utils.concurrency import cancel_and_join
+
 logger = logging.getLogger(__name__)
 
 SWEEP_INTERVAL_S = 300.0
@@ -62,11 +64,7 @@ class McpOAuthRefreshSweeper:
         try:
             await asyncio.wait_for(self._loop_task, timeout=STOP_GRACE)
         except TimeoutError:
-            self._loop_task.cancel()
-            try:
-                await self._loop_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await cancel_and_join(self._loop_task)
         except Exception:
             logger.warning(
                 "[McpOAuthRefreshSweeper] loop ended with an error at shutdown",

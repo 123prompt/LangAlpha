@@ -17,15 +17,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import anyio
 import httpx2
 
-from mcp.client.auth.utils import handle_token_response_scopes
-
 from src.server.database.mcp_oauth import (
+    SERVABLE,
+    BearerBundle,
     ConnectionStatus,
+    ConnectionSummary,
+    RefreshBundle,
     Secrets,
     commit_refresh,
     get_connection_by_id,
@@ -34,10 +36,11 @@ from src.server.database.mcp_oauth import (
 )
 from src.server.database.egress_grants import revoke_grants_for_connection
 from src.server.services.writer_guard import advisory_key
-from src.server.services.mcp_oauth.http import (
-    OAuthHopBlocked,
-    oauth_http_client,
-    pinned_request,
+from src.server.services.mcp_oauth.tokens import (
+    TokenExchangeError,
+    TokenFailure,
+    exchange_token,
+    registered_client,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,8 +79,8 @@ class AccessToken:
         return f"{self.token_type} {self.access_token}"
 
 
-def _expiry_seconds(row: dict) -> float | None:
-    expires_at = row.get("expires_at")
+def _expiry_seconds(row: ConnectionSummary) -> float | None:
+    expires_at = row.expires_at
     if expires_at is None:
         return None  # non-expiring token
     if expires_at.tzinfo is None:
@@ -85,7 +88,7 @@ def _expiry_seconds(row: dict) -> float | None:
     return (expires_at - datetime.now(timezone.utc)).total_seconds()
 
 
-def _usable(row: dict, *, floor: float = 0.0) -> bool:
+def _usable(row: ConnectionSummary, *, floor: float = 0.0) -> bool:
     remaining = _expiry_seconds(row)
     return remaining is None or remaining > floor
 
@@ -102,27 +105,22 @@ async def ensure_fresh_access_token(connection_id: str) -> AccessToken:
     row = await get_connection_by_id(connection_id, secrets=Secrets.BEARER)
     if row is None:
         raise TokenUnavailable("unknown_connection")
-    status = row["status"]
-    if status == ConnectionStatus.REVOKED:
-        raise TokenUnavailable("revoked")
-    if status == ConnectionStatus.NEEDS_REAUTH:
-        raise TokenUnavailable("needs_reauth")
+    if row.status not in SERVABLE:
+        # The reason IS the status: revoked and needs_reauth are the only ways
+        # out of the servable set, and both are the caller's answer verbatim.
+        raise TokenUnavailable(str(row.status))
 
     remaining = _expiry_seconds(row)
     if remaining is None or remaining > REFRESH_MARGIN_SECONDS:
         return _token_view(row)
-    if not row.get("has_refresh_token"):
-        # No refresh token: ride the access token to expiry, then re-auth.
+    if not row.has_refresh_token or row.status == ConnectionStatus.REFRESH_AMBIGUOUS:
+        # Nothing to refresh with, or nothing we may retry (an ambiguous refresh
+        # may already have consumed the token): ride the access token to expiry,
+        # then re-auth.
         if remaining > 0:
             return _token_view(row)
         await mark_status(connection_id, ConnectionStatus.NEEDS_REAUTH)
-        raise TokenUnavailable("needs_reauth", "access token expired, no refresh token")
-    if status == ConnectionStatus.REFRESH_AMBIGUOUS:
-        # Never re-attempt an ambiguous refresh; serve until expiry.
-        if remaining > 0:
-            return _token_view(row)
-        await mark_status(connection_id, ConnectionStatus.NEEDS_REAUTH)
-        raise TokenUnavailable("needs_reauth", "ambiguous refresh, token expired")
+        raise TokenUnavailable("needs_reauth", "access token expired, cannot refresh")
 
     return await _refresh_single_flight(connection_id, row)
 
@@ -135,7 +133,7 @@ async def current_access_token(connection_id: str) -> AccessToken | None:
     about freshness.
     """
     row = await get_connection_by_id(connection_id, secrets=Secrets.BEARER)
-    if row is None or not row.get("access_token"):
+    if row is None or not row.access_token:
         return None
     return _token_view(row)
 
@@ -161,15 +159,17 @@ async def mark_connection_needs_reauth(
     return flipped
 
 
-def _token_view(row: dict) -> AccessToken:
+def _token_view(row: BearerBundle) -> AccessToken:
     return AccessToken(
-        access_token=row["access_token"],
-        token_type=row.get("token_type") or "Bearer",
-        generation=row["token_generation"],
+        access_token=row.access_token,
+        token_type=row.token_type or "Bearer",
+        generation=row.token_generation,
     )
 
 
-async def _refresh_single_flight(connection_id: str, row: dict) -> AccessToken:
+async def _refresh_single_flight(
+    connection_id: str, row: BearerBundle
+) -> AccessToken:
     """Try-lock refresh: one winner per cluster; losers never block on it."""
     from src.server.database.pool import get_db_connection
 
@@ -207,126 +207,87 @@ async def _refresh_single_flight(connection_id: str, row: dict) -> AccessToken:
                     await cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
 
 
-async def _wait_for_winner(connection_id: str, row: dict) -> AccessToken:
+async def _wait_for_winner(connection_id: str, row: BearerBundle) -> AccessToken:
     """Loser path: old token if comfortably valid, else briefly poll the row."""
     if _usable(row, floor=OLD_TOKEN_FLOOR_SECONDS):
         return _token_view(row)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + LOSER_POLL_SECONDS
-    generation = row["token_generation"]
+    generation = row.token_generation
     while loop.time() < deadline:
         await asyncio.sleep(0.25)
         current = await get_connection_by_id(connection_id, secrets=Secrets.BEARER)
         if current is None:
             raise TokenUnavailable("unknown_connection")
-        if current["token_generation"] > generation and _usable(current):
+        if current.token_generation > generation and _usable(current):
             return _token_view(current)
     if _usable(row):
         return _token_view(row)
     raise TokenUnavailable("refresh_in_progress")
 
 
-async def _do_refresh(connection_id: str, row: dict, *, conn=None) -> AccessToken:
+async def _do_refresh(
+    connection_id: str, row: RefreshBundle, *, conn=None
+) -> AccessToken:
     """Winner path: one refresh POST, generation-CAS commit.
 
     ``conn`` is the pool connection already holding this refresh's advisory
     lock; every DB write here runs on it so the refresh never occupies a second
     pool slot.
     """
-    data: dict[str, str] = {
-        "grant_type": "refresh_token",
-        "refresh_token": row["refresh_token"],
-        "client_id": (row.get("client_info") or {}).get("client_id") or "",
-    }
-    if row.get("resource_metadata"):
-        resource = (row.get("resource_metadata") or {}).get("resource")
-        if resource:
-            data["resource"] = str(resource)
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    client_secret = row.get("client_secret")
-    if client_secret:
-        # Apply the client's registered token-endpoint auth method, mirroring
-        # the SDK's prepare_token_auth used on the connect path (RFC 6749
-        # §2.3.1): client_secret_basic carries credentials in the Authorization
-        # header; client_secret_post (and the historical absent default) carry
-        # them in the body. Hardcoding the body form 401s a basic-auth client.
-        client_info = row.get("client_info") or {}
-        if client_info.get("token_endpoint_auth_method") == "client_secret_basic":
-            import base64
-            from urllib.parse import quote
-
-            client_id = client_info.get("client_id") or ""
-            creds = f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}"
-            headers["Authorization"] = (
-                "Basic " + base64.b64encode(creds.encode()).decode()
-            )
-        else:
-            data["client_secret"] = client_secret
-
-    token_endpoint = (row.get("as_metadata") or {}).get("token_endpoint")
+    token_endpoint = row.as_metadata.get("token_endpoint")
     if not token_endpoint:
         await mark_status(connection_id, ConnectionStatus.NEEDS_REAUTH, conn=conn)
         raise TokenUnavailable("needs_reauth", "no token endpoint on record")
 
-    try:
-        async with oauth_http_client() as client:
-            client.timeout = REFRESH_TIMEOUT
-            response = await pinned_request(
-                client, "POST", str(token_endpoint), headers=headers, data=data
-            )
-    except (httpx2.TimeoutException, OAuthHopBlocked) as e:
-        # Ambiguous: the AS may have rotated the refresh token already.
-        # Retrying could burn the one-time token — flip to ambiguous and
-        # keep serving the old access token until it expires.
-        logger.warning(
-            "[mcp_oauth] ambiguous refresh for %s: %s", connection_id, e
-        )
-        await mark_status(connection_id, ConnectionStatus.REFRESH_AMBIGUOUS, conn=conn)
-        if _usable(row):
-            return _token_view(row)
-        raise TokenUnavailable("needs_reauth", "ambiguous refresh, token expired")
-    except Exception as e:
-        # Transport-level failure before the request could have been consumed.
-        logger.warning("[mcp_oauth] refresh transport error for %s: %s", connection_id, e)
-        if _usable(row):
-            return _token_view(row)
-        raise TokenUnavailable("expired", "refresh unreachable, token expired")
+    client_info = registered_client(row.client_info, row.client_secret)
+    grant: dict[str, str] = {
+        "grant_type": "refresh_token",
+        "refresh_token": row.refresh_token,
+        "client_id": client_info.client_id,
+    }
+    resource = (row.resource_metadata or {}).get("resource")
+    if resource:
+        grant["resource"] = str(resource)
 
-    if response.status_code != 200:
-        # Log the status only — never the vendor's response body. A failed
-        # token exchange carries no new token, and an AS is free to echo the
-        # request (client_id, even the refresh token) back in an error body;
-        # keeping it out of our logs removes that whole class of leak.
-        if response.status_code in (400, 401):
-            logger.warning(
-                "[mcp_oauth] refresh rejected for %s (status %s)",
-                connection_id, response.status_code,
+    try:
+        token = await exchange_token(
+            str(token_endpoint),
+            grant,
+            client_info=client_info,
+            timeout=REFRESH_TIMEOUT,
+        )
+    except TokenExchangeError as e:
+        if e.kind in (TokenFailure.TIMEOUT, TokenFailure.BLOCKED):
+            # Ambiguous: the AS may have rotated the refresh token already.
+            # Retrying could burn the one-time token — flip to ambiguous and
+            # keep serving the old access token until it expires.
+            logger.warning("[mcp_oauth] ambiguous refresh for %s: %s", connection_id, e)
+            await mark_status(
+                connection_id, ConnectionStatus.REFRESH_AMBIGUOUS, conn=conn
             )
+            if _usable(row):
+                return _token_view(row)
+            raise TokenUnavailable("needs_reauth", "ambiguous refresh, token expired")
+        if e.kind is TokenFailure.REJECTED:
+            logger.warning("[mcp_oauth] refresh rejected for %s (%s)", connection_id, e)
             await mark_status(connection_id, ConnectionStatus.NEEDS_REAUTH, conn=conn)
             raise TokenUnavailable("needs_reauth", "refresh token rejected")
-        # 5xx: transient server-side trouble — keep status, ride the old token.
-        logger.warning(
-            "[mcp_oauth] refresh failed for %s (status %s)",
-            connection_id, response.status_code,
-        )
+        # Transport failure (nothing could have been consumed) or a 5xx from an
+        # unwell AS: keep the status and ride the old token, retrying later.
+        logger.warning("[mcp_oauth] refresh failed for %s: %s", connection_id, e)
         if _usable(row):
             return _token_view(row)
         raise TokenUnavailable("expired", "refresh failing, token expired")
 
-    token = await handle_token_response_scopes(response)
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(seconds=token.expires_in)
-        if token.expires_in
-        else None
-    )
     committed = await commit_refresh(
         connection_id,
-        expected_generation=row["token_generation"],
+        expected_generation=row.token_generation,
         access_token=token.access_token,
         # None keeps the stored one; "" would otherwise overwrite a working
         # refresh token with an encrypted empty string.
-        refresh_token=token.refresh_token or None,
-        expires_at=expires_at,
+        refresh_token=token.refresh_token,
+        expires_at=token.expires_at,
         scope=token.scope,
         conn=conn,
     )
@@ -346,8 +307,8 @@ async def _do_refresh(connection_id: str, row: dict, *, conn=None) -> AccessToke
     # The CAS above committed exactly one increment over the generation we read.
     return AccessToken(
         access_token=token.access_token,
-        token_type=token.token_type or "Bearer",
-        generation=row["token_generation"] + 1,
+        token_type=token.token_type,
+        generation=row.token_generation + 1,
     )
 
 
@@ -359,20 +320,29 @@ async def disconnect_server(user_id: str, server_name: str) -> bool:
     in the vendor's own connected-apps page; we only drop our copy.
     """
     from src.server.database.mcp_oauth import get_connection
-    from src.server.database.mcp_servers import (
-        bump_user_workspaces_mcp_version,
-        delete_user_tool_schemas,
-    )
+    from src.server.database.mcp_servers import bump_user_workspaces_mcp_version
+    from src.server.database.mcp_tool_schemas import delete_user_tool_schemas
+    from src.server.database.pool import get_db_connection
 
     row = await get_connection(user_id, server_name)
     if row is None:
         return False
-    await mark_status(row["connection_id"], ConnectionStatus.REVOKED)
-    await revoke_grants_for_connection(row["connection_id"])
-    await delete_user_tool_schemas(user_id, server_name)
+    # One transaction: a partial disconnect disagrees with itself — grants
+    # revoked while the row still reads connected leaves the refresh sweeper
+    # renewing a credential the user gave up. The pool is autocommit, so the
+    # explicit transaction() — not merely sharing a connection — is the bind.
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            await mark_status(
+                row.connection_id, ConnectionStatus.REVOKED, conn=conn
+            )
+            await revoke_grants_for_connection(row.connection_id, conn=conn)
+            await delete_user_tool_schemas(user_id, server_name, conn=conn)
+    # Outside: the fan-out touches every workspace of the user and is
+    # convergence, not part of the revoke.
     await bump_user_workspaces_mcp_version(user_id)
     logger.info(
         "[mcp_oauth] disconnected user=%s server=%s connection=%s",
-        user_id, server_name, row["connection_id"],
+        user_id, server_name, row.connection_id,
     )
     return True

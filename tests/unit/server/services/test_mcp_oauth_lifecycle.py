@@ -14,13 +14,16 @@ carry that, and each gets its own coverage here:
   may already be consumed server-side, so the connection flips to
   ``refresh_ambiguous`` and rides the old access token to expiry.
 
+``disconnect_server`` is the module's other write path, and it gets the same
+treatment at the end of the file: its three revocation writes commit as one.
+
 Redis, Postgres and the network are all faked at the module's seams: the
 advisory-lock cursor, the connection-row store, and the token endpoint.
 """
 
 from __future__ import annotations
 
-import copy
+import dataclasses
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -30,8 +33,14 @@ import httpx2
 import pytest
 
 from src.server.database import mcp_oauth as mcp_oauth_db
-from src.server.database.mcp_oauth import Secrets
-from src.server.services.mcp_oauth import lifecycle
+from src.server.database.mcp_oauth import (
+    BearerBundle,
+    ConnectionStatus,
+    ConnectionSummary,
+    RefreshBundle,
+    Secrets,
+)
+from src.server.services.mcp_oauth import lifecycle, tokens
 from src.server.services.mcp_oauth.http import OAuthHopBlocked
 from src.server.services.mcp_oauth.lifecycle import (
     AccessToken,
@@ -56,31 +65,51 @@ def _row(
     access_token: str = "access-old",
     refresh_token: str | None = "refresh-old",
     **overrides,
-) -> dict:
-    """A decrypted connection row as :func:`get_connection_by_id` hands it over."""
-    row = {
+) -> RefreshBundle:
+    """A connection as :func:`get_connection_by_id` hands it over, fully read."""
+    now = datetime.now(timezone.utc)
+    fields = {
         "connection_id": CONNECTION_ID,
         "user_id": USER_ID,
         "server_name": SERVER_NAME,
         "server_url": SERVER_URL,
-        "status": status,
+        "status": ConnectionStatus(status),
         "token_type": "Bearer",
         "scope": "notes.read offline_access",
         "expires_at": (
-            None
-            if expires_in is None
-            else datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+            None if expires_in is None else now + timedelta(seconds=expires_in)
         ),
         "token_generation": generation,
         "client_info": {"client_id": "client-abc123"},
         "as_metadata": {"issuer": ISSUER, "token_endpoint": f"{ISSUER}/token"},
         "resource_metadata": None,
+        "has_refresh_token": refresh_token is not None,
+        "last_refresh_at": None,
+        "created_at": now,
+        "updated_at": now,
         "access_token": access_token,
         "refresh_token": refresh_token,
         "client_secret": None,
     }
-    row.update(overrides)
-    return row
+    fields.update(overrides)
+    return RefreshBundle(**fields)
+
+
+def _project(row: RefreshBundle, secrets: Secrets) -> ConnectionSummary:
+    """Mirror the real read: a mode carries only the columns it decrypted.
+
+    Code that reaches for the refresh token or client secret while asking for
+    BEARER fails here exactly as it would against Postgres.
+    """
+    fields = {f.name: getattr(row, f.name) for f in dataclasses.fields(row)}
+    if secrets is Secrets.FULL:
+        return RefreshBundle(**fields)
+    for name in ("refresh_token", "client_secret"):
+        fields.pop(name)
+    if secrets is Secrets.BEARER:
+        return BearerBundle(**fields)
+    fields.pop("access_token")
+    return ConnectionSummary(**fields)
 
 
 # ---------------------------------------------------------------------------
@@ -95,9 +124,9 @@ class FakeStore:
     competing worker's commit is made to land mid-flight.
     """
 
-    def __init__(self, row: dict | None):
+    def __init__(self, row: RefreshBundle | None):
         self.row = row
-        self.script: dict[int, dict | None] = {}
+        self.script: dict[int, RefreshBundle | None] = {}
         self.read_count = 0
         self.marks: list[str] = []
         self.commits: list[dict] = []
@@ -119,20 +148,12 @@ class FakeStore:
             self.row = self.script[self.read_count]
         if self.row is None:
             return None
-        row = copy.deepcopy(self.row)
-        # Mirror the real read exactly: a BEARER row carries the flag but not
-        # the refresh token or client secret, so code that needs those while
-        # asking for BEARER fails here the same way it would against Postgres.
-        row["has_refresh_token"] = bool(row.get("refresh_token"))
-        if secrets is not Secrets.FULL:
-            row.pop("refresh_token", None)
-            row.pop("client_secret", None)
-        return row
+        return _project(self.row, secrets)
 
     async def mark_status(self, connection_id, status, *, conn=None):
         self.marks.append(status)
         if self.row is not None:
-            self.row["status"] = status
+            self.row = dataclasses.replace(self.row, status=ConnectionStatus(status))
         return True
 
     async def commit_refresh(
@@ -157,15 +178,18 @@ class FakeStore:
                 "scope": scope,
             }
         )
-        if self.row is None or self.row["token_generation"] != expected_generation:
+        if self.row is None or self.row.token_generation != expected_generation:
             return False  # a newer bundle already landed
-        self.row.update(
+        surviving = refresh_token or self.row.refresh_token
+        self.row = dataclasses.replace(
+            self.row,
             access_token=access_token,
-            refresh_token=refresh_token or self.row["refresh_token"],
+            refresh_token=surviving,
+            has_refresh_token=surviving is not None,
             expires_at=expires_at,
-            scope=scope or self.row["scope"],
+            scope=scope or self.row.scope,
             token_generation=expected_generation + 1,
-            status="connected",
+            status=ConnectionStatus.CONNECTED,
         )
         return True
 
@@ -281,8 +305,10 @@ def db(monkeypatch) -> FakeLockDb:
 @pytest.fixture
 def token_endpoint(monkeypatch) -> FakeTokenEndpoint:
     fake = FakeTokenEndpoint()
-    monkeypatch.setattr(lifecycle, "pinned_request", fake.request)
-    monkeypatch.setattr(lifecycle, "oauth_http_client", _fake_http_client)
+    # The token POST lives in mcp_oauth.tokens — the one place both the refresh
+    # and the connect-time code exchange go through.
+    monkeypatch.setattr(tokens, "pinned_request", fake.request)
+    monkeypatch.setattr(tokens, "oauth_http_client", _fake_http_client)
     return fake
 
 
@@ -483,7 +509,7 @@ class TestWinner:
         expected = datetime.now(timezone.utc) + timedelta(seconds=3600)
         assert abs((commit["expires_at"] - expected).total_seconds()) < 30
         # The stored bundle advanced exactly one generation.
-        assert store.row["token_generation"] == 4
+        assert store.row.token_generation == 4
 
     @pytest.mark.asyncio
     async def test_the_under_lock_re_read_is_the_one_that_takes_the_full_bundle(
@@ -532,7 +558,7 @@ class TestWinner:
 
         assert token.access_token == "access-new"
         assert store.commits[0]["refresh_token"] is None
-        assert store.row["refresh_token"] == "refresh-old"
+        assert store.row.refresh_token == "refresh-old"
 
     @pytest.mark.asyncio
     async def test_confidential_client_and_resource_are_sent(
@@ -895,7 +921,7 @@ class TestGenerationCas:
         params_log: list[tuple] = []
 
         @asynccontextmanager
-        async def _conn():
+        async def _conn(conn=None):
             yield SimpleNamespace(
                 cursor=lambda *a, **k: _CasCursor(state, log, params_log)
             )
@@ -1025,7 +1051,7 @@ class TestNeedsReauthCas:
         log: list[str] = []
 
         @asynccontextmanager
-        async def _conn():
+        async def _conn(conn=None):
             yield SimpleNamespace(cursor=lambda *a, **k: _ReauthCursor(state, log))
 
         monkeypatch.setattr(mcp_oauth_db, "get_db_connection", _conn)
@@ -1138,6 +1164,7 @@ class TestRowShapeContract:
             "client_info": {"client_id": "client-abc123"},
             "as_metadata": {"issuer": ISSUER},
             "resource_metadata": None,
+            "has_refresh_token": True,
             "last_refresh_at": None,
             "created_at": now,
             "updated_at": now,
@@ -1147,7 +1174,7 @@ class TestRowShapeContract:
         }
 
         @asynccontextmanager
-        async def _conn():
+        async def _conn(conn=None):
             yield SimpleNamespace(cursor=lambda *a, **k: _RowCursor(row))
 
         monkeypatch.setattr(mcp_oauth_db, "get_db_connection", _conn)
@@ -1157,8 +1184,8 @@ class TestRowShapeContract:
     async def test_expires_at_survives_as_a_datetime(self, db_row):
         out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, secrets=Secrets.FULL)
 
-        assert isinstance(out["expires_at"], datetime)
-        assert out["expires_at"] == db_row["expires_at"]
+        assert isinstance(out.expires_at, datetime)
+        assert out.expires_at == db_row["expires_at"]
         # The consumer that broke: expiry math straight off the returned row.
         remaining = lifecycle._expiry_seconds(out)
         assert isinstance(remaining, float)
@@ -1184,30 +1211,36 @@ class TestRowShapeContract:
         assert token_endpoint.calls == []
 
     @pytest.mark.asyncio
-    async def test_decrypted_plaintext_is_mapped_and_raw_columns_dropped(self, db_row):
+    async def test_decrypted_plaintext_is_mapped_onto_the_full_record(self, db_row):
         out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, secrets=Secrets.FULL)
 
-        assert out["access_token"] == "access-old"
-        assert out["refresh_token"] == "refresh-old"
-        assert out["client_secret"] is None
+        assert isinstance(out, RefreshBundle)
+        assert out.access_token == "access-old"
+        assert out.refresh_token == "refresh-old"
+        assert out.client_secret is None
         # The ciphertext-column aliases must not ride along.
-        assert not [k for k in out if k.endswith("_plain")]
+        assert not [name for name in dir(out) if name.endswith("_plain")]
 
     @pytest.mark.asyncio
-    async def test_a_summary_read_never_carries_token_plaintext(self, db_row):
+    async def test_a_summary_read_cannot_reach_token_plaintext(self, db_row):
+        # The record IS the mode: a read that paid for no decrypt has nowhere
+        # to put a token, so "did this reader ask for the bearer?" stops being
+        # a convention and becomes a type.
         out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID)
 
-        assert "access_token" not in out
-        assert "refresh_token" not in out
-        assert not [k for k in out if k.endswith("_plain")]
+        assert type(out) is ConnectionSummary
+        assert not hasattr(out, "access_token")
+        assert not hasattr(out, "refresh_token")
+        # ...while still answering whether a refresh is possible at all.
+        assert out.has_refresh_token is True
 
     @pytest.mark.asyncio
     async def test_connection_id_is_stringified(self, db_row):
         out = await mcp_oauth_db.get_connection_by_id(CONNECTION_ID, secrets=Secrets.FULL)
 
         # Callers interpolate it into advisory-lock keys and log lines.
-        assert out["connection_id"] == CONNECTION_ID
-        assert isinstance(out["connection_id"], str)
+        assert out.connection_id == CONNECTION_ID
+        assert isinstance(out.connection_id, str)
 
     def test_the_ui_view_still_serializes_timestamps(self, db_row):
         # The other half of the split the fix established: list_connections is
@@ -1216,3 +1249,104 @@ class TestRowShapeContract:
 
         assert isinstance(summary["expires_at"], str)
         assert summary["expires_at"] == db_row["expires_at"].isoformat()
+
+
+# ---------------------------------------------------------------------------
+# disconnect_server — the revocation writes commit together
+# ---------------------------------------------------------------------------
+
+
+class FakeDisconnectDb:
+    """Records, per write, which connection it ran on and the open-transaction
+    depth at the time — the two things atomicity here consists of."""
+
+    def __init__(self) -> None:
+        self.conn = SimpleNamespace(transaction=self._transaction)
+        self.depth = 0
+        self.writes: list[tuple[str, object, int]] = []
+
+    @asynccontextmanager
+    async def _transaction(self):
+        self.depth += 1
+        try:
+            yield
+        finally:
+            self.depth -= 1
+
+    @asynccontextmanager
+    async def connection(self):
+        yield self.conn
+
+    def write(self, name: str):
+        async def _recorded(*args, conn=None, **kwargs):
+            self.writes.append((name, conn, self.depth))
+            return 1
+
+        return _recorded
+
+    @property
+    def trace(self) -> list[tuple[str, bool, int]]:
+        return [(name, c is self.conn, depth) for name, c, depth in self.writes]
+
+
+@pytest.fixture
+def disconnect_db(monkeypatch) -> FakeDisconnectDb:
+    fake = FakeDisconnectDb()
+    monkeypatch.setattr(
+        "src.server.database.pool.get_db_connection", fake.connection
+    )
+    monkeypatch.setattr(lifecycle, "mark_status", fake.write("mark_status"))
+    monkeypatch.setattr(
+        lifecycle, "revoke_grants_for_connection", fake.write("revoke_grants")
+    )
+    monkeypatch.setattr(
+        "src.server.database.mcp_tool_schemas.delete_user_tool_schemas",
+        fake.write("delete_schemas"),
+    )
+    monkeypatch.setattr(
+        "src.server.database.mcp_servers.bump_user_workspaces_mcp_version",
+        fake.write("bump_versions"),
+    )
+    return fake
+
+
+def _connected(row=None):
+    async def _get_connection(user_id, server_name, **kwargs):
+        return row
+
+    return _get_connection
+
+
+@pytest.mark.asyncio
+class TestDisconnectAtomicity:
+    """A half-applied disconnect disagrees with itself — grants revoked while
+    the row still reads connected leaves the sweeper renewing a credential the
+    user gave up. All three writes therefore share one transaction."""
+
+    async def test_the_three_revocation_writes_share_one_transaction(
+        self, disconnect_db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "src.server.database.mcp_oauth.get_connection",
+            _connected(_project(_row(), Secrets.NONE)),
+        )
+
+        assert await lifecycle.disconnect_server(USER_ID, SERVER_NAME) is True
+
+        # Same connection, transaction open, for each of the three.
+        assert disconnect_db.trace[:3] == [
+            ("mark_status", True, 1),
+            ("revoke_grants", True, 1),
+            ("delete_schemas", True, 1),
+        ]
+        # The fan-out is convergence across every workspace of the user, not
+        # part of the revoke — it commits on its own, after.
+        assert disconnect_db.trace[3:] == [("bump_versions", False, 0)]
+
+    async def test_no_connection_writes_nothing(self, disconnect_db, monkeypatch):
+        monkeypatch.setattr(
+            "src.server.database.mcp_oauth.get_connection", _connected(None)
+        )
+
+        assert await lifecycle.disconnect_server(USER_ID, SERVER_NAME) is False
+        assert disconnect_db.writes == []

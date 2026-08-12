@@ -32,17 +32,21 @@ import httpx2
 import pytest
 from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata
 
-from src.server.services.mcp_oauth import connect
+from src.server.services.mcp_oauth import connect, redirects, tokens
 from src.server.services.mcp_oauth.connect import (
-    DEFAULT_RETURN_TO,
     STATE_TTL_SECONDS,
     McpOAuthError,
+    StartedConnect,
     complete_callback,
-    sanitize_return_to,
-    sanitize_web_origin,
     start_connect,
 )
 from src.server.services.mcp_oauth.http import OAuthHopBlocked
+from src.server.services.mcp_oauth.redirects import (
+    DEFAULT_RETURN_TO,
+    callback_uri,
+    sanitize_return_to,
+    sanitize_web_origin,
+)
 from src.server.utils.egress_guard import EgressBlockedError, PinnedTarget
 
 USER_ID = "user-connect-1"
@@ -149,7 +153,7 @@ def _client_info(**overrides) -> OAuthClientInformationFull:
     data = {
         "client_id": "client-abc123",
         "client_name": "Langalpha",
-        "redirect_uris": [connect._redirect_uri()],
+        "redirect_uris": [callback_uri()],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
@@ -179,15 +183,15 @@ def _query(url: str) -> dict[str, str]:
     return {k: v[0] for k, v in parse_qs(urlsplit(url).query).items()}
 
 
-async def _callback(started: dict, **kwargs) -> str:
+async def _callback(started: StartedConnect, **kwargs) -> str:
     """Phase 2 as the initiating browser drives it.
 
     The real browser presents back the HttpOnly nonce cookie minted in phase 1,
-    so the round trip carries ``started["browser_nonce"]`` by default. Tests
+    so the round trip carries ``started.browser_nonce`` by default. Tests
     exercising the CSRF guard override ``browser_nonce`` (or ``state``).
     """
-    kwargs.setdefault("state", started["state"])
-    kwargs.setdefault("browser_nonce", started["browser_nonce"])
+    kwargs.setdefault("state", started.state)
+    kwargs.setdefault("browser_nonce", started.browser_nonce)
     return await complete_callback(**kwargs)
 
 
@@ -279,8 +283,10 @@ def phase2(monkeypatch) -> SimpleNamespace:
         if env.discovery_error is not None:
             raise env.discovery_error
 
-    monkeypatch.setattr(connect, "pinned_request", _pinned_request)
-    monkeypatch.setattr(connect, "oauth_http_client", _fake_http_client)
+    # The token POST lives in mcp_oauth.tokens — the one place both the code
+    # exchange and the refresh go through.
+    monkeypatch.setattr(tokens, "pinned_request", _pinned_request)
+    monkeypatch.setattr(tokens, "oauth_http_client", _fake_http_client)
     monkeypatch.setattr(connect, "upsert_connection", _upsert_connection)
     monkeypatch.setattr(connect, "bump_user_workspaces_mcp_version", _bump)
     monkeypatch.setattr(
@@ -301,7 +307,7 @@ class TestStartConnect:
         result = await start_connect(USER_ID, SERVER_NAME)
 
         [call] = redis.set_calls
-        assert call["key"] == f"{STATE_PREFIX}{result['state']}"
+        assert call["key"] == f"{STATE_PREFIX}{result.state}"
         # nx: the state key is claimed, never overwritten. ex: it self-expires.
         assert call["nx"] is True
         assert call["ex"] == STATE_TTL_SECONDS
@@ -312,7 +318,7 @@ class TestStartConnect:
         assert record["server_url"] == SERVER_URL
         assert record["issuer"] == str(phase1.as_metadata.issuer)
         assert record["token_endpoint"] == str(phase1.as_metadata.token_endpoint)
-        assert record["redirect_uri"] == connect._redirect_uri()
+        assert record["redirect_uri"] == callback_uri()
         assert record["return_to"] == DEFAULT_RETURN_TO
 
     @pytest.mark.asyncio
@@ -321,24 +327,24 @@ class TestStartConnect:
     ):
         result = await start_connect(USER_ID, SERVER_NAME)
 
-        params = _query(result["authorize_url"])
+        params = _query(result.authorize_url)
         verifier = redis.only_record()["code_verifier"]
 
         assert params["code_challenge_method"] == "S256"
         # Recomputed here — never read back from the implementation.
         assert params["code_challenge"] == _s256(verifier)
         assert params["code_challenge"] != verifier
-        assert params["state"] == result["state"]
+        assert params["state"] == result.state
         assert params["response_type"] == "code"
         assert params["client_id"] == "client-abc123"
-        assert params["redirect_uri"] == connect._redirect_uri()
-        assert result["authorize_url"].startswith(f"{ISSUER}/authorize?")
+        assert params["redirect_uri"] == callback_uri()
+        assert result.authorize_url.startswith(f"{ISSUER}/authorize?")
 
     @pytest.mark.asyncio
     async def test_offline_access_asks_for_explicit_consent(self, redis, phase1):
         # AS scopes_supported carries offline_access, so the durable-grant
         # prompt must be requested.
-        params = _query((await start_connect(USER_ID, SERVER_NAME))["authorize_url"])
+        params = _query((await start_connect(USER_ID, SERVER_NAME)).authorize_url)
 
         assert params["scope"] == "notes.read offline_access"
         assert params["prompt"] == "consent"
@@ -347,7 +353,7 @@ class TestStartConnect:
     async def test_no_consent_prompt_without_offline_access(self, redis, phase1):
         phase1.as_metadata = _as_metadata(scopes_supported=["notes.read"])
 
-        params = _query((await start_connect(USER_ID, SERVER_NAME))["authorize_url"])
+        params = _query((await start_connect(USER_ID, SERVER_NAME)).authorize_url)
 
         assert params["scope"] == "notes.read"
         assert "prompt" not in params
@@ -406,7 +412,7 @@ class TestRoundTrip:
     ):
         started = await start_connect(USER_ID, SERVER_NAME)
         verifier = redis.only_record()["code_verifier"]
-        challenge = _query(started["authorize_url"])["code_challenge"]
+        challenge = _query(started.authorize_url)["code_challenge"]
 
         redirect = await _callback(started, code="auth-code-1")
 
@@ -417,7 +423,7 @@ class TestRoundTrip:
         assert exchange["data"]["grant_type"] == "authorization_code"
         assert exchange["data"]["code"] == "auth-code-1"
         assert exchange["data"]["client_id"] == "client-abc123"
-        assert exchange["data"]["redirect_uri"] == connect._redirect_uri()
+        assert exchange["data"]["redirect_uri"] == callback_uri()
         # The pairing that makes PKCE worth anything.
         assert exchange["data"]["code_verifier"] == verifier
         assert _s256(exchange["data"]["code_verifier"]) == challenge
@@ -558,16 +564,16 @@ class TestCsrfBinding:
         one place the nonce is deliberately not minted — leaving it would put
         every case below on the skip path and silently stop testing the control.
         """
-        monkeypatch.setattr(connect, "SERVER_BASE_URL", "https://app.example.com")
+        monkeypatch.setattr(redirects, "SERVER_BASE_URL", "https://app.example.com")
 
     @pytest.mark.asyncio
     async def test_matching_nonce_connects(self, redis, phase1, phase2):
         started = await start_connect(USER_ID, SERVER_NAME)
 
         redirect = await complete_callback(
-            state=started["state"],
+            state=started.state,
             code="auth-code-1",
-            browser_nonce=started["browser_nonce"],
+            browser_nonce=started.browser_nonce,
         )
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
@@ -580,7 +586,7 @@ class TestCsrfBinding:
         started = await start_connect(USER_ID, SERVER_NAME)
 
         redirect = await complete_callback(
-            state=started["state"], code="auth-code-1", browser_nonce="not-the-cookie"
+            state=started.state, code="auth-code-1", browser_nonce="not-the-cookie"
         )
 
         assert redirect == (
@@ -591,9 +597,9 @@ class TestCsrfBinding:
         assert phase2.requests == []
         assert redis.store == {}
         replay = await complete_callback(
-            state=started["state"],
+            state=started.state,
             code="auth-code-1",
-            browser_nonce=started["browser_nonce"],
+            browser_nonce=started.browser_nonce,
         )
         assert replay == f"{DEFAULT_RETURN_TO}?mcp_error=invalid_state"
 
@@ -604,7 +610,7 @@ class TestCsrfBinding:
         # A callback landing in a browser that never held the cookie (the
         # classic login-CSRF replay) carries no nonce at all.
         redirect = await complete_callback(
-            state=started["state"], code="auth-code-1", browser_nonce=None
+            state=started.state, code="auth-code-1", browser_nonce=None
         )
 
         assert redirect == (
@@ -623,10 +629,10 @@ class TestCsrfBinding:
         record = redis.only_record()
         record["browser_nonce"] = ""
         redis.store.clear()
-        redis.park(started["state"], record)
+        redis.park(started.state, record)
 
         redirect = await complete_callback(
-            state=started["state"], code="auth-code-1", browser_nonce=None
+            state=started.state, code="auth-code-1", browser_nonce=None
         )
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
@@ -653,24 +659,24 @@ class TestLoopbackCallbackSkipsTheBinding:
         ],
     )
     def test_host_classification(self, monkeypatch, base, loopback):
-        monkeypatch.setattr(connect, "SERVER_BASE_URL", base)
-        assert connect.callback_is_loopback() is loopback
+        monkeypatch.setattr(redirects, "SERVER_BASE_URL", base)
+        assert redirects.callback_is_loopback() is loopback
 
     @pytest.mark.asyncio
     async def test_no_nonce_is_minted_and_the_callback_completes(
         self, monkeypatch, redis, phase1, phase2
     ):
-        monkeypatch.setattr(connect, "SERVER_BASE_URL", "http://127.0.0.1:8060")
+        monkeypatch.setattr(redirects, "SERVER_BASE_URL", "http://127.0.0.1:8060")
 
         started = await start_connect(USER_ID, SERVER_NAME)
 
         # Empty, so the parked record takes the same skip path a pre-control
         # record takes — no dev branch in the verification logic.
-        assert started["browser_nonce"] == ""
+        assert started.browser_nonce == ""
         assert redis.only_record()["browser_nonce"] == ""
 
         redirect = await complete_callback(
-            state=started["state"], code="auth-code-1", browser_nonce=None
+            state=started.state, code="auth-code-1", browser_nonce=None
         )
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
@@ -842,7 +848,7 @@ class TestReturnToAllowlist:
         record = redis.only_record()
         record["return_to"] = "https://evil.test/phish"
         redis.store.clear()
-        redis.park(started["state"], record)
+        redis.park(started.state, record)
 
         redirect = await _callback(started, code="auth-code-1")
 
@@ -856,7 +862,7 @@ class TestReturnToAllowlist:
         record = redis.only_record()
         record["return_to"] = "//evil.test/phish"
         redis.store.clear()
-        redis.park(started["state"], record)
+        redis.park(started.state, record)
 
         redirect = await _callback(started, code=None, error="access_denied")
 
@@ -907,7 +913,7 @@ class TestWebOriginCapture:
     def test_the_deployments_own_origin_is_honored(self, monkeypatch):
         # A non-loopback origin is honored only when it is this deployment's own
         # base URL (a same-origin prod redirect), never an arbitrary one.
-        monkeypatch.setattr(connect, "SERVER_BASE_URL", "https://app.example.com")
+        monkeypatch.setattr(redirects, "SERVER_BASE_URL", "https://app.example.com")
         assert sanitize_web_origin("https://app.example.com") == "https://app.example.com"
         assert sanitize_web_origin("https://evil.test") == ""
 
@@ -960,7 +966,7 @@ class TestWebOriginCapture:
         record = redis.only_record()
         record["web_origin"] = "https://evil.test/phish"
         redis.store.clear()
-        redis.park(started["state"], record)
+        redis.park(started.state, record)
 
         redirect = await _callback(started, code="auth-code-1")
 

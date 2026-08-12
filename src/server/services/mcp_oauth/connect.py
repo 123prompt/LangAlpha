@@ -14,15 +14,14 @@ from __future__ import annotations
 
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
-from ipaddress import ip_address
+from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import urlencode
 
+import httpx2
 from pydantic import BaseModel, ValidationError
 
 from mcp.client.auth import PKCEParameters
-from mcp.client.auth.oauth2 import OAuthContext
 from mcp.client.auth.utils import (
     build_oauth_authorization_server_metadata_discovery_urls,
     build_protected_resource_metadata_discovery_urls,
@@ -33,7 +32,6 @@ from mcp.client.auth.utils import (
     handle_auth_metadata_response,
     handle_protected_resource_response,
     handle_registration_response,
-    handle_token_response_scopes,
     validate_authorization_response_iss,
     validate_metadata_issuer,
 )
@@ -44,7 +42,6 @@ from mcp.shared.auth import (
     ProtectedResourceMetadata,
 )
 
-from src.config.env import SERVER_BASE_URL
 from src.server.database.mcp_oauth import Secrets, get_connection, upsert_connection
 from src.server.database.mcp_servers import (
     bump_user_workspaces_mcp_version,
@@ -56,6 +53,21 @@ from src.server.services.mcp_oauth.http import (
     pinned_request,
     pinned_send,
 )
+from src.server.services.mcp_oauth.redirects import (
+    DEFAULT_RETURN_TO,
+    callback_is_loopback,
+    callback_uri,
+    redirect_to,
+    sanitize_return_to,
+    sanitize_web_origin,
+)
+from src.server.services.mcp_oauth.tokens import (
+    PROTOCOL_VERSION,
+    TokenExchangeError,
+    TokenFailure,
+    build_context,
+    exchange_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +75,36 @@ STATE_TTL_SECONDS = 600
 _STATE_KEY_PREFIX = "mcp:oauth:state:"
 
 CLIENT_NAME = "Langalpha"
-DEFAULT_RETURN_TO = "/connectors"
 
 # The MCP endpoint probe advertises a protocol version so servers answer with
 # era-appropriate WWW-Authenticate hints.
 _PROBE_HEADERS = {
     "Accept": "application/json, text/event-stream",
-    "MCP-Protocol-Version": "2025-06-18",
+    "MCP-Protocol-Version": PROTOCOL_VERSION,
 }
 
 
 class McpOAuthError(Exception):
     """A connect-flow step failed in a way the caller should surface."""
+
+
+class McpServerNotFound(McpOAuthError):
+    """No such server in this user's catalog — the router's 404."""
+
+
+@dataclass(frozen=True, slots=True)
+class StartedConnect:
+    """Phase 1's result.
+
+    ``browser_nonce`` is cookie-only: it must never reach a JSON body, which
+    would defeat HttpOnly and hand it to any XSS on the page. Keeping the
+    result a record rather than a dict makes that a projection the router
+    performs explicitly instead of a convention it remembers.
+    """
+
+    authorize_url: str
+    state: str
+    browser_nonce: str
 
 
 class ConnectState(BaseModel):
@@ -117,83 +147,6 @@ class ConnectState(BaseModel):
     browser_nonce: str = ""
 
 
-def _redirect_uri() -> str:
-    return f"{SERVER_BASE_URL.rstrip('/')}/api/v1/mcp/oauth/callback"
-
-
-def _host_is_loopback(host: str | None) -> bool:
-    host = (host or "").lower()
-    if host == "localhost" or host.endswith(".localhost"):
-        return True
-    try:
-        return ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _server_origin() -> str:
-    parts = urlsplit(SERVER_BASE_URL)
-    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
-
-
-def callback_is_loopback() -> bool:
-    """Whether the browser-nonce binding can be honored at all here.
-
-    The cookie only returns if the origin the user browses shares a *host* with
-    this callback (cookies ignore port, not host). A loopback callback means a
-    local dev box, where the UI is routinely served from some other host — a
-    ``*.localhost`` dev proxy — while an AS will only accept a loopback literal
-    for an ``http`` redirect_uri. Those two demands can't both be met, so
-    requiring the cookie there rejects every connect. A deployed instance never
-    has a loopback callback, so the binding stays mandatory in production.
-    """
-    return _host_is_loopback(urlsplit(SERVER_BASE_URL).hostname or "")
-
-
-def sanitize_return_to(value: str | None) -> str:
-    """Allowlist: a same-app relative path only ('/x', never '//x' or '/\\x').
-
-    A leading '/' followed by '/' or '\\' is protocol-relative once the browser
-    normalizes backslashes ('/\\evil.com' → '//evil.com'), which would redirect
-    off-site — so the second character must be a normal path char.
-    """
-    if value and value.startswith("/") and value[1:2] not in ("/", "\\"):
-        return value
-    return DEFAULT_RETURN_TO
-
-
-def sanitize_web_origin(value: str | None) -> str:
-    """A vouched-for http(s) origin (scheme://host[:port]) or "".
-
-    Captured from the browser's Origin header on the authenticated start
-    request — it is where the UI actually lives, which the callback's own
-    origin is not when the frontend and API run on split dev ports. It becomes
-    the prefix of the post-connect redirect, so it must never be an
-    attacker-forged Origin: only a local dev host (the one case where the
-    callback's origin legitimately differs from the UI's) or this deployment's
-    own base URL is honored. Anything else — including a well-formed but foreign
-    public origin — is dropped, and the callback falls back to a relative path
-    on its own origin. Anything beyond a bare origin (path, query, userinfo,
-    "null") is dropped up front.
-    """
-    if not value:
-        return ""
-    parts = urlsplit(value)
-    if not (
-        parts.scheme in ("http", "https")
-        and parts.netloc
-        and "@" not in parts.netloc
-        and parts.path in ("", "/")
-        and not parts.query
-        and not parts.fragment
-    ):
-        return ""
-    origin = f"{parts.scheme}://{parts.netloc}"
-    if _host_is_loopback(parts.hostname) or origin == _server_origin():
-        return origin
-    return ""
-
-
 def _cache_client():
     from src.utils.cache.redis_cache import get_cache_client
 
@@ -203,33 +156,19 @@ def _cache_client():
     return cache.client
 
 
-def _build_context(
-    server_url: str,
-    *,
-    client_metadata: OAuthClientMetadata,
-    prm: ProtectedResourceMetadata | None,
-    as_metadata: OAuthMetadata | None,
-    auth_server_url: str | None,
-    client_info: OAuthClientInformationFull | None = None,
-) -> OAuthContext:
-    """Reconstruct the SDK's flow context from persisted pieces.
+async def _try_hop(client, url: str) -> httpx2.Response | None:
+    """One discovery GET; None when that URL is simply absent or unusable.
 
-    Storage/redirect/callback are the in-process provider's affordances — the
-    two-phase flow never uses them, so they are None. The context is used only
-    for its pure helpers (resource URL, token auth preparation).
+    A blocked hop is not a miss — it aborts discovery rather than falling
+    through to the next candidate.
     """
-    return OAuthContext(
-        server_url=server_url,
-        client_metadata=client_metadata,
-        storage=None,  # type: ignore[arg-type]
-        redirect_handler=None,
-        callback_handler=None,
-        protected_resource_metadata=prm,
-        oauth_metadata=as_metadata,
-        auth_server_url=auth_server_url,
-        protocol_version=_PROBE_HEADERS["MCP-Protocol-Version"],
-        client_info=client_info,
-    )
+    try:
+        return await pinned_request(client, "GET", url, headers=_PROBE_HEADERS)
+    except OAuthHopBlocked:
+        raise
+    except Exception as e:
+        logger.info("[mcp_oauth] discovery hop %s failed: %s", url, e)
+        return None
 
 
 async def _discover(client, server_url: str) -> tuple[
@@ -239,28 +178,18 @@ async def _discover(client, server_url: str) -> tuple[
     (prm, as_metadata, auth_server_url, www_scope)."""
     www_auth_url: str | None = None
     www_scope: str | None = None
-    try:
-        probe = await pinned_request(
-            client, "GET", server_url, headers=_PROBE_HEADERS
-        )
-        if probe.status_code == 401:
-            www_auth_url = extract_resource_metadata_from_www_auth(probe)
-            www_scope = extract_scope_from_www_auth(probe)
-    except OAuthHopBlocked:
-        raise
-    except Exception as e:
-        # The probe is a hint source only — discovery can proceed without it.
-        logger.info("[mcp_oauth] probe of %s failed: %s", server_url, e)
+    # The probe is a hint source only — discovery can proceed without it.
+    probe = await _try_hop(client, server_url)
+    if probe is not None and probe.status_code == 401:
+        www_auth_url = extract_resource_metadata_from_www_auth(probe)
+        www_scope = extract_scope_from_www_auth(probe)
 
     prm: ProtectedResourceMetadata | None = None
     for url in build_protected_resource_metadata_discovery_urls(
         www_auth_url, server_url
     ):
-        try:
-            resp = await pinned_request(client, "GET", url, headers=_PROBE_HEADERS)
-        except OAuthHopBlocked:
-            raise
-        except Exception:
+        resp = await _try_hop(client, url)
+        if resp is None:
             continue
         prm = await handle_protected_resource_response(resp)
         if prm is not None:
@@ -275,11 +204,8 @@ async def _discover(client, server_url: str) -> tuple[
     for url in build_oauth_authorization_server_metadata_discovery_urls(
         auth_server_url, server_url
     ):
-        try:
-            resp = await pinned_request(client, "GET", url, headers=_PROBE_HEADERS)
-        except OAuthHopBlocked:
-            raise
-        except Exception:
+        resp = await _try_hop(client, url)
+        if resp is None:
             continue
         keep_trying, meta = await handle_auth_metadata_response(resp)
         if meta is not None:
@@ -309,15 +235,14 @@ async def _register_client(
 ) -> OAuthClientInformationFull:
     """Reuse the stored DCR registration when the issuer matches; else register."""
     existing = await get_connection(user_id, server_name, secrets=Secrets.FULL)
-    if existing and existing.get("client_info"):
+    if existing and existing.client_info:
         try:
-            stored = OAuthClientInformationFull.model_validate(
-                existing["client_info"]
-            )
-            stored_issuer = (existing.get("as_metadata") or {}).get("issuer")
-            if stored.client_id and stored_issuer == str(as_metadata.issuer):
+            stored = OAuthClientInformationFull.model_validate(existing.client_info)
+            if stored.client_id and existing.as_metadata.get("issuer") == str(
+                as_metadata.issuer
+            ):
                 # client_secret is stored encrypted, outside the JSONB blob.
-                stored.client_secret = existing.get("client_secret")
+                stored.client_secret = existing.client_secret
                 return stored
         except Exception:
             logger.info(
@@ -342,11 +267,11 @@ async def start_connect(
     *,
     return_to: str | None = None,
     web_origin: str | None = None,
-) -> dict:
-    """Phase 1: discovery + DCR + state/PKCE persist. Returns {authorize_url}."""
+) -> StartedConnect:
+    """Phase 1: discovery + DCR + state/PKCE persist."""
     row = await get_catalog_server(user_id, server_name)
     if row is None:
-        raise McpOAuthError("MCP server not found")
+        raise McpServerNotFound("MCP server not found")
     server_url = row.get("url")
     # http only: the generated sandbox client rejects legacy `sse` transport
     # (it never implemented the real GET→endpoint-event→POST flow), so an
@@ -354,7 +279,7 @@ async def start_connect(
     if row.get("transport") != "http" or not server_url:
         raise McpOAuthError("OAuth connect requires a remote (http) MCP server")
 
-    redirect_uri = _redirect_uri()
+    redirect_uri = callback_uri()
     async with oauth_http_client() as client:
         prm, as_metadata, auth_server_url, www_scope = await _discover(
             client, server_url
@@ -369,7 +294,7 @@ async def start_connect(
             token_endpoint_auth_method="none",
             scope=scope,
         )
-        context = _build_context(
+        context = build_context(
             server_url,
             client_metadata=client_metadata,
             prm=prm,
@@ -464,14 +389,9 @@ async def start_connect(
         "[mcp_oauth] connect started user=%s server=%s issuer=%s",
         user_id, server_name, record.issuer,
     )
-    # browser_nonce is for the caller to set as an HttpOnly cookie only — it
-    # must never reach the JSON body (that would defeat HttpOnly and hand it to
-    # any XSS on the page).
-    return {
-        "authorize_url": authorize_url,
-        "state": state,
-        "browser_nonce": browser_nonce,
-    }
+    return StartedConnect(
+        authorize_url=authorize_url, state=state, browser_nonce=browser_nonce
+    )
 
 
 async def _claim_state(state: str) -> ConnectState | None:
@@ -513,33 +433,12 @@ async def complete_callback(
     replayed in a different browser (which carries no such cookie) is refused.
     """
     if not state:
-        return f"{DEFAULT_RETURN_TO}?mcp_error=missing_state"
+        return redirect_to(mcp_error="missing_state")
     record = await _claim_state(state)
     if record is None:
         # Unknown, expired, or already used — uniform answer, no oracle.
-        return f"{DEFAULT_RETURN_TO}?mcp_error=invalid_state"
+        return redirect_to(mcp_error="invalid_state")
 
-    # CSRF binding: the state is single-use and now claimed, so a mismatch here
-    # spends it (no retry oracle). An older-shaped record has an empty nonce and
-    # skips the check — it predates this control and can't be forged into one.
-    if record.browser_nonce and not secrets.compare_digest(
-        record.browser_nonce, browser_nonce or ""
-    ):
-        logger.warning(
-            "[mcp_oauth] callback browser-nonce mismatch user=%s server=%s",
-            record.user_id, record.server_name,
-        )
-        return_to = sanitize_web_origin(record.web_origin) + sanitize_return_to(
-            record.return_to
-        )
-        return f"{return_to}?mcp_error=state_mismatch&server={quote(record.server_name)}"
-
-    # Absolute when the start request carried a browser Origin (split-port
-    # dev: the callback's own origin is the API, which has no UI routes);
-    # relative otherwise, resolving on the unified proxy/prod origin.
-    return_to = sanitize_web_origin(record.web_origin) + sanitize_return_to(
-        record.return_to
-    )
     server_name = record.server_name
 
     def _fail(reason: str) -> str:
@@ -547,7 +446,21 @@ async def complete_callback(
             "[mcp_oauth] callback failed user=%s server=%s reason=%s",
             record.user_id, server_name, reason,
         )
-        return f"{return_to}?mcp_error={reason}&server={quote(server_name)}"
+        # Absolute when the start request carried a browser Origin (split-port
+        # dev: the callback's own origin is the API, which has no UI routes);
+        # relative otherwise, resolving on the unified proxy/prod origin.
+        return redirect_to(
+            record.return_to, record.web_origin,
+            mcp_error=reason, server=server_name,
+        )
+
+    # CSRF binding: the state is single-use and now claimed, so a mismatch here
+    # spends it (no retry oracle). An older-shaped record has an empty nonce and
+    # skips the check — it predates this control and can't be forged into one.
+    if record.browser_nonce and not secrets.compare_digest(
+        record.browser_nonce, browser_nonce or ""
+    ):
+        return _fail("state_mismatch")
 
     if error:
         # The AS reported denial/failure (user hit cancel, etc.).
@@ -570,24 +483,8 @@ async def complete_callback(
     # confidential client authenticates its token exchange below.
     if record.client_secret:
         client_info.client_secret = record.client_secret
-    prm = (
-        ProtectedResourceMetadata.model_validate(record.resource_metadata)
-        if record.resource_metadata
-        else None
-    )
-    context = _build_context(
-        record.server_url,
-        client_metadata=OAuthClientMetadata(
-            client_name=CLIENT_NAME,
-            redirect_uris=[record.redirect_uri],  # type: ignore[list-item]
-        ),
-        prm=prm,
-        as_metadata=as_metadata,
-        auth_server_url=None,
-        client_info=client_info,
-    )
 
-    token_data: dict[str, str] = {
+    grant: dict[str, str] = {
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": record.redirect_uri,
@@ -595,51 +492,32 @@ async def complete_callback(
         "code_verifier": record.code_verifier,
     }
     if record.resource:
-        token_data["resource"] = record.resource
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    token_data, headers = context.prepare_token_auth(token_data, headers)
+        grant["resource"] = record.resource
 
     try:
-        async with oauth_http_client() as client:
-            response = await pinned_request(
-                client,
-                "POST",
-                record.token_endpoint,
-                headers=headers,
-                data=token_data,
-            )
-        if response.status_code != 200:
-            body = (await response.aread())[:300]
-            logger.warning(
-                "[mcp_oauth] token exchange %s for %s: %s",
-                response.status_code, server_name, body,
-            )
-            return _fail("token_exchange_failed")
-        token = await handle_token_response_scopes(response)
-    except OAuthHopBlocked as e:
-        logger.warning("[mcp_oauth] token hop blocked: %s", e)
-        return _fail("blocked_endpoint")
+        token = await exchange_token(
+            record.token_endpoint, grant, client_info=client_info
+        )
+    except TokenExchangeError as e:
+        if e.kind is TokenFailure.BLOCKED:
+            logger.warning("[mcp_oauth] token hop blocked: %s", e)
+            return _fail("blocked_endpoint")
+        logger.warning("[mcp_oauth] token exchange for %s: %s", server_name, e)
+        return _fail("token_exchange_failed")
     except Exception:
         logger.exception("[mcp_oauth] token exchange errored for %s", server_name)
         return _fail("token_exchange_failed")
 
-    expires_at = (
-        datetime.now(timezone.utc) + timedelta(seconds=token.expires_in)
-        if token.expires_in
-        else None
-    )
     connection_id = await upsert_connection(
         record.user_id,
         server_name,
         server_url=record.server_url,
         access_token=token.access_token,
-        # "" and None both mean "no refresh token"; store NULL for both so the
-        # column's NOT NULL-ness is the single answer to "can this refresh?".
-        refresh_token=token.refresh_token or None,
+        refresh_token=token.refresh_token,
         client_secret=client_info.client_secret,
-        token_type=token.token_type or "Bearer",
+        token_type=token.token_type,
         scope=token.scope or record.scope,
-        expires_at=expires_at,
+        expires_at=token.expires_at,
         client_info=record.client_info,
         as_metadata=record.as_metadata,
         resource_metadata=record.resource_metadata,
@@ -667,4 +545,6 @@ async def complete_callback(
             server_name, exc_info=True,
         )
 
-    return f"{return_to}?mcp_connected={quote(server_name)}"
+    return redirect_to(
+        record.return_to, record.web_origin, mcp_connected=server_name
+    )

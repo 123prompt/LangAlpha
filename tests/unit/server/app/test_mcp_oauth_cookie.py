@@ -15,6 +15,7 @@ import pytest
 from fastapi import Response
 
 from src.server.app import mcp_oauth as mod
+from src.server.services.mcp_oauth import StartedConnect
 
 
 def _request(*, origin: str | None = None, cookies: dict | None = None):
@@ -33,11 +34,11 @@ def _set_cookies(response: Response) -> list[str]:
 @pytest.mark.asyncio
 async def test_start_names_the_cookie_for_its_state(monkeypatch):
     async def _start(user_id, name, *, return_to, web_origin):
-        return {
-            "authorize_url": "https://as.test/authorize?state=state-A",
-            "state": "state-A",
-            "browser_nonce": "nonce-A",
-        }
+        return StartedConnect(
+            authorize_url="https://as.test/authorize?state=state-A",
+            state="state-A",
+            browser_nonce="nonce-A",
+        )
 
     monkeypatch.setattr(mod, "start_connect", _start)
     response = Response()
@@ -54,8 +55,8 @@ async def test_start_names_the_cookie_for_its_state(monkeypatch):
 async def test_two_concurrent_starts_do_not_share_a_cookie_name(monkeypatch):
     flows = iter(
         [
-            {"authorize_url": "u", "state": "state-A", "browser_nonce": "nonce-A"},
-            {"authorize_url": "u", "state": "state-B", "browser_nonce": "nonce-B"},
+            StartedConnect(authorize_url="u", state="state-A", browser_nonce="nonce-A"),
+            StartedConnect(authorize_url="u", state="state-B", browser_nonce="nonce-B"),
         ]
     )
 
@@ -78,8 +79,8 @@ async def test_two_concurrent_starts_do_not_share_a_cookie_name(monkeypatch):
 @pytest.mark.asyncio
 async def test_loopback_start_sets_no_cookie(monkeypatch):
     async def _start(user_id, name, *, return_to, web_origin):
-        # Loopback callback → no nonce minted (see connect.callback_is_loopback).
-        return {"authorize_url": "u", "state": "state-A", "browser_nonce": ""}
+        # Loopback callback → no nonce minted (see redirects.callback_is_loopback).
+        return StartedConnect(authorize_url="u", state="state-A", browser_nonce="")
 
     monkeypatch.setattr(mod, "start_connect", _start)
     response = Response()

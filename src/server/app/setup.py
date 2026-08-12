@@ -104,6 +104,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Tells apart "Redis is slow" from "this worker's loop was blocked", which
     # read identically at the redis-py boundary.
     ("EventLoopLagMonitor", "src.observability.loop_lag"),
+    # Refreshes expiring MCP OAuth connections ahead of the hot path; the
+    # per-connection advisory try-lock dedups it across workers.
+    ("McpOAuthRefreshSweeper", "src.server.services.mcp_oauth.sweep"),
 )
 
 
@@ -304,17 +307,6 @@ async def lifespan(app: FastAPI):
             )
         except Exception as e:
             logger.warning(f"Failed to start PlatformSecretSweeper: {e}")
-
-        # MCP OAuth refresh sweep: proactively refreshes expiring connection
-        # tokens (per-connection advisory try-lock dedups across workers).
-        try:
-            from src.server.services.mcp_oauth.sweep import (
-                McpOAuthRefreshSweeper,
-            )
-
-            McpOAuthRefreshSweeper.get_instance().start()
-        except Exception as e:
-            logger.warning(f"Failed to start McpOAuthRefreshSweeper: {e}")
 
         # Connect once, freeze, install as the process-global registry so every
         # Session borrows the same tool snapshot instead of spawning its own
@@ -623,13 +615,6 @@ async def lifespan(app: FastAPI):
         await PlatformSecretSweeper.get_instance().stop()
     except Exception as e:
         logger.warning(f"Error stopping PlatformSecretSweeper: {e}")
-
-    try:
-        from src.server.services.mcp_oauth.sweep import McpOAuthRefreshSweeper
-
-        await McpOAuthRefreshSweeper.get_instance().stop()
-    except Exception as e:
-        logger.warning(f"Error stopping McpOAuthRefreshSweeper: {e}")
 
     try:
         from src.server.services.egress.relay import close_relay_client

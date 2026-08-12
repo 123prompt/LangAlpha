@@ -18,10 +18,12 @@ from mcp.client import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 
-from src.server.database.mcp_oauth import get_connection
+from src.server.database.mcp_oauth import ConnectionStatus, get_connection
 from src.server.database.mcp_servers import (
     bump_user_workspaces_mcp_version,
     get_catalog_server,
+)
+from src.server.database.mcp_tool_schemas import (
     get_user_tool_schemas,
     upsert_user_tool_schemas,
 )
@@ -59,11 +61,11 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
     if row is None:
         raise TokenUnavailable("unknown_server")
     connection = await get_connection(user_id, server_name)
-    if connection is None or connection["status"] == "revoked":
+    if connection is None or connection.status == ConnectionStatus.REVOKED:
         raise TokenUnavailable("unknown_connection")
 
     server = user_row_to_server_config(
-        row, oauth_connection_id=connection["connection_id"]
+        row, oauth_connection_id=connection.connection_id
     )
     fingerprint = mcp_discovery_fingerprint(server)
 
@@ -73,7 +75,7 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
         )
 
     try:
-        token = await ensure_fresh_access_token(connection["connection_id"])
+        token = await ensure_fresh_access_token(connection.connection_id)
     except TokenUnavailable as e:
         return await _fail(f"token unavailable: {e.reason}")
 

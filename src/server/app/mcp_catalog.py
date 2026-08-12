@@ -192,9 +192,9 @@ async def update_server(
     # disconnect_server writes only OAuth state, never this catalog row, so the
     # response is built from the row we already hold.
     connection = await get_connection(user_id, name)
-    if connection and connection["status"] != ConnectionStatus.REVOKED:
+    if connection and connection.status != ConnectionStatus.REVOKED:
         moved = server.transport not in ("http", "sse") or not same_consented_url(
-            connection.get("server_url"), server.url
+            connection.server_url, server.url
         )
         if moved:
             from src.server.services.mcp_oauth.lifecycle import disconnect_server

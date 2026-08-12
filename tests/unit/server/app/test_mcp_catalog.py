@@ -233,3 +233,16 @@ async def test_delete_happy_and_404(client):
     ):
         missing = await client.delete("/api/v1/mcp/servers/ghost")
     assert missing.status_code == 404
+
+
+def test_catalog_fields_match_the_writable_column_set():
+    """``update_catalog_server`` now REJECTS unknown keys instead of dropping
+    them, so a field added to ``to_catalog_fields`` without a matching column
+    would 500 every PUT. Lock the two together."""
+    from src.server.database.mcp_servers import CATALOG_COLUMNS
+    from src.server.models.mcp_server import McpServerInput
+
+    server = McpServerInput(
+        name="remote_server", transport="http", url="https://api.example.com/mcp"
+    )
+    assert set(server.to_catalog_fields()) == set(CATALOG_COLUMNS)

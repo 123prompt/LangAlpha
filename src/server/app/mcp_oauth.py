@@ -21,6 +21,7 @@ from fastapi.responses import RedirectResponse
 from src.config.env import SERVER_BASE_URL
 from src.server.services.mcp_oauth import (
     McpOAuthError,
+    McpServerNotFound,
     TokenUnavailable,
     complete_callback,
     disconnect_server,
@@ -63,7 +64,7 @@ async def oauth_start(
 ) -> dict:
     return_to = (body or {}).get("return_to")
     try:
-        result = await start_connect(
+        started = await start_connect(
             user_id,
             name,
             return_to=return_to,
@@ -71,25 +72,26 @@ async def oauth_start(
             # redirects there, since its own origin is the API on split ports.
             web_origin=request.headers.get("origin"),
         )
+    except McpServerNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except McpOAuthError as e:
-        status = 404 if "not found" in str(e) else 422
-        raise HTTPException(status_code=status, detail=str(e))
+        raise HTTPException(status_code=422, detail=str(e))
     # Bind the callback to THIS browser: the nonce goes only into an HttpOnly
     # cookie, never the JSON body. The callback requires it back, so a stolen
     # (state, code) replayed in another browser has no matching cookie. Empty
     # on a loopback callback, where the cookie provably cannot come back — see
-    # connect.callback_is_loopback.
-    if result["browser_nonce"]:
+    # redirects.callback_is_loopback.
+    if started.browser_nonce:
         response.set_cookie(
-            _oauth_cookie_name(result["state"]),
-            result["browser_nonce"],
+            _oauth_cookie_name(started.state),
+            started.browser_nonce,
             max_age=_OAUTH_COOKIE_MAX_AGE,
             path=_OAUTH_COOKIE_PATH,
             httponly=True,
             secure=_OAUTH_COOKIE_SECURE,
             samesite="lax",
         )
-    return {"authorize_url": result["authorize_url"]}
+    return {"authorize_url": started.authorize_url}
 
 
 @router.get("/oauth/callback")
