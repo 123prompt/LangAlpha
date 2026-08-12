@@ -1,16 +1,7 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence } from 'framer-motion';
-import {
-  Download,
-  Link2,
-  Link2Off,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Server,
-  Trash2,
-} from 'lucide-react';
+import { Link2, Link2Off, Pencil, RefreshCw, Server, Trash2 } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import {
   DropdownMenu,
@@ -34,14 +25,18 @@ import { McpServerModal } from '@/pages/ChatAgent/components/mcp/McpServerModal'
 import { McpImportModal } from '@/pages/ChatAgent/components/mcp/McpImportModal';
 import { McpOauthPill } from '@/pages/ChatAgent/components/mcp/McpStatusPill';
 import {
+  canDisconnectOauth,
+  needsOauthConnect,
+} from '@/pages/ChatAgent/components/mcp/mcpState';
+import { useMcpServerList } from '@/pages/ChatAgent/components/mcp/useMcpServerList';
+import {
   ConfirmStrip,
   EnabledToggle,
-  HeaderButton,
   KebabTrigger,
   ListEmpty,
   ListError,
-  ListHeader,
   ListSkeleton,
+  ListToolbar,
   ServerNameLine,
   ServerRowShell,
   TagBadge,
@@ -50,9 +45,6 @@ import {
   formatApiErrorDetail,
   startMcpOauth,
   type CatalogServer,
-  type EffectiveServer,
-  type McpOauthStatus,
-  type McpServerInput,
 } from '@/pages/ChatAgent/utils/api';
 
 /**
@@ -64,39 +56,10 @@ import {
  *
  * Row anatomy mirrors the workspace MCP tab (`McpServerRow`): identity line
  * (icon + name + transport badge), then the status line (OAuth pill + scope
- * text), then the description — same primitives, same rhythm.
+ * text), then the description — same primitives, same rhythm. The list
+ * mechanics (modals, toggle, delete) are the shared `useMcpServerList`; what
+ * lives here is the OAuth lifecycle, which the workspace tab has no version of.
  */
-
-/** Adapt a masked catalog row to the modal's `EffectiveServer`-shaped initial value. */
-function catalogToInitial(c: CatalogServer): EffectiveServer {
-  return {
-    name: c.name,
-    origin: 'workspace',
-    transport: c.transport,
-    enabled: true,
-    editable: true,
-    deletable: true,
-    status: 'unknown',
-    error: '',
-    tool_count: 0,
-    tools: [],
-    missing_secrets: [],
-    env_refs: c.env_refs,
-    header_refs: c.header_refs,
-    description: c.description,
-    instruction: c.instruction,
-    tool_exposure_mode: c.tool_exposure_mode,
-    command: c.command,
-    args: c.args,
-    url: c.url,
-    config_version: 0,
-  };
-}
-
-/** Statuses whose next step is (re-)running the authorize flow. */
-function needsConnect(status: McpOauthStatus | null | undefined): boolean {
-  return !status || status === 'revoked' || status === 'needs_reauth' || status === 'refresh_ambiguous';
-}
 
 export function ConnectorServers() {
   const { t } = useTranslation();
@@ -111,12 +74,49 @@ export function ConnectorServers() {
   const refreshMutation = useRefreshMcpOauthSchemas();
   const createSecretMutation = useCreateUserVaultSecret();
 
-  const [modalOpen, setModalOpen] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
-  const [editing, setEditing] = useState<CatalogServer | null>(null);
-  const [submitError, setSubmitError] = useState<string | null>(null);
-  const [togglingName, setTogglingName] = useState<string | null>(null);
-  const [deletingName, setDeletingName] = useState<string | null>(null);
+  const {
+    modalOpen,
+    importOpen,
+    editing,
+    submitError,
+    togglingName,
+    deletingName,
+    openAdd,
+    openEdit,
+    closeModal,
+    openImport,
+    closeImport,
+    submit,
+    toggle,
+    requestDelete,
+    cancelDelete,
+    confirmDelete,
+  } = useMcpServerList<CatalogServer>({
+    create: createMutation.mutateAsync,
+    update: updateMutation.mutateAsync,
+    toggle: toggleMutation.mutateAsync,
+    remove: deleteMutation.mutateAsync,
+    // Deleting a connector un-inherits it from every workspace, so the strip
+    // confirms first — and stays up if the delete fails, to retry or cancel.
+    confirmBeforeDelete: true,
+    onSaveWarnings: (warnings) =>
+      toast({ title: t('connectors.servers.warningTitle'), description: warnings.join('\n') }),
+    onToggleWarnings: (warnings) =>
+      toast({ title: t('connectors.servers.enabledWithWarnings'), description: warnings.join('\n') }),
+    onToggleError: (err) =>
+      toast({
+        variant: 'destructive',
+        title: t('connectors.servers.toggleFailed'),
+        description: formatApiErrorDetail(err),
+      }),
+    onDeleteError: (err) =>
+      toast({
+        variant: 'destructive',
+        title: t('connectors.servers.deleteFailed'),
+        description: formatApiErrorDetail(err),
+      }),
+  });
+
   const [connectingName, setConnectingName] = useState<string | null>(null);
   const [refreshingName, setRefreshingName] = useState<string | null>(null);
 
@@ -124,59 +124,6 @@ export function ConnectorServers() {
   const servers = catalog?.servers ?? [];
   const maxServers = catalog?.max_servers ?? 0;
   const atCap = maxServers > 0 && servers.length >= maxServers;
-
-  async function handleSubmit(body: McpServerInput) {
-    setSubmitError(null);
-    try {
-      const saved = editing
-        ? await updateMutation.mutateAsync({ name: editing.name, body })
-        : await createMutation.mutateAsync(body);
-      setModalOpen(false);
-      setEditing(null);
-      if (saved.warnings?.length) {
-        toast({
-          title: t('connectors.servers.warningTitle'),
-          description: saved.warnings.join('\n'),
-        });
-      }
-    } catch (err) {
-      setSubmitError(formatApiErrorDetail(err));
-    }
-  }
-
-  async function handleToggle(server: CatalogServer, enabled: boolean) {
-    setTogglingName(server.name);
-    try {
-      const result = await toggleMutation.mutateAsync({ name: server.name, enabled });
-      if (result.warnings?.length) {
-        toast({
-          title: t('connectors.servers.enabledWithWarnings'),
-          description: result.warnings.join('\n'),
-        });
-      }
-    } catch (err) {
-      toast({
-        variant: 'destructive',
-        title: t('connectors.servers.toggleFailed'),
-        description: formatApiErrorDetail(err),
-      });
-    } finally {
-      setTogglingName(null);
-    }
-  }
-
-  async function handleDelete(name: string) {
-    try {
-      await deleteMutation.mutateAsync(name);
-      setDeletingName(null);
-    } catch (err) {
-      toast({
-        variant: 'destructive',
-        title: t('connectors.servers.deleteFailed'),
-        description: formatApiErrorDetail(err),
-      });
-    }
-  }
 
   async function handleConnect(name: string) {
     setConnectingName(name);
@@ -241,32 +188,17 @@ export function ConnectorServers() {
     }
   }
 
-  if (isLoading) {
-    return <ListSkeleton />;
-  }
-
   return (
     <div className="flex flex-col gap-3">
-      <ListHeader icon={Server} title={t('mcp.list.title')} count={servers.length} max={maxServers}>
-        <HeaderButton
-          variant="secondary"
-          icon={Download}
-          onClick={() => setImportOpen(true)}
-          disabled={atCap}
-          title={atCap ? t('mcp.list.atCap', { max: maxServers }) : t('mcp.list.importHint')}
-        >
-          {t('mcp.list.importJson')}
-        </HeaderButton>
-        <HeaderButton
-          variant="primary"
-          icon={Plus}
-          onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
-          disabled={atCap}
-          title={atCap ? t('mcp.list.atCap', { max: maxServers }) : undefined}
-        >
-          {t('mcp.list.addServer')}
-        </HeaderButton>
-      </ListHeader>
+      <ListToolbar
+        icon={Server}
+        title={t('mcp.list.title')}
+        count={servers.length}
+        max={maxServers}
+        atCap={atCap}
+        onImport={openImport}
+        onAdd={openAdd}
+      />
 
       <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
         {t('connectors.servers.inheritHint')}
@@ -276,6 +208,8 @@ export function ConnectorServers() {
         <ListError>
           {(error as { message?: string })?.message || t('mcp.list.loadFailed')}
         </ListError>
+      ) : isLoading ? (
+        <ListSkeleton />
       ) : servers.length === 0 ? (
         <ListEmpty>{t('connectors.servers.empty')}</ListEmpty>
       ) : (
@@ -324,7 +258,7 @@ export function ConnectorServers() {
                   }
                   actions={
                     <>
-                      {oauthEligible && needsConnect(status) && (
+                      {oauthEligible && needsOauthConnect(status) && (
                         <button
                           type="button"
                           onClick={() => handleConnect(server.name)}
@@ -344,7 +278,7 @@ export function ConnectorServers() {
                         enabled={!!server.enabled}
                         name={server.name}
                         disabled={togglingName === server.name}
-                        onToggle={() => handleToggle(server, !server.enabled)}
+                        onToggle={() => toggle(server, !server.enabled)}
                       />
 
                       <DropdownMenu>
@@ -355,7 +289,7 @@ export function ConnectorServers() {
                           />
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
-                          <DropdownMenuItem onSelect={() => { setEditing(server); setSubmitError(null); setModalOpen(true); }}>
+                          <DropdownMenuItem onSelect={() => openEdit(server)}>
                             <Pencil className="h-3.5 w-3.5 mr-2" />
                             {t('mcp.row.edit')}
                           </DropdownMenuItem>
@@ -365,13 +299,13 @@ export function ConnectorServers() {
                               {t('connectors.oauth.refreshSchemas')}
                             </DropdownMenuItem>
                           )}
-                          {oauthEligible && status && status !== 'revoked' && (
+                          {oauthEligible && canDisconnectOauth(status) && (
                             <DropdownMenuItem onSelect={() => handleDisconnect(server.name)}>
                               <Link2Off className="h-3.5 w-3.5 mr-2" />
                               {t('connectors.oauth.disconnect')}
                             </DropdownMenuItem>
                           )}
-                          <DropdownMenuItem onSelect={() => setDeletingName(server.name)} variant="destructive">
+                          <DropdownMenuItem onSelect={() => requestDelete(server)} variant="destructive">
                             <Trash2 className="h-3.5 w-3.5 mr-2" />
                             {t('mcp.row.delete')}
                           </DropdownMenuItem>
@@ -392,20 +326,19 @@ export function ConnectorServers() {
           confirmLabel={deleteMutation.isPending ? t('common.loading') : t('connectors.servers.deleteConfirmYes')}
           cancelLabel={t('connectors.servers.deleteConfirmNo')}
           pending={deleteMutation.isPending}
-          onConfirm={() => handleDelete(deletingName)}
-          onCancel={() => setDeletingName(null)}
+          onConfirm={confirmDelete}
+          onCancel={cancelDelete}
         />
       )}
 
       {modalOpen && (
         <McpServerModal
-          workspaceId=""
           secretNames={secretNames}
-          initial={editing ? catalogToInitial(editing) : null}
+          initial={editing}
           allowDiscover={false}
-          onClose={() => { setModalOpen(false); setEditing(null); }}
-          onSubmit={handleSubmit}
-          createSecret={(body) => createSecretMutation.mutateAsync(body)}
+          onClose={closeModal}
+          onSubmit={submit}
+          createSecret={createSecretMutation.mutateAsync}
           saving={createMutation.isPending || updateMutation.isPending}
           submitError={submitError}
         />
@@ -413,7 +346,7 @@ export function ConnectorServers() {
 
       {importOpen && (
         <McpImportModal
-          onClose={() => setImportOpen(false)}
+          onClose={closeImport}
           onImport={(payload) => importMutation.mutateAsync(payload)}
           onImported={(createdNames) => {
             if (createdNames.length > 0) {

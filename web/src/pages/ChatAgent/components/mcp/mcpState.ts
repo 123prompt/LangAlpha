@@ -11,6 +11,11 @@ import type { EffectiveServer, McpOauthStatus, McpStatus } from '../../utils/api
  * one component down in `McpLifecycle`; the lifecycle label and its `data-phase`
  * were derived twice from overlapping conditions. Holding them here makes
  * "these agree" a property of the code rather than of review discipline.
+ *
+ * The OAuth predicates are written as NEGATIONS of the states that need
+ * nothing, never as an enumeration of the states that do — an enumeration is a
+ * list someone has to remember to extend when a status is added, and the
+ * Connectors page had already grown two of them.
  */
 
 /**
@@ -22,6 +27,34 @@ export function isOauthBroken(
   status: McpOauthStatus | null | undefined,
 ): status is Exclude<McpOauthStatus, 'connected'> {
   return !!status && status !== 'connected';
+}
+
+/**
+ * The next step for this connection is (re-)running the authorize flow. Stated
+ * as the negation of the one good state so a new status can't be forgotten
+ * here: every status that isn't a live connection — including none at all —
+ * needs one.
+ */
+export function needsOauthConnect(status: McpOauthStatus | null | undefined): boolean {
+  return status !== 'connected';
+}
+
+/**
+ * There is a connection worth tearing down. Also a negation: only a
+ * never-connected server (no status) and an already-revoked one have nothing
+ * to disconnect.
+ */
+export function canDisconnectOauth(status: McpOauthStatus | null | undefined): boolean {
+  return !!status && status !== 'revoked';
+}
+
+/**
+ * The row's tools are discovered host-side, so an in-sandbox probe is wrong for
+ * it (the backend 409s one). Shared by the auto-probe gate below and the row's
+ * "Test connection" menu item, which have to agree.
+ */
+export function isHostDiscovered(server: Pick<EffectiveServer, 'oauth_status'>): boolean {
+  return !!server.oauth_status;
 }
 
 /**
@@ -46,7 +79,7 @@ export function showsWorkspaceDetail(server: EffectiveServer): boolean {
 export function needsDiscoveryProbe(server: EffectiveServer): boolean {
   return (
     (server.origin === 'workspace' || server.origin === 'user') &&
-    !server.oauth_status &&
+    !isHostDiscovered(server) &&
     server.enabled &&
     server.status === 'pending'
   );

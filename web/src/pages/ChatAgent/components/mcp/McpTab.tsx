@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { AnimatePresence } from 'framer-motion';
-import { Plus, Server, Download, Cable } from 'lucide-react';
+import { Server, Cable } from 'lucide-react';
 import {
   useWorkspaceMcpServers,
   useAddWorkspaceMcpServer,
@@ -15,8 +15,12 @@ import {
   useMcpCatalog,
   useDelayedFalse,
 } from '@/hooks/useMcpServers';
+import {
+  useWorkspaceVaultSecrets,
+  useCreateWorkspaceVaultSecret,
+} from '@/hooks/useWorkspaceVault';
 import { toast } from '@/components/ui/use-toast';
-import { formatApiErrorDetail, getVaultSecrets, type EffectiveServer, type McpServerInput } from '../../utils/api';
+import { formatApiErrorDetail, type EffectiveServer, type McpServerInput } from '../../utils/api';
 import { McpServerRow } from './McpServerRow';
 import { McpServerModal } from './McpServerModal';
 import { McpImportModal } from './McpImportModal';
@@ -25,10 +29,11 @@ import {
   HeaderButton,
   ListEmpty,
   ListError,
-  ListHeader,
   ListSkeleton,
+  ListToolbar,
 } from './McpPrimitives';
 import { needsDiscoveryProbe } from './mcpState';
+import { useMcpServerList } from './useMcpServerList';
 
 /**
  * The "MCP" tab in the workspace settings panel — the workspace-scoped view.
@@ -36,7 +41,8 @@ import { needsDiscoveryProbe } from './mcpState';
  * inherited rows render here with their per-workspace enable toggle (writing
  * the workspace tombstone) plus a "Manage in Connectors" deep link.
  *
- * Three UX guarantees this component owns:
+ * The list mechanics (modals, toggle, delete) are the shared
+ * `useMcpServerList`. Three UX guarantees are this component's own:
  *  - **Live discovery progress.** A freshly-added (or any `pending`) workspace
  *    server doesn't sit on a dead "Pending" pill: when the sandbox is running we
  *    auto-run the synchronous discovery probe (`runDiscover`), so the row shows
@@ -88,31 +94,40 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
     [catalogData],
   );
 
-  // Vault secret names for the picker (loaded lazily; failure is non-fatal).
-  const [secretNames, setSecretNames] = useState<string[]>([]);
-  React.useEffect(() => {
-    let cancelled = false;
-    getVaultSecrets(workspaceId)
-      .then((secrets: Array<{ name: string }>) => {
-        if (!cancelled) setSecretNames(secrets.map((s) => s.name));
-      })
-      .catch(() => { if (!cancelled) setSecretNames([]); });
-    return () => { cancelled = true; };
-  }, [workspaceId]);
+  // Vault secret names for the picker. The create mutation invalidates the
+  // vault query, so a secret made inline in the modal (or auto-extracted by an
+  // import) shows up here without anything to refetch by hand.
+  const { data: vaultSecrets } = useWorkspaceVaultSecrets(workspaceId);
+  const createSecretMutation = useCreateWorkspaceVaultSecret(workspaceId);
+  const secretNames = useMemo(
+    () => (vaultSecrets ?? []).map((s) => s.name),
+    [vaultSecrets],
+  );
 
-  function refetchSecretNames() {
-    getVaultSecrets(workspaceId)
-      .then((secrets: Array<{ name: string }>) => setSecretNames(secrets.map((s) => s.name)))
-      .catch(() => {});
-  }
+  const {
+    modalOpen,
+    importOpen,
+    editing,
+    submitError,
+    togglingName,
+    deletingName,
+    openAdd,
+    openEdit,
+    closeModal,
+    openImport,
+    closeImport,
+    submit,
+    toggle,
+    requestDelete,
+  } = useMcpServerList<EffectiveServer>({
+    create: addMutation.mutateAsync,
+    update: updateMutation.mutateAsync,
+    toggle: toggleMutation.mutateAsync,
+    remove: deleteMutation.mutateAsync,
+    onSaveWarnings: (warnings) =>
+      toast({ title: t('mcp.tab.savedWithWarnings'), description: warnings.join('\n') }),
+  });
 
-  // Modal state
-  const [modalOpen, setModalOpen] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
-  const [editing, setEditing] = useState<EffectiveServer | null>(null);
-  const [submitError, setSubmitError] = useState<string | null>(null);
-  const [togglingName, setTogglingName] = useState<string | null>(null);
-  const [deletingName, setDeletingName] = useState<string | null>(null);
   // Set when "Save as template" hits an existing template name → confirm overwrite.
   const [promoteConfirm, setPromoteConfirm] = useState<string | null>(null);
 
@@ -207,58 +222,6 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
     }
   }, [servers, sandboxRunning, runDiscover]);
 
-  async function handleSubmit(body: McpServerInput) {
-    setSubmitError(null);
-    try {
-      const saved = editing
-        ? await updateMutation.mutateAsync({ name: editing.name, body })
-        : await addMutation.mutateAsync(body);
-      setModalOpen(false);
-      setEditing(null);
-      if (saved.warnings?.length) {
-        toast({ title: t('mcp.tab.savedWithWarnings'), description: saved.warnings.join('\n') });
-      }
-    } catch (err) {
-      setSubmitError(formatApiErrorDetail(err));
-    }
-  }
-
-  // Row handlers are stable `useCallback`s (and take the row's `server` at call
-  // time) so each row gets the SAME prop references every render — that's the
-  // referential stability `React.memo(McpServerRow)` needs to skip a re-render
-  // during the settling poll or when a sibling row toggles.
-  const toggleAsync = toggleMutation.mutateAsync;
-  const handleToggle = useCallback(
-    async (server: EffectiveServer, enabled: boolean) => {
-      setTogglingName(server.name);
-      try {
-        await toggleAsync({ name: server.name, enabled });
-      } finally {
-        setTogglingName(null);
-      }
-    },
-    [toggleAsync],
-  );
-
-  const deleteAsync = deleteMutation.mutateAsync;
-  const handleDelete = useCallback(
-    async (server: EffectiveServer) => {
-      setDeletingName(server.name);
-      try {
-        await deleteAsync(server.name);
-      } finally {
-        setDeletingName(null);
-      }
-    },
-    [deleteAsync],
-  );
-
-  const handleEdit = useCallback((server: EffectiveServer) => {
-    setEditing(server);
-    setSubmitError(null);
-    setModalOpen(true);
-  }, []);
-
   const handleDiscoverRow = useCallback(
     (server: EffectiveServer) => runDiscover(server.name),
     [runDiscover],
@@ -317,29 +280,19 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-3">
-          <ListHeader icon={Server} title={t('mcp.list.title')} count={workspaceCount} max={maxServers}>
+          <ListToolbar
+            icon={Server}
+            title={t('mcp.list.title')}
+            count={workspaceCount}
+            max={maxServers}
+            atCap={atCap}
+            onImport={openImport}
+            onAdd={openAdd}
+          >
             <HeaderButton variant="ghost" icon={Cable} onClick={handleManageInConnectors} title={t('mcp.tab.connectorsHint')}>
               {t('mcp.tab.connectors')}
             </HeaderButton>
-            <HeaderButton
-              variant="secondary"
-              icon={Download}
-              onClick={() => setImportOpen(true)}
-              disabled={atCap}
-              title={atCap ? t('mcp.list.atCap', { max: maxServers }) : t('mcp.list.importHint')}
-            >
-              {t('mcp.list.importJson')}
-            </HeaderButton>
-            <HeaderButton
-              variant="primary"
-              icon={Plus}
-              onClick={() => { setEditing(null); setSubmitError(null); setModalOpen(true); }}
-              disabled={atCap}
-              title={atCap ? t('mcp.list.atCap', { max: maxServers }) : undefined}
-            >
-              {t('mcp.list.addServer')}
-            </HeaderButton>
-          </ListHeader>
+          </ListToolbar>
 
           {!sandboxRunning && sandboxWarming && (
             <div className="text-[0.6875rem] p-2 rounded" style={{ backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text-tertiary)' }}>
@@ -396,10 +349,10 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
                     synced={synced}
                     sandboxRunning={sandboxRunning}
                     sandboxWarming={sandboxWarming}
-                    onToggle={handleToggle}
-                    onEdit={handleEdit}
+                    onToggle={toggle}
+                    onEdit={openEdit}
                     onDiscover={handleDiscoverRow}
-                    onDelete={handleDelete}
+                    onDelete={requestDelete}
                     onPromoteToTemplate={server.origin === 'workspace' ? handlePromote : undefined}
                     onSetupSecret={handleSetupSecret}
                     onManageInConnectors={server.origin === 'user' ? handleManageInConnectors : undefined}
@@ -412,14 +365,13 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
 
       {modalOpen && (
         <McpServerModal
-          workspaceId={workspaceId}
           secretNames={secretNames}
           initial={editing}
           allowDiscover={!!editing && sandboxRunning}
-          onClose={() => { setModalOpen(false); setEditing(null); }}
-          onSubmit={handleSubmit}
+          onClose={closeModal}
+          onSubmit={submit}
           onDiscover={editing ? handleDiscoverFromModal : undefined}
-          onSecretCreated={refetchSecretNames}
+          createSecret={createSecretMutation.mutateAsync}
           saving={addMutation.isPending || updateMutation.isPending}
           submitError={submitError}
         />
@@ -427,11 +379,8 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
 
       {importOpen && (
         <McpImportModal
-          onClose={() => setImportOpen(false)}
+          onClose={closeImport}
           onImport={(payload) => importMutation.mutateAsync(payload)}
-          onImported={(_createdNames, secretsCreated) => {
-            if (secretsCreated.length > 0) refetchSecretNames();
-          }}
         />
       )}
 

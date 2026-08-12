@@ -15,7 +15,7 @@ import {
   ServerRowShell,
   TagBadge,
 } from './McpPrimitives';
-import { isOauthBroken, showsWorkspaceDetail } from './mcpState';
+import { isHostDiscovered, isOauthBroken, showsWorkspaceDetail } from './mcpState';
 import type { EffectiveServer } from '../../utils/api';
 
 /**
@@ -218,7 +218,7 @@ function McpServerRowImpl({
               {/* OAuth rows are discovered host-side — the backend 409s an
                   in-sandbox probe, so don't offer one. */}
               <DropdownMenuItem
-                disabled={isBuiltin || !server.enabled || !!server.oauth_status}
+                disabled={isBuiltin || !server.enabled || isHostDiscovered(server)}
                 onSelect={() => onDiscover(server)}
               >
                 <Zap className="h-3.5 w-3.5 mr-2" />

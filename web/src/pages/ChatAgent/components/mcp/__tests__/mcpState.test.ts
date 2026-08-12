@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
+  canDisconnectOauth,
   deriveLifecycle,
   isOauthBroken,
   needsDiscoveryProbe,
+  needsOauthConnect,
   showsWorkspaceDetail,
   type McpLifecycleInput,
 } from '../mcpState';
@@ -51,6 +53,28 @@ describe('isOauthBroken', () => {
     for (const s of ['revoked', 'needs_reauth', 'refresh_ambiguous'] as const) {
       expect(isOauthBroken(s)).toBe(true);
     }
+  });
+});
+
+describe('the OAuth action predicates', () => {
+  // Written as negations so a newly-added status is covered by default. These
+  // pin that property: the only status NOT needing a connect is 'connected',
+  // and the only ones with nothing to disconnect are none-at-all and 'revoked'.
+  const ALL: Array<McpOauthStatus | null | undefined> = [
+    null,
+    undefined,
+    'connected',
+    'needs_reauth',
+    'refresh_ambiguous',
+    'revoked',
+  ];
+
+  it('needsOauthConnect covers everything except a live connection', () => {
+    for (const s of ALL) expect(needsOauthConnect(s)).toBe(s !== 'connected');
+  });
+
+  it('canDisconnectOauth covers every existing connection except an already-revoked one', () => {
+    for (const s of ALL) expect(canDisconnectOauth(s)).toBe(!!s && s !== 'revoked');
   });
 });
 

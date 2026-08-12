@@ -11,7 +11,13 @@ import {
   collectVaultRefs,
   validateMcpServer,
 } from './mcpSchemas';
-import { formatApiErrorDetail, type McpServerInput, type McpDiscoveryResult, type EffectiveServer } from '../../utils/api';
+import {
+  formatApiErrorDetail,
+  type McpDiscoveryResult,
+  type McpServerDraft,
+  type McpServerInput,
+  type McpTransport,
+} from '../../utils/api';
 
 /**
  * Create/edit modal for a workspace (or catalog) MCP server.
@@ -26,7 +32,6 @@ import { formatApiErrorDetail, type McpServerInput, type McpDiscoveryResult, typ
  * summary/detailed. "Test connection" runs the discovery probe.
  */
 
-type Transport = (typeof TRANSPORTS)[number];
 type Exposure = (typeof EXPOSURE_MODES)[number];
 
 interface KV {
@@ -57,41 +62,35 @@ function mapToKVs(m: Record<string, string>): KV[] {
 }
 
 export interface McpServerModalProps {
-  workspaceId: string;
   /** Existing vault secret names for the picker. */
   secretNames: string[];
   /** When editing, the server being edited (its name field is locked). */
-  initial?: EffectiveServer | null;
+  initial?: McpServerDraft | null;
   /** Hide the "Test connection" button (e.g. in the catalog where there's no sandbox). */
   allowDiscover?: boolean;
   onClose: () => void;
   onSubmit: (body: McpServerInput) => Promise<void>;
   onDiscover?: (body: McpServerInput) => Promise<McpDiscoveryResult>;
-  onSecretCreated?: (name: string) => void;
-  /** Inline secret-create override for the picker (user vault on /connectors). */
-  createSecret?: (body: { name: string; value: string }) => Promise<unknown>;
+  /** Inline secret-create for the picker, into the tier this modal edits. */
+  createSecret: (body: { name: string; value: string }) => Promise<unknown>;
   saving?: boolean;
   submitError?: string | null;
 }
 
 export function McpServerModal({
-  workspaceId,
   secretNames,
   initial,
   allowDiscover = true,
   onClose,
   onSubmit,
   onDiscover,
-  onSecretCreated,
   createSecret,
   saving = false,
   submitError = null,
 }: McpServerModalProps) {
   const isEdit = !!initial;
   const [name, setName] = useState(initial?.name ?? '');
-  const [transport, setTransport] = useState<Transport>(
-    (initial?.transport as Transport) ?? 'stdio',
-  );
+  const [transport, setTransport] = useState<McpTransport>(initial?.transport ?? 'stdio');
   const [command, setCommand] = useState(initial?.command ?? 'npx');
   const [args, setArgs] = useState<string[]>(initial?.args ?? []);
   const [url, setUrl] = useState(initial?.url ?? '');
@@ -380,9 +379,7 @@ export function McpServerModal({
                 <KeyValueEditor
                   kvs={env}
                   onChange={setEnv}
-                  workspaceId={workspaceId}
                   secretNames={secretNames}
-                  onSecretCreated={onSecretCreated}
                   createSecret={createSecret}
                   keyPlaceholder="ENV_VAR"
                 />
@@ -407,9 +404,7 @@ export function McpServerModal({
                 <KeyValueEditor
                   kvs={headers}
                   onChange={setHeaders}
-                  workspaceId={workspaceId}
                   secretNames={secretNames}
-                  onSecretCreated={onSecretCreated}
                   createSecret={createSecret}
                   keyPlaceholder="Authorization"
                 />
@@ -633,14 +628,12 @@ function ArgsEditor({ args, onChange }: { args: string[]; onChange: (a: string[]
 interface KeyValueEditorProps {
   kvs: KV[];
   onChange: (kvs: KV[]) => void;
-  workspaceId: string;
   secretNames: string[];
-  onSecretCreated?: (name: string) => void;
-  createSecret?: (body: { name: string; value: string }) => Promise<unknown>;
+  createSecret: (body: { name: string; value: string }) => Promise<unknown>;
   keyPlaceholder: string;
 }
 
-function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreated, createSecret, keyPlaceholder }: KeyValueEditorProps) {
+function KeyValueEditor({ kvs, onChange, secretNames, createSecret, keyPlaceholder }: KeyValueEditorProps) {
   return (
     <div className="flex flex-col gap-2">
       {kvs.map((kv, i) => (
@@ -669,11 +662,9 @@ function KeyValueEditor({ kvs, onChange, workspaceId, secretNames, onSecretCreat
             </button>
           </div>
           <VaultSecretPicker
-            workspaceId={workspaceId}
             value={kv.value}
             onChange={(value) => onChange(kvs.map((x, j) => (j === i ? { ...x, value } : x)))}
             secretNames={secretNames}
-            onSecretCreated={onSecretCreated}
             createSecret={createSecret}
           />
         </div>

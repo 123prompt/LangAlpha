@@ -237,7 +237,9 @@ describe('mcp mutations — invalidation', () => {
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.workspace(WS) });
   });
 
-  it('catalog create invalidates the catalog list', async () => {
+  it('catalog create invalidates the whole mcp prefix, not just the catalog', async () => {
+    // An enabled catalog row is inherited by every workspace, so a catalog write
+    // changes each workspace's effective list — one blast radius for all six.
     const client = makeClient();
     const spy = vi.spyOn(client, 'invalidateQueries');
     (createMcpCatalogServer as Mock).mockResolvedValue({ name: 't1' });
@@ -247,7 +249,7 @@ describe('mcp mutations — invalidation', () => {
       await result.current.mutateAsync({ name: 't1', transport: 'stdio', command: 'npx' });
     });
 
-    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.catalog() });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.all });
   });
 
   it('catalog import invalidates the user vault too — the backend auto-vaults inline secrets', async () => {
@@ -268,7 +270,7 @@ describe('mcp mutations — invalidation', () => {
       await result.current.mutateAsync({ mcpServers: {} });
     });
 
-    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.catalog() });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.mcp.all });
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.userVault.all });
   });
 });

@@ -9,10 +9,13 @@ import { api } from '@/api/client';
 // Env/header literal values are never echoed by
 // the backend — only `${vault:NAME}` reference names surface (as `*_refs`).
 
+/** The wire transports a user-configured server can speak. */
+export type McpTransport = 'stdio' | 'sse' | 'http';
+
 /** A full MCP server definition payload (matches backend `McpServerInput`). */
 export interface McpServerInput {
   name: string;
-  transport: 'stdio' | 'sse' | 'http';
+  transport: McpTransport;
   command?: string | null;
   args?: string[];
   url?: string | null;
@@ -53,7 +56,7 @@ export interface EffectiveServer {
   origin: 'builtin' | 'workspace' | 'user';
   /** Workspace-local fork that overrides a same-named inherited server. */
   shadows_inherited?: boolean;
-  transport: string;
+  transport: McpTransport;
   enabled: boolean;
   editable: boolean;
   deletable: boolean;
@@ -88,6 +91,30 @@ export interface EffectiveServer {
   oauth_status?: McpOauthStatus | null;
 }
 
+/**
+ * The config-shaped half of a server row: everything the create/edit modal
+ * reads, and nothing it doesn't. Both list surfaces hand their own row straight
+ * to the modal — an `EffectiveServer` and a `CatalogServer` are each
+ * structurally assignable to this — so neither has to fabricate the runtime
+ * fields (status, tool counts, permissions) it doesn't have.
+ */
+export type McpServerDraft = Pick<
+  EffectiveServer,
+  | 'name'
+  | 'transport'
+  | 'command'
+  | 'args'
+  | 'url'
+  | 'env'
+  | 'env_refs'
+  | 'headers'
+  | 'header_refs'
+  | 'description'
+  | 'instruction'
+  | 'tool_exposure_mode'
+  | 'discovery_uses_secrets'
+>;
+
 export interface EffectiveServerList {
   servers: EffectiveServer[];
   sandbox_running: boolean;
@@ -111,7 +138,7 @@ export interface EffectiveServerList {
 /** A user catalog template row (masked — only vault refs surfaced). */
 export interface CatalogServer {
   name: string;
-  transport: string;
+  transport: McpTransport;
   command: string | null;
   args: string[];
   url: string | null;

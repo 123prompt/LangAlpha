@@ -235,13 +235,20 @@ export function useDeleteWorkspaceMcpServer(workspaceId: string) {
   });
 }
 
-/** Bulk-import a standard `mcpServers` blob (parsed JSON object). */
+/**
+ * Bulk-import a standard `mcpServers` blob (parsed JSON object). The backend
+ * auto-extracts inline literal credentials into the WORKSPACE vault, so that
+ * list is invalidated too — otherwise the freshly created secrets stay
+ * invisible (and the server modal's picker keeps offering to re-create them)
+ * until the staleTime lapses. Same rule as the catalog import.
+ */
 export function useImportWorkspaceMcpServers(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (payload: unknown) => importWorkspaceMcpServers(workspaceId, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaceVault.byWorkspace(workspaceId) });
     },
   });
 }
@@ -281,12 +288,21 @@ export function useDiscoverWorkspaceMcpServer(workspaceId: string) {
 // Catalog mutations
 // ---------------------------------------------------------------------------
 
+/**
+ * One blast radius for every catalog mutation: `queryKeys.mcp.all`.
+ *
+ * A catalog row that is enabled is inherited by EVERY workspace of the user, so
+ * creating, editing, deleting or disconnecting one changes each workspace's
+ * effective list exactly as toggling it does. Invalidating only the catalog
+ * leaves an open workspace panel showing the pre-edit definition, which is the
+ * drift these three different radii had already produced.
+ */
 export function useCreateMcpCatalogServer() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (body: McpServerInput) => createMcpCatalogServer(body),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
     },
   });
 }
@@ -297,7 +313,7 @@ export function useUpdateMcpCatalogServer() {
     mutationFn: ({ name, body }: { name: string; body: McpServerInput }) =>
       updateMcpCatalogServer(name, body),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
     },
   });
 }
@@ -307,16 +323,12 @@ export function useDeleteMcpCatalogServer() {
   return useMutation({
     mutationFn: (name: string) => deleteMcpCatalogServer(name),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
     },
   });
 }
 
-/**
- * Optimistic user-level enabled toggle (Connectors). Enabling fans the server
- * out to every workspace of the user, so on settle we invalidate the whole
- * mcp prefix — any open workspace panel refetches its effective list too.
- */
+/** Optimistic user-level enabled toggle (Connectors). */
 export function useToggleMcpCatalogServer() {
   const queryClient = useQueryClient();
   const key = queryKeys.mcp.catalog();
@@ -357,7 +369,7 @@ export function useImportMcpCatalogServers() {
   return useMutation({
     mutationFn: (payload: unknown) => importMcpCatalogServers(payload),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.catalog() });
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.userVault.all });
     },
   });

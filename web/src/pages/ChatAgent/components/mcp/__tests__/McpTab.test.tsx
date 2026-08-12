@@ -47,11 +47,13 @@ vi.mock('@/hooks/useMcpServers', () => ({
 // (matches the existing toast-mock pattern across the codebase).
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 
-// getVaultSecrets is called on mount for the secret picker; keep it benign.
-vi.mock('../../../utils/api', async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>();
-  return { ...actual, getVaultSecrets: vi.fn().mockResolvedValue([]), createVaultSecret: vi.fn() };
-});
+// The secret picker reads the workspace vault through React Query; keep it
+// empty and benign. (`formatApiErrorDetail` stays real — the inline submit-error
+// copy is what the first test asserts on.)
+vi.mock('@/hooks/useWorkspaceVault', () => ({
+  useWorkspaceVaultSecrets: () => ({ data: [], isLoading: false, error: null }),
+  useCreateWorkspaceVaultSecret: () => ({ mutateAsync: vi.fn(), isPending: false }),
+}));
 
 // Stub the row so the promote action is a plain button — the real Radix kebab
 // needs portal/pointer machinery jsdom doesn't drive (the row's own test mocks
@@ -286,7 +288,6 @@ describe('McpTab — Add button cap gating', () => {
   it('disables "Add server" when the workspace is at max_servers', async () => {
     listData = makeList([makeServer('a'), makeServer('b')], 2);
     renderWithProviders(<McpTab workspaceId="ws-1" />);
-    // Flush the on-mount getVaultSecrets effect so its setState lands in act().
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /add server/i })).toBeDisabled(),
     );

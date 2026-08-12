@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
 import { KeyRound, Plus, Check } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
-import { createVaultSecret, formatApiErrorDetail } from '../../utils/api';
+import { formatApiErrorDetail } from '../../utils/api';
 
 /**
- * Picks an existing workspace vault secret (emitting a `${vault:NAME}`
- * reference) or lets the user type a plain literal value. Includes an inline
- * "create a new secret" affordance so a user can provision a credential
- * without leaving the MCP modal.
+ * Picks an existing vault secret (emitting a `${vault:NAME}` reference) or lets
+ * the user type a plain literal value. Includes an inline "create a new secret"
+ * affordance so a user can provision a credential without leaving the MCP
+ * modal. Which vault that create lands in is the caller's to decide — the
+ * picker knows nothing about tiers.
  *
  * The picker NEVER reveals a secret value — it only deals in names. The chosen
  * value is the literal `${vault:NAME}` string (resolved server-side inside the
@@ -27,27 +28,23 @@ function refName(value: string): string | null {
 }
 
 interface VaultSecretPickerProps {
-  workspaceId: string;
   /** Current value (a `${vault:NAME}` ref or a literal). */
   value: string;
   onChange: (value: string) => void;
-  /** Existing vault secret names in this workspace. */
+  /** Existing secret names in the vault this picker writes to. */
   secretNames: string[];
-  /** Called after a successful inline create so the parent can refetch names. */
-  onSecretCreated?: (name: string) => void;
   /**
-   * Inline-create override. Defaults to the workspace vault; the Connectors
-   * page injects the user-level vault so refs resolve for inherited servers.
+   * Inline-create into the caller's vault tier — the workspace vault in the
+   * settings panel, the user vault on /connectors, so a ref always resolves
+   * where the server it belongs to runs.
    */
-  createSecret?: (body: { name: string; value: string }) => Promise<unknown>;
+  createSecret: (body: { name: string; value: string }) => Promise<unknown>;
 }
 
 export function VaultSecretPicker({
-  workspaceId,
   value,
   onChange,
   secretNames,
-  onSecretCreated,
   createSecret,
 }: VaultSecretPickerProps) {
   const initialRef = refName(value);
@@ -68,13 +65,8 @@ export function VaultSecretPicker({
     setSaving(true);
     setCreateError(null);
     try {
-      if (createSecret) {
-        await createSecret({ name, value: newValue });
-      } else {
-        await createVaultSecret(workspaceId, { name, value: newValue });
-      }
+      await createSecret({ name, value: newValue });
       onChange(vaultRef(name));
-      onSecretCreated?.(name);
       setCreating(false);
       setNewName('');
       setNewValue('');

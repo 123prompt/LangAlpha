@@ -1,7 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion } from 'framer-motion';
-import { MoreVertical } from 'lucide-react';
+import { Download, MoreVertical, Plus } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 
 /**
@@ -242,6 +242,52 @@ export function HeaderButton({
       {Icon && <Icon className="h-3 w-3" />}
       {children}
     </button>
+  );
+}
+
+/**
+ * The header both server lists wear: counter on the left, Import + Add on the
+ * right, and the at-cap explanation that has to appear on BOTH buttons (it was
+ * spelled out four times, and the two lists had already stopped agreeing on
+ * which of them said what). `children` takes a surface's own extra action.
+ */
+export function ListToolbar({
+  icon,
+  title,
+  count,
+  max,
+  atCap,
+  onImport,
+  onAdd,
+  children,
+}: {
+  icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
+  title: string;
+  count: number;
+  max: number;
+  atCap: boolean;
+  onImport: () => void;
+  onAdd: () => void;
+  children?: React.ReactNode;
+}) {
+  const { t } = useTranslation();
+  const atCapHint = atCap ? t('mcp.list.atCap', { max }) : undefined;
+  return (
+    <ListHeader icon={icon} title={title} count={count} max={max}>
+      {children}
+      <HeaderButton
+        variant="secondary"
+        icon={Download}
+        onClick={onImport}
+        disabled={atCap}
+        title={atCapHint ?? t('mcp.list.importHint')}
+      >
+        {t('mcp.list.importJson')}
+      </HeaderButton>
+      <HeaderButton variant="primary" icon={Plus} onClick={onAdd} disabled={atCap} title={atCapHint}>
+        {t('mcp.list.addServer')}
+      </HeaderButton>
+    </ListHeader>
   );
 }
 
