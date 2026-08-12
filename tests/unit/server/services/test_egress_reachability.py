@@ -15,11 +15,12 @@ from src.server.services.egress.reachability import (
 
 @pytest.fixture
 def env(monkeypatch):
-    def _set(base_url: str, *, is_default: bool) -> None:
-        monkeypatch.setattr("src.config.env.EGRESS_RELAY_BASE_URL", base_url)
-        monkeypatch.setattr(
-            "src.config.env.EGRESS_RELAY_BASE_URL_IS_DEFAULT", is_default
-        )
+    """Set the two inputs: the relay base (empty = unconfigured) and the
+    server base it falls back to."""
+
+    def _set(*, relay: str = "", server: str = "http://localhost:8000") -> None:
+        monkeypatch.setattr("src.config.env.EGRESS_RELAY_BASE_URL", relay)
+        monkeypatch.setattr("src.config.env.SERVER_BASE_URL", server)
 
     return _set
 
@@ -37,19 +38,19 @@ class TestEffectiveBaseUrl:
     def test_docker_rewrites_a_defaulted_loopback_to_the_host_gateway(
         self, env, base, expected
     ):
-        env(base, is_default=True)
+        env(server=base)
         assert effective_relay_base_url("docker") == expected
 
     def test_docker_leaves_a_defaulted_public_base_alone(self, env):
-        env("https://app.example.com", is_default=True)
+        env(server="https://app.example.com")
         assert effective_relay_base_url("docker") == "https://app.example.com"
 
     def test_an_explicit_value_is_honored_verbatim_even_when_loopback(self, env):
-        env("http://localhost:8000", is_default=False)
+        env(relay="http://localhost:8000", server="https://app.example.com")
         assert effective_relay_base_url("docker") == "http://localhost:8000"
 
     def test_daytona_never_gets_the_docker_rewrite(self, env):
-        env("http://localhost:8000", is_default=True)
+        env(server="http://localhost:8000")
         assert effective_relay_base_url("daytona") == "http://localhost:8000"
 
 

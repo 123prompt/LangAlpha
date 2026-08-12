@@ -2,9 +2,9 @@
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import TracebackType
-from typing import Any
 
 import structlog
 
@@ -14,6 +14,20 @@ from .mcp_registry import MCPRegistry, get_global_registry
 from .sandbox import PTCSandbox
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class EgressBinding:
+    """What this process last pushed to a session's sandbox credential file.
+
+    ``jwt_exp`` (from the mint, never recomputed) drives the cheap remint
+    check; ``user_id`` lets the remint run on paths with no request user in
+    hand. Not liveness truth — the grant rows are.
+    """
+
+    grants: Mapping[str, str]
+    jwt_exp: float
+    user_id: str
 
 
 class Session:
@@ -56,10 +70,8 @@ class Session:
 
         # Egress-relay binding for OAuth-connected servers: what THIS process
         # last pushed to the sandbox. Execution context only — grant truth is
-        # the sandbox_egress_grants table. An `EgressBinding | None`, typed
-        # loosely because the binding service is server-side and this core
-        # module must not import it (see services/egress/session_binding.py).
-        self.egress_binding: Any = None
+        # the sandbox_egress_grants table (see services/egress/session_binding).
+        self.egress_binding: EgressBinding | None = None
 
         # The platform-secret fleet generation whose bindings were last applied
         # to this session's sandbox (the ``mcp_config_version`` analog) — lets

@@ -11,7 +11,8 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from src.server.services.egress import RelayError
+from src.server.services.egress import RelayError, RelayRejection
+from src.server.utils.slot_guard import acquire_slot_member, release_slot_member
 
 logger = logging.getLogger(__name__)
 
@@ -20,18 +21,24 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_RPM = 120
 CONCURRENCY_LIMIT = 4
 
-# TTLs bound leak windows if a worker dies mid-request. The concurrency TTL
-# must exceed the relay's 55s wall clock: a live request outliving its key
-# would decr a fresh counter negative on release and hand out extra slots.
+# The rate bucket is a fixed-minute counter; its TTL only has to outlive the
+# minute it counts. The concurrency window is a reap horizon for slots whose
+# holder died, so it must exceed the relay's 55s wall clock.
 _RATE_KEY_TTL = 120
-_CONC_KEY_TTL = 120
+_CONC_STALE_AFTER = 120
 
 
-class RelayLimited(Exception):
+class RelayLimited(RelayRejection):
+    """A budget rejection: 429 with the vendor-agnostic backoff hint."""
+
     def __init__(self, kind: str):
         self.kind = kind  # "rate" | "concurrency"
-        self.code = RelayError(f"limited_{kind}")
-        super().__init__(kind)
+        super().__init__(
+            429,
+            RelayError(f"limited_{kind}"),
+            f"relay limit: {kind}",
+            retry_after=5,
+        )
 
 
 @asynccontextmanager
@@ -63,10 +70,9 @@ async def acquire_slot(grant_id: str):
         raise RelayLimited("rate")
 
     try:
-        async with redis.pipeline(transaction=True) as pipe:
-            pipe.incr(conc_key)
-            pipe.expire(conc_key, _CONC_KEY_TTL)
-            inflight, _ = await pipe.execute()
+        admitted = await acquire_slot_member(
+            redis, conc_key, limit=CONCURRENCY_LIMIT, stale_after=_CONC_STALE_AFTER
+        )
     except Exception:
         logger.warning(
             "[egress_limits] concurrency check failed; failing open", exc_info=True
@@ -74,13 +80,13 @@ async def acquire_slot(grant_id: str):
         yield
         return
 
+    if not admitted.allowed:
+        raise RelayLimited("concurrency")
     try:
-        if int(inflight) > CONCURRENCY_LIMIT:
-            raise RelayLimited("concurrency")
         yield
     finally:
         try:
-            await redis.decr(conc_key)
+            await release_slot_member(redis, conc_key, admitted.slot_id)
         except Exception:
             logger.warning(
                 "[egress_limits] slot release failed for %s", grant_id

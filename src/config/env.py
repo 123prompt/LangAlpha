@@ -54,12 +54,12 @@ EGRESS_RELAY_SECRET: str = os.getenv("EGRESS_RELAY_SECRET", "")
 
 # Base URL sandboxes use to reach the egress relay (the generated client
 # appends /v1/egress/{grant_id}). Sandboxes are remote (or in OSS Docker, on a
-# different network), so this must be a sandbox-reachable address. Unset, it
-# falls back to the server base — and services/egress/reachability.py adapts
-# that fallback per sandbox provider (Docker host gateway) or warns (Daytona +
-# a local address). Point it at the API origin, not an SPA-fallback frontend.
-EGRESS_RELAY_BASE_URL_IS_DEFAULT: bool = not os.getenv("EGRESS_RELAY_BASE_URL")
-EGRESS_RELAY_BASE_URL: str = os.getenv("EGRESS_RELAY_BASE_URL", "") or SERVER_BASE_URL
+# different network), so this must be a sandbox-reachable address. Empty means
+# unconfigured: services/egress/reachability.py then falls back to the server
+# base, adapted per sandbox provider (Docker host gateway) or warned about
+# (Daytona + a local address). Point it at the API origin, not an SPA-fallback
+# frontend.
+EGRESS_RELAY_BASE_URL: str = os.getenv("EGRESS_RELAY_BASE_URL", "")
 
 # Credit conversion rate (USD → credits).  Override with USD_TO_CREDITS_RATE env var.
 USD_TO_CREDITS_RATE: int = int(os.getenv("USD_TO_CREDITS_RATE", "1000"))

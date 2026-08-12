@@ -1,12 +1,15 @@
 """The egress session binding under multi-worker truth rules.
 
-Two properties matter beyond the happy path. Removal must converge on a worker
+Three properties matter beyond the happy path. Removal must converge on a worker
 that never bound anything — ``Session`` state is process-local, so the decision
 to tear down the sandbox credential file comes from the ``sandbox_egress_grants``
-table, not from ``session.egress_binding``. And mint+upload takes no cross-worker
-lock: the credential file is replaced atomically inside the sandbox, so a
-concurrent push can only overwrite this one's file with an equally-valid one —
-never tear it. The push must therefore touch no DB connection at all.
+table, not from ``session.egress_binding``. The credential file is the ONLY
+channel carrying grant ids: resolved server configs are inputs and are never
+written back to, so a retired grant cannot linger in a second place. And
+mint+upload takes no cross-worker lock: the credential file is replaced
+atomically inside the sandbox, so a concurrent push can only overwrite this
+one's file with an equally-valid one — never tear it. The push must therefore
+touch no DB connection at all.
 """
 
 from __future__ import annotations
@@ -16,8 +19,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from ptc_agent.config.core import MCPServerConfig
+from ptc_agent.core.session import EgressBinding
+from src.server.database.egress_grants import GrantSync
 from src.server.services.egress.session_binding import (
-    EgressBinding,
     maybe_remint_egress_jwt,
     sync_egress_relay,
 )
@@ -28,11 +33,14 @@ SECRET = "test-relay-secret-0123456789abcdef0123456789abcdef"
 
 
 def _server(name: str, connection_id: str | None):
-    return SimpleNamespace(
+    # A real config model, so a resolution output written back onto it would
+    # raise rather than quietly re-open the second grant channel.
+    return MCPServerConfig(
         name=name,
-        oauth_connection_id=connection_id,
+        transport="http",
         url=f"https://vendor.example.test/{name}",
-        egress_grant_id=None,
+        source="user",
+        oauth_connection_id=connection_id,
     )
 
 
@@ -53,9 +61,15 @@ def _resolved(*servers):
     return SimpleNamespace(servers=list(servers))
 
 
+def _synced(grants: dict[str, str] | None = None, retired: int = 0):
+    return AsyncMock(return_value=GrantSync(grants=grants or {}, retired=retired))
+
+
 @pytest.fixture
 def secret():
-    with patch("src.config.env.EGRESS_RELAY_SECRET", SECRET):
+    with patch(
+        "src.server.services.egress.session_binding.EGRESS_RELAY_SECRET", SECRET
+    ):
         yield
 
 
@@ -83,15 +97,17 @@ class TestTeardown:
     @pytest.mark.asyncio
     async def test_fresh_worker_still_tears_down_when_the_table_has_grants(self):
         # Worker B: brand-new session (binding None), but the table says this
-        # workspace has active grants — the credential file must still go.
+        # workspace had active grants — the credential file must still go.
         session = _session(binding=None)
+        sync = _synced(retired=2)
         with patch(
-            "src.server.services.egress.session_binding.retire_stale_grants",
-            AsyncMock(return_value=2),
-        ) as retire:
+            "src.server.services.egress.session_binding.sync_oauth_grants", sync
+        ):
             await sync_egress_relay(WS, USER, session, _resolved())
 
-        retire.assert_awaited_once_with(WS, keep_grant_ids=())
+        sync.assert_awaited_once_with(
+            user_id=USER, workspace_id=WS, connection_ids=[]
+        )
         session.sandbox.upload_egress_relay_credentials.assert_awaited_once_with(None)
         assert session.egress_binding is None
 
@@ -101,8 +117,7 @@ class TestTeardown:
         # no-op UPDATE, zero sandbox I/O.
         session = _session(binding=None)
         with patch(
-            "src.server.services.egress.session_binding.retire_stale_grants",
-            AsyncMock(return_value=0),
+            "src.server.services.egress.session_binding.sync_oauth_grants", _synced()
         ):
             await sync_egress_relay(WS, USER, session, _resolved())
 
@@ -115,13 +130,26 @@ class TestTeardown:
         binding = EgressBinding(grants={"srv": "g1"}, jwt_exp=9e9, user_id=USER)
         session = _session(binding=binding)
         with patch(
-            "src.server.services.egress.session_binding.retire_stale_grants",
-            AsyncMock(return_value=0),
+            "src.server.services.egress.session_binding.sync_oauth_grants", _synced()
         ):
             await sync_egress_relay(WS, USER, session, _resolved())
 
         session.sandbox.upload_egress_relay_credentials.assert_awaited_once_with(None)
         assert session.egress_binding is None
+
+    @pytest.mark.asyncio
+    async def test_a_removal_the_sandbox_refused_keeps_the_binding(self):
+        # Same confirmed-publication rule as the add path: a file that is still
+        # there must not be recorded as gone, or nothing ever retries it.
+        binding = EgressBinding(grants={"srv": "g1"}, jwt_exp=9e9, user_id=USER)
+        session = _session(binding=binding)
+        session.sandbox.upload_egress_relay_credentials = AsyncMock(return_value=False)
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants", _synced()
+        ):
+            await sync_egress_relay(WS, USER, session, _resolved())
+
+        assert session.egress_binding is binding
 
 
 # ---------------------------------------------------------------------------
@@ -131,28 +159,22 @@ class TestTeardown:
 
 class TestBind:
     @pytest.mark.asyncio
-    async def test_binds_grants_retires_stale_and_records_the_minted_expiry(
+    async def test_binds_grants_in_one_transaction_and_records_the_minted_expiry(
         self, secret, relay_base
     ):
         a, b = _server("srv_a", "conn-a"), _server("srv_b", "conn-b")
         session = _session()
-        ensure = AsyncMock(side_effect=["grant-a", "grant-b"])
-        retire = AsyncMock(return_value=0)
-        with (
-            patch(
-                "src.server.services.egress.session_binding.ensure_oauth_grant",
-                ensure,
-            ),
-            patch(
-                "src.server.services.egress.session_binding.retire_stale_grants",
-                retire,
-            ),
+        sync = _synced({"conn-a": "grant-a", "conn-b": "grant-b"})
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants", sync
         ):
             await sync_egress_relay(WS, USER, session, _resolved(a, b))
 
-        assert a.egress_grant_id == "grant-a"
-        assert b.egress_grant_id == "grant-b"
-        retire.assert_awaited_once_with(WS, keep_grant_ids=("grant-a", "grant-b"))
+        # Upsert AND retirement are one call — a workspace is never left with a
+        # committed grant set that the retirement half hasn't caught up to.
+        sync.assert_awaited_once_with(
+            user_id=USER, workspace_id=WS, connection_ids=["conn-a", "conn-b"]
+        )
 
         payload = session.sandbox.upload_egress_relay_credentials.await_args.args[0]
         assert payload["grants"] == {"srv_a": "grant-a", "srv_b": "grant-b"}
@@ -168,30 +190,32 @@ class TestBind:
         assert binding.jwt_exp == validate_relay_jwt(SECRET, payload["token"]).expires_at
 
     @pytest.mark.asyncio
+    async def test_the_resolved_configs_are_never_annotated(self, secret, relay_base):
+        """The credential file is the only channel: nothing about the grant is
+        written back onto the resolution output the codegen path reads."""
+        srv = _server("srv", "conn-1")
+        before = srv.model_dump()
+        session = _session()
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants",
+            _synced({"conn-1": "g-1"}),
+        ):
+            await sync_egress_relay(WS, USER, session, _resolved(srv))
+
+        assert srv.model_dump() == before
+
+    @pytest.mark.asyncio
     async def test_vanished_connection_leaves_only_that_server_unbound(
         self, secret, relay_base
     ):
-        from src.server.database.egress_grants import GrantConnectionUnavailable
-
         gone, alive = _server("gone", "conn-gone"), _server("alive", "conn-ok")
         session = _session()
-        ensure = AsyncMock(
-            side_effect=[GrantConnectionUnavailable("gone"), "grant-ok"]
-        )
-        with (
-            patch(
-                "src.server.services.egress.session_binding.ensure_oauth_grant",
-                ensure,
-            ),
-            patch(
-                "src.server.services.egress.session_binding.retire_stale_grants",
-                AsyncMock(return_value=0),
-            ),
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants",
+            _synced({"conn-ok": "grant-ok"}),
         ):
             await sync_egress_relay(WS, USER, session, _resolved(gone, alive))
 
-        assert gone.egress_grant_id is None
-        assert alive.egress_grant_id == "grant-ok"
         payload = session.sandbox.upload_egress_relay_credentials.await_args.args[0]
         assert payload["grants"] == {"alive": "grant-ok"}
 
@@ -208,15 +232,9 @@ class TestBind:
 
         srv = _server("srv", "conn-1")
         session = _session()
-        with (
-            patch(
-                "src.server.services.egress.session_binding.ensure_oauth_grant",
-                AsyncMock(return_value="g-1"),
-            ),
-            patch(
-                "src.server.services.egress.session_binding.retire_stale_grants",
-                AsyncMock(return_value=0),
-            ),
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants",
+            _synced({"conn-1": "g-1"}),
         ):
             await sync_egress_relay(WS, USER, session, _resolved(srv))
 
@@ -232,19 +250,33 @@ class TestBind:
         srv = _server("srv", "conn-1")
         session = _session()
         session.sandbox.upload_egress_relay_credentials = AsyncMock(return_value=False)
-        with (
-            patch(
-                "src.server.services.egress.session_binding.ensure_oauth_grant",
-                AsyncMock(return_value="g-1"),
-            ),
-            patch(
-                "src.server.services.egress.session_binding.retire_stale_grants",
-                AsyncMock(return_value=0),
-            ),
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants",
+            _synced({"conn-1": "g-1"}),
         ):
             await sync_egress_relay(WS, USER, session, _resolved(srv))
 
         assert session.egress_binding is None
+
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_relay_touches_neither_db_nor_sandbox(
+        self, relay_base
+    ):
+        srv = _server("srv", "conn-1")
+        session = _session()
+        sync = _synced({"conn-1": "g-1"})
+        with (
+            patch(
+                "src.server.services.egress.session_binding.EGRESS_RELAY_SECRET", ""
+            ),
+            patch(
+                "src.server.services.egress.session_binding.sync_oauth_grants", sync
+            ),
+        ):
+            await sync_egress_relay(WS, USER, session, _resolved(srv))
+
+        sync.assert_not_awaited()
+        session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -254,13 +286,13 @@ class TestBind:
 
 class TestRemint:
     @pytest.mark.asyncio
-    async def test_noop_without_a_binding(self):
+    async def test_noop_without_a_binding(self, secret):
         session = _session(binding=None)
         await maybe_remint_egress_jwt(WS, session)
         session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_noop_while_the_jwt_is_fresh(self):
+    async def test_noop_while_the_jwt_is_fresh(self, secret):
         binding = EgressBinding(grants={"s": "g"}, jwt_exp=9e9, user_id=USER)
         session = _session(binding=binding)
         await maybe_remint_egress_jwt(WS, session)

@@ -73,14 +73,14 @@ UNSUPPORTED_MODERN = ("2099-01-01",)
 def _oauth_server() -> MCPServerConfig:
     """An OAuth-connected (relay-bound) HTTP server — the only kind the relay
     exists for. ``url`` is the mutable catalog value that must never leak into
-    the generated client; the real destination lives host-side in the grant."""
+    the generated client; the real destination lives host-side in the grant,
+    and the grant id reaches the sandbox only through the credential file."""
     return MCPServerConfig(
         name=SERVER_NAME,
         transport="http",
         url="https://vendor.example.com/mcp",
         source="user",
         oauth_connection_id=CONNECTION_ID,
-        egress_grant_id=GRANT_ID,
     )
 
 
@@ -278,7 +278,7 @@ class _Harness:
             p(patch("src.server.services.egress.relay.get_relay_client", lambda: vendor_client))
             p(
                 patch(
-                    "src.server.services.mcp_oauth.lifecycle.ensure_fresh_access_token",
+                    "src.server.services.egress.relay.ensure_fresh_access_token",
                     _ensure_token,
                 )
             )

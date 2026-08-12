@@ -50,15 +50,14 @@ async def pinned_request(
         target = await pin_public_url(url, require_https=True)
     except EgressBlockedError as e:
         raise OAuthHopBlocked(str(e)) from e
-    send_headers = dict(headers or {})
-    send_headers["Host"] = target.host
+    url_pinned, send_headers, extensions = target.pinned_kwargs(headers)
     response = await client.request(
         method,
-        target.url,
+        url_pinned,
         headers=send_headers,
         data=data,
         content=content,
-        extensions={"sni_hostname": target.host},
+        extensions=extensions,
     )
     if response.is_redirect:
         raise OAuthHopBlocked(

@@ -35,3 +35,27 @@ class RelayError(StrEnum):
     LIMITED_RATE = "limited_rate"
     LIMITED_CONCURRENCY = "limited_concurrency"
     WALL_CLOCK = "wall_clock"
+
+
+class RelayRejection(Exception):
+    """Terminal per-request outcome, mapped by the router to an HTTP answer.
+
+    ``code`` is machine-readable and surfaced as an X-Relay-Error header so
+    the generated client (and the agent) can distinguish relay-auth failures
+    from vendor-auth failures without parsing bodies. Every rejection the
+    pipeline can raise is one of these, so the route needs exactly one arm.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        code: RelayError,
+        detail: str = "",
+        *,
+        retry_after: int | None = None,
+    ):
+        self.status = status
+        self.code = RelayError(code)
+        self.detail = detail or str(self.code)
+        self.retry_after = retry_after
+        super().__init__(self.detail)

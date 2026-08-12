@@ -25,12 +25,11 @@ import anyio
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
 
-from src.server.services.egress import RelayError
+from src.server.services.egress import RelayError, RelayRejection
 from src.server.services.egress.jsonrpc import MAX_BODY_BYTES
-from src.server.services.egress.limits import RelayLimited, acquire_slot
+from src.server.services.egress.limits import acquire_slot
 from src.server.services.egress.relay import (
     WALL_CLOCK_S,
-    RelayRejection,
     authenticate_relay,
     open_upstream,
     prepare_relay,
@@ -43,11 +42,14 @@ router = APIRouter(tags=["Egress Relay"])
 
 
 def _reject(e: RelayRejection) -> Response:
+    headers = {"X-Relay-Error": e.code}
+    if e.retry_after is not None:
+        headers["Retry-After"] = str(e.retry_after)
     return Response(
         status_code=e.status,
         content=e.detail,
         media_type="text/plain",
-        headers={"X-Relay-Error": e.code},
+        headers=headers,
     )
 
 
@@ -99,39 +101,26 @@ async def relay(grant_id: str, request: Request) -> Response:
             uuid.UUID(grant_id)
         except ValueError:
             raise RelayRejection(404, RelayError.NOT_FOUND)
-        async with asyncio.timeout_at(deadline):
-            # Authenticate first — before the body read and before a slot is
-            # taken — so an unauthenticated caller spends neither worker memory
-            # nor a concurrency slot.
-            claims = authenticate_relay(request.headers.get("authorization"))
-            await resources.enter_async_context(acquire_slot(grant_id))
-            raw_body = await _read_capped_body(request)
-            prepared = await prepare_relay(
-                grant_id, claims=claims, raw_body=raw_body
+        try:
+            async with asyncio.timeout_at(deadline):
+                # Authenticate first — before the body read and before a slot
+                # is taken — so an unauthenticated caller spends neither worker
+                # memory nor a concurrency slot.
+                claims = authenticate_relay(request.headers.get("authorization"))
+                await resources.enter_async_context(acquire_slot(grant_id))
+                raw_body = await _read_capped_body(request)
+                prepared = await prepare_relay(
+                    grant_id, claims=claims, raw_body=raw_body
+                )
+                upstream = await open_upstream(prepared, dict(request.headers))
+        except TimeoutError:
+            raise RelayRejection(
+                504, RelayError.WALL_CLOCK, "relay wall clock exceeded"
             )
-            upstream = await open_upstream(prepared, dict(request.headers))
     except RelayRejection as e:
         with anyio.CancelScope(shield=True):
             await resources.aclose()
         return _reject(e)
-    except RelayLimited as e:
-        with anyio.CancelScope(shield=True):
-            await resources.aclose()
-        return Response(
-            status_code=429,
-            content=f"relay limit: {e.kind}",
-            media_type="text/plain",
-            headers={"X-Relay-Error": e.code, "Retry-After": "5"},
-        )
-    except TimeoutError:
-        with anyio.CancelScope(shield=True):
-            await resources.aclose()
-        return Response(
-            status_code=504,
-            content="relay wall clock exceeded",
-            media_type="text/plain",
-            headers={"X-Relay-Error": RelayError.WALL_CLOCK},
-        )
     except BaseException:
         # Shield the release: a cancellation here (client gone during setup)
         # would otherwise skip aclose and leak the slot + connection.

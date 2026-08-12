@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import httpx
 
 from src.config.env import EGRESS_RELAY_SECRET
 from src.server.database.egress_grants import fetch_grant_for_relay
-from src.server.services.egress import RelayError
+from src.server.services.egress import RelayError, RelayRejection
 from src.server.services.egress.jsonrpc import (
     CanonicalRequest,
     JsonRpcRejected,
@@ -33,10 +32,15 @@ from src.server.services.egress.relay_jwt import (
     RelayJwtError,
     validate_relay_jwt,
 )
+from src.server.services.mcp_oauth import SERVABLE
+from src.server.services.mcp_oauth.lifecycle import (
+    AccessToken,
+    TokenUnavailable,
+    current_access_token,
+    ensure_fresh_access_token,
+    mark_connection_needs_reauth,
+)
 from src.server.utils.egress_guard import EgressBlockedError, pin_public_url
-
-if TYPE_CHECKING:
-    from src.server.services.mcp_oauth.lifecycle import AccessToken
 
 logger = logging.getLogger(__name__)
 
@@ -74,21 +78,6 @@ REQUEST_HEADER_ALLOWLIST = frozenset(
 RESPONSE_HEADER_ALLOWLIST = frozenset(
     {"content-type", "mcp-session-id", "mcp-protocol-version", "retry-after"}
 )
-
-
-class RelayRejection(Exception):
-    """Terminal per-request outcome, mapped by the router to an HTTP answer.
-
-    ``code`` is machine-readable and surfaced as an X-Relay-Error header so
-    the generated client (and the agent) can distinguish relay-auth failures
-    from vendor-auth failures without parsing bodies.
-    """
-
-    def __init__(self, status: int, code: RelayError, detail: str = ""):
-        self.status = status
-        self.code = RelayError(code)
-        self.detail = detail or str(self.code)
-        super().__init__(self.detail)
 
 
 @dataclass
@@ -176,8 +165,6 @@ async def prepare_relay(
     ):
         raise RelayRejection(404, RelayError.NOT_FOUND)
 
-    from src.server.services.mcp_oauth import SERVABLE
-
     if grant["connection_status"] not in SERVABLE:
         raise RelayRejection(401, RelayError.NEEDS_REAUTH)
 
@@ -193,11 +180,6 @@ async def prepare_relay(
         and canonical.tool_name not in allowlist
     ):
         raise RelayRejection(403, RelayError.TOOL_BLOCKED, "tool not in grant policy")
-
-    from src.server.services.mcp_oauth.lifecycle import (
-        TokenUnavailable,
-        ensure_fresh_access_token,
-    )
 
     try:
         token = await ensure_fresh_access_token(grant["connection_id"])
@@ -247,28 +229,29 @@ async def open_upstream(
         raise RelayRejection(502, RelayError.DESTINATION_BLOCKED)
 
     client = get_relay_client()
-    headers = _vendor_headers(prepared, incoming_headers)
-    headers["Host"] = target.authority
+    url, headers, extensions = target.pinned_kwargs(
+        _vendor_headers(prepared, incoming_headers)
+    )
+    connection_id = prepared.grant["connection_id"]
 
     async def _send(hdrs: dict[str, str]) -> httpx.Response:
-        request = client.build_request(
-            "POST",
-            target.url,
-            headers=hdrs,
-            content=prepared.canonical.body,
-            extensions={"sni_hostname": target.host},
-        )
-        return await client.send(request, stream=True)
+        try:
+            request = client.build_request(
+                "POST",
+                url,
+                headers=hdrs,
+                content=prepared.canonical.body,
+                extensions=extensions,
+            )
+            return await client.send(request, stream=True)
+        except httpx.HTTPError as e:
+            logger.warning(
+                "[egress_relay] upstream unreachable for connection %s: %s",
+                connection_id, e,
+            )
+            raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
 
-    try:
-        response = await _send(headers)
-    except httpx.HTTPError as e:
-        logger.warning(
-            "[egress_relay] upstream unreachable for connection %s: %s",
-            prepared.grant["connection_id"], e,
-        )
-        raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
-
+    response = await _send(headers)
     if response.status_code != 401:
         return response
 
@@ -276,24 +259,11 @@ async def open_upstream(
     # stored bundle rotated since our read, retry once with the new token;
     # otherwise the vendor is rejecting a current token → needs_reauth.
     await response.aclose()
-    from src.server.services.mcp_oauth.lifecycle import (
-        current_access_token,
-        mark_connection_needs_reauth,
-    )
-
-    connection_id = prepared.grant["connection_id"]
     rejected = prepared.token
     current = await current_access_token(connection_id)
     if current is not None and current.generation > rejected.generation:
         headers["authorization"] = current.header()
-        try:
-            retry = await _send(headers)
-        except httpx.HTTPError as e:
-            logger.warning(
-                "[egress_relay] upstream unreachable on retry for connection %s: %s",
-                prepared.grant["connection_id"], e,
-            )
-            raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
+        retry = await _send(headers)
         if retry.status_code != 401:
             return retry
         await retry.aclose()

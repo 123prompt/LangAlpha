@@ -6,13 +6,16 @@ uniform 404 for absent/wrong-scope grants, strict JSON-RPC canonicalization,
 allowlisted headers in *both* directions, one-shot 401 retry on a rotated
 bundle, and a server-side destination pinned through the SSRF guard.
 
-Seams patched here:
+Every seam is patched where ``relay`` imports it, never at the definition
+module — one convention, so a reader of any patch line knows which binding it
+replaces:
   * ``relay.EGRESS_RELAY_SECRET`` — the OSS kill switch
   * ``relay.fetch_grant_for_relay`` — the authorization read
   * ``relay.pin_public_url`` — the SSRF guard (real one in ``TestSsrfPosture``)
   * ``relay.get_relay_client`` — the shared upstream client (httpx.MockTransport)
-  * ``mcp_oauth.lifecycle`` — the vendor credential, the 401 re-read, and the
-    needs_reauth report (the relay never writes connection status itself)
+  * ``relay.{ensure_fresh_access_token,current_access_token,
+    mark_connection_needs_reauth}`` — the vendor credential, the 401 re-read,
+    and the needs_reauth report (the relay never writes connection status)
 """
 
 from __future__ import annotations
@@ -259,21 +262,11 @@ async def env():
         p(patch("src.server.services.egress.relay.fetch_grant_for_relay", _fetch_grant))
         p(patch("src.server.services.egress.relay.pin_public_url", _pin))
         p(patch("src.server.services.egress.relay.get_relay_client", lambda: e.vendor.client))
+        p(patch("src.server.services.egress.relay.ensure_fresh_access_token", _ensure_token))
+        p(patch("src.server.services.egress.relay.current_access_token", _current_token))
         p(
             patch(
-                "src.server.services.mcp_oauth.lifecycle.ensure_fresh_access_token",
-                _ensure_token,
-            )
-        )
-        p(
-            patch(
-                "src.server.services.mcp_oauth.lifecycle.current_access_token",
-                _current_token,
-            )
-        )
-        p(
-            patch(
-                "src.server.services.mcp_oauth.lifecycle.mark_connection_needs_reauth",
+                "src.server.services.egress.relay.mark_connection_needs_reauth",
                 _mark_needs_reauth,
             )
         )

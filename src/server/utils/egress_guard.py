@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -45,6 +46,19 @@ class PinnedTarget:
     host: str
     ip: str
     authority: str
+
+    def pinned_kwargs(
+        self, headers: Mapping[str, str] | None = None
+    ) -> tuple[str, dict[str, str], dict[str, str]]:
+        """The (url, headers, extensions) triple that keeps the pin intact.
+
+        Every caller must apply all three together — sending the pinned URL
+        without the restored Host/SNI reaches the right IP under the wrong
+        name, and sending the original URL re-resolves the hostname.
+        """
+        sent = dict(headers or {})
+        sent["Host"] = self.authority
+        return self.url, sent, {"sni_hostname": self.host}
 
 
 def _classify(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -105,9 +119,8 @@ async def pin_public_url(
 ) -> PinnedTarget:
     """Validate ``url`` and return it pinned to one validated resolved IP.
 
-    Callers send the request to ``PinnedTarget.url`` with
-    ``headers["Host"] = target.host`` and
-    ``extensions={"sni_hostname": target.host}`` (https targets).
+    Callers send the request with ``PinnedTarget.pinned_kwargs()``, which
+    carries the pinned URL, the restored Host authority and the SNI extension.
     """
     parts = urlsplit(url)
     if require_https and parts.scheme != "https":

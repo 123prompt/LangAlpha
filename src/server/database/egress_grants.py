@@ -7,6 +7,8 @@ connection status flips deny the next request with no sandbox convergence.
 """
 
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -18,59 +20,89 @@ logger = logging.getLogger(__name__)
 GRANT_KIND_OAUTH_MCP = "oauth_mcp"
 
 
-class GrantConnectionUnavailable(Exception):
-    """No connection backs the requested grant — absent, or another user's."""
+@dataclass(frozen=True)
+class GrantSync:
+    """The workspace's grant set after one convergence.
+
+    ``grants`` maps connection_id → grant_id for every connection that got one;
+    ``retired`` counts the overhang that was revoked, which is what tells a
+    caller with no local state that a sandbox still has a credential file to
+    tear down.
+    """
+
+    grants: dict[str, str]
+    retired: int
 
 
-async def ensure_oauth_grant(
+async def sync_oauth_grants(
     *,
     user_id: str,
     workspace_id: str,
-    connection_id: str,
-) -> str:
-    """Idempotently ensure the (workspace, connection) grant. Returns grant_id.
+    connection_ids: Sequence[str],
+) -> GrantSync:
+    """Make ``connection_ids`` exactly this workspace's active OAuth grants.
+
+    One transaction: upsert a grant per connection, then revoke every other
+    active grant of the workspace. Retirement is not optional cleanup — an
+    active grant the resolved set no longer contains is an authorization
+    overhang, since the sandbox may still hold that grant_id and a live relay
+    JWT — so it must not be able to commit separately from the upserts.
 
     The relay dials ``destination_url``, and it is taken from the connection's
-    consented ``server_url`` inside this INSERT — never from a caller argument.
+    consented ``server_url`` inside the INSERT — never from a caller argument.
     That is the whole security posture: a mutable catalog-row URL can never
-    steer the grant at a host the token wasn't issued for. The connection is
-    the consent record; when its URL changes the connection is re-consented
-    (a fresh row), and this upsert then reflects the new consented URL.
-
-    The connection is selected rather than trusted, under the owner predicate:
-    a connection_id that is absent or belongs to a different user matches no
-    row, so it can never be bound into this workspace. Both cases raise
-    :class:`GrantConnectionUnavailable` — a caller that guessed an id learns
-    nothing from telling them apart.
+    steer a grant at a host the token wasn't issued for. Connections are
+    likewise *selected* under the owner predicate rather than trusted, so an id
+    that is absent or another user's simply produces no grant (and is then
+    retired like any other): a caller that guessed an id learns nothing.
     """
-    async with get_db_connection() as conn:
+    async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
+            granted: dict[str, str] = {}
+            if connection_ids:
+                await cur.execute(
+                    """
+                    INSERT INTO sandbox_egress_grants
+                        (user_id, workspace_id, kind, connection_id,
+                         destination_url, status, created_at, updated_at)
+                    SELECT %s, %s::uuid, %s, c.connection_id, c.server_url,
+                           'active', NOW(), NOW()
+                    FROM user_mcp_oauth_connections c
+                    WHERE c.connection_id = ANY(%s::uuid[]) AND c.user_id = %s
+                    ON CONFLICT (workspace_id, kind, connection_id) DO UPDATE SET
+                        destination_url = EXCLUDED.destination_url,
+                        status = 'active',
+                        updated_at = NOW()
+                    RETURNING connection_id, grant_id
+                    """,
+                    (
+                        user_id, workspace_id, GRANT_KIND_OAUTH_MCP,
+                        list(connection_ids), user_id,
+                    ),
+                )
+                granted = {
+                    str(row["connection_id"]): str(row["grant_id"])
+                    for row in await cur.fetchall()
+                }
+
             await cur.execute(
                 """
-                INSERT INTO sandbox_egress_grants
-                    (user_id, workspace_id, kind, connection_id,
-                     destination_url, status, created_at, updated_at)
-                SELECT %s, %s::uuid, %s, c.connection_id, c.server_url, 'active',
-                       NOW(), NOW()
-                FROM user_mcp_oauth_connections c
-                WHERE c.connection_id = %s::uuid AND c.user_id = %s
-                ON CONFLICT (workspace_id, kind, connection_id) DO UPDATE SET
-                    destination_url = EXCLUDED.destination_url,
-                    status = 'active',
-                    updated_at = NOW()
-                RETURNING grant_id
+                UPDATE sandbox_egress_grants
+                SET status = 'revoked', updated_at = NOW()
+                WHERE workspace_id = %s AND kind = %s AND status = 'active'
+                  AND grant_id != ALL(%s::uuid[])
                 """,
                 (
-                    user_id, workspace_id, GRANT_KIND_OAUTH_MCP,
-                    connection_id, user_id,
+                    workspace_id, GRANT_KIND_OAUTH_MCP,
+                    list(granted.values()),
                 ),
             )
-            row = await cur.fetchone()
-            if row is None:
-                raise GrantConnectionUnavailable(
-                    f"no OAuth connection {connection_id} for this user"
+            if cur.rowcount:
+                logger.info(
+                    f"[egress_grants_db] retired {cur.rowcount} stale grant(s) "
+                    f"for workspace {workspace_id}"
                 )
-            return str(row["grant_id"])
+            return GrantSync(grants=granted, retired=cur.rowcount)
 
 
 async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
@@ -110,39 +142,10 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
             }
 
 
-async def retire_stale_grants(
-    workspace_id: str, *, keep_grant_ids: tuple[str, ...]
-) -> int:
-    """Revoke this workspace's active OAuth grants outside ``keep_grant_ids``.
-
-    The resolved server set is the intent; an active grant it no longer
-    contains is an authorization overhang — the sandbox may still hold that
-    grant_id and a live relay JWT. Returns the number retired. Re-adding the
-    server re-activates through ``ensure_oauth_grant``'s upsert.
-    """
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE sandbox_egress_grants
-                SET status = 'revoked', updated_at = NOW()
-                WHERE workspace_id = %s AND kind = %s AND status = 'active'
-                  AND grant_id != ALL(%s::uuid[])
-                """,
-                (workspace_id, GRANT_KIND_OAUTH_MCP, list(keep_grant_ids)),
-            )
-            if cur.rowcount:
-                logger.info(
-                    f"[egress_grants_db] retired {cur.rowcount} stale grant(s) "
-                    f"for workspace {workspace_id}"
-                )
-            return cur.rowcount
-
-
-async def revoke_grants_for_connection(connection_id: str) -> int:
+async def revoke_grants_for_connection(connection_id: str, *, conn=None) -> int:
     """Flip every grant of a connection to revoked. Returns count."""
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
+    async with get_db_connection(conn) as db:
+        async with db.cursor() as cur:
             await cur.execute(
                 """
                 UPDATE sandbox_egress_grants

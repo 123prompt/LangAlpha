@@ -84,16 +84,15 @@ class ChatAuthResult:
 
 
 # ---------------------------------------------------------------------------
-# Burst guard (local Redis ZSET of slot ids — stays in langalpha)
+# Burst guard (the shared ZSET slot primitive, keyed per user — stays in
+# langalpha)
 #
 # v4 (1.7): each admission holds a uuid member in a per-user ZSET scored by
 # admission time. Release is ZREM — idempotent, so the finalize-time release
 # can ride the hook outbox (effect-before-ack retries are harmless), unlike
 # the old INCR/DECR counter where a retried DECR freed slots never held.
-# Stale members (crashed before release) are reaped by score on each check,
-# so a leak self-heals after the reap horizon even for a busy user who keeps
-# the key alive (the old counter never healed under load). The horizon is
-# workflow-timeout-based so a long-running turn is never reaped while live.
+# The horizon is workflow-timeout-based so a long-running turn is never reaped
+# while live.
 # ---------------------------------------------------------------------------
 
 def _burst_key(user_id: str) -> str:
@@ -104,42 +103,32 @@ def _burst_key(user_id: str) -> str:
 
 async def _check_burst_guard(user_id: str, max_concurrent: int) -> dict:
     """Admit by ZSET cardinality; returns the held slot_id on success."""
-    import time
-    from uuid import uuid4
-
+    from src.server.utils.slot_guard import acquire_slot_member
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
     if not cache.enabled or not cache.client:
         return {"allowed": True}
 
-    key = _burst_key(user_id)
-    slot_id = str(uuid4())
-    now = time.time()
-    horizon = _burst_reap_horizon()
     try:
-        pipe = cache.client.pipeline()
-        pipe.zremrangebyscore(key, "-inf", now - horizon)  # reap leaked
-        pipe.zadd(key, {slot_id: now})
-        pipe.zcard(key)
-        pipe.expire(key, horizon)
-        results = await pipe.execute()
-        current = results[2]
-
-        if current > max_concurrent:
-            # Roll back our own member only.
-            await cache.client.zrem(key, slot_id)
-            return {"allowed": False, "current": current - 1, "limit": max_concurrent}
-
-        return {
-            "allowed": True,
-            "current": current,
-            "limit": max_concurrent,
-            "slot_id": slot_id,
-        }
+        admitted = await acquire_slot_member(
+            cache.client,
+            _burst_key(user_id),
+            limit=max_concurrent,
+            stale_after=_burst_reap_horizon(),
+        )
     except Exception as e:
         logger.warning("Burst guard Redis error, allowing request: %s", e)
         return {"allowed": True}
+
+    result = {
+        "allowed": admitted.allowed,
+        "current": admitted.current,
+        "limit": admitted.limit,
+    }
+    if admitted.allowed:
+        result["slot_id"] = admitted.slot_id
+    return result
 
 
 async def release_burst_slot(
@@ -158,6 +147,7 @@ async def release_burst_slot(
     if not slot_id:
         return
 
+    from src.server.utils.slot_guard import release_slot_member
     from src.utils.cache.redis_cache import get_cache_client
 
     cache = get_cache_client()
@@ -170,7 +160,7 @@ async def release_burst_slot(
         return
 
     try:
-        await cache.client.zrem(_burst_key(user_id), slot_id)
+        await release_slot_member(cache.client, _burst_key(user_id), slot_id)
     except Exception as e:
         if strict:
             raise

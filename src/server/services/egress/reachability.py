@@ -48,20 +48,18 @@ def effective_relay_base_url(provider: str) -> str:
     sandboxes a loopback host is rewritten to the Docker host gateway, so the
     OSS default stack works with zero relay configuration.
     """
-    from src.config.env import (
-        EGRESS_RELAY_BASE_URL,
-        EGRESS_RELAY_BASE_URL_IS_DEFAULT,
-    )
+    from src.config.env import EGRESS_RELAY_BASE_URL, SERVER_BASE_URL
 
-    base = EGRESS_RELAY_BASE_URL
-    if not EGRESS_RELAY_BASE_URL_IS_DEFAULT or provider != "docker":
-        return base
-    parts = urlsplit(base)
+    if EGRESS_RELAY_BASE_URL:
+        return EGRESS_RELAY_BASE_URL
+    parts = urlsplit(SERVER_BASE_URL)
     host = (parts.hostname or "").lower()
-    if host in _LOOPBACK_HOSTNAMES or host.startswith("127."):
+    if provider == "docker" and (
+        host in _LOOPBACK_HOSTNAMES or host.startswith("127.")
+    ):
         port = f":{parts.port}" if parts.port else ""
         return f"{parts.scheme or 'http'}://host.docker.internal{port}"
-    return base
+    return SERVER_BASE_URL
 
 
 def relay_reachability_warning(provider: str, base_url: str) -> str | None:
