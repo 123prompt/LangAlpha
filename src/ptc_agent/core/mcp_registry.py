@@ -1,11 +1,14 @@
-"""MCP Server Registry - Connect to and manage external MCP servers."""
+"""MCP Server Registry - Connect to and manage external MCP servers.
+
+Connection lifecycle only. Schema translation lives in :mod:`mcp_schema`,
+failure diagnosis in :mod:`mcp_diagnostics`, and the per-workspace composite in
+:mod:`mcp_composite`; all three are re-exported here because this module is the
+documented import surface.
+"""
 
 import asyncio
 import os
-import threading
-from collections import deque
 from types import TracebackType
-from typing import Any, NamedTuple
 
 import structlog
 from mcp import StdioServerParameters
@@ -17,240 +20,26 @@ from mcp.client.streamable_http import streamable_http_client
 # The SDK's own httpx factory (sse_client's default); no public re-export yet.
 from mcp.shared._httpx_utils import create_mcp_http_client
 
-from mcp.shared.exceptions import MCPError
-from mcp.types import CONNECTION_CLOSED
-
 from ptc_agent.config.core import CoreConfig, MCPServerConfig
 from src.observability.tracing import tracer as _otel_tracer
 
+from .mcp_composite import SchemaOnlyRegistry, build_composite_registry
+from .mcp_diagnostics import StderrTail, classify_startup_failure
+from .mcp_schema import MCPToolInfo
+
 logger = structlog.get_logger(__name__)
 
-
-def _contains_connection_closed(error: BaseException) -> bool:
-    if isinstance(error, MCPError) and error.code == CONNECTION_CLOSED:
-        return True
-    if isinstance(error, BaseExceptionGroup):
-        return any(_contains_connection_closed(sub) for sub in error.exceptions)
-    return _contains_connection_closed(error.__cause__) if error.__cause__ else False
-
-
-def classify_startup_failure(error: BaseException, stderr_tail: str) -> str | None:
-    """Name the failure when a stdio server process dies before the handshake.
-
-    The SDK surfaces a crashed child as CONNECTION_CLOSED buried in TaskGroup
-    wrappers; the child's actual traceback exists only in our stderr capture.
-    Returns a one-line human diagnosis, or None for other failure shapes.
-    """
-    if not _contains_connection_closed(error):
-        return None
-    if "No module named 'mcp." in stderr_tail or (
-        "ImportError" in stderr_tail and "from mcp." in stderr_tail
-    ):
-        return (
-            "server process crashed importing an MCP SDK module its runtime "
-            "does not provide — its environment pins an incompatible mcp "
-            "version; launch it isolated (uvx/npx) with pinned versions"
-        )
-    if stderr_tail:
-        return (
-            "server process exited before completing the MCP handshake — "
-            "see stderr_tail for the crash output"
-        )
-    return (
-        "server process exited before completing the MCP handshake, "
-        "with no stderr output"
-    )
-
-
-class _StderrTail:
-    """Bounded in-memory tail of an MCP subprocess's stderr.
-
-    ``errlog`` reaches ``subprocess.Popen`` as the child's stderr, so it must
-    be a real file descriptor: a pipe drained by a daemon thread into a
-    bounded deque. Steady-state server chatter never reaches our logs; on a
-    connection failure :meth:`tail` recovers the crash output that would
-    otherwise surface only as an opaque "Connection closed".
-    """
-
-    def __init__(self, max_lines: int = 80) -> None:
-        self._lines: deque[str] = deque(maxlen=max_lines)
-        read_fd, write_fd = os.pipe()
-        self.writer = os.fdopen(write_fd, "w")
-        self._reader = os.fdopen(read_fd, "r", errors="replace")
-        # The drain thread lives for the connection's whole lifetime (not just
-        # connect): it copies subprocess stderr into the deque until EOF.
-        self._thread = threading.Thread(target=self._drain, daemon=True)
-        self._thread.start()
-
-    def _drain(self) -> None:
-        # The thread owns the read end: EOF arrives once every write end
-        # (ours and the exited subprocess's dup) is closed.
-        with self._reader:
-            for line in self._reader:
-                self._lines.append(line.rstrip("\n"))
-
-    def tail(self, *, drain: bool = False) -> str:
-        """Snapshot of the captured lines.
-
-        Pass ``drain=True`` on the failure path to close the writer and join
-        the drain thread first, so the read can't race the daemon thread still
-        appending the subprocess's dying output into the bounded deque.
-        """
-        if drain:
-            self.close()
-            self._thread.join(timeout=0.25)
-        return "\n".join(list(self._lines))
-
-    def close(self) -> None:
-        try:
-            self.writer.close()
-        except OSError:
-            pass
-
-
-class _ResolvedType(NamedTuple):
-    type: str
-    nullable: bool
-    enum: list[Any] | None
-    items_type: str | None
-
-
-def _resolve_schema_type(prop: dict[str, Any]) -> _ResolvedType:
-    """Resolve a property schema to a base JSON type + the facts wrappers need.
-
-    Handles the two shapes real servers actually emit for optionality —
-    pydantic's ``anyOf [T, null]`` and the ``type: [T, "null"]`` list form —
-    so a nullable string surfaces as ``string`` + nullable instead of
-    degrading to ``any``. Anything more exotic still falls back to ``any``.
-    """
-    t = prop.get("type")
-    node = prop
-    nullable = False
-    if t is None:
-        variants = prop.get("anyOf") or prop.get("oneOf")
-        if isinstance(variants, list):
-            typed = [
-                v for v in variants
-                if isinstance(v, dict) and v.get("type") != "null"
-            ]
-            nullable = len(typed) != len(variants)
-            if len(typed) == 1:
-                node = typed[0]
-                t = node.get("type")
-    if isinstance(t, list):
-        non_null = [x for x in t if x != "null"]
-        nullable = nullable or len(non_null) != len(t)
-        t = non_null[0] if len(non_null) == 1 else None
-    if not isinstance(t, str):
-        t = "any"
-    enum = node.get("enum")
-    if not (isinstance(enum, list) and enum):
-        enum = None
-    items_type = None
-    if t == "array":
-        items = node.get("items")
-        if isinstance(items, dict) and isinstance(items.get("type"), str):
-            items_type = items["type"]
-    return _ResolvedType(t, nullable, enum, items_type)
-
-
-class MCPToolInfo:
-    """Snapshot of a single tool's schema as reported by its MCP server."""
-
-    def __init__(
-        self,
-        name: str,
-        description: str,
-        input_schema: dict[str, Any],
-        server_name: str,
-    ) -> None:
-        self.name = name
-        self.description = description
-        self.input_schema = input_schema
-        self.server_name = server_name
-
-    def get_parameters(self) -> dict[str, Any]:
-        """Return ``{param_name: {type, description, required, default, ...}}``.
-
-        Beyond the historical keys, each entry carries ``has_default`` (a
-        stored ``default: null`` is not the same as no default), ``nullable``,
-        ``enum`` and ``items_type`` — resolved by :func:`_resolve_schema_type`
-        so wrappers and docs can show real types and allowed values.
-        """
-        params = {}
-
-        if "properties" in self.input_schema:
-            required_params = self.input_schema.get("required", [])
-
-            for param_name, param_info in self.input_schema["properties"].items():
-                if not isinstance(param_info, dict):
-                    param_info = {}
-                resolved = _resolve_schema_type(param_info)
-                params[param_name] = {
-                    "type": resolved.type,
-                    "description": param_info.get("description", ""),
-                    "required": param_name in required_params,
-                    "default": param_info.get("default"),
-                    "has_default": "default" in param_info,
-                    "nullable": resolved.nullable,
-                    "enum": resolved.enum,
-                    "items_type": resolved.items_type,
-                }
-
-        return params
-
-    def _extract_return_type_from_description(self) -> str:
-        """Extract return type hint from description's Returns: section.
-
-        Returns:
-            Type hint string (e.g., "dict", "list[dict]") or "Any" if not found
-        """
-        import re
-
-        if not self.description:
-            return "Any"
-
-        # Look for common type indicators after "Returns:"
-        match = re.search(
-            r"Returns?:\s*\n?\s*(\w+(?:\[[\w,\s]+\])?)",
-            self.description,
-            re.IGNORECASE
-        )
-
-        if match:
-            type_str = match.group(1).lower()
-            type_map = {
-                "dict": "dict",
-                "dictionary": "dict",
-                "list": "list",
-                "array": "list",
-                "str": "str",
-                "string": "str",
-                "int": "int",
-                "integer": "int",
-                "float": "float",
-                "number": "float",
-                "bool": "bool",
-                "boolean": "bool",
-            }
-            return type_map.get(type_str, "Any")
-
-        return "Any"
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary.
-
-        Returns:
-            Dictionary representation
-        """
-        return_type = self._extract_return_type_from_description()
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.get_parameters(),
-            "server_name": self.server_name,
-            "return_type": return_type,
-        }
+__all__ = [
+    "MCPRegistry",
+    "MCPServerConnector",
+    "MCPToolInfo",
+    "SchemaOnlyRegistry",
+    "build_composite_registry",
+    "classify_startup_failure",
+    "clear_global_registry",
+    "get_global_registry",
+    "set_global_registry",
+]
 
 
 class MCPServerConnector:
@@ -297,15 +86,10 @@ class MCPServerConnector:
     })
 
     def _prepare_env(self) -> dict[str, str]:
-        """Prepare environment variables by expanding placeholders.
+        """Safe base vars plus the server's declared ``env:``, placeholders expanded.
 
-        Starts from a safe subset of os.environ (not the full environment)
-        to prevent leaking host secrets to MCP server subprocesses.
-        Servers that need specific env vars must declare them in their
-        config's `env:` block.
-
-        Returns:
-            Dictionary with safe base vars + expanded declared env vars
+        Starts from a safe subset of os.environ (not the full environment) to
+        prevent leaking host secrets to MCP server subprocesses.
         """
         base_env = {k: os.environ[k] for k in self._SAFE_ENV_VARS if k in os.environ}
 
@@ -412,7 +196,7 @@ class MCPServerConnector:
         (MCP SDK best practice); the transport variants differ only in how the
         stream contexts are built.
         """
-        stderr_capture: _StderrTail | None = None
+        stderr_capture: StderrTail | None = None
         try:
             if self.config.transport == "http":
                 url = self._expand_url()
@@ -448,7 +232,7 @@ class MCPServerConnector:
                     env=self._prepare_env(),
                 )
 
-                stderr_capture = _StderrTail()
+                stderr_capture = StderrTail()
                 async with Client(
                     stdio_client(server_params, errlog=stderr_capture.writer)
                 ) as client:
@@ -526,14 +310,10 @@ class MCPServerConnector:
             span.end()
 
     async def _discover_tools_with_retry(self, *, max_retries: int = 3) -> None:
-        """Discover tools with retry logic for SSE connections.
+        """Discover tools with exponential backoff, for SSE only.
 
-        SSE connections may have timing issues where the endpoint event
-        hasn't been received yet. This method retries tool discovery
-        with exponential backoff.
-
-        Args:
-            max_retries: Maximum number of retry attempts
+        An SSE connection can be usable before its endpoint event arrives, so
+        the first list_tools may legitimately come back empty.
         """
         for attempt in range(max_retries):
             try:
@@ -623,6 +403,16 @@ class MCPRegistry:
     # may leak (process exit reaps them).
     FREEZE_TIMEOUT_S = 10.0
 
+    async def _exit_all_connectors(self) -> None:
+        """Exit every connector context in parallel, absorbing their failures."""
+        await asyncio.gather(
+            *[
+                connector.__aexit__(None, None, None)
+                for connector in self.connectors.values()
+            ],
+            return_exceptions=True,
+        )
+
     async def freeze(self) -> None:
         """Terminate stdio subprocesses while preserving each connector's ``tools``.
 
@@ -634,14 +424,7 @@ class MCPRegistry:
 
         try:
             await asyncio.wait_for(
-                asyncio.gather(
-                    *[
-                        connector.__aexit__(None, None, None)
-                        for connector in self.connectors.values()
-                    ],
-                    return_exceptions=True,
-                ),
-                timeout=self.FREEZE_TIMEOUT_S,
+                self._exit_all_connectors(), timeout=self.FREEZE_TIMEOUT_S
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -722,14 +505,7 @@ class MCPRegistry:
 
         logger.info("Disconnecting from all MCP servers")
 
-        await asyncio.gather(
-            *[
-                connector.__aexit__(None, None, None)
-                for connector in self.connectors.values()
-            ],
-            return_exceptions=True,
-        )
-
+        await self._exit_all_connectors()
         self.connectors.clear()
 
     async def _force_disconnect_all(self) -> None:
@@ -742,43 +518,18 @@ class MCPRegistry:
         if not self.connectors:
             return
 
-        await asyncio.gather(
-            *[
-                connector.__aexit__(None, None, None)
-                for connector in self.connectors.values()
-            ],
-            return_exceptions=True,
-        )
+        await self._exit_all_connectors()
         self.connectors.clear()
 
     def get_all_tools(self) -> dict[str, list[MCPToolInfo]]:
         """Return tools grouped by server name."""
-        tools_by_server = {}
-
-        for server_name, connector in self.connectors.items():
-            tools_by_server[server_name] = connector.tools
-
-        return tools_by_server
+        return {name: c.tools for name, c in self.connectors.items()}
 
     def get_tool_info(self, server_name: str, tool_name: str) -> MCPToolInfo | None:
-        """Get information about a specific tool.
-
-        Args:
-            server_name: Name of the server
-            tool_name: Name of the tool
-
-        Returns:
-            Tool info or None if not found
-        """
         connector = self.connectors.get(server_name)
         if not connector:
             return None
-
-        for tool in connector.tools:
-            if tool.name == tool_name:
-                return tool
-
-        return None
+        return next((t for t in connector.tools if t.name == tool_name), None)
 
     async def __aenter__(self) -> "MCPRegistry":
         """Async context manager entry."""
@@ -827,157 +578,3 @@ def clear_global_registry() -> None:
     """Drop the process-global registry reference."""
     global _GLOBAL_REGISTRY
     _GLOBAL_REGISTRY = None
-
-
-# ---------------------------------------------------------------------------
-# Per-workspace composite registry (append-only over the frozen built-ins).
-# ---------------------------------------------------------------------------
-#
-# A workspace's effective MCP set = the process-global built-ins (taken
-# verbatim, never round-tripped through the discovery cache) PLUS the
-# workspace's user-configured servers, whose tool schemas come from the
-# sanitized discovery snapshot. Nothing here executes a tool: the registry is
-# a schema surface, and every MCP call happens sandbox-side.
-#
-# A zero-user-server workspace short-circuits to the built-in registry object
-# itself (identity), which is what keeps such workspaces byte-identical to the
-# pre-change behavior (manifest hash + prompt summary unchanged).
-
-
-class _SchemaConfig:
-    """Minimal ``CoreConfig``-shaped view exposing the effective ``mcp.servers``.
-
-    Duck-types only the ``.mcp`` attribute consumers read off a registry's
-    ``.config`` (``.mcp.servers`` and ``.mcp.tool_exposure_mode``). Built-in
-    config objects are reused verbatim; only the server list is the merged
-    built-ins + user servers.
-    """
-
-    def __init__(self, builtin_config: CoreConfig, servers: list[MCPServerConfig]) -> None:
-        self._builtin_config = builtin_config
-        self.mcp = builtin_config.mcp.model_copy(update={"servers": servers})
-
-    def __getattr__(self, name: str) -> Any:
-        # Defer every other attribute to the built-in CoreConfig so the composite
-        # remains a faithful stand-in (e.g. ``.filesystem``, ``.sandbox``).
-        return getattr(self._builtin_config, name)
-
-
-class SchemaOnlyRegistry:
-    """Duck-typed ``MCPRegistry`` over built-in connectors + user-server schemas.
-
-    Read-only: built-in tools come straight from the frozen global registry's
-    connectors; user-server tools are wrapped ``MCPToolInfo`` from the sanitized
-    discovery cache.
-    """
-
-    def __init__(
-        self,
-        builtin_registry: "MCPRegistry",
-        user_servers: list[MCPServerConfig],
-        tool_schemas: dict[str, list[dict]],
-        disabled_builtin_names: frozenset[str] = frozenset(),
-    ) -> None:
-        self._builtin_registry = builtin_registry
-        # Built-ins a workspace turned off: excluded from get_all_tools(),
-        # connectors, and the effective config so the agent neither sees nor can
-        # call them (a disable-marker must take effect at runtime, not just in
-        # the resolver).
-        self._disabled_builtin_names = frozenset(disabled_builtin_names)
-        # User-server tools, in deterministic per-server order, wrapped as
-        # MCPToolInfo so every downstream reader (codegen, formatter, hash) sees
-        # the same shape as a built-in. Original tool names are preserved;
-        # codegen re-sanitizes them.
-        self._user_tools: dict[str, list[MCPToolInfo]] = {}
-        for server in user_servers:
-            schemas = tool_schemas.get(server.name)
-            if not schemas:
-                # Pending/error server: contributes config (so the prompt can
-                # mention it) but zero tools.
-                continue
-            self._user_tools[server.name] = [
-                MCPToolInfo(
-                    name=schema.get("name", ""),
-                    description=schema.get("description", "") or "",
-                    input_schema=schema.get("input_schema") or {},
-                    server_name=server.name,
-                )
-                for schema in schemas
-            ]
-        # Effective config: enabled built-ins (verbatim, minus disabled) + user
-        # servers, so the formatter sees each user server's
-        # description/instruction/source and never a workspace-disabled built-in.
-        effective_builtins = [
-            s
-            for s in builtin_registry.config.mcp.servers
-            if s.name not in self._disabled_builtin_names
-        ]
-        effective_servers = [*effective_builtins, *user_servers]
-        self.config = _SchemaConfig(builtin_registry.config, effective_servers)
-
-    @property
-    def frozen(self) -> bool:
-        """Always frozen — a schema-only snapshot has no live subprocesses."""
-        return True
-
-    @property
-    def connectors(self) -> dict[str, "MCPServerConnector"]:
-        """Built-in connectors ONLY — user servers have no host connector, ever.
-
-        Workspace-disabled built-ins are excluded so a disabled built-in's
-        connector is neither visible nor callable.
-        """
-        connectors = self._builtin_registry.connectors
-        if not self._disabled_builtin_names:
-            return connectors
-        return {
-            name: conn
-            for name, conn in connectors.items()
-            if name not in self._disabled_builtin_names
-        }
-
-    def get_all_tools(self) -> dict[str, list[MCPToolInfo]]:
-        """Enabled built-in tools (minus disabled), then user-server tools."""
-        tools_by_server: dict[str, list[MCPToolInfo]] = {
-            name: tools
-            for name, tools in self._builtin_registry.get_all_tools().items()
-            if name not in self._disabled_builtin_names
-        }
-        tools_by_server.update(self._user_tools)
-        return tools_by_server
-
-    def get_tool_info(self, server_name: str, tool_name: str) -> MCPToolInfo | None:
-        """Look up a tool by server + name across built-ins and user servers."""
-        if server_name in self._disabled_builtin_names:
-            return None
-        if server_name in self._user_tools:
-            for tool in self._user_tools[server_name]:
-                if tool.name == tool_name:
-                    return tool
-            return None
-        return self._builtin_registry.get_tool_info(server_name, tool_name)
-
-def build_composite_registry(
-    builtin_registry: "MCPRegistry",
-    user_servers: list[MCPServerConfig],
-    tool_schemas: dict[str, list[dict]],
-    disabled_builtin_names: frozenset[str] = frozenset(),
-) -> Any:
-    """Append user-server schemas onto the frozen built-in registry.
-
-    ``user_servers`` are ``source='workspace'``, enabled, in resolver order
-    (built-ins config-order, then user servers alphabetical). ``tool_schemas``
-    maps a server name to its sanitized ``[{name, description, input_schema}]``
-    snapshot; only ``status='ok'`` servers appear. ``disabled_builtin_names``
-    are built-ins a workspace turned off — excluded from tools/connectors/config
-    so the agent can't see or call them at runtime.
-
-    When there are NO user servers AND no disabled built-ins, the built-in
-    registry is returned UNCHANGED (identity), keeping clean workspaces
-    byte-identical downstream.
-    """
-    if not user_servers and not disabled_builtin_names:
-        return builtin_registry
-    return SchemaOnlyRegistry(
-        builtin_registry, user_servers, tool_schemas, disabled_builtin_names
-    )

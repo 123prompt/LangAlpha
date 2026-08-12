@@ -5,21 +5,17 @@ deterministic byte-stable summaries, and builtin-only ``.connectors``.
 """
 
 from ptc_agent.agent.prompts.formatter import build_tool_summary_from_registry
-from ptc_agent.config.core import MCPConfig, MCPServerConfig
-from ptc_agent.core.mcp_registry import (
-    MCPRegistry,
-    MCPToolInfo,
-    SchemaOnlyRegistry,
-    build_composite_registry,
+from ptc_agent.config.core import (
+    CoreConfig,
+    FilesystemConfig,
+    LoggingConfig,
+    MCPConfig,
+    MCPServerConfig,
+    SandboxConfig,
+    SecurityConfig,
 )
-
-
-class _FakeCore:
-    """Minimal CoreConfig-shaped stand-in exposing .mcp and an extra attr."""
-
-    def __init__(self, mcp: MCPConfig) -> None:
-        self.mcp = mcp
-        self.filesystem = "FS-SENTINEL"
+from ptc_agent.core.mcp_composite import SchemaOnlyRegistry, build_composite_registry
+from ptc_agent.core.mcp_registry import MCPRegistry, MCPToolInfo
 
 
 class _FakeConnector:
@@ -35,7 +31,13 @@ def _make_builtin_registry() -> MCPRegistry:
         instruction="Use for prices.",
     )
     reg = MCPRegistry.__new__(MCPRegistry)
-    reg.config = _FakeCore(MCPConfig(servers=[builtin_cfg], tool_exposure_mode="summary"))
+    reg.config = CoreConfig(
+        sandbox=SandboxConfig(),
+        security=SecurityConfig(),
+        mcp=MCPConfig(servers=[builtin_cfg], tool_exposure_mode="summary"),
+        logging=LoggingConfig(),
+        filesystem=FilesystemConfig(),
+    )
     reg._frozen = True
     reg.connectors = {
         "market": _FakeConnector(
@@ -104,8 +106,9 @@ def test_composite_config_exposes_builtins_and_user_servers():
     by_name = {s.name: s for s in servers}
     assert by_name["market"].source == "builtin"
     assert by_name["userserver"].source == "workspace"
-    # Other CoreConfig attributes defer to the built-in config.
-    assert composite.config.filesystem == "FS-SENTINEL"
+    # Only .mcp is rebuilt — every other sub-config is the built-in's own object.
+    assert composite.config.filesystem is reg.config.filesystem
+    assert composite.config.sandbox is reg.config.sandbox
     assert composite.frozen is True
 
 
