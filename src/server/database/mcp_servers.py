@@ -23,16 +23,6 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from src.server.database.mcp_tool_schemas import (  # noqa: F401
-    delete_tool_schemas,
-    delete_tool_schemas_and_bump,
-    delete_user_tool_schemas,
-    delete_user_tool_schemas_and_bump,
-    get_tool_schemas,
-    get_user_tool_schemas,
-    upsert_tool_schemas,
-    upsert_user_tool_schemas,
-)
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
