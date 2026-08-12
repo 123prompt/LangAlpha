@@ -207,9 +207,12 @@ async def patched_get_db_connection(test_db_pool):
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
-    async def _test_get_db_connection():
-        async with test_db_pool.connection() as conn:
+    async def _test_get_db_connection(conn=None):
+        if conn is not None:
             yield conn
+            return
+        async with test_db_pool.connection() as owned:
+            yield owned
 
     # Every module that does a module-level `from .conversation import
     # get_db_connection` holds its own local reference, so each one needs

@@ -127,7 +127,7 @@ def get_or_create_pool() -> AsyncConnectionPool:
 
 
 @asynccontextmanager
-async def get_db_connection():
+async def get_db_connection(conn=None):
     """
     Shared database connection context manager using connection pooling.
 
@@ -135,6 +135,12 @@ async def get_db_connection():
     - Uses connection pool for efficient connection reuse
     - Prepared statements disabled (prepare_threshold=0)
     - Autocommit mode enabled (configured at pool creation)
+
+    Pass an already-acquired ``conn`` to yield it unchanged instead of checking
+    out a second pool slot — that is how a write joins a caller's transaction,
+    and how statements stay on an advisory-lock holder's session (a nested
+    fresh acquire would tie up two slots per caller and can stall on pool
+    timeout under load).
 
     IMPORTANT:
     - Pool must be opened during server startup (in app.py lifespan)
@@ -144,6 +150,10 @@ async def get_db_connection():
                 await cur.execute("SELECT * FROM table")
     - Do NOT modify connection after acquisition - causes pool to discard it.
     """
+    if conn is not None:
+        yield conn
+        return
+
     pool = get_or_create_pool()
 
     # Pool should already be open from startup
