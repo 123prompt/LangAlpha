@@ -75,7 +75,7 @@ class SecretRedactor:
 
         Args:
             text: Content to scan.
-            vault_secrets: Per-workspace vault secrets ({name: value}).
+            vault_secrets: A workspace's effective vault secrets ({name: value}).
                 Merged into the scan alongside global MCP secrets.
         """
         for name, value in self._secrets:
@@ -122,10 +122,10 @@ def get_redactor() -> SecretRedactor:
 
 
 async def get_vault_secrets_for_redaction(workspace_id: str) -> dict[str, str]:
-    """Get per-workspace vault secrets for redaction.
+    """Get a workspace's effective vault secrets (user ∪ workspace) for redaction.
 
-    Tries the active sandbox session first (zero cost), falls back to DB
-    for stopped workspaces.
+    Tries the active sandbox session first (zero cost — it holds the same
+    merged set the push uploaded), falls back to DB for stopped workspaces.
     """
     # Fast path: read from active session (already in memory from push_vault_secrets)
     try:
@@ -140,11 +140,11 @@ async def get_vault_secrets_for_redaction(workspace_id: str) -> dict[str, str]:
     except Exception:
         pass
 
-    # Slow path: DB query for stopped workspaces (infrequent, max 20 rows)
+    # Slow path: DB query for stopped workspaces (infrequent)
     try:
-        from src.server.database.vault_secrets import get_workspace_secrets_decrypted
+        from src.server.database.vault_secrets import get_effective_secrets
 
-        return await get_workspace_secrets_decrypted(workspace_id)
+        return await get_effective_secrets(workspace_id)
     except Exception:
         logger.warning("Failed to fetch vault secrets for redaction", workspace_id=workspace_id)
         return {}
