@@ -1,6 +1,6 @@
 """Database CRUD for per-workspace and user-level MCP server configuration.
 
-Four concerns live here:
+Two concerns live here:
 - User-level servers (``user_mcp_servers``): CRUD by ``(user_id, name)``.
   ``enabled`` rows are LIVE config inherited by every workspace of the user at
   resolve time; disabled rows are inert templates (the pre-connectors
@@ -9,23 +9,30 @@ Four concerns live here:
 - Per-workspace rows (``workspace_mcp_servers``): the source of truth for a
   workspace's effective MCP set. EVERY write bumps ``workspaces.mcp_config_version``
   in the SAME transaction so sessions can detect drift on their next acquire.
-- Discovery schema cache (``workspace_mcp_tool_schemas``): tool snapshots keyed
-  by ``(workspace_id, server_name, config_hash)`` — a per-server config
-  fingerprint, so toggling/adding an unrelated server never orphans a snapshot.
-- User-level discovery cache (``user_mcp_tool_schemas``): same shape, keyed by
-  user — for OAuth servers whose discovery runs host-side, plus a
-  ``schema_digest`` so fan-out happens only when tool content actually changed.
+
+The discovery schema cache for both tiers lives in ``mcp_tool_schemas``.
 
 Secrets are never stored here — env/header values hold ``${vault:NAME}``
 references resolved against ``workspace_vault_secrets`` inside the sandbox.
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from src.server.database.mcp_tool_schemas import (  # noqa: F401
+    delete_tool_schemas,
+    delete_tool_schemas_and_bump,
+    delete_user_tool_schemas,
+    delete_user_tool_schemas_and_bump,
+    get_tool_schemas,
+    get_user_tool_schemas,
+    upsert_tool_schemas,
+    upsert_user_tool_schemas,
+)
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -35,6 +42,15 @@ MAX_MCP_SERVERS_PER_WORKSPACE = 20
 
 # Hard cap on catalog templates per user.
 MAX_CATALOG_SERVERS_PER_USER = 50
+
+# Mutable catalog columns, split by how a value binds. Anything outside the
+# union is rejected by ``update_catalog_server`` rather than silently dropped.
+_CATALOG_JSONB_COLUMNS = frozenset({"args", "env", "headers"})
+_CATALOG_SCALAR_COLUMNS = frozenset({
+    "transport", "command", "url", "description", "instruction",
+    "tool_exposure_mode", "discovery_uses_secrets",
+})
+CATALOG_COLUMNS = _CATALOG_JSONB_COLUMNS | _CATALOG_SCALAR_COLUMNS
 
 
 # ---------------------------------------------------------------------------
@@ -92,13 +108,14 @@ async def create_catalog_server(
     instruction: str = "",
     tool_exposure_mode: str = "summary",
     discovery_uses_secrets: bool = False,
+    conn=None,
 ) -> dict[str, Any]:
     """Insert a catalog template. Raises ValueError on duplicate name or over cap.
 
     Enforces ``MAX_CATALOG_SERVERS_PER_USER`` under an advisory lock on the
     user so concurrent creates can't slip past the cap.
     """
-    async with get_db_connection() as conn:
+    async with get_db_connection(conn) as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 # Serialize concurrent catalog creates for this user.
@@ -146,29 +163,24 @@ async def create_catalog_server(
 
 
 async def update_catalog_server(
-    user_id: str, name: str, *, updates: dict[str, Any]
+    user_id: str, name: str, *, updates: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    """Partial update of a catalog template. Returns the row, or None if absent."""
+    """Partial update of a catalog template. Returns the row, or None if absent.
+
+    Raises ValueError on a key outside ``CATALOG_COLUMNS``: a caller that
+    misspells a column must not have the write silently dropped.
+    """
+    unknown = sorted(set(updates) - CATALOG_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown catalog column(s): {', '.join(unknown)}")
     if not updates:
         return await get_catalog_server(user_id, name)
 
-    # Whitelist mutable columns; JSONB columns are wrapped in Json().
-    _jsonb_cols = {"args", "env", "headers"}
-    _scalar_cols = {
-        "transport", "command", "url", "description", "instruction",
-        "tool_exposure_mode", "discovery_uses_secrets",
-    }
-    parts: list[str] = []
-    params: list[Any] = []
-    for col, val in updates.items():
-        if col in _jsonb_cols:
-            parts.append(f"{col} = %s")
-            params.append(Json(val))
-        elif col in _scalar_cols:
-            parts.append(f"{col} = %s")
-            params.append(val)
-    if not parts:
-        return await get_catalog_server(user_id, name)
+    parts: list[str] = [f"{col} = %s" for col in updates]
+    params: list[Any] = [
+        Json(val) if col in _CATALOG_JSONB_COLUMNS else val
+        for col, val in updates.items()
+    ]
     parts.append("updated_at = NOW()")
     params.extend([user_id, name])
 
@@ -424,6 +436,7 @@ async def insert_workspace_server(
     name: str,
     *,
     config: dict[str, Any] | None = None,
+    conn=None,
 ) -> dict[str, Any] | None:
     """Insert a NEW source='workspace' row; bumps version. None on name conflict.
 
@@ -432,7 +445,7 @@ async def insert_workspace_server(
     name already exists, which the router maps to a 409. Enforces
     ``MAX_MCP_SERVERS_PER_WORKSPACE`` under the same advisory lock as upsert.
     """
-    async with get_db_connection() as conn:
+    async with get_db_connection(conn) as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 # Serialize concurrent mutations for this workspace.
@@ -535,221 +548,6 @@ async def delete_workspace_server(workspace_id: str, name: str) -> bool:
                 return True
 
 
-# ---------------------------------------------------------------------------
-# Discovery schema cache
-# ---------------------------------------------------------------------------
-
-
-async def get_tool_schemas(workspace_id: str) -> list[dict[str, Any]]:
-    """Latest discovery snapshot per server for a workspace (any config_hash).
-
-    Returns one row per server — the most recently discovered — including its
-    ``config_hash``. The caller compares that against the server's CURRENT
-    fingerprint to decide whether the snapshot is a valid hit (config unchanged)
-    or stale (config changed ⇒ treat as pending / re-discover). Decoupling the
-    read from the workspace config_version is what stops an unrelated mutation
-    from invalidating every server's cache.
-    """
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT DISTINCT ON (server_name)
-                       workspace_id, server_name, config_hash, tools, status,
-                       error, observed_meta, discovered_at
-                FROM workspace_mcp_tool_schemas
-                WHERE workspace_id = %s
-                ORDER BY server_name, discovered_at DESC
-                """,
-                (workspace_id,),
-            )
-            return [_schema_row_to_dict(r) for r in await cur.fetchall()]
-
-
-async def upsert_tool_schemas(
-    workspace_id: str,
-    server_name: str,
-    config_hash: str,
-    *,
-    tools: list[dict[str, Any]] | None = None,
-    status: str = "pending",
-    error: str = "",
-    observed_meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Insert or replace a discovery snapshot for one server at one config hash.
-
-    Snapshots for the same server at OTHER config hashes are deleted in the
-    same transaction — only the current config's snapshot is kept, so config
-    iteration doesn't accumulate dead rows. A non-ok write never downgrades an
-    existing same-hash ``ok`` row (config unchanged ⇒ the cached tools are
-    still valid): the transient failure is recorded in ``error`` but tools,
-    status, and ``discovered_at`` are preserved.
-    """
-    async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    DELETE FROM workspace_mcp_tool_schemas
-                    WHERE workspace_id = %s AND server_name = %s
-                      AND config_hash <> %s
-                    """,
-                    (workspace_id, server_name, config_hash),
-                )
-                await cur.execute(
-                    """
-                    INSERT INTO workspace_mcp_tool_schemas AS t
-                        (workspace_id, server_name, config_hash, tools, status,
-                         error, observed_meta, discovered_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (workspace_id, server_name, config_hash) DO UPDATE
-                        SET tools = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                         THEN t.tools ELSE EXCLUDED.tools END,
-                            status = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                          THEN t.status ELSE EXCLUDED.status END,
-                            error = EXCLUDED.error,
-                            observed_meta = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                                 THEN t.observed_meta ELSE EXCLUDED.observed_meta END,
-                            discovered_at = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                                 THEN t.discovered_at ELSE NOW() END
-                    RETURNING workspace_id, server_name, config_hash, tools, status,
-                              error, observed_meta, discovered_at
-                    """,
-                    (
-                        workspace_id, server_name, config_hash, Json(tools or []),
-                        status, error, Json(observed_meta or {}),
-                    ),
-                )
-                return _schema_row_to_dict(await cur.fetchone())
-
-
-async def delete_tool_schemas(workspace_id: str, server_name: str) -> int:
-    """Delete ALL discovery snapshots for one server (any hash). Returns count.
-
-    Used when a snapshot may be invalid despite an unchanged config hash —
-    e.g. a vault secret the server's discovery depends on changed value.
-    """
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM workspace_mcp_tool_schemas "
-                "WHERE workspace_id = %s AND server_name = %s",
-                (workspace_id, server_name),
-            )
-            return cur.rowcount
-
-
-async def delete_tool_schemas_and_bump(
-    workspace_id: str, server_names: list[str]
-) -> int:
-    """Purge snapshots for the named servers AND bump mcp_config_version, atomically.
-
-    One transaction so a mid-purge failure can never leave schemas partially
-    deleted with the version un-bumped (live sessions would skip re-resolution
-    against the half-purged cache). Returns the deleted row count.
-    """
-    async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "DELETE FROM workspace_mcp_tool_schemas "
-                    "WHERE workspace_id = %s AND server_name = ANY(%s)",
-                    (workspace_id, server_names),
-                )
-                deleted = cur.rowcount
-                await _bump_version(cur, workspace_id)
-                return deleted
-
-
-# ---------------------------------------------------------------------------
-# User-level discovery schema cache (host-side discovery for OAuth servers)
-# ---------------------------------------------------------------------------
-
-
-async def get_user_tool_schemas(user_id: str) -> list[dict[str, Any]]:
-    """Latest snapshot per server for a user (any config_hash), like
-    ``get_tool_schemas`` but user-scoped."""
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                SELECT DISTINCT ON (server_name)
-                       user_id, server_name, config_hash, tools, status,
-                       error, schema_digest, observed_meta, discovered_at
-                FROM user_mcp_tool_schemas
-                WHERE user_id = %s
-                ORDER BY server_name, discovered_at DESC
-                """,
-                (user_id,),
-            )
-            return [_user_schema_row_to_dict(r) for r in await cur.fetchall()]
-
-
-async def upsert_user_tool_schemas(
-    user_id: str,
-    server_name: str,
-    config_hash: str,
-    *,
-    tools: list[dict[str, Any]] | None = None,
-    status: str = "pending",
-    error: str = "",
-    schema_digest: str = "",
-    observed_meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Insert or replace a user-level snapshot; same no-downgrade rule as the
-    workspace variant (a non-ok write never clobbers a same-hash ok row)."""
-    async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    DELETE FROM user_mcp_tool_schemas
-                    WHERE user_id = %s AND server_name = %s
-                      AND config_hash <> %s
-                    """,
-                    (user_id, server_name, config_hash),
-                )
-                await cur.execute(
-                    """
-                    INSERT INTO user_mcp_tool_schemas AS t
-                        (user_id, server_name, config_hash, tools, status,
-                         error, schema_digest, observed_meta, discovered_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    ON CONFLICT (user_id, server_name, config_hash) DO UPDATE
-                        SET tools = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                         THEN t.tools ELSE EXCLUDED.tools END,
-                            status = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                          THEN t.status ELSE EXCLUDED.status END,
-                            error = EXCLUDED.error,
-                            schema_digest = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                                 THEN t.schema_digest ELSE EXCLUDED.schema_digest END,
-                            observed_meta = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                                 THEN t.observed_meta ELSE EXCLUDED.observed_meta END,
-                            discovered_at = CASE WHEN t.status = 'ok' AND EXCLUDED.status <> 'ok'
-                                                 THEN t.discovered_at ELSE NOW() END
-                    RETURNING user_id, server_name, config_hash, tools, status,
-                              error, schema_digest, observed_meta, discovered_at
-                    """,
-                    (
-                        user_id, server_name, config_hash, Json(tools or []),
-                        status, error, schema_digest, Json(observed_meta or {}),
-                    ),
-                )
-                return _user_schema_row_to_dict(await cur.fetchone())
-
-
-async def delete_user_tool_schemas(user_id: str, server_name: str) -> int:
-    """Delete ALL user-level snapshots for one server. Returns count."""
-    async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM user_mcp_tool_schemas "
-                "WHERE user_id = %s AND server_name = %s",
-                (user_id, server_name),
-            )
-            return cur.rowcount
-
-
 async def bump_workspace_mcp_version(workspace_id: str) -> None:
     """Bump mcp_config_version outside a row mutation (own transaction).
 
@@ -821,33 +619,4 @@ def _workspace_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "config": row["config"],
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
-    }
-
-
-def _user_schema_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a user_mcp_tool_schemas row into a plain dict."""
-    return {
-        "user_id": row["user_id"],
-        "server_name": row["server_name"],
-        "config_hash": row["config_hash"],
-        "tools": row["tools"] or [],
-        "status": row["status"],
-        "error": row["error"] or "",
-        "schema_digest": row["schema_digest"] or "",
-        "observed_meta": row["observed_meta"] or {},
-        "discovered_at": row["discovered_at"].isoformat(),
-    }
-
-
-def _schema_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a workspace_mcp_tool_schemas row into a plain dict."""
-    return {
-        "workspace_id": str(row["workspace_id"]),
-        "server_name": row["server_name"],
-        "config_hash": row["config_hash"],
-        "tools": row["tools"] or [],
-        "status": row["status"],
-        "error": row["error"] or "",
-        "observed_meta": row["observed_meta"] or {},
-        "discovered_at": row["discovered_at"].isoformat(),
     }

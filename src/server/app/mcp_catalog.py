@@ -22,21 +22,24 @@ import logging
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
 
-from src.server.database.mcp_oauth import get_connection, list_connections
-from src.server.services.mcp_config import same_consented_url
+from src.server.database.mcp_oauth import (
+    ConnectionStatus,
+    get_connection,
+    list_connections,
+)
+from src.server.services.mcp_config import builtin_names, same_consented_url
 from src.server.database.mcp_servers import (
     MAX_CATALOG_SERVERS_PER_USER,
     create_catalog_server,
     delete_catalog_server,
     get_catalog_server,
-    get_user_tool_schemas,
     list_catalog_servers,
     set_catalog_server_enabled,
     update_catalog_server,
 )
+from src.server.database.mcp_tool_schemas import get_user_tool_schemas
 from src.server.database.user_vault_secrets import (
     create_user_secret,
-    delete_user_secret,
     get_user_secret_names,
 )
 from src.server.models.mcp_server import (
@@ -49,11 +52,7 @@ from src.server.models.mcp_server import (
     isolation_warnings,
     parse_mcp_servers_payload,
 )
-from src.server.services.mcp_import import (
-    ImportScope,
-    ImportSession,
-    run_mcp_import,
-)
+from src.server.services.mcp_import import ImportScope, run_mcp_import
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
@@ -61,20 +60,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/mcp", tags=["MCP Catalog"])
 
 
-def _builtin_names() -> set[str]:
-    """Names of the process-global built-in MCP servers (from agent_config)."""
-    from src.server.app import setup
-
-    if setup.agent_config is None:
-        return set()
-    return {s.name for s in setup.agent_config.mcp.servers}
-
-
-async def _oauth_status_by_server(user_id: str) -> dict[str, str]:
+async def _oauth_status_by_server(user_id: str) -> dict[str, ConnectionStatus]:
     """server_name → connection status, for decorating catalog responses."""
     try:
         return {
-            c["server_name"]: c["status"] for c in await list_connections(user_id)
+            c["server_name"]: ConnectionStatus(c["status"])
+            for c in await list_connections(user_id)
         }
     except Exception:
         logger.warning(
@@ -144,25 +135,14 @@ async def create_server(
         server = McpServerInput(**body)
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=_format_validation_error(e))
-    if server.name in _builtin_names():
+    if server.name in builtin_names():
         raise HTTPException(
             status_code=409,
             detail=f"{server.name!r} collides with a built-in server name",
         )
     try:
         row = await create_catalog_server(
-            user_id,
-            server.name,
-            transport=server.transport,
-            command=server.command,
-            args=server.args,
-            url=server.url,
-            env=server.env,
-            headers=server.headers,
-            description=server.description,
-            instruction=server.instruction,
-            tool_exposure_mode=server.tool_exposure_mode,
-            discovery_uses_secrets=server.discovery_uses_secrets,
+            user_id, server.name, **server.to_catalog_fields()
         )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -196,26 +176,12 @@ async def update_server(
         raise HTTPException(
             status_code=409, detail="name in body must match the path name"
         )
+    # The row write and its version fan-out are one transaction in the DB layer.
     row = await update_catalog_server(
-        user_id,
-        name,
-        updates={
-            "transport": server.transport,
-            "command": server.command,
-            "args": server.args,
-            "url": server.url,
-            "env": server.env,
-            "headers": server.headers,
-            "description": server.description,
-            "instruction": server.instruction,
-            "tool_exposure_mode": server.tool_exposure_mode,
-            "discovery_uses_secrets": server.discovery_uses_secrets,
-        },
+        user_id, name, updates=server.to_catalog_fields()
     )
     if not row:
         raise HTTPException(status_code=404, detail="MCP server not found")
-
-    from src.server.services.mcp_oauth.lifecycle import disconnect_server
 
     # Force reconnect when the edit moves an OAuth-connected server off its
     # consented endpoint: the stored token was issued for the old host, so it
@@ -223,14 +189,17 @@ async def update_server(
     # server_url, so no token can leak in the meantime — this revokes the now-
     # stale connection so the UI shows a clean reconnect. Transport away from a
     # remote scheme also invalidates consent (no relay path exists).
-    conn = await get_connection(user_id, name)
-    if conn and conn["status"] != "revoked":
+    # disconnect_server writes only OAuth state, never this catalog row, so the
+    # response is built from the row we already hold.
+    connection = await get_connection(user_id, name)
+    if connection and connection["status"] != ConnectionStatus.REVOKED:
         moved = server.transport not in ("http", "sse") or not same_consented_url(
-            conn.get("server_url"), server.url
+            connection.get("server_url"), server.url
         )
         if moved:
+            from src.server.services.mcp_oauth.lifecycle import disconnect_server
+
             await disconnect_server(user_id, name)
-            row = await get_catalog_server(user_id, name) or row
     response = catalog_row_to_response(row)
     response.warnings = isolation_warnings(server) or None
     return response
@@ -257,28 +226,16 @@ async def import_servers(
             '{"mcpServers": { "<name>": { ... } }}.',
         )
 
-    async def create_secret(name: str, value: str, description: str) -> None:
-        await create_user_secret(user_id, name, value, description)
+    async def create_secret(conn, secret) -> None:
+        await create_user_secret(
+            user_id, secret.name, secret.value, secret.description, conn=conn
+        )
 
-    async def delete_secret(name: str) -> None:
-        await delete_user_secret(user_id, name)
-
-    async def persist(server: McpServerInput) -> bool:
+    async def persist(conn, server: McpServerInput) -> bool:
         # No ON CONFLICT arm here — a raced duplicate raises ValueError, so a
         # successful call always means "created".
         await create_catalog_server(
-            user_id,
-            server.name,
-            transport=server.transport,
-            command=server.command,
-            args=server.args,
-            url=server.url,
-            env=server.env,
-            headers=server.headers,
-            description=server.description,
-            instruction=server.instruction,
-            tool_exposure_mode=server.tool_exposure_mode,
-            discovery_uses_secrets=server.discovery_uses_secrets,
+            user_id, server.name, conn=conn, **server.to_catalog_fields()
         )
         return True
 
@@ -286,7 +243,7 @@ async def import_servers(
     report = await run_mcp_import(
         parsed,
         scope=ImportScope(
-            reserved_names=_builtin_names(),
+            reserved_names=builtin_names(),
             existing_names=existing_names,
             current_count=len(existing_names),
             cap=MAX_CATALOG_SERVERS_PER_USER,
@@ -295,12 +252,9 @@ async def import_servers(
                 f"({MAX_CATALOG_SERVERS_PER_USER}) reached"
             ),
             exists_message="already exists in your Connectors",
-            persist=persist,
-        ),
-        session=ImportSession(
+            existing_secret_names=set(await get_user_secret_names(user_id)),
             create_secret=create_secret,
-            delete_secret=delete_secret,
-            used_secret_names=set(await get_user_secret_names(user_id)),
+            persist=persist,
         ),
     )
 
@@ -318,7 +272,6 @@ async def _relay_execution_warning(user_id: str, name: str) -> str | None:
     is the moment to tell the user their deployment can't actually run them."""
     from src.config.env import EGRESS_RELAY_SECRET
     from src.server.app import setup
-    from src.server.database.mcp_oauth import get_connection
     from src.server.services.egress.reachability import (
         effective_relay_base_url,
         relay_reachability_warning,

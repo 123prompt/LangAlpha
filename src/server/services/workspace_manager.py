@@ -314,12 +314,11 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         sandbox: "PTCSandbox | None" = None,
         user_id: str | None = None,
     ) -> None:
-        """Push vault secrets to the running sandbox.
+        """Push the workspace's effective vault secrets to the running sandbox.
 
         Called by the vault APIs on mutation and by ``_sync_sandbox_assets``
-        during workspace startup/restart. The pushed set is the MERGE of the
-        owner's user-level secrets and the workspace's own, workspace winning
-        on name collision — user secrets back inherited (Connectors) servers.
+        during workspace startup/restart. The merge rule (user secrets shadowed
+        by the workspace's own) lives in ``get_effective_secrets``.
 
         Args:
             workspace_id: Workspace UUID.
@@ -336,18 +335,9 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 return
             sandbox = session.sandbox
 
-        from src.server.database.user_vault_secrets import get_user_secrets_decrypted
-        from src.server.database.vault_secrets import get_workspace_secrets_decrypted
+        from src.server.database.vault_secrets import get_effective_secrets
 
-        if user_id is None:
-            workspace = await db_get_workspace(workspace_id)
-            user_id = (workspace or {}).get("user_id")
-
-        secrets = await get_workspace_secrets_decrypted(workspace_id)
-        if user_id:
-            user_secrets = await get_user_secrets_decrypted(user_id)
-            if user_secrets:
-                secrets = {**user_secrets, **secrets}
+        secrets = await get_effective_secrets(workspace_id, user_id)
         await sandbox.upload_vault_secrets(secrets)
         logger.debug(
             f"[vault] Pushed {len(secrets)} secret(s) to sandbox",
@@ -490,7 +480,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         untrusted_servers = [s for s in resolved.servers if is_untrusted_server(s)]
         tool_schemas: dict[str, list[dict]] = {}
         if untrusted_servers:
-            from src.server.database.mcp_servers import (
+            from src.server.database.mcp_tool_schemas import (
                 get_tool_schemas,
                 get_user_tool_schemas,
             )
@@ -538,6 +528,8 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         tools already appears in the composite; one without (pending/error/new)
         contributes config but zero tools until discovery completes.
         """
+        from src.server.services.mcp_config import State
+
         registry = session.mcp_registry
         get_all = getattr(registry, "get_all_tools", None)
         present_with_tools: set[str] = set()
@@ -545,19 +537,15 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             for name, tools in get_all().items():
                 if tools:
                     present_with_tools.add(name)
-        oauth_names = resolved.oauth_status_by_name
         return [
-            s
-            for s in resolved.servers
-            if is_untrusted_server(s)
-            # OAuth servers are discovered host-side (the sandbox holds no
-            # vendor token, so an in-sandbox probe can only fail). The status
-            # map also covers DISCONNECTED ones, whose oauth_connection_id is
-            # None — probing those would just cache junk error rows. A
-            # workspace-local fork of the same name is not OAuth-bound.
-            and not s.oauth_connection_id
-            and not (s.source == "user" and s.name in oauth_names)
-            and s.name not in present_with_tools
+            e.config
+            for e in resolved.entries
+            if e.state is State.ACTIVE
+            and is_untrusted_server(e.config)
+            # OAuth servers are discovered host-side — probing one from the
+            # sandbox (which holds no vendor token) could only cache junk.
+            and not e.host_side_oauth
+            and e.name not in present_with_tools
         ]
 
     def _kick_mcp_discovery(

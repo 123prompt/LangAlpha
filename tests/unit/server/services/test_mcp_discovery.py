@@ -217,7 +217,7 @@ class TestSanitizeSizeCap:
 class TestDiscoverAndCacheNoSandbox:
     async def test_sandbox_none_marks_every_server_pending(self, monkeypatch):
         upsert = AsyncMock(side_effect=lambda *a, **k: {"row": a})
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         servers = [_server("srv_a"), _server("srv_b")]
         rows = await discover_and_cache("ws-1", None, servers)
@@ -230,7 +230,7 @@ class TestDiscoverAndCacheNoSandbox:
 
     async def test_sandbox_without_discover_attr_marks_pending(self, monkeypatch):
         upsert = AsyncMock(return_value={"ok": True})
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         # An old sandbox object that predates the discovery driver.
         sandbox = SimpleNamespace()  # no discover_user_mcp_schemas attribute
@@ -251,7 +251,7 @@ class TestDiscoverAndCacheNoSandbox:
 class TestDiscoverAndCacheDriverRaises:
     async def test_driver_exception_marks_every_server_error(self, monkeypatch):
         upsert = AsyncMock(return_value={"ok": True})
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         async def boom(_servers):
             raise RuntimeError("sandbox exploded")
@@ -278,7 +278,7 @@ class TestDiscoverAndCacheDriverRaises:
 class TestDiscoverAndCachePerServer:
     async def test_missing_result_for_one_server_is_isolated(self, monkeypatch):
         upsert = AsyncMock(return_value={"ok": True})
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         # Driver returns an OK result for srv_a but nothing for srv_b.
         async def discover(_servers):
@@ -315,7 +315,7 @@ class TestDiscoverAndCachePerServer:
 
     async def test_error_status_result_persisted_with_error_text(self, monkeypatch):
         upsert = AsyncMock(return_value={"ok": True})
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         async def discover(_servers):
             return {
@@ -336,7 +336,7 @@ class TestDiscoverAndCachePerServer:
 
     async def test_error_result_missing_error_field_uses_default_text(self, monkeypatch):
         upsert = AsyncMock(return_value={"ok": True})
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         async def discover(_servers):
             # A non-ok status with no 'error' key falls back to a default.
@@ -441,7 +441,7 @@ class TestDiscoverAndCacheStaleGuard:
         self, monkeypatch
     ):
         upsert = AsyncMock()
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         async def _stale(workspace_id, servers):
             return {"acme"}
@@ -465,7 +465,7 @@ class TestDiscoverAndCacheStaleGuard:
             upserted.append(server_name)
             return {"server_name": server_name, **kw}
 
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", _upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", _upsert)
 
         async def _stale(workspace_id, servers):
             return {"edited"}
@@ -487,7 +487,7 @@ class TestDiscoverAndCacheStaleGuard:
 
     async def test_pending_path_dropped_when_stale(self, monkeypatch):
         upsert = AsyncMock()
-        monkeypatch.setattr(mcp_discovery.mcp_db, "upsert_tool_schemas", upsert)
+        monkeypatch.setattr(mcp_discovery, "upsert_tool_schemas", upsert)
 
         async def _stale(workspace_id, servers):
             return {"acme"}
@@ -568,21 +568,17 @@ class TestDiscoveryFingerprint:
             self._srv(discovery_uses_secrets=False)
         ) != mcp_discovery_fingerprint(self._srv(discovery_uses_secrets=True))
 
-    def test_ignores_resolve_time_binding_fields(self):
+    def test_ignores_the_resolve_time_oauth_binding(self):
         """The whole user-tier cache rides on this exemption.
 
         The Connectors catalog hashes a RAW row (no connection bound); the
         resolver hashes the same server annotated with its
-        ``oauth_connection_id`` (and, in a session, ``egress_grant_id``). If
-        either churned the hash, every OAuth server's snapshot would read as
-        stale forever — permanently 'pending', never any tools.
+        ``oauth_connection_id``. If that churned the hash, every OAuth server's
+        snapshot would read as stale forever — permanently 'pending', never any
+        tools.
         """
         bare = self._srv(source="user")
-        bound = self._srv(
-            source="user",
-            oauth_connection_id="conn-1",
-            egress_grant_id="grant-1",
-        )
+        bound = self._srv(source="user", oauth_connection_id="conn-1")
         assert mcp_discovery_fingerprint(bare) == mcp_discovery_fingerprint(bound)
 
 

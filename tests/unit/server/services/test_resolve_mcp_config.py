@@ -15,10 +15,21 @@ import pytest
 
 from ptc_agent.config.core import MCPConfig, MCPServerConfig
 from src.server.services.mcp_config import (
+    Origin,
     ResolvedMCP,
+    State,
     resolve_mcp_config,
     workspace_row_to_server_config,
 )
+
+
+def _entries(resolved, origin, state):
+    """One partition of the resolved entry table, in resolver order."""
+    return [e for e in resolved.entries if e.origin is origin and e.state is state]
+
+
+def _names(resolved, origin, state):
+    return [e.name for e in _entries(resolved, origin, state)]
 
 
 def _base_config(*servers: MCPServerConfig):
@@ -121,8 +132,9 @@ class TestConverter:
         assert workspace_row_to_server_config(row).name == "authoritative"
 
     def test_strips_resolve_time_binding_fields(self):
-        # oauth_connection_id / egress_grant_id are resolution OUTPUTS: a
-        # stored blob must never be able to bind itself to a connection.
+        # oauth_connection_id is a resolution OUTPUT: a stored blob must never
+        # be able to bind itself to a connection. egress_grant_id is no longer
+        # a config field at all — a stale key must still parse, not 500.
         row = _ws_row(
             "acme",
             config={
@@ -134,7 +146,7 @@ class TestConverter:
         )
         cfg = workspace_row_to_server_config(row)
         assert cfg.oauth_connection_id is None
-        assert cfg.egress_grant_id is None
+        assert not hasattr(cfg, "egress_grant_id")
 
 
 # ---------------------------------------------------------------------------
@@ -155,8 +167,8 @@ class TestResolveMergePrecedence:
         # SAME objects, no copies — byte-identical downstream.
         assert resolved.servers[0] is b1
         assert resolved.servers[1] is b2
-        assert resolved.builtin_names == frozenset({"alpha", "beta"})
-        assert resolved.local_names == frozenset()
+        assert _names(resolved, Origin.BUILTIN, State.ACTIVE) == ["alpha", "beta"]
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == []
         assert resolved.version == 3
 
     async def test_disabled_builtin_is_removed(self):
@@ -168,16 +180,16 @@ class TestResolveMergePrecedence:
         resolved = await _resolve(base, rows)
 
         assert [s.name for s in resolved.servers] == ["alpha"]
-        assert resolved.builtin_names == frozenset({"alpha"})
+        assert _names(resolved, Origin.BUILTIN, State.ACTIVE) == ["alpha"]
         # Exposed so the API can keep a re-enable toggle visible in the UI.
-        assert resolved.disabled_builtin_names == frozenset({"beta"})
+        assert _names(resolved, Origin.BUILTIN, State.DISABLED) == ["beta"]
 
     async def test_disabled_builtin_names_empty_when_no_rows(self):
         base = _base_config(MCPServerConfig(name="alpha"))
 
         resolved = await _resolve(base, rows=[])
 
-        assert resolved.disabled_builtin_names == frozenset()
+        assert _names(resolved, Origin.BUILTIN, State.DISABLED) == []
 
     async def test_user_server_appended_after_builtins(self):
         base = _base_config(MCPServerConfig(name="alpha"))
@@ -187,7 +199,7 @@ class TestResolveMergePrecedence:
 
         assert [s.name for s in resolved.servers] == ["alpha", "zeta"]
         assert resolved.servers[1].source == "workspace"
-        assert resolved.local_names == frozenset({"zeta"})
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == ["zeta"]
 
     async def test_user_servers_sorted_alphabetically(self):
         base = _base_config(MCPServerConfig(name="alpha"))
@@ -217,7 +229,7 @@ class TestResolveMergePrecedence:
         resolved = await _resolve(base, rows)
 
         assert [s.name for s in resolved.servers] == ["alpha"]
-        assert resolved.local_names == frozenset()
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == []
 
     async def test_disabled_user_row_carried_for_reenable(self):
         # Disabled workspace servers stay out of the effective set but are
@@ -232,21 +244,22 @@ class TestResolveMergePrecedence:
 
         # 'zeta' runs nowhere, but is available to re-enable.
         assert [s.name for s in resolved.servers] == ["alpha", "yankee"]
-        assert resolved.local_names == frozenset({"yankee"})
-        disabled = [s.name for s in resolved.disabled_workspace_servers]
-        assert disabled == ["zeta"]
-        assert resolved.disabled_workspace_servers[0].source == "workspace"
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == ["yankee"]
+        disabled = _entries(resolved, Origin.WORKSPACE, State.DISABLED)
+        assert [e.name for e in disabled] == ["zeta"]
+        assert disabled[0].config.source == "workspace"
 
     async def test_disabled_workspace_servers_sorted_and_empty_when_none(self):
         base = _base_config(MCPServerConfig(name="alpha"))
         # No disabled rows ⇒ empty list (default_factory, not a shared default).
-        assert (await _resolve(base, rows=[])).disabled_workspace_servers == []
+        empty = await _resolve(base, rows=[])
+        assert _names(empty, Origin.WORKSPACE, State.DISABLED) == []
         rows = [
             _ws_row("zulu", enabled=False, config={"transport": "stdio"}),
             _ws_row("yankee", enabled=False, config={"transport": "stdio"}),
         ]
         resolved = await _resolve(base, rows)
-        assert [s.name for s in resolved.disabled_workspace_servers] == ["yankee", "zulu"]
+        assert _names(resolved, Origin.WORKSPACE, State.DISABLED) == ["yankee", "zulu"]
         assert [s.name for s in resolved.servers] == ["alpha"]  # only the built-in runs
 
     async def test_workspace_server_colliding_with_builtin_is_skipped(self):
@@ -259,7 +272,7 @@ class TestResolveMergePrecedence:
 
         assert [s.name for s in resolved.servers] == ["alpha"]
         assert resolved.servers[0].source == "builtin"
-        assert resolved.local_names == frozenset()
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == []
 
     async def test_disabled_builtins_excluded_from_builtin_names(self):
         base = _base_config(
@@ -273,8 +286,8 @@ class TestResolveMergePrecedence:
         resolved = await _resolve(base, rows)
 
         assert [s.name for s in resolved.servers] == ["alpha", "gamma"]
-        assert resolved.builtin_names == frozenset({"alpha"})
-        assert resolved.local_names == frozenset({"gamma"})
+        assert _names(resolved, Origin.BUILTIN, State.ACTIVE) == ["alpha"]
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == ["gamma"]
 
     async def test_globally_disabled_builtin_not_in_effective_set(self):
         # A built-in disabled in agent_config.yaml itself is never effective.
@@ -301,8 +314,8 @@ class TestResolveInheritedLayer:
         resolved = await _resolve(base, rows, user_rows=user_rows)
 
         assert [s.name for s in resolved.servers] == ["alpha", "acme", "local"]
-        assert resolved.inherited_names == frozenset({"acme"})
-        assert resolved.local_names == frozenset({"local"})
+        assert _names(resolved, Origin.USER, State.ACTIVE) == ["acme"]
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == ["local"]
         acme = resolved.servers[1]
         assert acme.source == "user"
         assert acme.oauth_connection_id is None
@@ -333,9 +346,9 @@ class TestResolveInheritedLayer:
         resolved = await _resolve(base, rows, user_rows=[_user_row("acme")])
 
         assert [s.name for s in resolved.servers] == ["alpha"]
-        assert resolved.inherited_names == frozenset()
+        assert _names(resolved, Origin.USER, State.ACTIVE) == []
         # Carried (full config) so the UI keeps a re-enable toggle.
-        assert [s.name for s in resolved.tombstoned_inherited_servers] == ["acme"]
+        assert _names(resolved, Origin.USER, State.TOMBSTONED) == ["acme"]
 
     async def test_workspace_local_shadows_inherited(self):
         base = _base_config(MCPServerConfig(name="alpha"))
@@ -347,8 +360,8 @@ class TestResolveInheritedLayer:
         assert names == ["alpha", "acme"]
         # The one effective 'acme' is the LOCAL fork, not the inherited config.
         assert resolved.servers[1].source == "workspace"
-        assert resolved.shadowed_inherited_names == frozenset({"acme"})
-        assert resolved.inherited_names == frozenset()
+        assert _names(resolved, Origin.USER, State.SHADOWED) == ["acme"]
+        assert _names(resolved, Origin.USER, State.ACTIVE) == []
 
     async def test_disabled_local_fork_still_shadows_inherited(self):
         # A disabled local fork must not fall back to running the inherited
@@ -364,8 +377,8 @@ class TestResolveInheritedLayer:
         resolved = await _resolve(base, rows, user_rows=[_user_row("acme")])
 
         assert [s.name for s in resolved.servers] == ["alpha"]
-        assert resolved.shadowed_inherited_names == frozenset({"acme"})
-        assert [s.name for s in resolved.disabled_workspace_servers] == ["acme"]
+        assert _names(resolved, Origin.USER, State.SHADOWED) == ["acme"]
+        assert _names(resolved, Origin.WORKSPACE, State.DISABLED) == ["acme"]
 
     async def test_user_server_colliding_with_builtin_is_skipped(self):
         b1 = MCPServerConfig(name="alpha")
@@ -375,7 +388,7 @@ class TestResolveInheritedLayer:
 
         assert [s.name for s in resolved.servers] == ["alpha"]
         assert resolved.servers[0] is b1
-        assert resolved.inherited_names == frozenset()
+        assert _names(resolved, Origin.USER, State.ACTIVE) == []
 
     async def test_oauth_connection_id_annotated(self):
         base = _base_config(MCPServerConfig(name="alpha"))
@@ -471,7 +484,7 @@ class TestResolveInheritedLayer:
             resolved = await resolve_mcp_config(base, "user-1", "ws-1")
 
         reader.assert_awaited_once_with("user-1")
-        assert resolved.inherited_names == frozenset({"acme"})
+        assert _names(resolved, Origin.USER, State.ACTIVE) == ["acme"]
         assert resolved.servers[1].enabled is True
 
     async def test_inert_enabled_user_marker_row_is_skipped(self):
@@ -484,4 +497,4 @@ class TestResolveInheritedLayer:
 
         assert [s.name for s in resolved.servers] == ["alpha", "acme"]
         assert resolved.servers[1].source == "user"
-        assert resolved.inherited_names == frozenset({"acme"})
+        assert _names(resolved, Origin.USER, State.ACTIVE) == ["acme"]

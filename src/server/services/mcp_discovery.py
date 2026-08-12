@@ -22,6 +22,7 @@ from ptc_agent.core.mcp_sanitize import (
 )
 
 from src.server.database import mcp_servers as mcp_db
+from src.server.database.mcp_tool_schemas import upsert_tool_schemas
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def mcp_discovery_fingerprint(server: MCPServerConfig) -> str:
     Because only the ``${vault:NAME}`` ref STRING is hashed, changing a secret's
     VALUE never churns this hash — vault mutations instead invalidate explicitly
     (version bump + snapshot purge for secret-dependent servers; see
-    ``src/server/app/vault.py``).
+    ``src/server/services/vault_invalidation.py``).
     """
     payload = discovery_affecting_payload(server, include_identity=False)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -241,7 +242,7 @@ async def discover_and_cache(
             if server.name in stale:
                 continue
             rows.append(
-                await mcp_db.upsert_tool_schemas(
+                await upsert_tool_schemas(
                     workspace_id, server.name, mcp_discovery_fingerprint(server),
                     status="pending",
                 )
@@ -272,7 +273,7 @@ async def discover_and_cache(
         }
         if result.get("status") != "ok":
             rows.append(
-                await mcp_db.upsert_tool_schemas(
+                await upsert_tool_schemas(
                     workspace_id,
                     server.name,
                     fingerprint,
@@ -283,7 +284,7 @@ async def discover_and_cache(
             continue
         kept, skipped = sanitize_discovered_tools(result.get("tools") or [])
         rows.append(
-            await mcp_db.upsert_tool_schemas(
+            await upsert_tool_schemas(
                 workspace_id,
                 server.name,
                 fingerprint,

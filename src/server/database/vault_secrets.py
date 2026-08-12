@@ -146,10 +146,16 @@ async def _names(tier: _VaultTier, owner_id: str) -> set[str]:
 
 
 async def _create(
-    tier: _VaultTier, owner_id: str, name: str, value: str, description: str = ""
+    tier: _VaultTier,
+    owner_id: str,
+    name: str,
+    value: str,
+    description: str = "",
+    *,
+    conn=None,
 ) -> None:
     enc_key = _get_encryption_key()
-    async with get_db_connection() as conn:
+    async with get_db_connection(conn) as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
                 # Serialize concurrent creates for the same owner
@@ -283,10 +289,10 @@ async def get_workspace_secret_names(workspace_id: str) -> set[str]:
 
 
 async def create_secret(
-    workspace_id: str, name: str, value: str, description: str = ""
+    workspace_id: str, name: str, value: str, description: str = "", *, conn=None
 ) -> None:
     """Insert a new secret (encrypted). Raises ValueError on duplicate or limit."""
-    await _create(WORKSPACE_TIER, workspace_id, name, value, description)
+    await _create(WORKSPACE_TIER, workspace_id, name, value, description, conn=conn)
 
 
 async def update_secret(
@@ -305,3 +311,39 @@ async def update_secret(
 async def delete_secret(workspace_id: str, name: str) -> bool:
     """Delete a secret by name. Returns True if row existed."""
     return await _delete(WORKSPACE_TIER, workspace_id, name)
+
+
+# ---------------------------------------------------------------------------
+# Both tiers — the merge rule
+# ---------------------------------------------------------------------------
+
+
+async def get_effective_secrets(
+    workspace_id: str, user_id: str | None = None
+) -> dict[str, str]:
+    """The secret set a workspace actually sees: the owner's user-level secrets
+    shadowed by the workspace's own.
+
+    The one definition of the merge, because its two consumers must agree — the
+    sandbox push decides what a server can authenticate with, the redactor
+    decides what gets scrubbed out of files. A redactor answering
+    workspace-only leaves an inherited server's credential in the clear.
+
+    ``user_id`` is read off the workspace row when omitted; callers that
+    already hold the owner should pass it.
+    """
+    # Imported here: the user tier's module is built on this one's internals,
+    # so a top-level import would close the cycle.
+    from src.server.database.user_vault_secrets import get_user_secrets_decrypted
+
+    if user_id is None:
+        from src.server.database.workspace import get_workspace
+
+        workspace = await get_workspace(workspace_id)
+        user_id = (workspace or {}).get("user_id")
+
+    secrets = await _decrypted(WORKSPACE_TIER, workspace_id)
+    if not user_id:
+        return secrets
+    user_secrets = await get_user_secrets_decrypted(user_id)
+    return {**user_secrets, **secrets} if user_secrets else secrets

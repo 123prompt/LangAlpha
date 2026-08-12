@@ -36,8 +36,8 @@ def vault_mock_db(mock_cursor):
     conn.cursor = _cursor_cm
 
     @asynccontextmanager
-    async def _fake_connection():
-        yield conn
+    async def _fake_connection(conn_in=None):
+        yield conn_in if conn_in is not None else conn
 
     # The user tier's SQL runs inside vault_secrets — that is where the pool
     # handle lives after the tier collapse.
@@ -162,3 +162,67 @@ def test_shipped_tiers_are_valid():
     assert uvs.USER_TIER.table == "user_vault_secrets"
     assert uvs.USER_TIER.max_secrets == uvs.MAX_SECRETS_PER_USER
     assert WORKSPACE_TIER.table != uvs.USER_TIER.table
+
+
+# ---------------------------------------------------------------------------
+# get_effective_secrets — the merge rule both the sandbox push and the
+# redactor read, so a fork here would leave an inherited credential unredacted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def merge_probes(monkeypatch):
+    import src.server.database.vault_secrets as vs
+
+    ws = AsyncMock(return_value={})
+    monkeypatch.setattr(vs, "_decrypted", ws)
+    user = AsyncMock(return_value={})
+    monkeypatch.setattr(uvs, "get_user_secrets_decrypted", user)
+    return ws, user
+
+
+@pytest.mark.asyncio
+async def test_workspace_secret_shadows_the_user_one(merge_probes):
+    from src.server.database.vault_secrets import get_effective_secrets
+
+    ws, user = merge_probes
+    ws.return_value = {"API_KEY": "ws-value"}
+    user.return_value = {"API_KEY": "user-value", "OTHER": "u"}
+
+    assert await get_effective_secrets("ws-1", "user-1") == {
+        "API_KEY": "ws-value",
+        "OTHER": "u",
+    }
+
+
+@pytest.mark.asyncio
+async def test_owner_is_read_from_the_workspace_when_omitted(
+    merge_probes, monkeypatch
+):
+    """The redactor calls with only a workspace id."""
+    import src.server.database.workspace as ws_db
+    from src.server.database.vault_secrets import get_effective_secrets
+
+    _, user = merge_probes
+    user.return_value = {"OTHER": "u"}
+    monkeypatch.setattr(
+        ws_db, "get_workspace", AsyncMock(return_value={"user_id": "user-9"})
+    )
+
+    assert await get_effective_secrets("ws-1") == {"OTHER": "u"}
+    user.assert_awaited_once_with("user-9")
+
+
+@pytest.mark.asyncio
+async def test_ownerless_workspace_falls_back_to_workspace_only(
+    merge_probes, monkeypatch
+):
+    import src.server.database.workspace as ws_db
+    from src.server.database.vault_secrets import get_effective_secrets
+
+    ws, user = merge_probes
+    ws.return_value = {"API_KEY": "ws-value"}
+    monkeypatch.setattr(ws_db, "get_workspace", AsyncMock(return_value=None))
+
+    assert await get_effective_secrets("ws-1") == {"API_KEY": "ws-value"}
+    user.assert_not_awaited()

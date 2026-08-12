@@ -29,6 +29,8 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
+from src.server.database.mcp_oauth import ConnectionStatus
+from src.server.services.mcp_config import Origin
 
 
 def _format_validation_error(exc: ValidationError) -> str:
@@ -289,6 +291,16 @@ class McpServerInput(BaseModel):
             "discovery_uses_secrets": self.discovery_uses_secrets,
         }
 
+    def to_catalog_fields(self) -> dict[str, Any]:
+        """Serialize to the ``user_mcp_servers`` column set (the catalog tier).
+
+        Same content as ``to_config_blob`` minus ``name``, which the catalog
+        addresses rows by rather than storing in a blob.
+        """
+        fields = self.to_config_blob()
+        fields.pop("name")
+        return fields
+
 
 class EnabledInput(BaseModel):
     """PATCH body for the enabled toggle."""
@@ -493,7 +505,7 @@ class EffectiveServer(BaseModel):
     """
 
     name: str
-    origin: Literal["builtin", "user", "workspace"]
+    origin: Origin
     transport: str
     enabled: bool
     editable: bool
@@ -523,7 +535,7 @@ class EffectiveServer(BaseModel):
     # for this server, INCLUDING 'revoked' — so the UI can say "Disconnected,
     # reconnect in Connectors" instead of waiting on a discovery that can
     # never run. None = the server has no OAuth connection at all.
-    oauth_status: Optional[str] = None
+    oauth_status: Optional[ConnectionStatus] = None
 
 
 class EffectiveServerList(BaseModel):
@@ -556,7 +568,7 @@ class CatalogServer(BaseModel):
     name: str
     transport: str
     enabled: bool = False
-    oauth_status: Optional[str] = None
+    oauth_status: Optional[ConnectionStatus] = None
     # Host-side discovered tool count for the server's CURRENT config (OAuth
     # servers only today — that's the only user-level discovery path). None =
     # no current snapshot; the UI omits the count rather than showing 0.
@@ -601,7 +613,7 @@ def collect_vault_refs(mapping: dict[str, str] | None) -> list[str]:
 def catalog_row_to_response(
     row: dict[str, Any],
     *,
-    oauth_status: str | None = None,
+    oauth_status: ConnectionStatus | None = None,
     tool_count: int | None = None,
 ) -> CatalogServer:
     """Mask a DB catalog row: drop env/header literals, expose vault refs only."""

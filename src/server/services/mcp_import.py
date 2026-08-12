@@ -1,18 +1,17 @@
 """Scope-neutral bulk import of standard ``mcpServers`` JSON.
 
 Both import surfaces (per-workspace servers and the user-level Connectors
-catalog) accept the same blob with inline credentials, and run the same
+catalog) accept the same blob with inline credentials and run the same
 per-entry gauntlet: skip reserved/duplicate names, enforce the scope's cap,
-rewrite credential-looking literals to ``${vault:NAME}`` refs, validate, then
-persist — rolling the extracted secrets back whenever the entry fails after
-extraction. That loop, the heuristic, and the rollback bookkeeping live here
-once; a scope supplies only what genuinely differs (its cap, its prose, its
-storage).
+rewrite credential-looking literals to ``${vault:NAME}`` refs, validate — all
+of it pure, writing nothing — then commit the entry's vault secrets and its
+server row in ONE transaction. An entry either lands whole or not at all, and
+its failure never touches the others. A scope supplies only what genuinely
+differs (its cap, its prose, its two writers).
 """
 
 from __future__ import annotations
 
-import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -20,13 +19,7 @@ from typing import Any, Awaitable, Callable
 from pydantic import ValidationError
 
 from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
-
-logger = logging.getLogger(__name__)
-
-# ``(name, value, description)`` — raises ValueError on duplicate/cap.
-SecretCreate = Callable[[str, str, str], Awaitable[Any]]
-# ``(name)`` — best-effort delete.
-SecretDelete = Callable[[str], Awaitable[Any]]
+from src.server.database.pool import get_db_connection
 
 # On bulk import, an env/header value is auto-extracted into a vault secret when
 # it looks like a credential — either the key name reads like one, or the value
@@ -63,6 +56,23 @@ def vault_secret_name(server_name: str, key: str, used: set[str]) -> str:
 
 
 @dataclass(frozen=True)
+class PlannedSecret:
+    """A vault secret an entry needs, not yet written."""
+
+    name: str
+    value: str
+    description: str
+
+
+# Both writers run inside ONE per-entry transaction, on the connection they are
+# handed. ``persist`` returns True when the server was created, False when the
+# name turned out to be taken; ValueError is a scope-level refusal (cap, raced
+# duplicate) — either way the transaction is rolled back whole.
+SecretWriter = Callable[[Any, PlannedSecret], Awaitable[None]]
+ServerWriter = Callable[[Any, Any], Awaitable[bool]]
+
+
+@dataclass(frozen=True)
 class ImportScope:
     """What one import surface contributes to the shared per-entry loop."""
 
@@ -75,9 +85,10 @@ class ImportScope:
     cap: int
     cap_message: str
     exists_message: str
-    # ``True`` when the server was created, ``False`` when the name turned out
-    # to be taken; ``ValueError`` for a scope-level refusal (cap, raced dupe).
-    persist: Callable[[Any], Awaitable[bool]]
+    # Names already in the scope's vault — allocation must not collide with them.
+    existing_secret_names: set[str]
+    create_secret: SecretWriter
+    persist: ServerWriter
 
 
 @dataclass
@@ -87,50 +98,21 @@ class ImportReport:
     secrets_created: list[str] = field(default_factory=list)
 
 
-class ImportSession:
-    """The vault side of one import run: storage plus its dedupe bookkeeping.
+@dataclass(frozen=True)
+class _EntryPlan:
+    """One entry's fully-validated intent: what to write, and under what refs."""
 
-    ``allocated`` maps a literal value to the ref it became, so an identical
-    token reused across servers is stored once; ``used_secret_names`` keeps
-    allocated names unique against the vault's existing contents. Both unwind
-    on rollback, so a failed entry can never leave a ref pointing at a deleted
-    secret.
-    """
-
-    def __init__(
-        self,
-        *,
-        create_secret: SecretCreate,
-        delete_secret: SecretDelete,
-        used_secret_names: set[str],
-    ) -> None:
-        self._create_secret = create_secret
-        self._delete_secret = delete_secret
-        self.used_secret_names = used_secret_names
-        self.allocated: dict[str, str] = {}
-
-    async def extract(self, server_name: str, config: dict[str, Any]) -> list[str]:
-        return await extract_literals_to_vault(
-            server_name,
-            config,
-            allocated=self.allocated,
-            used_secret_names=self.used_secret_names,
-            create_secret=self._create_secret,
-            delete_secret=self._delete_secret,
-        )
-
-    async def rollback(self, names: list[str]) -> None:
-        await rollback_import_secrets(
-            names,
-            allocated=self.allocated,
-            used_secret_names=self.used_secret_names,
-            delete_secret=self._delete_secret,
-        )
+    secrets: tuple[PlannedSecret, ...]
+    # literal value → ``${vault:NAME}``, merged into the run-wide dedupe map
+    # only once this entry commits.
+    refs: dict[str, str]
 
 
-async def run_mcp_import(
-    parsed: list[Any], *, scope: ImportScope, session: ImportSession
-) -> ImportReport:
+class _NameTaken(Exception):
+    """Raised to roll back an entry whose server name lost the insert race."""
+
+
+async def run_mcp_import(parsed: list[Any], *, scope: ImportScope) -> ImportReport:
     """Import each parsed entry into ``scope``, reporting per-entry outcomes.
 
     A partial import is the normal case: every entry that fails is reported in
@@ -144,6 +126,11 @@ async def run_mcp_import(
 
     report = ImportReport()
     seen_names: set[str] = set()
+    # Committed state only: an identical token reused across servers is stored
+    # once, but a ref is published here only after its entry lands — so a failed
+    # entry can never leave a later one pointing at a secret that was never made.
+    allocated: dict[str, str] = {}
+    used_secret_names = set(scope.existing_secret_names)
 
     for entry in parsed:
         base = {
@@ -179,11 +166,12 @@ async def run_mcp_import(
 
         seen_names.add(entry.name)
         config = dict(entry.config)
-        try:
-            made = await session.extract(entry.name, config)
-        except ValueError as e:
-            report.results.append({**base, "status": "error", "error": str(e)})
-            continue
+        plan = plan_vault_extraction(
+            entry.name,
+            config,
+            allocated=allocated,
+            used_secret_names=used_secret_names,
+        )
 
         # An authenticated remote server needs its header even to list tools, so
         # discovery must resolve secrets — set it explicitly so the stored value
@@ -196,135 +184,103 @@ async def run_mcp_import(
         try:
             server = McpServerInput(**config)
         except ValidationError as e:
-            await session.rollback(made)
             report.results.append(
                 {**base, "status": "invalid", "error": _format_validation_error(e)}
             )
             continue
 
         try:
-            created = await scope.persist(server)
+            created = await _commit_entry(scope, server, plan.secrets)
         except ValueError as e:
-            await session.rollback(made)
             report.results.append({**base, "status": "error", "error": str(e)})
             continue
         if not created:
-            await session.rollback(made)
             report.results.append({**base, "status": "exists"})
             continue
 
-        report.secrets_created.extend(made)
+        allocated.update(plan.refs)
+        used_secret_names.update(s.name for s in plan.secrets)
+        report.secrets_created.extend(s.name for s in plan.secrets)
         report.created += 1
         report.results.append({**base, "status": "created"})
 
     return report
 
 
-async def rollback_import_secrets(
-    names: list[str],
-    *,
-    allocated: dict[str, str],
-    used_secret_names: set[str],
-    delete_secret: SecretDelete,
-) -> None:
-    """Best-effort removal of vault secrets created for a server whose import failed.
+async def _commit_entry(
+    scope: ImportScope, server: Any, secrets: tuple[PlannedSecret, ...]
+) -> bool:
+    """Write one entry's vault secrets and its server row in a single transaction.
 
-    Also unwinds the cross-server dedupe bookkeeping so a later server in the
-    same import can't reuse a ref that points at a deleted secret.
+    Postgres owns the rollback: a vault cap, a duplicate, or a lost insert race
+    aborts the whole entry, so there is no compensation to write (or to get
+    wrong) on the way out.
     """
-    if not names:
-        return
-    refs = {f"${{vault:{n}}}" for n in names}
-    for literal in [k for k, v in allocated.items() if v in refs]:
-        del allocated[literal]
-    for n in names:
-        used_secret_names.discard(n)
-        try:
-            await delete_secret(n)
-        except Exception:
-            logger.warning(
-                "[mcp] failed to roll back imported secret %s", n, exc_info=True
-            )
-
-
-async def extract_literals_to_vault(
-    server_name: str,
-    config: dict[str, Any],
-    *,
-    allocated: dict[str, str],
-    used_secret_names: set[str],
-    create_secret: SecretCreate,
-    delete_secret: SecretDelete,
-) -> list[str]:
-    """Move credential-looking env/header literals into the vault, in place.
-
-    Existing ``${vault:NAME}`` refs and benign config literals are left alone.
-    Returns the names of any vault secrets created. May raise ``ValueError`` if
-    the vault secret cap is reached — secrets already created for THIS server
-    are rolled back first, so a cap hit never strands orphans.
-    """
-    created: list[str] = []
     try:
-        return await _extract_literals_inner(
-            server_name,
-            config,
-            allocated=allocated,
-            used_secret_names=used_secret_names,
-            created=created,
-            create_secret=create_secret,
-        )
-    except Exception:
-        await rollback_import_secrets(
-            created,
-            allocated=allocated,
-            used_secret_names=used_secret_names,
-            delete_secret=delete_secret,
-        )
-        raise
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                for secret in secrets:
+                    await scope.create_secret(conn, secret)
+                if not await scope.persist(conn, server):
+                    raise _NameTaken
+    except _NameTaken:
+        return False
+    return True
 
 
-async def _extract_literals_inner(
+def plan_vault_extraction(
     server_name: str,
     config: dict[str, Any],
     *,
     allocated: dict[str, str],
     used_secret_names: set[str],
-    created: list[str],
-    create_secret: SecretCreate,
-) -> list[str]:
+) -> _EntryPlan:
+    """Rewrite credential-looking env/header/arg literals in ``config`` to
+    ``${vault:NAME}`` refs and return the secrets that must exist for them.
+
+    Pure apart from ``config``: nothing is written, and neither ``allocated``
+    (literal → ref, committed entries only) nor ``used_secret_names`` is
+    mutated. Existing refs and benign literals are left alone. Bare
+    space-separated arg secrets (``--token VALUE``) are left as-is too — too
+    ambiguous to auto-extract without over-vaulting benign positionals.
+    """
+    secrets: list[PlannedSecret] = []
+    refs: dict[str, str] = {}
+    used = set(used_secret_names)
+
+    def _ref_for(value: str, key_hint: str) -> str:
+        ref = allocated.get(value) or refs.get(value)
+        if ref is not None:
+            return ref
+        name = vault_secret_name(server_name, key_hint, used)
+        used.add(name)
+        ref = f"${{vault:{name}}}"
+        secrets.append(
+            PlannedSecret(name, value, f"Imported with MCP server {server_name}")
+        )
+        refs[value] = ref
+        return ref
+
     for section in ("env", "headers"):
         mapping = config.get(section)
         if not isinstance(mapping, dict):
             continue
-        out: dict[str, Any] = {}
-        for k, v in mapping.items():
-            if (
-                not isinstance(v, str)
-                or not v.strip()
-                or VAULT_REF_RE.fullmatch(v)
-                or not looks_like_secret(str(k), v)
-            ):
-                out[k] = v
-                continue
-            ref = allocated.get(v)
-            if ref is None:
-                secret_name = vault_secret_name(server_name, str(k), used_secret_names)
-                await create_secret(
-                    secret_name, v, f"Imported with MCP server {server_name}"
-                )
-                used_secret_names.add(secret_name)
-                created.append(secret_name)
-                ref = f"${{vault:{secret_name}}}"
-                allocated[v] = ref
-            out[k] = ref
-        config[section] = out
+        config[section] = {
+            k: (
+                _ref_for(v, str(k))
+                if isinstance(v, str)
+                and v.strip()
+                and not VAULT_REF_RE.fullmatch(v)
+                and looks_like_secret(str(k), v)
+                else v
+            )
+            for k, v in mapping.items()
+        }
 
     # stdio ``args`` is a list; the common credential shape is a single
     # ``--flag=VALUE`` token (or ``KEY=VALUE``). Split on the first ``=`` and
-    # vault the value half when the flag or value looks secret, rewriting the arg
-    # to ``--flag=${vault:NAME}`` (the generated client resolves refs in args).
-    # Bare / space-separated arg secrets (``--token VALUE``) are left as-is —
-    # too ambiguous to auto-extract without over-vaulting benign positionals.
+    # vault the value half when the flag or value looks secret, rewriting the
+    # arg to ``--flag=${vault:NAME}`` (the generated client resolves refs in args).
     args = config.get("args")
     if isinstance(args, list):
         new_args: list[Any] = []
@@ -340,17 +296,7 @@ async def _extract_literals_inner(
             ):
                 new_args.append(arg)
                 continue
-            ref = allocated.get(val)
-            if ref is None:
-                key_hint = flag.lstrip("-") or "arg"
-                secret_name = vault_secret_name(server_name, key_hint, used_secret_names)
-                await create_secret(
-                    secret_name, val, f"Imported with MCP server {server_name}"
-                )
-                used_secret_names.add(secret_name)
-                created.append(secret_name)
-                ref = f"${{vault:{secret_name}}}"
-                allocated[val] = ref
-            new_args.append(f"{flag}={ref}")
+            new_args.append(f"{flag}={_ref_for(val, flag.lstrip('-') or 'arg')}")
         config["args"] = new_args
-    return created
+
+    return _EntryPlan(secrets=tuple(secrets), refs=refs)

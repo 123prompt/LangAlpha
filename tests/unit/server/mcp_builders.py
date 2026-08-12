@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from ptc_agent.config.core import MCPServerConfig
+from src.server.database.mcp_oauth import ConnectionStatus
 from src.server.services.mcp_config import (
     Origin,
     ResolvedMCP,
@@ -32,7 +33,9 @@ def resolved_mcp(
     oauth_status: dict[str, str] | None = None,
 ) -> ResolvedMCP:
     """Build a ResolvedMCP in resolver order (running set first)."""
-    status = oauth_status or {}
+    # ResolvedServer is a plain dataclass — nothing coerces for us, and callers
+    # spell statuses as wire strings.
+    status = {k: ConnectionStatus(v) for k, v in (oauth_status or {}).items()}
 
     def _user(config: MCPServerConfig, state: State) -> ResolvedServer:
         return ResolvedServer(

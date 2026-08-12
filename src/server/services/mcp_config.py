@@ -33,6 +33,7 @@ from functools import cached_property
 from urllib.parse import urlsplit
 
 from ptc_agent.config.core import MCPServerConfig
+from src.server.database.mcp_oauth import ConnectionStatus
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -109,11 +110,23 @@ class ResolvedServer:
     # ``oauth_connection_id``, which only binds live connections) — lets
     # consumers tell "never OAuth" from "OAuth but disconnected". Only ever
     # set on ``USER``-origin entries.
-    oauth_status: str | None = None
+    oauth_status: ConnectionStatus | None = None
 
     @property
     def name(self) -> str:
         return self.config.name
+
+    @property
+    def host_side_oauth(self) -> bool:
+        """Whether this server's tools are discovered host-side, never in-sandbox.
+
+        True for a DISCONNECTED OAuth server too: ``oauth_connection_id`` is
+        None once revoked, but the sandbox still holds no vendor token, so a
+        probe from there could only cache a junk failure.
+        """
+        return bool(self.config.oauth_connection_id) or (
+            self.origin is Origin.USER and self.oauth_status is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -123,8 +136,8 @@ class ResolvedMCP:
     ``entries`` is the single source of truth: one labelled row per server the
     workspace knows about, ordered so that filtering to ``ACTIVE`` yields the
     effective run order (built-ins in config order, then inherited, then local
-    — both alphabetical). Every historical projection below is derived from
-    it, so the partition can never disagree with itself. ``version`` is
+    — both alphabetical). The projections below are derived from it, so the
+    partition can never disagree with itself. ``version`` is
     ``workspaces.mcp_config_version``.
     """
 
@@ -136,29 +149,10 @@ class ResolvedMCP:
             e.name for e in self.entries if e.origin is origin and e.state is state
         )
 
-    def _configs(self, origin: Origin, state: State) -> list[MCPServerConfig]:
-        return [
-            e.config for e in self.entries if e.origin is origin and e.state is state
-        ]
-
     @cached_property
     def servers(self) -> list[MCPServerConfig]:
         """The effective (running) set, in deterministic order."""
         return [e.config for e in self.entries if e.state is State.ACTIVE]
-
-    @cached_property
-    def builtin_names(self) -> frozenset[str]:
-        return self._names(Origin.BUILTIN, State.ACTIVE)
-
-    @cached_property
-    def local_names(self) -> frozenset[str]:
-        """Names of the workspace's OWN (source='workspace') running servers."""
-        return self._names(Origin.WORKSPACE, State.ACTIVE)
-
-    @cached_property
-    def inherited_names(self) -> frozenset[str]:
-        """Names inherited live from the user's Connectors (source='user')."""
-        return self._names(Origin.USER, State.ACTIVE)
 
     @cached_property
     def disabled_builtin_names(self) -> frozenset[str]:
@@ -167,22 +161,6 @@ class ResolvedMCP:
     @cached_property
     def shadowed_inherited_names(self) -> frozenset[str]:
         return self._names(Origin.USER, State.SHADOWED)
-
-    @cached_property
-    def disabled_workspace_servers(self) -> list[MCPServerConfig]:
-        return self._configs(Origin.WORKSPACE, State.DISABLED)
-
-    @cached_property
-    def tombstoned_inherited_servers(self) -> list[MCPServerConfig]:
-        return self._configs(Origin.USER, State.TOMBSTONED)
-
-    @cached_property
-    def oauth_status_by_name(self) -> dict[str, str]:
-        return {
-            e.name: e.oauth_status
-            for e in self.entries
-            if e.oauth_status is not None
-        }
 
 
 @dataclass(frozen=True)
@@ -200,6 +178,19 @@ class ServerRef:
     row: dict | None = None
 
 
+def builtin_names() -> set[str]:
+    """Names of the process-global built-in MCP servers (from agent_config).
+
+    Built-in names are reserved across every tier, so this is the one place
+    that reads them — the routers and the resolver must agree on the set.
+    """
+    from src.server.app import setup
+
+    if setup.agent_config is None:
+        return set()
+    return {s.name for s in setup.agent_config.mcp.servers}
+
+
 def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
     """Convert a ``workspace_mcp_servers`` row into an ``MCPServerConfig``.
 
@@ -210,10 +201,9 @@ def workspace_row_to_server_config(row: dict) -> MCPServerConfig:
     config = dict(row.get("config") or {})
     config.pop("vault_blueprints", None)
     config.pop("source", None)  # never trust a stored source tag
-    # Resolution outputs, never inputs: a stored blob must not be able to bind
-    # itself to someone's OAuth connection or egress grant.
+    # A resolution OUTPUT, never an input: a stored blob must not be able to
+    # bind itself to someone's OAuth connection.
     config.pop("oauth_connection_id", None)
-    config.pop("egress_grant_id", None)
     # The row's name is authoritative over any name baked into the JSON blob.
     config["name"] = row["name"]
     config["source"] = "workspace"
@@ -336,10 +326,14 @@ async def resolve_mcp_config(
             version=version,
         )
 
-    connection_by_server = {
-        c["server_name"]: c for c in connections if c["status"] != "revoked"
+    oauth_status_by_name = {
+        c["server_name"]: ConnectionStatus(c["status"]) for c in connections
     }
-    oauth_status_by_name = {c["server_name"]: str(c["status"]) for c in connections}
+    connection_by_server = {
+        c["server_name"]: c
+        for c in connections
+        if oauth_status_by_name[c["server_name"]] is not ConnectionStatus.REVOKED
+    }
 
     disabled_builtins: set[str] = set()
     tombstoned_user_names: set[str] = set()
@@ -409,7 +403,7 @@ async def resolve_mcp_config(
             # The catalog URL was edited since consent (or a write path missed
             # the revoke): the stored token was issued for a different host.
             # Never bind it — leave the server un-connected so no grant is
-            # created and retire_stale_grants revokes any prior one; surface
+            # created and sync_oauth_grants retires any prior one; surface
             # needs_reauth so the UI prompts re-consent to the new URL. This is
             # defense-in-depth behind the edit-time revoke and the grant's own
             # server_url pinning.
@@ -419,9 +413,8 @@ async def resolve_mcp_config(
                 user_id, name, connection.get("server_url"), row.get("url"),
             )
             connection = None
-            # Surface reconnect intent to the UI (status vocabulary is the raw
-            # DB/wire string, same as the rest of oauth_status_by_name).
-            oauth_status_by_name[name] = "needs_reauth"
+            # Surface reconnect intent to the UI.
+            oauth_status_by_name[name] = ConnectionStatus.NEEDS_REAUTH
         try:
             cfg = user_row_to_server_config(
                 row,

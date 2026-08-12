@@ -241,11 +241,11 @@ class TestSessionCachesMcp:
 
         with (
             patch(
-                "src.server.database.mcp_servers.get_tool_schemas",
+                "src.server.database.mcp_tool_schemas.get_tool_schemas",
                 new=AsyncMock(return_value=[_row("stale_in_sandbox")]),
             ),
             patch(
-                "src.server.database.mcp_servers.get_user_tool_schemas",
+                "src.server.database.mcp_tool_schemas.get_user_tool_schemas",
                 new=AsyncMock(return_value=[_row("fresh_host_side")]),
             ),
             patch(

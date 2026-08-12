@@ -18,6 +18,7 @@ from httpx import ASGITransport, AsyncClient
 
 from ptc_agent.config.core import MCPServerConfig
 from src.server.app.mcp_servers import _derive_status
+from src.server.services.mcp_config import Origin
 from src.server.services.mcp_discovery import mcp_discovery_fingerprint
 from tests.conftest import create_test_app
 from tests.unit.server.mcp_builders import resolved_mcp
@@ -112,6 +113,34 @@ def _no_user_level_rows():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _import_txn():
+    """Stub the per-entry import transaction with a sentinel connection.
+
+    The import commits each entry's secrets + server row in one transaction;
+    the tests assert on the writers, so the connection only has to be a real
+    context manager that re-raises (an entry's failure must reach the caller).
+    """
+    from contextlib import asynccontextmanager
+
+    conn = MagicMock(name="conn")
+
+    @asynccontextmanager
+    async def _txn():
+        yield None
+
+    conn.transaction = _txn
+
+    @asynccontextmanager
+    async def _connection():
+        yield conn
+
+    with patch(
+        "src.server.services.mcp_import.get_db_connection", new=_connection
+    ):
+        yield conn
+
+
 # ---------------------------------------------------------------------------
 # Status derivation (pure unit)
 # ---------------------------------------------------------------------------
@@ -119,7 +148,7 @@ def _no_user_level_rows():
 
 def test_status_builtin_is_connected():
     status, err, missing = _derive_status(
-        origin="builtin", env_refs=[], header_refs=[],
+        origin=Origin.BUILTIN, env_refs=[], header_refs=[],
         secret_names=set(), schema_row=None,
     )
     assert status == "connected" and err == "" and missing == []
@@ -127,7 +156,7 @@ def test_status_builtin_is_connected():
 
 def test_status_needs_secret_when_ref_missing():
     status, _, missing = _derive_status(
-        origin="workspace", env_refs=[], header_refs=["API_KEY"],
+        origin=Origin.WORKSPACE, env_refs=[], header_refs=["API_KEY"],
         secret_names=set(), schema_row={"status": "ok", "tools": []},
     )
     assert status == "needs_secret"
@@ -136,7 +165,7 @@ def test_status_needs_secret_when_ref_missing():
 
 def test_status_connected_when_schema_ok_and_secret_present():
     status, _, missing = _derive_status(
-        origin="workspace", env_refs=[], header_refs=["API_KEY"],
+        origin=Origin.WORKSPACE, env_refs=[], header_refs=["API_KEY"],
         secret_names={"API_KEY"}, schema_row={"status": "ok", "tools": []},
     )
     assert status == "connected"
@@ -145,7 +174,7 @@ def test_status_connected_when_schema_ok_and_secret_present():
 
 def test_status_error_passes_text():
     status, err, _ = _derive_status(
-        origin="workspace", env_refs=[], header_refs=[],
+        origin=Origin.WORKSPACE, env_refs=[], header_refs=[],
         secret_names=set(), schema_row={"status": "error", "error": "boom"},
     )
     assert status == "error" and err == "boom"
@@ -153,7 +182,7 @@ def test_status_error_passes_text():
 
 def test_status_pending_when_no_schema_row():
     status, _, _ = _derive_status(
-        origin="workspace", env_refs=[], header_refs=[],
+        origin=Origin.WORKSPACE, env_refs=[], header_refs=[],
         secret_names=set(), schema_row=None,
     )
     assert status == "pending"
@@ -644,7 +673,7 @@ async def test_import_creates_and_extracts_secret(client):
     ws = _ws()
     base = _agent_config([_builtin("builtin_search")])
     insert = AsyncMock(
-        side_effect=lambda w, name, config=None: {
+        side_effect=lambda w, name, config=None, conn=None: {
             "name": name, "source": "workspace", "enabled": True,
         }
     )
@@ -690,6 +719,8 @@ async def test_import_creates_and_extracts_secret(client):
     # An authenticated remote server is set to use its secret during discovery,
     # otherwise tools/list returns 401.
     assert ins_kwargs["config"]["discovery_uses_secrets"] is True
+    # Secret and server row are written on ONE connection — the entry is atomic.
+    assert create_secret.await_args.kwargs["conn"] is ins_kwargs["conn"]
     assert "EXAMPLE-OPAQUE-TOKEN-1234567890" not in resp.text
     push.assert_awaited_once()
 
@@ -702,7 +733,7 @@ async def test_import_extracts_secret_in_args(client):
     ws = _ws()
     base = _agent_config([_builtin("builtin_search")])
     insert = AsyncMock(
-        side_effect=lambda w, name, config=None: {
+        side_effect=lambda w, name, config=None, conn=None: {
             "name": name, "source": "workspace", "enabled": True,
         }
     )
@@ -748,7 +779,7 @@ async def test_import_dedupes_identical_token_across_servers(client):
     base = _agent_config([])
     create_secret = AsyncMock()
     insert = AsyncMock(
-        side_effect=lambda w, name, config=None: {
+        side_effect=lambda w, name, config=None, conn=None: {
             "name": name, "source": "workspace", "enabled": True,
         }
     )
@@ -783,15 +814,17 @@ async def test_import_dedupes_identical_token_across_servers(client):
 
 
 @pytest.mark.asyncio
-async def test_import_cap_mid_server_rolls_back_created_secrets(client):
-    """The vault cap firing on a server's SECOND secret must delete the first —
-    a failed server import never strands orphaned vault entries."""
+async def test_import_cap_mid_server_lands_nothing(client):
+    """The vault cap firing on a server's SECOND secret aborts the whole entry.
+
+    The first secret went into the same transaction, so Postgres discards it —
+    there is nothing to compensate, and the entry leaves no server row.
+    """
     ws = _ws()
     base = _agent_config([])
     create_secret = AsyncMock(
         side_effect=[None, ValueError("vault secret cap (20) reached")]
     )
-    delete_secret = AsyncMock()
     insert = AsyncMock()
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
@@ -799,7 +832,6 @@ async def test_import_cap_mid_server_rolls_back_created_secrets(client):
         patch("src.server.app.mcp_servers.get_workspace_servers_and_version", new=AsyncMock(return_value=([], 9))),
         patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
         patch("src.server.app.mcp_servers.create_secret_db", new=create_secret),
-        patch("src.server.app.mcp_servers.delete_secret_db", new=delete_secret),
         patch("src.server.app.mcp_servers.insert_workspace_server", new=insert),
         patch("src.server.app.mcp_servers._push_vault_to_sandbox", new=AsyncMock()) as push,
     ):
@@ -822,29 +854,26 @@ async def test_import_cap_mid_server_rolls_back_created_secrets(client):
     body = resp.json()
     assert body["results"][0]["status"] == "error"
     assert body["secrets_created"] == []
-    # The one secret that DID get created was rolled back; no server row, no push.
-    delete_secret.assert_awaited_once()
-    assert delete_secret.await_args.args[0] == ws["workspace_id"]
-    assert delete_secret.await_args.args[1] == "CAPPER_AUTHORIZATION"
+    # Both secrets were attempted on the one connection; neither survives, and
+    # the server row was never reached.
+    assert create_secret.await_count == 2
     insert.assert_not_awaited()
     push.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_import_existing_server_rolls_back_extracted_secrets(client):
-    """A name that turns out to already exist (insert returns None) must not
-    keep the secrets vaulted for it during extraction."""
+async def test_import_existing_server_keeps_no_extracted_secrets(client):
+    """A name that turns out to already exist (insert returns None) rolls the
+    entry's transaction back, so its extracted secrets are never committed."""
     ws = _ws()
     base = _agent_config([])
     create_secret = AsyncMock()
-    delete_secret = AsyncMock()
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
         patch("src.server.app.mcp_servers.get_workspace_servers_and_version", new=AsyncMock(return_value=([], 9))),
         patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
         patch("src.server.app.mcp_servers.create_secret_db", new=create_secret),
-        patch("src.server.app.mcp_servers.delete_secret_db", new=delete_secret),
         patch("src.server.app.mcp_servers.insert_workspace_server", new=AsyncMock(return_value=None)),
         patch("src.server.app.mcp_servers._push_vault_to_sandbox", new=AsyncMock()) as push,
     ):
@@ -864,8 +893,8 @@ async def test_import_existing_server_rolls_back_extracted_secrets(client):
     body = resp.json()
     assert body["results"][0]["status"] == "exists"
     assert body["secrets_created"] == []
-    delete_secret.assert_awaited_once()
-    assert delete_secret.await_args.args[1] == "RACER_AUTHORIZATION"
+    create_secret.assert_awaited_once()
+    assert create_secret.await_args.args[1] == "RACER_AUTHORIZATION"
     push.assert_not_awaited()
 
 
@@ -903,7 +932,7 @@ async def test_import_reports_invalid_server_without_aborting(client):
     ws = _ws()
     base = _agent_config([])
     insert = AsyncMock(
-        side_effect=lambda w, name, config=None: {
+        side_effect=lambda w, name, config=None, conn=None: {
             "name": name, "source": "workspace", "enabled": True,
         }
     )

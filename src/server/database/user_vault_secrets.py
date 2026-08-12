@@ -52,10 +52,10 @@ async def get_user_secret_names(user_id: str) -> set[str]:
 
 
 async def create_user_secret(
-    user_id: str, name: str, value: str, description: str = ""
+    user_id: str, name: str, value: str, description: str = "", *, conn=None
 ) -> None:
     """Insert a new secret (encrypted). Raises ValueError on duplicate or limit."""
-    await _create(USER_TIER, user_id, name, value, description)
+    await _create(USER_TIER, user_id, name, value, description, conn=conn)
 
 
 async def update_user_secret(
