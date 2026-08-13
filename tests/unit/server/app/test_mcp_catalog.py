@@ -756,6 +756,69 @@ async def test_delete_happy_and_404(client):
 
 
 # ---------------------------------------------------------------------------
+# PATCH enabled — disable must bite live grants now, not at next acquire
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _toggle_patches(*, connection):
+    revoke = AsyncMock()
+    with (
+        patch(
+            "src.server.app.mcp_catalog.set_catalog_server_enabled",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.server.app.mcp_catalog.get_connection",
+            new=AsyncMock(return_value=connection),
+        ),
+        patch(
+            "src.server.app.mcp_catalog.revoke_grants_for_connection",
+            new=revoke,
+        ),
+        patch(
+            "src.server.app.mcp_catalog._relay_execution_warning",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        yield revoke
+
+
+@pytest.mark.asyncio
+async def test_disable_revokes_live_grants(client):
+    """An idle sandbox holds its grant_id and a relay JWT for hours, and the
+    relay never consults the catalog row — the toggle itself must revoke."""
+    connection = MagicMock(connection_id="c-1")
+    async with _toggle_patches(connection=connection) as revoke:
+        resp = await client.patch(
+            "/api/v1/mcp/servers/remote_server/enabled", json={"enabled": False}
+        )
+    assert resp.status_code == 200
+    revoke.assert_awaited_once_with("c-1")
+
+
+@pytest.mark.asyncio
+async def test_disable_without_connection_skips_revocation(client):
+    async with _toggle_patches(connection=None) as revoke:
+        resp = await client.patch(
+            "/api/v1/mcp/servers/remote_server/enabled", json={"enabled": False}
+        )
+    assert resp.status_code == 200
+    revoke.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enable_does_not_revoke(client):
+    connection = MagicMock(connection_id="c-1")
+    async with _toggle_patches(connection=connection) as revoke:
+        resp = await client.patch(
+            "/api/v1/mcp/servers/remote_server/enabled", json={"enabled": True}
+        )
+    assert resp.status_code == 200
+    revoke.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # POST import — created secrets must converge like the vault routes' do
 # ---------------------------------------------------------------------------
 

@@ -6,6 +6,11 @@ workspace server entry from carrying ``MCP-Protocol-Version`` or a forged
 the same name on the wire. The strip in ``_mcp_headers`` is the one guard.
 """
 
+import json as _json
+from types import SimpleNamespace
+
+import httpx
+
 from ptc_agent.core.sandbox import mcp_client_runtime as m
 
 
@@ -55,3 +60,79 @@ class TestReservedHeaderStrip:
         )
 
         assert headers["Accept"] == "application/json"
+
+
+class TestProbeHeaderStrip:
+    """The discover probe was the one request built outside ``_mcp_headers``:
+    a configured reserved header reached the wire only there, silently
+    desyncing negotiation. Pin that the probe now goes through the filter."""
+
+    def test_probe_strips_reserved_configured_headers(self, monkeypatch):
+        captured: list[dict] = []
+
+        class _Resp:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+
+            def __init__(self, body: bytes):
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def iter_bytes(self):
+                yield self._body
+
+            def raise_for_status(self):
+                pass
+
+        class _Client:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def stream(self, method, url, *, json=None, headers=None):
+                captured.append(dict(headers or {}))
+                body = _json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": json["id"],
+                    "result": {"supportedVersions": [m._MODERN_VERSIONS[0]]},
+                }).encode()
+                return _Resp(body)
+
+        monkeypatch.setattr(
+            m,
+            "_SERVER_CONFIGS",
+            {"srv": m._normalize("srv", {"transport": "http", "untrusted": False, "url": "https://mcp.invalid/rpc"})},
+        )
+        monkeypatch.setattr(m, "_PROTO", {})
+        monkeypatch.setattr(
+            m,
+            "_resolve_http",
+            lambda cfg, discovery=False: (
+                "https://mcp.invalid/rpc",
+                {
+                    "Mcp-Session-Id": "forged",
+                    "mcp-protocol-version": "1999-01-01",
+                    "X-Api-Key": "k-123",
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            m, "httpx", SimpleNamespace(Client=lambda **kw: _Client(), HTTPError=httpx.HTTPError)
+        )
+
+        assert m._ensure_http_server("srv")["mode"] == "modern"
+
+        probe = captured[0]
+        assert probe["Mcp-Method"] == "server/discover"
+        assert probe["MCP-Protocol-Version"] == m._MODERN_VERSIONS[0]
+        assert "mcp-protocol-version" not in probe  # no alternate-casing dup
+        assert not any(k.lower() == "mcp-session-id" for k in probe)
+        assert probe["X-Api-Key"] == "k-123"
+        assert "Mcp-Name" not in probe  # probe has no tool name to send

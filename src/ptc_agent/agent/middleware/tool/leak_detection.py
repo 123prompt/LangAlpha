@@ -51,7 +51,10 @@ class LeakDetectionMiddleware(AgentMiddleware):
         """
         secrets: dict[str, str] = {}
 
-        from ptc_agent.core.mcp_sanitize import looks_like_secret
+        from ptc_agent.core.mcp_sanitize import (
+            iter_arg_credentials,
+            looks_like_secret,
+        )
 
         for server in mcp_servers or []:
             if not server.enabled:
@@ -76,6 +79,13 @@ class LeakDetectionMiddleware(AgentMiddleware):
                 if not isinstance(value, str) or value.startswith("${"):
                     continue
                 if len(value) >= 8 and looks_like_secret(key, value):
+                    secrets[f"{server.name}:{key}"] = value
+            # stdio args: only values a flag names as credentials — arg lists
+            # are full of paths/URLs the opaque-value heuristic misreads.
+            for key, value in iter_arg_credentials(
+                getattr(server, "args", None)
+            ):
+                if len(value) >= 8:
                     secrets[f"{server.name}:{key}"] = value
 
         # Also check for GITHUB_TOKEN (injected separately by _build_sandbox_env_vars).

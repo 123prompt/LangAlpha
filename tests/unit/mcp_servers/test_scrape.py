@@ -311,3 +311,37 @@ def test_close_error_hook_writes_one_stderr_line(capsys):
     assert "RuntimeError: driver gone" in lines[0]
     assert "during teardown" in lines[0]
     assert "after cancellation" in lines[1]
+
+
+@pytest.mark.asyncio
+async def test_hung_close_does_not_stall_the_caller(monkeypatch):
+    """A wedged Playwright close previously held the teardown await open until
+    the generated client's whole-server kill took every batch result with it;
+    the deadline detaches the close and returns the fetch instead."""
+    from mcp_servers import _browser
+
+    monkeypatch.setattr(_browser, "_CLOSE_DEADLINE_S", 0.05)
+    release = asyncio.Event()
+
+    class _Page:
+        body = b"<html></html>"
+        encoding = "utf-8"
+        status = 200
+
+    class _Session:
+        async def start(self):
+            pass
+
+        async def fetch(self, url, **kw):
+            return _Page()
+
+        async def close(self):
+            await release.wait()
+
+    _page, html_body, status = await asyncio.wait_for(
+        _browser.fetch_with_session(_Session(), "http://x"), timeout=2.0
+    )
+    assert status == 200
+    assert html_body == "<html></html>"
+    release.set()  # let the detached close finish so the loop drains clean
+    await asyncio.sleep(0.01)

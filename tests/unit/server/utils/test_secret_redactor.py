@@ -371,6 +371,43 @@ class TestConnectorLiteralRedaction:
         assert secrets == {"mcp:beta:SESSION": "abcdefghij0123456789abcde"}
 
     @pytest.mark.asyncio
+    async def test_arg_credentials_join_from_both_tiers(self, monkeypatch):
+        self._patch_sources(
+            monkeypatch,
+            ws_rows=[{
+                "name": "alpha",
+                "config": {"args": ["--api-key=wsargkey_12345"]},
+            }],
+            catalog_rows=[{
+                "name": "beta",
+                "args": ["--token", "userargtok_9999"],
+            }],
+        )
+
+        secrets = await get_vault_secrets_for_redaction("ws-1")
+
+        assert secrets["mcp:alpha:api-key"] == "wsargkey_12345"
+        assert secrets["mcp:beta:token"] == "userargtok_9999"
+
+    @pytest.mark.asyncio
+    async def test_ordinary_args_stay_servable(self, monkeypatch):
+        """Arg lists are full of paths and URLs; only a flag that NAMES the
+        value a credential may pull it into the redaction set."""
+        self._patch_sources(
+            monkeypatch,
+            catalog_rows=[{
+                "name": "beta",
+                "args": [
+                    "--config",
+                    "/workspace/output/analysis_results_2026.csv",
+                    "https://api.example.com/v1/some/endpoint",
+                ],
+            }],
+        )
+
+        assert await get_vault_secrets_for_redaction("ws-1") == {}
+
+    @pytest.mark.asyncio
     async def test_vault_refs_are_not_collected(self, monkeypatch):
         """A ``${vault:NAME}`` ref resolves to a vault value the scan already
         covers; the ref text itself is not a secret."""

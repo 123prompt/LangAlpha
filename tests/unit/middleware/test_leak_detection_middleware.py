@@ -149,6 +149,24 @@ class TestSecretDiscovery:
             mw = LeakDetectionMiddleware(mcp_servers=[server])
         assert mw._secrets == []
 
+    def test_arg_credentials_are_tracked_but_paths_are_not(self):
+        """A credential passed as a CLI flag redacts like an env literal; the
+        path and URL arguments beside it must stay quotable in tool output."""
+        server = MCPServerConfig(
+            name="stdio",
+            command="npx",
+            args=[
+                "--token=inline_argtok_123",
+                "--out",
+                "/workspace/data/long_output_file.csv",
+            ],
+            env={},
+            enabled=True,
+        )
+        with patch(_GNC, side_effect=_disable_github):
+            mw = LeakDetectionMiddleware(mcp_servers=[server])
+        assert mw._secrets == [("stdio:token", "inline_argtok_123")]
+
     def test_github_token_from_config(self):
         """GitHub token is discovered via get_nested_config."""
         def _enable_github(key, default):

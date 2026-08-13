@@ -141,8 +141,8 @@ async def get_vault_secrets_for_redaction(workspace_id: str) -> dict[str, str]:
 
 
 async def _connector_secret_literals(workspace_id: str) -> dict[str, str]:
-    """Inline env/header literals from the workspace's connectors that read
-    as credentials.
+    """Inline env/header/arg literals from the workspace's connectors that
+    read as credentials.
 
     The sanctioned home for these values is a ``${vault:NAME}`` ref, but the
     API accepts plain literals too, and a literal the platform delivers into
@@ -152,7 +152,11 @@ async def _connector_secret_literals(workspace_id: str) -> dict[str, str]:
     ``looks_like_secret`` keeps ordinary config (``application/json``,
     ``LOG_LEVEL=ERROR``) from being redacted out of served files.
     """
-    from ptc_agent.core.mcp_sanitize import VAULT_REF_RE, looks_like_secret
+    from ptc_agent.core.mcp_sanitize import (
+        VAULT_REF_RE,
+        iter_arg_credentials,
+        looks_like_secret,
+    )
     from src.server.database.mcp_servers import (
         list_catalog_servers,
         list_workspace_servers,
@@ -169,22 +173,38 @@ async def _connector_secret_literals(workspace_id: str) -> dict[str, str]:
                 continue
             out[f"mcp:{server}:{key}"] = value
 
-    entries: list[tuple[str, object, object]] = []
+    def _collect_args(server: str, args, out: dict[str, str]) -> None:
+        for key, value in iter_arg_credentials(args):
+            if len(value) >= 8:
+                out[f"mcp:{server}:{key}"] = value
+
+    entries: list[tuple[str, object, object, object]] = []
     for row in await list_workspace_servers(workspace_id):
         config = row.get("config") or {}
         entries.append(
-            (row.get("name") or "", config.get("env"), config.get("headers"))
+            (
+                row.get("name") or "",
+                config.get("env"),
+                config.get("headers"),
+                config.get("args"),
+            )
         )
     workspace = await get_workspace(workspace_id)
     user_id = (workspace or {}).get("user_id")
     if user_id:
         for row in await list_catalog_servers(str(user_id)):
             entries.append(
-                (row.get("name") or "", row.get("env"), row.get("headers"))
+                (
+                    row.get("name") or "",
+                    row.get("env"),
+                    row.get("headers"),
+                    row.get("args"),
+                )
             )
 
     literals: dict[str, str] = {}
-    for server, env, headers in entries:
+    for server, env, headers, args in entries:
         _collect(server, env, literals)
         _collect(server, headers, literals)
+        _collect_args(server, args, literals)
     return literals

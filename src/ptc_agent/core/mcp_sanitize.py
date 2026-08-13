@@ -50,6 +50,41 @@ def looks_like_secret(key: str, value: str) -> bool:
     return len(v) >= _OPAQUE_TOKEN_MIN_LEN and " " not in v and not v.isdigit()
 
 
+def iter_arg_credentials(args) -> "list[tuple[str, str]]":
+    """Credential literals in a stdio arg list: ``--token=X`` and ``--token X``.
+
+    Key-signal only — no opaque-value fallback: arg lists are full of paths and
+    URLs that the value heuristic reads as secrets, and the redaction lanes
+    consuming this would scrub ordinary arguments out of served files. A bare
+    positional secret with no flag naming it is accepted as missed.
+    """
+    found: list[tuple[str, str]] = []
+    prev_flag = ""
+    for arg in args or []:
+        if not isinstance(arg, str):
+            prev_flag = ""
+            continue
+        if arg.startswith("-"):
+            flag, sep, val = arg.partition("=")
+            if (
+                sep
+                and val
+                and not VAULT_REF_RE.search(val)
+                and _SECRET_KEY_RE.search(flag)
+            ):
+                found.append((flag.lstrip("-"), val))
+            prev_flag = flag if not sep else ""
+            continue
+        if (
+            prev_flag
+            and _SECRET_KEY_RE.search(prev_flag)
+            and not VAULT_REF_RE.search(arg)
+        ):
+            found.append((prev_flag.lstrip("-"), arg))
+        prev_flag = ""
+    return found
+
+
 @dataclass(frozen=True)
 class SanitizedToolSet:
     """Result of sanitizing one server's tool list.

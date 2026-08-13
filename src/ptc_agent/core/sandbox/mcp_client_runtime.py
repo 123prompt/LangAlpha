@@ -1138,12 +1138,12 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
         with httpx.Client(timeout=_HTTP_EXCHANGE_BUDGET) as client:
             outer = time.monotonic() + _HTTP_EXCHANGE_BUDGET
             probe = _modern_request("server/discover", {}, version)
-            probe_headers = {
-                "Accept": "application/json, text/event-stream",
-                "MCP-Protocol-Version": version,
-                "Mcp-Method": "server/discover",
-            }
-            probe_headers.update(_headers)
+            probe_headers = _mcp_headers(
+                "server/discover",
+                "",
+                {"mode": "modern", "version": version, "session_id": None},
+                _headers,
+            )
             reply = None
             try:
                 with client.stream("POST", url, json=probe, headers=probe_headers) as response:

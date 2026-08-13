@@ -24,6 +24,7 @@ import logging
 from fastapi import APIRouter, Body, HTTPException
 from pydantic import ValidationError
 
+from src.server.database.egress_grants import revoke_grants_for_connection
 from src.server.database.mcp_oauth import (
     ConnectionStatus,
     get_connection,
@@ -364,6 +365,16 @@ async def set_enabled(
         warning = await _relay_execution_warning(user_id, name)
         if warning:
             out["warnings"] = [warning]
+    else:
+        # Disable must bite now, not at next acquire: an idle sandbox holds its
+        # grant_id and a relay JWT for hours, and the relay checks grant and
+        # connection status but never the catalog row. Safe against a
+        # concurrent re-mint — the toggle's version bump above fails the
+        # sync's CAS — and re-enable self-heals: the next acquire's grant sync
+        # re-activates via its upsert arm.
+        connection = await get_connection(user_id, name)
+        if connection is not None:
+            await revoke_grants_for_connection(connection.connection_id)
     return out
 
 

@@ -100,6 +100,12 @@ def make_session(
     )
 
 
+# A hung Playwright/Camoufox close would otherwise stall the caller (bulk
+# fetches wait for a cancelled fetch's teardown) until the whole-server kill;
+# past this deadline the close keeps running detached.
+_CLOSE_DEADLINE_S = 15.0
+
+
 async def fetch_with_session(
     session: Any,
     url: str,
@@ -131,8 +137,8 @@ async def fetch_with_session(
             session._is_alive = True  # unblock close()'s guard clause
         close_task = asyncio.create_task(session.close())
         try:
-            await asyncio.shield(close_task)
-        except asyncio.CancelledError:
+            await asyncio.wait_for(asyncio.shield(close_task), _CLOSE_DEADLINE_S)
+        except (TimeoutError, asyncio.CancelledError):
             close_task.add_done_callback(
                 lambda task: _report_post_cancel(task, on_close_error)
             )

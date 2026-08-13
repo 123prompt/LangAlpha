@@ -12,6 +12,7 @@ from ptc_agent.core.mcp_sanitize import (
     VAULT_REF_RE,
     discovery_should_use_secrets,
     is_untrusted_server,
+    iter_arg_credentials,
     sanitize_tool_name,
     sanitize_tool_set,
     sanitize_tool_text,
@@ -112,6 +113,42 @@ class TestVaultRefRegex:
     def test_rejects_illegal_secret_name_chars(self):
         assert vault_refs("${vault:bad-name}") == []
         assert vault_refs("${vault:ok_name}") == ["ok_name"]
+
+
+class TestIterArgCredentials:
+    """Key-signal only: a flag must NAME the value a credential to collect it."""
+
+    def test_collects_both_flag_forms(self):
+        args = ["--token=tok_equals_form", "--api-key", "tok_two_token_form"]
+        assert iter_arg_credentials(args) == [
+            ("token", "tok_equals_form"),
+            ("api-key", "tok_two_token_form"),
+        ]
+
+    def test_paths_and_urls_are_never_collected(self):
+        """The false-positive class the key-signal restriction exists for:
+        long opaque-looking positionals (paths, URLs) must stay servable."""
+        args = [
+            "/workspace/output/analysis_results_2026.csv",
+            "https://api.example.com/v1/some/endpoint",
+            "--config=/etc/app/settings_production.yaml",
+        ]
+        assert iter_arg_credentials(args) == []
+
+    def test_vault_refs_are_skipped(self):
+        args = ["--token=${vault:MY_TOKEN}", "--secret", "${vault:OTHER}"]
+        assert iter_arg_credentials(args) == []
+
+    def test_a_flag_is_not_a_flags_value(self):
+        # "--token -x" is a dangling flag followed by another flag, not a pair.
+        assert iter_arg_credentials(["--token", "-x"]) == []
+
+    def test_non_string_entries_break_the_pair(self):
+        assert iter_arg_credentials(["--token", 42, "loose_value_123"]) == []
+
+    def test_empty_and_none(self):
+        assert iter_arg_credentials([]) == []
+        assert iter_arg_credentials(None) == []
 
 
 class TestSanitizeToolName:
