@@ -56,6 +56,7 @@ from src.server.services.mcp_config import (
 )
 from src.server.services.mcp_discovery import ToolSnapshotIndex
 from src.server.services.mcp_import import ImportScope, run_mcp_import
+from src.server.services.vault_invalidation import refs_for_server
 from src.server.models.mcp_server import (
     CatalogServer,
     EffectiveServer,
@@ -110,18 +111,10 @@ async def _require_owned_workspace(workspace_id: str, user_id: str) -> dict:
     return workspace
 
 
-def _missing_secrets(
-    env_refs: list[str], header_refs: list[str], secret_names: set[str]
-) -> list[str]:
-    """Sorted, de-duplicated vault refs not present in the workspace vault."""
-    return sorted({n for n in (*env_refs, *header_refs) if n not in secret_names})
-
-
 def _derive_status(
     *,
     origin: Origin,
-    env_refs: list[str],
-    header_refs: list[str],
+    refs: set[str],
     secret_names: set[str],
     schema_row: dict[str, Any] | None,
 ) -> tuple[str, str, list[str]]:
@@ -129,12 +122,16 @@ def _derive_status(
 
     - builtin disabled-marker rows never reach here (excluded from effective).
     - builtins are process-global ⇒ ``connected``.
-    - a workspace server with a ``${vault:NAME}`` ref naming a secret missing
-      from the workspace vault ⇒ ``needs_secret``.
+    - a server with a ``${vault:NAME}`` ref that ``secret_names`` cannot satisfy
+      ⇒ ``needs_secret``. ``secret_names`` must be the merged user+workspace set
+      the sandbox actually resolves against, and ``refs`` the full resolve-time
+      scan (env/headers/args/url — ``refs_for_server``), not just the env/header
+      projections: the import path writes ``--flag=${vault:N}`` args, and a ref
+      only in args fails at call time all the same.
     - else from the schema cache at the current version: ``ok`` ⇒ connected,
       ``error`` ⇒ error (with text), missing row ⇒ pending.
     """
-    missing = _missing_secrets(env_refs, header_refs, secret_names)
+    missing = sorted(refs - secret_names)
     if origin is Origin.BUILTIN:
         return "connected", "", missing
     if missing:
@@ -271,11 +268,10 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
             )
             status, error, missing = _derive_status(
                 origin=origin,
-                env_refs=env_refs,
-                header_refs=header_refs,
-                secret_names=(
-                    merged_secret_names if origin is Origin.USER else secret_names
-                ),
+                refs=refs_for_server(srv),
+                # Merged for BOTH tiers: the push is one namespace, so a
+                # workspace server's ref lands whichever tier defines it.
+                secret_names=merged_secret_names,
                 schema_row=schema_row,
             )
             tools = _tools_from_schema(schema_row)
@@ -351,9 +347,13 @@ async def add_server(
         )
 
     try:
-        # Conflict-safe insert (ON CONFLICT DO NOTHING): a concurrent create of
-        # the same new name can't silently turn into an UPDATE. None ⇒ the name
-        # already exists. The pre-check above only short-circuits built-ins.
+        # Conflict-safe insert (ON CONFLICT DO NOTHING): two concurrent creates
+        # of the same new name can't both win — the loser gets a 409, never a
+        # silent UPDATE. None ⇒ the name already exists. The pre-check above
+        # only short-circuits built-ins. The tombstone-replace branch below is
+        # the deliberate exception: it reads then upserts without a shared lock,
+        # so racing creates over a tombstone are last-write-wins (same user
+        # only — the workspace is owner-checked above).
         row = await insert_workspace_server(
             workspace_id,
             server.name,
@@ -434,8 +434,41 @@ async def promote_server(
     fields = server.to_catalog_fields()
 
     if overwrite:
+        # Pre-update read: the rediscovery decision below needs the OLD
+        # fingerprint, and the update returns only the new row.
+        prior = await get_catalog_server(user_id, server.name)
         row = await update_catalog_server(user_id, server.name, updates=fields)
         if row is not None:
+            # Same consent rule as the catalog PUT: overwriting a template can
+            # move a connected server off its consented endpoint (or onto stdio,
+            # which has no relay path at all). The two writes are not atomic — a
+            # refresh racing the gap is caught by the consent re-check in
+            # refresh_user_tool_schemas.
+            from src.server.services.mcp_oauth.discovery import (
+                schedule_post_edit_rediscovery,
+            )
+            from src.server.services.mcp_oauth.lifecycle import (
+                revoke_if_consent_moved,
+            )
+
+            # Fresh read, not the values we just wrote: this check is its own
+            # transaction, so a concurrent edit that already moved the row back
+            # onto the consented endpoint must not be revoked on stale values.
+            # A row deleted underneath us needs neither the revoke nor the
+            # rediscovery — DELETE revokes on both sides of its own drop.
+            committed = await get_catalog_server(user_id, server.name)
+            if committed is not None and not await revoke_if_consent_moved(
+                user_id,
+                server.name,
+                transport=committed["transport"],
+                url=committed.get("url"),
+            ):
+                # Consent survived the overwrite, so the connection lives on
+                # against a config whose discovery fingerprint may have moved —
+                # its cached snapshot serves only under the old one.
+                schedule_post_edit_rediscovery(
+                    user_id, server.name, prior=prior, updated=row
+                )
             return catalog_row_to_response(row)
         # Nothing to overwrite (raced delete / never existed) ⇒ fall through.
 

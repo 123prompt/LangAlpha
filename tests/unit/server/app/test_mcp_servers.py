@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -148,7 +149,7 @@ def _import_txn():
 
 def test_status_builtin_is_connected():
     status, err, missing = _derive_status(
-        origin=Origin.BUILTIN, env_refs=[], header_refs=[],
+        origin=Origin.BUILTIN, refs=set(),
         secret_names=set(), schema_row=None,
     )
     assert status == "connected" and err == "" and missing == []
@@ -156,7 +157,7 @@ def test_status_builtin_is_connected():
 
 def test_status_needs_secret_when_ref_missing():
     status, _, missing = _derive_status(
-        origin=Origin.WORKSPACE, env_refs=[], header_refs=["API_KEY"],
+        origin=Origin.WORKSPACE, refs={"API_KEY"},
         secret_names=set(), schema_row={"status": "ok", "tools": []},
     )
     assert status == "needs_secret"
@@ -165,7 +166,7 @@ def test_status_needs_secret_when_ref_missing():
 
 def test_status_connected_when_schema_ok_and_secret_present():
     status, _, missing = _derive_status(
-        origin=Origin.WORKSPACE, env_refs=[], header_refs=["API_KEY"],
+        origin=Origin.WORKSPACE, refs={"API_KEY"},
         secret_names={"API_KEY"}, schema_row={"status": "ok", "tools": []},
     )
     assert status == "connected"
@@ -174,7 +175,7 @@ def test_status_connected_when_schema_ok_and_secret_present():
 
 def test_status_error_passes_text():
     status, err, _ = _derive_status(
-        origin=Origin.WORKSPACE, env_refs=[], header_refs=[],
+        origin=Origin.WORKSPACE, refs=set(),
         secret_names=set(), schema_row={"status": "error", "error": "boom"},
     )
     assert status == "error" and err == "boom"
@@ -182,7 +183,7 @@ def test_status_error_passes_text():
 
 def test_status_pending_when_no_schema_row():
     status, _, _ = _derive_status(
-        origin=Origin.WORKSPACE, env_refs=[], header_refs=[],
+        origin=Origin.WORKSPACE, refs=set(),
         secret_names=set(), schema_row=None,
     )
     assert status == "pending"
@@ -429,6 +430,68 @@ async def test_list_needs_secret_surfaces_missing(client):
     s = resp.json()["servers"][0]
     assert s["status"] == "needs_secret"
     assert s["missing_secrets"] == ["API_KEY"]
+
+
+@pytest.mark.asyncio
+async def test_list_needs_secret_counts_args_refs(client):
+    """A ref only in stdio args (the import path writes ``--flag=${vault:N}``)
+    must surface as needs_secret — it fails at call time exactly like an env
+    ref, and an ok discovery snapshot must not mask it."""
+    ws = _ws()
+    base = _agent_config([])
+    srv = MCPServerConfig(
+        name="stdio_args",
+        transport="stdio",
+        command="uvx",
+        args=["some-mcp-server", "--token=${vault:ARG_TOKEN}"],
+        source="workspace",
+    )
+    resolved = resolved_mcp(local=[srv])
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.resolve_mcp_config", new=AsyncMock(return_value=resolved)),
+        patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
+        patch("src.server.app.mcp_servers.get_tool_schemas", new=AsyncMock(return_value=[])),
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers")
+
+    s = resp.json()["servers"][0]
+    assert s["status"] == "needs_secret"
+    assert s["missing_secrets"] == ["ARG_TOKEN"]
+    # The projections stay env/header-only; the ref still counts toward status.
+    assert s["env_refs"] == [] and s["header_refs"] == []
+
+
+@pytest.mark.asyncio
+async def test_list_workspace_ref_satisfied_by_the_user_tier(client):
+    """The vault push merges user + workspace secrets unconditionally, so a
+    workspace-origin ref the USER tier defines is already resolvable in the
+    sandbox — calling it needs_secret told the user to re-add a secret they
+    have, and hid a server that works."""
+    ws = _ws()
+    base = _agent_config([])
+    srv = _workspace_server(headers={"Authorization": "${vault:API_KEY}"})
+    resolved = resolved_mcp(local=[srv])
+    ws_rows = [
+        {"server_name": srv.name, "status": "ok", "tools": [], "error": "",
+         "config_hash": mcp_discovery_fingerprint(srv),
+         "discovered_at": NOW.isoformat()},
+    ]
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.resolve_mcp_config", new=AsyncMock(return_value=resolved)),
+        patch("src.server.app.mcp_servers.get_workspace_secret_names", new=AsyncMock(return_value=set())),
+        patch("src.server.app.mcp_servers.get_user_secret_names", new=AsyncMock(return_value={"API_KEY"})),
+        patch("src.server.app.mcp_servers.get_tool_schemas", new=AsyncMock(return_value=ws_rows)),
+    ):
+        resp = await client.get(f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers")
+
+    s = resp.json()["servers"][0]
+    assert s["origin"] == "workspace"
+    assert s["status"] == "connected"
+    assert s["missing_secrets"] == []
 
 
 @pytest.mark.asyncio
@@ -1056,6 +1119,17 @@ async def test_promote_409_when_template_exists_without_overwrite(client):
     create.assert_not_awaited()
 
 
+def _oauth_connection(server_url="https://api.example.com/mcp", status=None):
+    """A connection as ``get_connection`` hands it to the consent check."""
+    from src.server.database.mcp_oauth import ConnectionStatus
+
+    return SimpleNamespace(
+        connection_id="c-1",
+        server_url=server_url,
+        status=status or ConnectionStatus.CONNECTED,
+    )
+
+
 @pytest.mark.asyncio
 async def test_promote_overwrite_updates_existing(client):
     ws = _ws()
@@ -1068,6 +1142,12 @@ async def test_promote_overwrite_updates_existing(client):
         patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=[_promotable_row()])),
         patch("src.server.app.mcp_servers.update_catalog_server", new=update),
         patch("src.server.app.mcp_servers.create_catalog_server", new=create),
+        # Pre-update read, then the committed read the consent check runs on.
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(return_value=_catalog_row()),
+        ),
+        patch("src.server.database.mcp_oauth.get_connection", new=AsyncMock(return_value=None)),
     ):
         resp = await client.post(
             f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/remote_server/promote",
@@ -1077,6 +1157,216 @@ async def test_promote_overwrite_updates_existing(client):
     update.assert_awaited_once()
     # Overwrite path never falls through to create when a row was updated.
     create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "promoted, revokes",
+    [
+        # Moves the connected server off its consented endpoint.
+        ({"url": "https://moved.example.com/mcp"}, True),
+        # Same endpoint, only cosmetic URL differences ⇒ consent still holds.
+        ({"url": "https://API.example.com:443/mcp/"}, False),
+        # No remote endpoint at all: nothing the stored token could serve.
+        ({"transport": "stdio", "command": "npx", "url": None, "headers": {}}, True),
+    ],
+)
+async def test_promote_overwrite_revokes_when_consent_moves(client, promoted, revokes):
+    """Overwrite is a catalog write like PUT, so it owes the same consent rule:
+    a token consented for the old endpoint must not survive onto a new one."""
+    ws = _ws()
+    base = _agent_config([])
+    disconnect = AsyncMock(return_value=True)
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch(
+            "src.server.app.mcp_servers.list_workspace_servers",
+            new=AsyncMock(return_value=[_promotable_row(**promoted)]),
+        ),
+        patch(
+            "src.server.app.mcp_servers.update_catalog_server",
+            new=AsyncMock(return_value=_catalog_row()),
+        ),
+        # Pre-update read, then the committed read the consent check runs on.
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(side_effect=[_catalog_row(), _catalog_row(**promoted)]),
+        ),
+        patch(
+            "src.server.database.mcp_oauth.get_connection",
+            new=AsyncMock(return_value=_oauth_connection()),
+        ),
+        patch(
+            "src.server.services.mcp_oauth.lifecycle.disconnect_server",
+            new=disconnect,
+        ),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/remote_server/promote",
+            json={"overwrite": True},
+        )
+    assert resp.status_code == 201
+    if revokes:
+        disconnect.assert_awaited_once_with(USER, "remote_server")
+    else:
+        disconnect.assert_not_awaited()
+
+
+async def _drain_rediscovery_tasks():
+    """Await any background rediscovery the overwrite scheduled."""
+    import asyncio
+
+    from src.server.services.mcp_oauth import discovery
+
+    pending = list(discovery._rediscovery_tasks)
+    if pending:
+        await asyncio.gather(*pending)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_promote_overwrite_consent_check_reads_the_committed_row(client):
+    """An overwrite racing a catalog PUT: this call wrote a moved URL, the PUT
+    committed the consented one back before this consent check — a separate
+    transaction — ran. Reading the row rather than trusting the values this call
+    wrote is what keeps the survivor's connection alive."""
+    ws = _ws()
+    disconnect = AsyncMock(return_value=True)
+    scheduled = MagicMock()
+    moved = "https://moved.example.com/mcp"
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", _agent_config([])),
+        patch(
+            "src.server.app.mcp_servers.list_workspace_servers",
+            new=AsyncMock(return_value=[_promotable_row(url=moved)]),
+        ),
+        patch(
+            "src.server.app.mcp_servers.update_catalog_server",
+            new=AsyncMock(return_value=_catalog_row(url=moved)),
+        ),
+        # Pre-update read, then the restored row the racing PUT committed.
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(side_effect=[_catalog_row(), _catalog_row()]),
+        ),
+        patch(
+            "src.server.database.mcp_oauth.get_connection",
+            new=AsyncMock(return_value=_oauth_connection()),
+        ),
+        patch(
+            "src.server.services.mcp_oauth.lifecycle.disconnect_server",
+            new=disconnect,
+        ),
+        patch(
+            "src.server.services.mcp_oauth.discovery.schedule_post_edit_rediscovery",
+            new=scheduled,
+        ),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/remote_server/promote",
+            json={"overwrite": True},
+        )
+    assert resp.status_code == 201
+    disconnect.assert_not_awaited()
+    scheduled.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_promote_overwrite_rediscovers_when_consent_survives(client):
+    """An overwrite is a catalog write like the PUT, so it owes the same
+    refresh: the user-tier snapshot serves only under the CURRENT fingerprint
+    and host-side OAuth servers are never probed from a sandbox, so a
+    consent-preserving overwrite that moves the fingerprint would otherwise
+    leave the connector toolless in every workspace."""
+    ws = _ws()
+    refresh = AsyncMock(return_value={"status": "ok"})
+    resync = AsyncMock()
+    promoted = _promotable_row(headers={"X-New": "1"})
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", _agent_config([])),
+        patch(
+            "src.server.app.mcp_servers.list_workspace_servers",
+            new=AsyncMock(return_value=[promoted]),
+        ),
+        patch(
+            "src.server.app.mcp_servers.update_catalog_server",
+            new=AsyncMock(return_value=_catalog_row(headers={"X-New": "1"})),
+        ),
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(
+                side_effect=[_catalog_row(), _catalog_row(headers={"X-New": "1"})]
+            ),
+        ),
+        patch(
+            "src.server.database.mcp_oauth.get_connection",
+            new=AsyncMock(return_value=_oauth_connection()),
+        ),
+        patch(
+            "src.server.services.mcp_oauth.discovery.refresh_user_tool_schemas",
+            new=refresh,
+        ),
+        patch(
+            "src.server.services.mcp_oauth.connect._resync_live_sandboxes",
+            new=resync,
+        ),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/remote_server/promote",
+            json={"overwrite": True},
+        )
+        await _drain_rediscovery_tasks()
+    assert resp.status_code == 201
+    refresh.assert_awaited_once_with(USER, "remote_server")
+    resync.assert_awaited_once_with(USER)
+
+
+@pytest.mark.asyncio
+async def test_promote_overwrite_skips_rediscovery_when_consent_moved(client):
+    """The reconnect the revoke forces runs its own discovery, and refreshing a
+    just-revoked connection could only 409."""
+    ws = _ws()
+    refresh = AsyncMock()
+    moved = "https://moved.example.com/mcp"
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", _agent_config([])),
+        patch(
+            "src.server.app.mcp_servers.list_workspace_servers",
+            new=AsyncMock(return_value=[_promotable_row(url=moved)]),
+        ),
+        patch(
+            "src.server.app.mcp_servers.update_catalog_server",
+            new=AsyncMock(return_value=_catalog_row(url=moved)),
+        ),
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(side_effect=[_catalog_row(), _catalog_row(url=moved)]),
+        ),
+        patch(
+            "src.server.database.mcp_oauth.get_connection",
+            new=AsyncMock(return_value=_oauth_connection()),
+        ),
+        patch(
+            "src.server.services.mcp_oauth.lifecycle.disconnect_server",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.server.services.mcp_oauth.discovery.refresh_user_tool_schemas",
+            new=refresh,
+        ),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/remote_server/promote",
+            json={"overwrite": True},
+        )
+        await _drain_rediscovery_tasks()
+    assert resp.status_code == 201
+    refresh.assert_not_awaited()
 
 
 @pytest.mark.asyncio

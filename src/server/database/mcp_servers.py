@@ -66,10 +66,17 @@ async def list_catalog_servers(user_id: str) -> list[dict[str, Any]]:
             return [_catalog_row_to_dict(r) for r in await cur.fetchall()]
 
 
-async def get_catalog_server(user_id: str, name: str) -> dict[str, Any] | None:
-    """Return a single catalog template by name, or None."""
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+async def get_catalog_server(
+    user_id: str, name: str, *, conn=None, for_share: bool = False
+) -> dict[str, Any] | None:
+    """Return a single catalog template by name, or None.
+
+    ``for_share`` locks the row so concurrent edits block until the caller's
+    transaction ends — pass ``conn`` with it so a snapshot write can fence on
+    the config still being the one it read.
+    """
+    async with get_db_connection(conn) as db:
+        async with db.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 SELECT user_mcp_server_id, user_id, name, transport, command, args,
@@ -77,7 +84,8 @@ async def get_catalog_server(user_id: str, name: str) -> dict[str, Any] | None:
                        discovery_uses_secrets, enabled, created_at, updated_at
                 FROM user_mcp_servers
                 WHERE user_id = %s AND name = %s
-                """,
+                """
+                + (" FOR SHARE" if for_share else ""),
                 (user_id, name),
             )
             row = await cur.fetchone()
@@ -199,10 +207,12 @@ async def update_catalog_server(
 async def delete_catalog_server(user_id: str, name: str) -> bool:
     """Delete a user server by name. Returns True if a row existed.
 
-    For an enabled (live) server, the same transaction also purges its
-    per-workspace disable-markers (their name would otherwise squat the
-    UNIQUE(workspace_id, name) slot forever), drops the user-level discovery
-    cache, and fans out the version bump.
+    The same transaction always purges the per-workspace disable-markers (a
+    surviving marker would squat the UNIQUE(workspace_id, name) slot forever)
+    and the user-level discovery cache (OAuth schema refresh has no ``enabled``
+    check, so even a never-enabled server can hold schema rows a same-name
+    recreate would resurrect). Only the version fan-out is conditional: an
+    inert row reaches no workspace, so nothing needs to re-resolve.
     """
     async with get_db_connection() as conn:
         async with conn.transaction():
@@ -315,6 +325,31 @@ async def list_workspace_servers(workspace_id: str) -> list[dict[str, Any]]:
                 ORDER BY name
                 """,
                 (workspace_id,),
+            )
+            return [_workspace_row_to_dict(r) for r in await cur.fetchall()]
+
+
+async def list_local_servers_for_user(user_id: str) -> list[dict[str, Any]]:
+    """Workspace-LOCAL rows (source='workspace') across ALL of a user's workspaces.
+
+    For user-tier vault invalidation: the sandbox resolves one merged secret
+    namespace, so a user secret satisfies a local server's ``${vault:NAME}``
+    too, and nothing scoped to the catalog would ever reach that server's cached
+    snapshot. Stopped workspaces and disabled rows included — a snapshot
+    outlives both the sandbox that wrote it and the row being switched off.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT workspace_mcp_server_id, workspace_id, name, source, enabled,
+                       config, created_at, updated_at
+                FROM workspace_mcp_servers
+                WHERE source = 'workspace' AND workspace_id IN
+                    (SELECT workspace_id FROM workspaces WHERE user_id = %s)
+                ORDER BY name
+                """,
+                (user_id,),
             )
             return [_workspace_row_to_dict(r) for r in await cur.fetchall()]
 

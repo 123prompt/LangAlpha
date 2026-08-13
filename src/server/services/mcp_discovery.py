@@ -19,6 +19,7 @@ from ptc_agent.core.mcp_sanitize import (
     discovery_affecting_payload,
     sanitize_tool_name,
     sanitize_tool_text,
+    unsalvageable_required_params,
 )
 
 from src.server.database import mcp_servers as mcp_db
@@ -127,6 +128,13 @@ def sanitize_discovered_tools(
     whose names cannot become a legal identifier or that collide after
     sanitization, sanitizes description text, and enforces count/size caps.
     Returns ``(kept, skipped)`` where skipped entries are ``(name, reason)``.
+
+    The schema container is validated here, not downstream: a malformed
+    ``input_schema`` (or ``properties``) reaches wrapper generation as an
+    AttributeError that has no per-server isolation, so one hostile server
+    would wedge a whole workspace's asset sync. A tool whose REQUIRED param
+    name is unsalvageable is dropped for the opposite reason — codegen would
+    emit it, minus that param, as a permanently uncallable wrapper.
     """
     kept: list[dict[str, Any]] = []
     skipped: list[tuple[str, str]] = []
@@ -141,13 +149,29 @@ def sanitize_discovered_tools(
         if sanitized in seen:
             skipped.append((name, f"sanitized name {sanitized!r} collides with another tool"))
             continue
+        raw_schema = tool.get("input_schema")
+        if raw_schema is None:
+            raw_schema = {}
+        if not isinstance(raw_schema, dict):
+            skipped.append((name, "input_schema is not a JSON object"))
+            continue
+        properties = raw_schema.get("properties")
+        if properties is not None and not isinstance(properties, dict):
+            skipped.append((name, "input_schema properties is not a JSON object"))
+            continue
+        if bad_required := unsalvageable_required_params(raw_schema):
+            joined = ", ".join(repr(p) for p in bad_required)
+            skipped.append(
+                (name, f"required parameter {joined} is not a valid Python identifier")
+            )
+            continue
         if len(kept) >= MAX_TOOLS_PER_SERVER:
             skipped.append((name, f"server exceeds {MAX_TOOLS_PER_SERVER}-tool cap"))
             continue
         entry = {
             "name": name,
             "description": sanitize_tool_text(tool.get("description")),
-            "input_schema": tool.get("input_schema") or {},
+            "input_schema": raw_schema,
         }
         entry_chars = len(json.dumps(entry, ensure_ascii=False))
         if total_chars + entry_chars > MAX_SCHEMA_CHARS_PER_SERVER:

@@ -162,6 +162,109 @@ class TestSanitizeDescription:
 
 
 # ---------------------------------------------------------------------------
+# sanitize_discovered_tools — malformed schema containers
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeMalformedSchema:
+    """A schema container the cache accepts is one wrapper generation will
+    walk: a non-dict ``properties`` crashed codegen with an AttributeError,
+    and codegen has no per-server isolation — one bad remote tool wedged the
+    whole workspace's asset sync."""
+
+    @pytest.mark.parametrize(
+        "schema",
+        [{"properties": []}, {"properties": "oops"}, {"properties": 3}],
+    )
+    def test_non_dict_properties_skipped(self, schema):
+        kept, skipped = sanitize_discovered_tools([_tool("bad", input_schema=schema), _tool("ok")])
+
+        assert [t["name"] for t in kept] == ["ok"]
+        assert skipped == [("bad", "input_schema properties is not a JSON object")]
+
+    @pytest.mark.parametrize("schema", [[], ["a"], "oops", 3, True])
+    def test_non_dict_input_schema_skipped(self, schema):
+        kept, skipped = sanitize_discovered_tools([_tool("bad", input_schema=schema), _tool("ok")])
+
+        assert [t["name"] for t in kept] == ["ok"]
+        assert skipped == [("bad", "input_schema is not a JSON object")]
+
+    def test_absent_schema_becomes_an_empty_object(self):
+        kept, skipped = sanitize_discovered_tools([{"name": "ok", "description": "d"}])
+
+        assert skipped == []
+        assert kept[0]["input_schema"] == {}
+
+    def test_well_formed_schema_passes_through_verbatim(self):
+        schema = {
+            "type": "object",
+            "properties": {"ticker": {"type": "string"}},
+            "required": ["ticker"],
+        }
+        kept, skipped = sanitize_discovered_tools([_tool("quote", input_schema=schema)])
+
+        assert skipped == []
+        assert kept[0]["input_schema"] == schema
+
+
+# ---------------------------------------------------------------------------
+# sanitize_discovered_tools — unusable REQUIRED params
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeRequiredParams:
+    """Codegen drops a param whose name can't become an identifier. If that
+    param is REQUIRED the wrapper ships permanently uncallable while the UI
+    advertises the tool healthy — so the tool is dropped at discovery."""
+
+    def test_unsalvageable_required_param_skips_the_tool(self):
+        schema = {
+            "properties": {"名前": {"type": "string"}},
+            "required": ["名前"],
+        }
+        kept, skipped = sanitize_discovered_tools([_tool("bad", input_schema=schema), _tool("ok")])
+
+        assert [t["name"] for t in kept] == ["ok"]
+        name, reason = skipped[0]
+        assert name == "bad"
+        # The offending param is named so the UI can say which one.
+        assert "名前" in reason
+        assert "not a valid Python identifier" in reason
+
+    def test_unsalvageable_optional_param_keeps_the_tool(self):
+        # Optional params are droppable: every required arg still reaches the
+        # server, so the tool stays callable.
+        schema = {
+            "properties": {"ticker": {"type": "string"}, "名前": {"type": "string"}},
+            "required": ["ticker"],
+        }
+        kept, skipped = sanitize_discovered_tools([_tool("t", input_schema=schema)])
+
+        assert [t["name"] for t in kept] == ["t"]
+        assert skipped == []
+
+    def test_colliding_required_params_keep_the_tool(self):
+        # 'foo-bar' and 'foo.bar' both sanitize to 'foo_bar' — salvageable by
+        # the codegen de-duplication, so discovery must NOT drop the tool.
+        schema = {
+            "properties": {"foo-bar": {"type": "string"}, "foo.bar": {"type": "string"}},
+            "required": ["foo-bar", "foo.bar"],
+        }
+        kept, skipped = sanitize_discovered_tools([_tool("t", input_schema=schema)])
+
+        assert [t["name"] for t in kept] == ["t"]
+        assert skipped == []
+
+    def test_keyword_required_param_keeps_the_tool(self):
+        # 'class' sanitizes to 'class_' (wire key preserved at codegen).
+        schema = {"properties": {"class": {"type": "string"}}, "required": ["class"]}
+        kept, skipped = sanitize_discovered_tools([_tool("t", input_schema=schema)])
+
+        assert [t["name"] for t in kept] == ["t"]
+        assert skipped == []
+
+
+# ---------------------------------------------------------------------------
 # sanitize_discovered_tools — total-schema-size cap (skip, not truncate)
 # ---------------------------------------------------------------------------
 

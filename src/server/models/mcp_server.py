@@ -12,9 +12,9 @@ servers (plan §6 / Security). They reject hostile input early:
   host-env-style values are rejected (they would never resolve)
 - ``vault_blueprints`` / ``source`` keys are rejected (built-in-only fields)
 
-Response models NEVER echo env/header literal values for any row — only the
-vault reference names are surfaced (``env_refs`` / ``header_refs``); literals
-are masked.
+Response models echo env/headers exactly as stored — ``${vault:NAME}`` refs or
+owner-supplied literals, never resolved secrets — so the owner's edit form can
+round-trip them; ``env_refs``/``header_refs`` carry just the vault names.
 """
 
 from __future__ import annotations
@@ -70,6 +70,15 @@ def isolation_warnings(server: "McpServerInput") -> list[str]:
             "are pinned by the platform image and may change under it. For "
             "third-party servers prefer an isolated launch: uvx --from "
             "'<package>==<version>' <entrypoint> (or npx <package>@<version>)."
+        ]
+    # A warning, not a rejection: imports normalize legacy configs and must
+    # keep landing — but the sandbox client refuses 'sse' outright, so without
+    # this the server saves looking healthy and every tool call fails.
+    if server.transport == "sse":
+        return [
+            "transport 'sse' is the legacy remote MCP transport and the "
+            "sandbox client cannot execute its tools; change the server's "
+            "transport to 'http' (streamable HTTP)."
         ]
     return []
 
@@ -165,6 +174,10 @@ def validate_remote_url(url: str) -> str:
         raise ValueError("url must use https://")
     if parts.username or parts.password or "@" in (parts.netloc or ""):
         raise ValueError("url must not contain userinfo credentials")
+    try:
+        parts.port
+    except ValueError:
+        raise ValueError("url port must be a number between 1 and 65535")
 
     host = parts.hostname
     if not host:
@@ -557,7 +570,7 @@ class EffectiveServerList(BaseModel):
 
 
 class CatalogServer(BaseModel):
-    """A user-level server row (masked — only vault refs surfaced).
+    """A user-level server row, returned only to its owner.
 
     ``enabled`` rows are live: inherited into every one of the user's
     workspaces by ``resolve_mcp_config``. Disabled rows are inert templates
@@ -578,6 +591,13 @@ class CatalogServer(BaseModel):
     url: Optional[str] = None
     env_refs: list[str] = Field(default_factory=list)
     header_refs: list[str] = Field(default_factory=list)
+    # Echo the stored reference maps (``${vault:NAME}`` ref strings or the
+    # owner's own literals — never resolved secrets) so the edit form can
+    # round-trip them, exactly as ``EffectiveServer`` does for workspace-origin
+    # rows. A PUT replaces the whole row, so a response that dropped them would
+    # make every unrelated edit a silent wipe.
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
     description: str = ""
     instruction: str = ""
     tool_exposure_mode: str = "summary"
@@ -616,7 +636,12 @@ def catalog_row_to_response(
     oauth_status: ConnectionStatus | None = None,
     tool_count: int | None = None,
 ) -> CatalogServer:
-    """Mask a DB catalog row: drop env/header literals, expose vault refs only."""
+    """Shape a DB catalog row for the owner-scoped API.
+
+    ``env``/``headers`` are echoed verbatim (refs and literals alike — the row
+    stores no resolved secret) so an edit round-trips; ``env_refs``/
+    ``header_refs`` stay the display-only projection of the vault names.
+    """
     return CatalogServer(
         name=row["name"],
         transport=row["transport"],
@@ -628,6 +653,8 @@ def catalog_row_to_response(
         url=row.get("url"),
         env_refs=collect_vault_refs(row.get("env")),
         header_refs=collect_vault_refs(row.get("headers")),
+        env=dict(row.get("env") or {}),
+        headers=dict(row.get("headers") or {}),
         description=row.get("description") or "",
         instruction=row.get("instruction") or "",
         tool_exposure_mode=row.get("tool_exposure_mode") or "summary",

@@ -2,9 +2,11 @@
 
 An ``enabled`` row is live config: ``resolve_mcp_config`` inherits it into
 every one of the user's workspaces. A disabled row is inert — a stored
-definition that reaches no workspace until it is enabled. All env/header
-literals are masked in responses; only ``${vault:NAME}`` reference names are
-surfaced.
+definition that reaches no workspace until it is enabled. Every route here is
+owner-scoped, so responses echo the stored env/header maps as written — vault
+refs and the owner's own literals, never a resolved secret — because a PUT
+replaces the whole row and the edit form has to round-trip them.
+``env_refs``/``header_refs`` remain the display-only vault-name projection.
 
 Endpoints (user-scoped):
 - GET    /api/v1/mcp/servers
@@ -27,7 +29,7 @@ from src.server.database.mcp_oauth import (
     get_connection,
     list_connections,
 )
-from src.server.services.mcp_config import builtin_names, same_consented_url
+from src.server.services.mcp_config import builtin_names
 from src.server.database.mcp_servers import (
     MAX_CATALOG_SERVERS_PER_USER,
     create_catalog_server,
@@ -53,6 +55,7 @@ from src.server.models.mcp_server import (
     parse_mcp_servers_payload,
 )
 from src.server.services.mcp_import import ImportScope, run_mcp_import
+from src.server.services.vault_invalidation import USER_TIER, after_secret_change
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
@@ -107,6 +110,40 @@ async def _tool_counts_by_server(
     return counts
 
 
+async def _oauth_headers_warning(user_id: str, server: McpServerInput) -> str | None:
+    """Warn when configured headers meet a live OAuth connection.
+
+    The two are independently settable, but the OAuth path never sends the
+    configured headers: the probe sends its own, host discovery and the relay
+    send only the OAuth Authorization. Silence would read as pass-through.
+    """
+    if not server.headers:
+        return None
+    try:
+        connection = await get_connection(user_id, server.name)
+    except Exception:
+        logger.warning(
+            "[mcp_catalog] OAuth connection lookup failed for %s", user_id,
+            exc_info=True,
+        )
+        return None
+    if connection is None or connection.status == ConnectionStatus.REVOKED:
+        return None
+    return (
+        "This server is OAuth-connected, so its configured headers are not "
+        "sent: discovery and sandbox tool calls carry only the OAuth "
+        "Authorization header. Disconnect OAuth to use headers instead."
+    )
+
+
+async def _write_warnings(user_id: str, server: McpServerInput) -> list[str] | None:
+    """The write-time nudges for a catalog row: isolation, then dropped headers."""
+    warnings = isolation_warnings(server)
+    if headers_warning := await _oauth_headers_warning(user_id, server):
+        warnings.append(headers_warning)
+    return warnings or None
+
+
 @router.get("/servers")
 @handle_api_exceptions("list MCP catalog servers", logger)
 async def list_servers(user_id: CurrentUserId) -> CatalogServerList:
@@ -147,7 +184,9 @@ async def create_server(
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     response = catalog_row_to_response(row)
-    response.warnings = isolation_warnings(server) or None
+    # A brand-new name has no connection, but a recreate over a name whose
+    # connection row outlived the old catalog entry does.
+    response.warnings = await _write_warnings(user_id, server)
     return response
 
 
@@ -176,6 +215,9 @@ async def update_server(
         raise HTTPException(
             status_code=409, detail="name in body must match the path name"
         )
+    # Pre-update read: the rediscovery decision below needs the OLD fingerprint,
+    # and the update returns only the new row.
+    prior = await get_catalog_server(user_id, name)
     # The row write and its version fan-out are one transaction in the DB layer.
     row = await update_catalog_server(
         user_id, name, updates=server.to_catalog_fields()
@@ -187,21 +229,31 @@ async def update_server(
     # consented endpoint: the stored token was issued for the old host, so it
     # must not carry to the new one. The grant already pins to the connection's
     # server_url, so no token can leak in the meantime — this revokes the now-
-    # stale connection so the UI shows a clean reconnect. Transport away from a
-    # remote scheme also invalidates consent (no relay path exists).
-    # disconnect_server writes only OAuth state, never this catalog row, so the
-    # response is built from the row we already hold.
-    connection = await get_connection(user_id, name)
-    if connection and connection.status != ConnectionStatus.REVOKED:
-        moved = server.transport not in ("http", "sse") or not same_consented_url(
-            connection.server_url, server.url
-        )
-        if moved:
-            from src.server.services.mcp_oauth.lifecycle import disconnect_server
+    # stale connection so the UI shows a clean reconnect. The revoke writes only
+    # OAuth state, never this catalog row, so the response is built from the row
+    # we already hold.
+    from src.server.services.mcp_oauth.discovery import (
+        schedule_post_edit_rediscovery,
+    )
+    from src.server.services.mcp_oauth.lifecycle import revoke_if_consent_moved
 
-            await disconnect_server(user_id, name)
+    # The consent check runs against a fresh read, never this request's own
+    # values: the write above and the revoke below are separate transactions,
+    # so a concurrent edit that already moved the row back onto the consented
+    # endpoint would otherwise be revoked on values no row still holds. A row
+    # deleted underneath us needs neither — DELETE revokes on both sides of its
+    # own drop.
+    committed = await get_catalog_server(user_id, name)
+    if committed is not None and not await revoke_if_consent_moved(
+        user_id, name, transport=committed["transport"], url=committed.get("url")
+    ):
+        # Consent survived the edit; if the discovery fingerprint moved, the
+        # connection's cached snapshot just went stale under it.
+        schedule_post_edit_rediscovery(user_id, name, prior=prior, updated=row)
     response = catalog_row_to_response(row)
-    response.warnings = isolation_warnings(server) or None
+    # After the revoke above, so an edit that just severed the connection does
+    # not warn about headers it has now made effective.
+    response.warnings = await _write_warnings(user_id, server)
     return response
 
 
@@ -258,7 +310,13 @@ async def import_servers(
         ),
     )
 
-    # Imported rows are disabled (inert) — no fan-out, no sandbox push needed.
+    # The imported SERVERS land disabled (inert), so they need no fan-out; the
+    # imported SECRETS do. One can complete a ``${vault:NAME}`` ref that an
+    # already-enabled connector has been dangling on, and nothing else in this
+    # path purges its snapshot, bumps the version, or pushes to a live sandbox.
+    for name in dict.fromkeys(report.secrets_created):
+        await after_secret_change(USER_TIER, user_id, name, user_id=user_id)
+
     return {
         "results": report.results,
         "created": report.created,
@@ -322,4 +380,11 @@ async def delete_server(name: str, user_id: CurrentUserId) -> dict:
     found = await delete_catalog_server(user_id, name)
     if not found:
         raise HTTPException(status_code=404, detail="MCP server not found")
+    # Fence the gap between those two writes — they are separate transactions,
+    # so an OAuth callback landing in between leaves a connected row behind a
+    # catalog entry that no longer exists: referenced by nothing, yet serviced
+    # by the refresh sweeper forever (it has no catalog join). Revoking again
+    # closes it, idempotently — no connection is a no-op, and revoked-on-revoked
+    # is an accepted write.
+    await disconnect_server(user_id, name)
     return {"ok": True}

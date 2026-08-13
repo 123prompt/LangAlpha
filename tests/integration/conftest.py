@@ -214,27 +214,29 @@ async def patched_get_db_connection(test_db_pool):
         async with test_db_pool.connection() as owned:
             yield owned
 
-    # Every module that does a module-level `from .conversation import
-    # get_db_connection` holds its own local reference, so each one needs
-    # its own patch target. Modules that import lazily inside a function
-    # (market_insight, services.workspace_manager) automatically pick up
-    # the source patch on pool.get_db_connection.
+    # Every module that does a module-level `from .pool import
+    # get_db_connection` holds its own local reference, so each one needs its
+    # own patch target. The database package is swept dynamically — a
+    # hand-kept list goes stale every time a DB module is added (it silently
+    # missed mcp_tool_schemas). Modules that import lazily inside a function
+    # automatically pick up the source patch on pool.get_db_connection.
+    import importlib
+    import pkgutil
+
+    import src.server.database as _database_pkg
+    from src.server.database.pool import get_db_connection as _pool_gdc
+
     targets = [
-        "src.server.database.pool.get_db_connection",
-        "src.server.database.workspace.get_db_connection",
-        "src.server.database.workspace_file.get_db_connection",
-        "src.server.database.user.get_db_connection",
-        "src.server.database.watchlist.get_db_connection",
-        "src.server.database.portfolio.get_db_connection",
-        "src.server.database.api_keys.get_db_connection",
-        "src.server.database.automation.get_db_connection",
-        "src.server.database.oauth_tokens.get_db_connection",
-        "src.server.database.vault_secrets.get_db_connection",
-        "src.server.database.mcp_servers.get_db_connection",
         # Services that hold their own from-import of get_db_connection
         "src.server.services.user_data_io.get_db_connection",
         "src.server.services.platform_secret_rollout.get_db_connection",
     ]
+    for _info in pkgutil.walk_packages(
+        _database_pkg.__path__, prefix="src.server.database."
+    ):
+        _mod = importlib.import_module(_info.name)
+        if getattr(_mod, "get_db_connection", None) is _pool_gdc:
+            targets.append(f"{_info.name}.get_db_connection")
     from contextlib import ExitStack
 
     with ExitStack() as stack:

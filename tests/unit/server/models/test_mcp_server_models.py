@@ -1,9 +1,9 @@
-"""Validation + masking unit tests for the MCP server Pydantic models.
+"""Validation + response-shaping unit tests for the MCP server Pydantic models.
 
 Covers the API security boundary: name regex, transport coherence, command
 allowlist (no bash), URL policy (incl. metadata IP / userinfo / private ranges),
 vault-ref vs bare host-env values, length caps, forbidden keys, and the
-env/header masking that keeps literal secret values out of all responses.
+owner-scoped echo of the stored env/header maps (never a resolved secret).
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from src.server.models.mcp_server import (
     catalog_row_to_response,
     coerce_mcp_name,
     collect_vault_refs,
+    isolation_warnings,
     normalize_transport,
     parse_mcp_servers_payload,
     validate_remote_url,
@@ -145,6 +146,8 @@ def test_url_accepts_public_https():
         "https://api.example.com/${vault:TOK}",  # secret in url
         "https://api.example.com/${VAR}/mcp",  # brace env placeholder
         "https://api.example.com/${vault:TOK",  # unclosed brace form
+        "https://api.example.com:99999/mcp",  # port out of range
+        "https://api.example.com:notaport/mcp",  # non-numeric port
     ],
 )
 def test_url_policy_rejects(url):
@@ -280,6 +283,33 @@ def test_catalog_row_discovery_uses_secrets_in_response():
 
 
 # ---------------------------------------------------------------------------
+# Isolation warnings — non-blocking nudges on an otherwise valid definition
+# ---------------------------------------------------------------------------
+
+
+def test_sse_transport_warns_it_is_not_executable():
+    # The sandbox client refuses legacy sse outright, so a silently-accepted
+    # sse server saves looking healthy and fails on every tool call.
+    server = McpServerInput(**_http(transport="sse"))
+    [warning] = isolation_warnings(server)
+    assert "sse" in warning
+    assert "http" in warning
+    # A warning, never a rejection — legacy imports must keep landing.
+    assert server.transport == "sse"
+
+
+def test_http_and_isolated_stdio_gain_no_warning():
+    assert isolation_warnings(McpServerInput(**_http())) == []
+    assert isolation_warnings(McpServerInput(**_stdio(command="npx"))) == []
+    assert isolation_warnings(McpServerInput(**_stdio(command="uvx"))) == []
+
+
+def test_shared_env_stdio_command_still_warns():
+    [warning] = isolation_warnings(McpServerInput(**_stdio(command="python")))
+    assert "shared sandbox" in warning
+
+
+# ---------------------------------------------------------------------------
 # Forbidden keys — reject, don't strip
 # ---------------------------------------------------------------------------
 
@@ -300,7 +330,7 @@ def test_unknown_extra_key_rejected():
 
 
 # ---------------------------------------------------------------------------
-# Masking — vault refs surfaced, literal values never echoed
+# Reference maps — echoed to the owner, with vault refs as a projection
 # ---------------------------------------------------------------------------
 
 
@@ -309,7 +339,7 @@ def test_collect_vault_refs_dedupes_and_sorts():
     assert refs == ["A", "Z"]
 
 
-def test_catalog_row_response_masks_literals():
+def _catalog_row(**overrides):
     row = {
         "name": "remote_server",
         "transport": "http",
@@ -324,10 +354,46 @@ def test_catalog_row_response_masks_literals():
         "created_at": "2026-01-01T00:00:00+00:00",
         "updated_at": "2026-01-01T00:00:00+00:00",
     }
-    resp = catalog_row_to_response(row)
-    dumped = resp.model_dump_json()
-    assert "literal-value" not in dumped
+    row.update(overrides)
+    return row
+
+
+def test_catalog_row_response_echoes_maps_verbatim():
+    """The owner's stored values round-trip, mixed refs and literals alike.
+
+    A PUT replaces the whole row and the edit form hydrates from these maps, so
+    a response that surfaced only ``header_refs`` would turn every unrelated
+    edit into a silent wipe of the literal entries.
+    """
+    resp = catalog_row_to_response(_catalog_row())
+    assert resp.headers == {
+        "Authorization": "${vault:API_KEY}",
+        "X-Trace": "literal-value",
+    }
+    # …and the refs stay a projection over the same map, not a replacement.
     assert resp.header_refs == ["API_KEY"]
+    assert resp.env == {} and resp.env_refs == []
+
+
+def test_catalog_row_response_echoes_stdio_env():
+    resp = catalog_row_to_response(
+        _catalog_row(
+            transport="stdio",
+            command="npx",
+            url=None,
+            headers={},
+            env={"API_TOKEN": "${vault:API_KEY}", "REGION": "us-east-1"},
+        )
+    )
+    assert resp.env == {"API_TOKEN": "${vault:API_KEY}", "REGION": "us-east-1"}
+    assert resp.env_refs == ["API_KEY"]
+    assert resp.headers == {} and resp.header_refs == []
+
+
+def test_catalog_row_response_tolerates_null_maps():
+    resp = catalog_row_to_response(_catalog_row(env=None, headers=None))
+    assert resp.env == {} and resp.headers == {}
+    assert resp.env_refs == [] and resp.header_refs == []
 
 
 # ---------------------------------------------------------------------------
