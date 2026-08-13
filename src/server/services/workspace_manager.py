@@ -437,14 +437,26 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # install so the grant annotations ride into the config copies codegen
         # reads. Best-effort: a relay hiccup leaves those servers unbound (their
         # generated clients fail with a clear error) but never blocks the turn.
+        egress_ok = True
         try:
-            await sync_egress_relay(workspace_id, user_id, session, resolved)
+            egress_ok = await sync_egress_relay(
+                workspace_id, user_id, session, resolved
+            )
         except Exception as e:
+            egress_ok = False
             logger.warning(
                 "[EGRESS] relay binding failed for %s: %s", workspace_id, e
             )
 
         await self._install_session_composite(session, resolved, user_id=user_id)
+        if not egress_ok:
+            # A refused credential push must not be stamped as applied: nothing
+            # else re-pushes the file (the remint re-sends only the stale
+            # in-memory map), so withhold the version — the same busted-stamp
+            # idiom refresh_session_mcp uses — and the next acquire re-resolves
+            # and retries. The composite stays installed so every non-OAuth
+            # tool remains live for this turn.
+            session.mcp_config_version = None
         return resolved
 
     async def _install_session_composite(
@@ -479,6 +491,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # a disconnect — the agent lane must not serve those tools).
         untrusted_servers = [s for s in resolved.servers if is_untrusted_server(s)]
         tool_schemas: dict[str, list[dict]] = {}
+        settled: set[str] = set()
         if untrusted_servers:
             from src.server.database.mcp_tool_schemas import (
                 get_tool_schemas,
@@ -496,7 +509,9 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             for server in untrusted_servers:
                 snapshot = snapshots.ok(server)
                 if snapshot is not None:
+                    settled.add(server.name)
                     tool_schemas[server.name] = snapshot.get("tools") or []
+        session.mcp_settled_servers = settled
 
         # Always build from the BUILTIN registry, never a prior composite —
         # session.mcp_registry may already be a composite from an earlier resolve.
@@ -522,21 +537,18 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         session.mcp_config_version = resolved.version
 
     def _servers_needing_discovery(self, session: Session, resolved: Any) -> list[Any]:
-        """Untrusted servers in ``resolved`` with no ok-status schema in the composite.
+        """Untrusted servers in ``resolved`` with no current ok-status snapshot.
 
-        Used to decide whether to kick background discovery. A server with cached
-        tools already appears in the composite; one without (pending/error/new)
-        contributes config but zero tools until discovery completes.
+        Used to decide whether to kick background discovery. Settlement is the
+        hash-gated snapshot presence recorded at composite install — not the
+        composite's tool count, which would re-probe a server that
+        legitimately advertises zero tools (or whose tools were all sanitized
+        out) on every acquire. Pending/error/new snapshots still re-probe, and
+        a config edit moves the fingerprint so its snapshot stops answering.
         """
         from src.server.services.mcp_config import State
 
-        registry = session.mcp_registry
-        get_all = getattr(registry, "get_all_tools", None)
-        present_with_tools: set[str] = set()
-        if callable(get_all):
-            for name, tools in get_all().items():
-                if tools:
-                    present_with_tools.add(name)
+        settled = session.mcp_settled_servers
         return [
             e.config
             for e in resolved.entries
@@ -545,7 +557,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             # OAuth servers are discovered host-side — probing one from the
             # sandbox (which holds no vendor token) could only cache junk.
             and not e.host_side_oauth
-            and e.name not in present_with_tools
+            and e.name not in settled
         ]
 
     def _kick_mcp_discovery(
@@ -901,6 +913,11 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         Returns the new session (already cached and DB-updated).
         """
         workspace = await db_get_workspace(workspace_id)
+        # Callers reaching recovery off the cached-session fast path may carry no
+        # user_id (they return before the slow path's DB correction). The row is
+        # the owner of record (workspaces.user_id is NOT NULL), and provisioning
+        # without it resolves the owner's MCP/OAuth tier as empty.
+        user_id = user_id or (workspace or {}).get("user_id")
         tier = await self._entitled_tier(workspace or {}, user_id)
         always_on = await self._entitled_always_on(workspace or {}, user_id)
         auto_stop_minutes = 0 if always_on else None
@@ -1412,7 +1429,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                         # Cooldown active, skip expensive Daytona calls — warm fast
                         # path, no recreation, so no tier re-check needed. The
                         # relay-JWT check is a pure in-memory compare unless the
-                        # token is actually near expiry (~once per 90min).
+                        # token is actually near expiry (~once per 1.5h).
                         await maybe_remint_egress_jwt(workspace_id, session)
                         safe_add(session_path_counter, 1, {"path": "warm_cooldown"})
                         return session

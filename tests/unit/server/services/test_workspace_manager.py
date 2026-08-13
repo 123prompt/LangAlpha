@@ -2790,6 +2790,64 @@ class TestRecoverSandboxEntitledTier:
         assert session.initialize.await_args.kwargs["tier"] == "standard"
 
 
+class TestRecoverSandboxOwnerBackfill:
+    """Recovery is reachable from callers that hold no user_id (the cached-session
+    fast path returns before the slow path's DB correction). Provisioning without
+    an owner resolves that owner's MCP/OAuth tier as empty, so the row supplies
+    it here — above every recovery call site."""
+
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    def _make_manager(self):
+        return WorkspaceManager.get_instance(config=_make_config())
+
+    async def _recover(self, manager, ws_id, user_id):
+        session = _make_mock_session()
+        manager._entitled_tier = AsyncMock(return_value="standard")
+        manager._entitled_always_on = AsyncMock(return_value=False)
+        manager._provision_sandbox_session = AsyncMock(return_value=(session, {}))
+        await manager._recover_sandbox(ws_id, user_id, MagicMock())
+        return session
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_a_caller_without_a_user_id_recovers_as_the_row_owner(
+        self, mock_get_ws, mock_activity
+    ):
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = _make_workspace(
+            workspace_id=ws_id, user_id="user-9", status="running"
+        )
+
+        await self._recover(manager, ws_id, None)
+
+        assert manager._provision_sandbox_session.await_args.args[1] == "user-9"
+        assert manager._entitled_tier.await_args.args[1] == "user-9"
+        assert manager._entitled_always_on.await_args.args[1] == "user-9"
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.update_workspace_activity")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_an_explicit_caller_identity_is_not_overwritten(
+        self, mock_get_ws, mock_activity
+    ):
+        manager = self._make_manager()
+        ws_id = str(uuid.uuid4())
+        mock_get_ws.return_value = _make_workspace(
+            workspace_id=ws_id, user_id="user-9", status="running"
+        )
+
+        await self._recover(manager, ws_id, "user-1")
+
+        assert manager._provision_sandbox_session.await_args.args[1] == "user-1"
+
+
 # ---------------------------------------------------------------------------
 # set_workspace_spec — tier change recreates the sandbox (hosted Daytona can't
 # resize a snapshot sandbox). Persist-then-revert on failure; guards against

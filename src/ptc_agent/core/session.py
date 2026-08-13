@@ -67,6 +67,11 @@ class Session:
         # the current composite + summary.
         self.mcp_tool_summary: str | None = None
         self.mcp_config_version: int | None = None
+        # Untrusted servers with a current-fingerprint ok discovery snapshot,
+        # recorded at composite install. Settlement lives here rather than in
+        # the composite's tool lists: a server that legitimately advertises
+        # zero tools is settled too, and must not re-probe every acquire.
+        self.mcp_settled_servers: set[str] = set()
 
         # Egress-relay binding for OAuth-connected servers: what THIS process
         # last pushed to the sandbox. Execution context only — grant truth is
