@@ -16,7 +16,7 @@ import logging
 import secrets
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx2
 from pydantic import BaseModel, ValidationError
@@ -47,6 +47,8 @@ from src.server.database.mcp_servers import (
     bump_user_workspaces_mcp_version,
     get_catalog_server,
 )
+from src.server.database.workspace import get_running_workspace_ids_for_user
+from src.server.services.mcp_config import same_consented_url
 from src.server.services.mcp_oauth.http import (
     OAuthHopBlocked,
     oauth_http_client,
@@ -233,7 +235,13 @@ async def _register_client(
     client_metadata: OAuthClientMetadata,
     auth_base_url: str,
 ) -> OAuthClientInformationFull:
-    """Reuse the stored DCR registration when the issuer matches; else register."""
+    """Reuse the stored DCR registration when it still fits; else register.
+
+    "Fits" = same issuer AND the registration covers the redirect_uris we are
+    about to send. The second half matters after a SERVER_BASE_URL change:
+    the stored registration then carries the old callback URL, and reusing it
+    has the AS reject every authorize request with no path back in-product.
+    """
     existing = await get_connection(user_id, server_name, secrets=Secrets.FULL)
     if existing and existing.client_info:
         try:
@@ -241,9 +249,17 @@ async def _register_client(
             if stored.client_id and existing.as_metadata.get("issuer") == str(
                 as_metadata.issuer
             ):
-                # client_secret is stored encrypted, outside the JSONB blob.
-                stored.client_secret = existing.client_secret
-                return stored
+                wanted = {str(u) for u in (client_metadata.redirect_uris or [])}
+                registered = {str(u) for u in (stored.redirect_uris or [])}
+                if wanted <= registered:
+                    # client_secret is stored encrypted, outside the JSONB blob.
+                    stored.client_secret = existing.client_secret
+                    return stored
+                logger.info(
+                    "[mcp_oauth] re-registering %s: stored registration lacks "
+                    "the current redirect_uri",
+                    server_name,
+                )
         except Exception:
             logger.info(
                 "[mcp_oauth] stored client_info for %s unusable; re-registering",
@@ -384,7 +400,18 @@ async def start_connect(
     if not stored:
         raise McpOAuthError("state collision — retry the connect")
 
-    authorize_url = f"{authorize_endpoint}?{urlencode(params)}"
+    # RFC 6749 §3.1 lets the authorization endpoint publish its own query
+    # (tenant routing, etc.) and requires it be retained — appending with a bare
+    # `?` would emit a second one and break the flow. Ours win on collision.
+    endpoint_parts = urlsplit(authorize_endpoint)
+    kept = [(k, v) for k, v in parse_qsl(endpoint_parts.query) if k not in params]
+    authorize_url = urlunsplit((
+        endpoint_parts.scheme,
+        endpoint_parts.netloc,
+        endpoint_parts.path,
+        urlencode(kept + list(params.items())),
+        endpoint_parts.fragment,
+    ))
     logger.info(
         "[mcp_oauth] connect started user=%s server=%s issuer=%s",
         user_id, server_name, record.issuer,
@@ -409,8 +436,40 @@ async def _claim_state(state: str) -> ConnectState | None:
     except ValidationError as e:
         # The key is already consumed, so an unusable record is spent — same
         # outcome as an expired one, and the caller must not leak the shape.
-        logger.warning("[mcp_oauth] unusable state record discarded: %s", e)
+        # Field locations only: the rendered ValidationError embeds the input it
+        # rejected, and this record carries the DCR client secret.
+        logger.warning(
+            "[mcp_oauth] unusable state record discarded: %d invalid field(s): %s",
+            e.error_count(),
+            ", ".join(
+                ".".join(str(part) for part in err["loc"]) for err in e.errors()
+            ),
+        )
         return None
+
+
+async def _resync_live_sandboxes(user_id: str) -> None:
+    """Re-apply the config on the user's running workspaces after a connect.
+
+    The version bump alone only makes sessions re-resolve; the generated MCP
+    client — which embeds the relay binding and drops the configured headers —
+    is re-uploaded by the asset sync the apply drives. Without this a warm
+    sandbox keeps dialing the vendor directly with the headers the connection
+    just displaced. Best-effort, like the catalog and vault mutation paths: a
+    failure here delays convergence to the next turn.
+    """
+    try:
+        # Lazy: the scheduler lives in a router, and a service must not import
+        # an app module at import time.
+        from src.server.app.mcp_servers import _schedule_proactive_apply
+
+        for workspace_id in await get_running_workspace_ids_for_user(user_id):
+            _schedule_proactive_apply(workspace_id, user_id)
+    except Exception:
+        logger.warning(
+            "[mcp_oauth] post-connect sandbox resync failed for user=%s",
+            user_id, exc_info=True,
+        )
 
 
 async def complete_callback(
@@ -499,7 +558,10 @@ async def complete_callback(
             record.token_endpoint, grant, client_info=client_info
         )
     except TokenExchangeError as e:
-        if e.kind is TokenFailure.BLOCKED:
+        # Both hop-block kinds: a policy rejection is always the pre-send one,
+        # so naming only the post-send kind here would report the case this
+        # error exists for as a generic exchange failure.
+        if e.kind in (TokenFailure.BLOCKED, TokenFailure.BLOCKED_PRE_SEND):
             logger.warning("[mcp_oauth] token hop blocked: %s", e)
             return _fail("blocked_endpoint")
         logger.warning("[mcp_oauth] token exchange for %s: %s", server_name, e)
@@ -507,6 +569,18 @@ async def complete_callback(
     except Exception:
         logger.exception("[mcp_oauth] token exchange errored for %s", server_name)
         return _fail("token_exchange_failed")
+
+    # The catalog row was validated in phase 1, up to STATE_TTL_SECONDS ago —
+    # long enough for the user to delete or re-point the server mid-consent.
+    # Persisting anyway would resurrect a connection with no catalog row behind
+    # it: invisible to the UI, refreshed forever by the sweeper, and silently
+    # inherited by a same-name recreate. The freshly exchanged token is dropped
+    # on the floor here; it simply expires.
+    catalog_row = await get_catalog_server(record.user_id, server_name)
+    if catalog_row is None or not same_consented_url(
+        catalog_row.get("url"), record.server_url
+    ):
+        return _fail("server_changed")
 
     connection_id = await upsert_connection(
         record.user_id,
@@ -544,6 +618,12 @@ async def complete_callback(
             "[mcp_oauth] post-connect discovery failed for %s",
             server_name, exc_info=True,
         )
+
+    # After discovery either way: a success lands its schemas first, and the
+    # failure path is precisely the one that needs this — nothing was written to
+    # the user tier, so the read falls back to the pre-connect snapshot and the
+    # warm sandbox would otherwise never learn it is relay-bound.
+    await _resync_live_sandboxes(record.user_id)
 
     return redirect_to(
         record.return_to, record.web_origin, mcp_connected=server_name

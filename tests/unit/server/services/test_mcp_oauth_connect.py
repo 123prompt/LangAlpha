@@ -26,12 +26,18 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
-from mcp.shared.auth import OAuthClientInformationFull, OAuthMetadata
+from mcp.shared.auth import (
+    OAuthClientInformationFull,
+    OAuthClientMetadata,
+    OAuthMetadata,
+)
 
+import src.server.app.mcp_servers as mcp_servers_mod
 from src.server.services.mcp_oauth import connect, redirects, tokens
 from src.server.services.mcp_oauth.connect import (
     STATE_TTL_SECONDS,
@@ -257,6 +263,8 @@ def phase2(monkeypatch) -> SimpleNamespace:
         upserts=[],
         bumps=[],
         discoveries=[],
+        applies=[],
+        running_workspaces=["ws-warm-1"],
         status_code=200,
         payload=_token_payload(),
         raises=None,
@@ -283,6 +291,12 @@ def phase2(monkeypatch) -> SimpleNamespace:
         if env.discovery_error is not None:
             raise env.discovery_error
 
+    async def _running_workspaces(user_id):
+        return list(env.running_workspaces)
+
+    def _schedule_proactive_apply(workspace_id, user_id):
+        env.applies.append((workspace_id, user_id))
+
     # The token POST lives in mcp_oauth.tokens — the one place both the code
     # exchange and the refresh go through.
     monkeypatch.setattr(tokens, "pinned_request", _pinned_request)
@@ -292,6 +306,12 @@ def phase2(monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(
         "src.server.services.mcp_oauth.discovery.refresh_user_tool_schemas",
         _refresh_user_tool_schemas,
+    )
+    monkeypatch.setattr(
+        connect, "get_running_workspace_ids_for_user", _running_workspaces
+    )
+    monkeypatch.setattr(
+        mcp_servers_mod, "_schedule_proactive_apply", _schedule_proactive_apply
     )
     return env
 
@@ -339,6 +359,45 @@ class TestStartConnect:
         assert params["client_id"] == "client-abc123"
         assert params["redirect_uri"] == callback_uri()
         assert result.authorize_url.startswith(f"{ISSUER}/authorize?")
+
+    @pytest.mark.asyncio
+    async def test_an_endpoints_own_query_survives_the_merge(self, redis, phase1):
+        # RFC 6749 §3.1: the authorization endpoint may publish a query, and it
+        # must be retained. Naive concatenation would emit a second '?'.
+        phase1.as_metadata = _as_metadata(
+            authorization_endpoint=f"{ISSUER}/authorize?tenant=acme&ui=dark"
+        )
+
+        result = await start_connect(USER_ID, SERVER_NAME)
+
+        assert result.authorize_url.count("?") == 1
+        params = _query(result.authorize_url)
+        assert params["tenant"] == "acme"
+        assert params["ui"] == "dark"
+        assert params["response_type"] == "code"
+        assert params["state"] == result.state
+
+    @pytest.mark.asyncio
+    async def test_our_parameters_win_a_collision_with_the_endpoints_own(
+        self, redis, phase1
+    ):
+        # A published `state`/`redirect_uri` must not survive alongside ours —
+        # duplicates make the AS's choice undefined, and the wrong one breaks
+        # the callback.
+        phase1.as_metadata = _as_metadata(
+            authorization_endpoint=(
+                f"{ISSUER}/authorize?state=stale&redirect_uri=https://evil.test"
+                "&tenant=acme"
+            )
+        )
+
+        result = await start_connect(USER_ID, SERVER_NAME)
+
+        appearing = parse_qs(urlsplit(result.authorize_url).query)
+        assert appearing["state"] == [result.state]
+        assert appearing["redirect_uri"] == [callback_uri()]
+        # A non-colliding one is untouched.
+        assert appearing["tenant"] == ["acme"]
 
     @pytest.mark.asyncio
     async def test_offline_access_asks_for_explicit_consent(self, redis, phase1):
@@ -403,6 +462,79 @@ class TestStartConnect:
 # ---------------------------------------------------------------------------
 # Round trip — phase 1 parks, phase 2 consumes
 # ---------------------------------------------------------------------------
+
+
+class TestRegistrationReuse:
+    """_register_client reuses a stored DCR registration only while it fits —
+    same issuer AND the registration still covers the redirect_uri we send."""
+
+    def _existing(self, client_info: OAuthClientInformationFull) -> SimpleNamespace:
+        return SimpleNamespace(
+            client_info=client_info.model_dump(mode="json", exclude_none=True),
+            client_secret="sec-1",
+            as_metadata={"issuer": str(_as_metadata().issuer)},
+        )
+
+    def _metadata_for(self, redirect: str) -> OAuthClientMetadata:
+        return OAuthClientMetadata.model_validate(
+            {
+                "redirect_uris": [redirect],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_reuses_while_issuer_and_redirect_still_fit(self, monkeypatch):
+        stored = _client_info()
+        monkeypatch.setattr(
+            connect, "get_connection", AsyncMock(return_value=self._existing(stored))
+        )
+        send = AsyncMock(side_effect=AssertionError("re-registered"))
+        monkeypatch.setattr(connect, "pinned_send", send)
+
+        result = await connect._register_client(
+            object(),
+            user_id=USER_ID,
+            server_name=SERVER_NAME,
+            as_metadata=_as_metadata(),
+            client_metadata=self._metadata_for(callback_uri()),
+            auth_base_url=ISSUER,
+        )
+
+        assert result.client_id == stored.client_id
+        assert result.client_secret == "sec-1"
+        send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_re_registers_when_the_redirect_moved(self, monkeypatch):
+        """A SERVER_BASE_URL change leaves the stored registration carrying the
+        old callback URL; reusing it would have the AS reject every authorize
+        request with no in-product path back."""
+        stored = _client_info(redirect_uris=["https://old.example.test/oauth/cb"])
+        monkeypatch.setattr(
+            connect, "get_connection", AsyncMock(return_value=self._existing(stored))
+        )
+        fresh = _client_info(client_id="client-fresh")
+        monkeypatch.setattr(
+            connect, "create_client_registration_request", lambda *a: object()
+        )
+        monkeypatch.setattr(connect, "pinned_send", AsyncMock(return_value=object()))
+        monkeypatch.setattr(
+            connect, "handle_registration_response", AsyncMock(return_value=fresh)
+        )
+
+        result = await connect._register_client(
+            object(),
+            user_id=USER_ID,
+            server_name=SERVER_NAME,
+            as_metadata=_as_metadata(),
+            client_metadata=self._metadata_for(callback_uri()),
+            auth_base_url=ISSUER,
+        )
+
+        assert result.client_id == "client-fresh"
 
 
 class TestRoundTrip:
@@ -490,6 +622,52 @@ class TestRoundTrip:
         assert phase2.upserts, "the connection is stored before discovery is attempted"
 
     @pytest.mark.asyncio
+    async def test_success_resyncs_the_users_warm_sandboxes(
+        self, redis, phase1, phase2
+    ):
+        """The bump only makes sessions re-resolve. A warm sandbox's generated
+        client embeds the relay binding, so it must be re-applied too — until it
+        is, the sandbox dials the vendor directly with the headers this
+        connection displaced."""
+        phase2.running_workspaces = ["ws-warm-1", "ws-warm-2"]
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        await _callback(started, code="auth-code-1")
+
+        assert phase2.applies == [("ws-warm-1", USER_ID), ("ws-warm-2", USER_ID)]
+
+    @pytest.mark.asyncio
+    async def test_discovery_failure_still_resyncs_warm_sandboxes(
+        self, redis, phase1, phase2
+    ):
+        """The failure path is the one that needs the resync most: nothing was
+        written to the user tier, so the read falls back to the pre-connect
+        snapshot and no other input can carry the binding into the sandbox."""
+        phase2.discovery_error = RuntimeError("needs reauth")
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        await _callback(started, code="auth-code-1")
+
+        assert phase2.applies == [("ws-warm-1", USER_ID)]
+
+    @pytest.mark.asyncio
+    async def test_resync_failure_does_not_break_the_connect(
+        self, redis, phase1, phase2, monkeypatch
+    ):
+        """Best-effort, like the sibling mutation paths: convergence slips to the
+        next turn rather than failing a connection that is already stored."""
+        async def _boom(user_id):
+            raise RuntimeError("workspace lookup down")
+
+        monkeypatch.setattr(connect, "get_running_workspace_ids_for_user", _boom)
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        redirect = await _callback(started, code="auth-code-1")
+
+        assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
+        assert phase2.upserts
+
+    @pytest.mark.asyncio
     async def test_matching_iss_is_accepted(self, redis, phase1, phase2):
         started = await start_connect(USER_ID, SERVER_NAME)
         issuer = redis.only_record()["issuer"]
@@ -497,6 +675,76 @@ class TestRoundTrip:
         redirect = await _callback(started, code="auth-code-1", iss=issuer)
 
         assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
+
+
+# ---------------------------------------------------------------------------
+# Catalog revalidation — phase 1's check is up to STATE_TTL_SECONDS stale
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogRevalidation:
+    """The catalog row must still describe the server the user consented to.
+
+    A connection row is never deleted, so persisting against a server that was
+    deleted (or re-pointed) mid-consent leaves a live, auto-refreshing
+    connection with no catalog row behind it — invisible to the UI and
+    inherited by the next same-name server.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_server_deleted_during_consent_is_not_resurrected(
+        self, redis, phase1, phase2
+    ):
+        started = await start_connect(USER_ID, SERVER_NAME)
+        phase1.catalog_row = None
+
+        redirect = await _callback(started, code="auth-code-1")
+
+        assert redirect == (
+            f"{DEFAULT_RETURN_TO}?mcp_error=server_changed&server={SERVER_NAME_Q}"
+        )
+        assert phase2.upserts == []
+        # Nothing downstream runs either — no version bump, no discovery, and
+        # no sandbox resync (there is no binding to converge on).
+        assert phase2.bumps == []
+        assert phase2.discoveries == []
+        assert phase2.applies == []
+
+    @pytest.mark.asyncio
+    async def test_a_server_repointed_during_consent_is_refused(
+        self, redis, phase1, phase2
+    ):
+        started = await start_connect(USER_ID, SERVER_NAME)
+        phase1.catalog_row = {
+            "name": SERVER_NAME,
+            "url": "https://mcp.other.test/mcp",
+            "transport": "http",
+        }
+
+        redirect = await _callback(started, code="auth-code-1")
+
+        assert redirect == (
+            f"{DEFAULT_RETURN_TO}?mcp_error=server_changed&server={SERVER_NAME_Q}"
+        )
+        assert phase2.upserts == []
+
+    @pytest.mark.asyncio
+    async def test_a_cosmetically_different_url_still_connects(
+        self, redis, phase1, phase2
+    ):
+        # The comparison is the consent canonicalizer, not raw equality: a
+        # default port or trailing slash is the same consented endpoint.
+        started = await start_connect(USER_ID, SERVER_NAME)
+        phase1.catalog_row = {
+            "name": SERVER_NAME,
+            "url": "https://MCP.demo.test:443/mcp/",
+            "transport": "http",
+        }
+
+        redirect = await _callback(started, code="auth-code-1")
+
+        assert redirect == f"{DEFAULT_RETURN_TO}?mcp_connected={SERVER_NAME_Q}"
+        assert len(phase2.upserts) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -781,6 +1029,31 @@ class TestCallbackErrors:
     @pytest.mark.asyncio
     async def test_blocked_token_endpoint(self, redis, phase1, phase2):
         phase2.raises = OAuthHopBlocked("egress to token endpoint is blocked")
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        redirect = await _callback(started, code="auth-code-1")
+
+        assert redirect == (
+            f"{DEFAULT_RETURN_TO}?mcp_error=blocked_endpoint&server={SERVER_NAME_Q}"
+        )
+        assert phase2.upserts == []
+
+    @pytest.mark.asyncio
+    async def test_a_pre_send_block_is_still_named_as_a_blocked_endpoint(
+        self, redis, phase1, phase2
+    ):
+        """The shape an SSRF policy rejection actually takes.
+
+        The guard refuses before the request is built, so every real blocked
+        endpoint arrives tagged as never-sent; only a refused redirect is the
+        other kind. Reporting this one as a generic exchange failure would leave
+        the user's own misconfiguration unnamed.
+        """
+        phase2.raises = OAuthHopBlocked(
+            "egress to 'token.internal.test' is blocked: "
+            "resolves to a non-global address",
+            request_sent=False,
+        )
         started = await start_connect(USER_ID, SERVER_NAME)
 
         redirect = await _callback(started, code="auth-code-1")

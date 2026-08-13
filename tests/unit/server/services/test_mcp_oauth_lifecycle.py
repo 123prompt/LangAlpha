@@ -23,6 +23,7 @@ advisory-lock cursor, the connection-row store, and the token endpoint.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import uuid
 from contextlib import asynccontextmanager
@@ -34,13 +35,14 @@ import pytest
 
 from src.server.database import mcp_oauth as mcp_oauth_db
 from src.server.database.mcp_oauth import (
+    SERVABLE,
     BearerBundle,
     ConnectionStatus,
     ConnectionSummary,
     RefreshBundle,
     Secrets,
 )
-from src.server.services.mcp_oauth import lifecycle, tokens
+from src.server.services.mcp_oauth import http, lifecycle, tokens
 from src.server.services.mcp_oauth.http import OAuthHopBlocked
 from src.server.services.mcp_oauth.lifecycle import (
     AccessToken,
@@ -48,6 +50,7 @@ from src.server.services.mcp_oauth.lifecycle import (
     ensure_fresh_access_token,
 )
 from src.server.services.writer_guard import advisory_key
+from src.server.utils.egress_guard import EgressBlockedError, PinnedTarget
 
 CONNECTION_ID = "11111111-2222-3333-4444-555555555555"
 USER_ID = "user-lifecycle-1"
@@ -129,6 +132,17 @@ class FakeStore:
         self.script: dict[int, RefreshBundle | None] = {}
         self.read_count = 0
         self.marks: list[str] = []
+        # Status writes the generation fence refused, and the fences each write
+        # carried — a refresh outcome may only land on the bundle it describes.
+        self.refused_marks: list[str] = []
+        self.mark_generations: list[int] = []
+        self.mark_conns: list = []
+        # Writes that went through the UNFENCED writer. disconnect_server is its
+        # only legitimate caller; a refresh outcome here is the regression.
+        self.unfenced_marks: list[str] = []
+        # Fires just before a fenced write evaluates its guard — the window a
+        # reconnect's upsert lands in.
+        self.on_mark = None
         self.commits: list[dict] = []
         self.reads: list[Secrets] = []
         # The connection each write/read was handed — None means it acquired
@@ -151,10 +165,34 @@ class FakeStore:
         return _project(self.row, secrets)
 
     async def mark_status(self, connection_id, status, *, conn=None):
+        self.unfenced_marks.append(status)
+        self._apply(status)
+        return True
+
+    async def mark_status_if_generation(
+        self, connection_id, status, *, expected_generation, conn=None
+    ):
+        if self.on_mark is not None:
+            self.on_mark()
+        self.mark_generations.append(expected_generation)
+        self.mark_conns.append(conn)
+        row = self.row
+        if (
+            row is None
+            or row.token_generation != expected_generation
+            or (row.status is ConnectionStatus.REVOKED and status != "revoked")
+        ):
+            # Both halves of the real UPDATE's WHERE: the generation fence, and
+            # mark_status' terminal guard.
+            self.refused_marks.append(status)
+            return False
+        self._apply(status)
+        return True
+
+    def _apply(self, status) -> None:
         self.marks.append(status)
         if self.row is not None:
             self.row = dataclasses.replace(self.row, status=ConnectionStatus(status))
-        return True
 
     async def commit_refresh(
         self,
@@ -178,8 +216,14 @@ class FakeStore:
                 "scope": scope,
             }
         )
-        if self.row is None or self.row.token_generation != expected_generation:
-            return False  # a newer bundle already landed
+        if (
+            self.row is None
+            or self.row.token_generation != expected_generation
+            or self.row.status not in SERVABLE
+        ):
+            # A newer bundle already landed, or the row left the servable set —
+            # both halves of the real UPDATE's WHERE.
+            return False
         surviving = refresh_token or self.row.refresh_token
         self.row = dataclasses.replace(
             self.row,
@@ -289,6 +333,9 @@ def store(monkeypatch) -> FakeStore:
     fake = FakeStore(_row())
     monkeypatch.setattr(lifecycle, "get_connection_by_id", fake.get_connection_by_id)
     monkeypatch.setattr(lifecycle, "mark_status", fake.mark_status)
+    monkeypatch.setattr(
+        lifecycle, "mark_status_if_generation", fake.mark_status_if_generation
+    )
     monkeypatch.setattr(lifecycle, "commit_refresh", fake.commit_refresh)
     return fake
 
@@ -477,6 +524,54 @@ class TestHotPath:
 
 
 # ---------------------------------------------------------------------------
+# current_access_token — the relay's 401-retry read
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentAccessToken:
+    @pytest.mark.asyncio
+    async def test_a_revoked_row_hands_out_no_bearer(self, store, db, token_endpoint):
+        # The race this pins: entry gate passed → vendor 401 → a concurrent
+        # refresh rotated the bundle → the user disconnected → the retry asks
+        # for the rotated bearer. Handing it out would send one
+        # post-revocation request with a still-vendor-valid token.
+        store.row = _row(status="revoked", generation=4)
+
+        assert await lifecycle.current_access_token(CONNECTION_ID) is None
+        assert token_endpoint.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_needs_reauth_row_hands_out_no_bearer(
+        self, store, db, token_endpoint
+    ):
+        store.row = _row(status="needs_reauth", generation=4)
+
+        assert await lifecycle.current_access_token(CONNECTION_ID) is None
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_row_serves_its_bearer_even_expired(
+        self, store, db, token_endpoint
+    ):
+        # Servable and no freshness gate: the caller already holds a vendor
+        # 401 in hand — whether THIS bearer is any better is the vendor's
+        # call, not a clock check here.
+        store.row = _row(status="refresh_ambiguous", expires_in=-5, generation=4)
+
+        token = await lifecycle.current_access_token(CONNECTION_ID)
+
+        assert token is not None
+        assert token.access_token == "access-old"
+        assert token.generation == 4
+        assert token_endpoint.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_missing_bearer_is_none(self, store, db, token_endpoint):
+        store.row = _row(access_token="")
+
+        assert await lifecycle.current_access_token(CONNECTION_ID) is None
+
+
+# ---------------------------------------------------------------------------
 # Winner — one refresh, generation-CAS commit, lock always released
 # ---------------------------------------------------------------------------
 
@@ -559,6 +654,55 @@ class TestWinner:
         assert token.access_token == "access-new"
         assert store.commits[0]["refresh_token"] is None
         assert store.row.refresh_token == "refresh-old"
+
+    @pytest.mark.asyncio
+    async def test_expires_in_zero_is_stored_as_an_expiry_not_as_forever(
+        self, store, db, token_endpoint
+    ):
+        """0 is an AS saying "already expired", not "no expiry".
+
+        The two are opposite instructions that a falsy test collapses into one:
+        stored as NULL, the bearer reads as non-expiring, so it is served past
+        its death and never refreshed again.
+        """
+        store.row = _row(expires_in=120)
+        token_endpoint.payload = {
+            "access_token": "access-new",
+            "token_type": "Bearer",
+            "expires_in": 0,
+        }
+
+        await ensure_fresh_access_token(CONNECTION_ID)
+
+        [commit] = store.commits
+        assert commit["expires_at"] is not None
+        elapsed = (commit["expires_at"] - datetime.now(timezone.utc)).total_seconds()
+        assert abs(elapsed) < 30
+
+        # The consequence, end to end: the next call finds a dead bearer and
+        # refreshes it instead of handing it out forever.
+        token_endpoint.payload = {
+            "access_token": "access-newer",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }
+        again = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert again.access_token == "access-newer"
+        assert len(token_endpoint.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_an_omitted_expires_in_is_still_stored_as_no_expiry(
+        self, store, db, token_endpoint
+    ):
+        # The other side of the same test: absent really does mean "no expiry",
+        # and must not become an instantly-dead token.
+        store.row = _row(expires_in=120)
+        token_endpoint.payload = {"access_token": "access-new", "token_type": "Bearer"}
+
+        await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.commits[0]["expires_at"] is None
 
     @pytest.mark.asyncio
     async def test_confidential_client_and_resource_are_sent(
@@ -674,6 +818,106 @@ class TestWinner:
         assert token.access_token == "access-rival"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["revoked", "needs_reauth"])
+    async def test_a_status_change_under_the_lock_stops_the_refresh(
+        self, store, db, token_endpoint, status
+    ):
+        """The entry gate ran before the lock; the row is re-read after it.
+
+        Without re-checking the status there, a disconnect landing in that
+        window still spends the refresh token against a grant the user has
+        surrendered — and the outcome then lands back on the revoked row.
+        """
+        store.row = _row(expires_in=120)
+        store.script[2] = _row(expires_in=120, status=status)
+
+        with pytest.raises(TokenUnavailable) as excinfo:
+            await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert excinfo.value.reason == status
+        assert token_endpoint.calls == []
+        assert store.commits == []
+        assert store.marks == []
+        assert db.unlocks == [LOCK_KEY]
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_flip_under_the_lock_is_never_retried(
+        self, store, db, token_endpoint
+    ):
+        """Ambiguous is servable but not retryable — the two must not blur.
+
+        The previous winner failed ambiguously and released the lock; our
+        entry-gate read predates its mark. Re-spending the same refresh token
+        here is exactly the replay the ambiguous state exists to prevent, so
+        the under-lock re-read must ride the old bearer instead.
+        """
+        store.row = _row(expires_in=120)
+        store.script[2] = _row(expires_in=120, status="refresh_ambiguous")
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.access_token == "access-old"
+        assert token_endpoint.calls == []
+        assert store.commits == []
+        assert store.marks == []
+        assert db.unlocks == [LOCK_KEY]
+
+    @pytest.mark.asyncio
+    async def test_an_expired_ambiguous_flip_under_the_lock_needs_reauth(
+        self, store, db, token_endpoint
+    ):
+        # Same race, but the bearer is already dead: nothing may be served and
+        # nothing may be retried, so the row settles as needs_reauth.
+        store.row = _row(expires_in=120)
+        store.script[2] = _row(expires_in=-10, status="refresh_ambiguous")
+
+        with pytest.raises(TokenUnavailable) as excinfo:
+            await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert excinfo.value.reason == "needs_reauth"
+        assert token_endpoint.calls == []
+        assert store.marks == ["needs_reauth"]
+        assert db.unlocks == [LOCK_KEY]
+
+    @pytest.mark.asyncio
+    async def test_a_refresh_token_nulled_under_the_lock_serves_the_bearer(
+        self, store, db, token_endpoint
+    ):
+        # A reconnect's upsert can null the stored refresh token mid-window;
+        # the winner must serve what remains, not POST a None grant.
+        store.row = _row(expires_in=120)
+        store.script[2] = _row(expires_in=120, refresh_token=None)
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.access_token == "access-old"
+        assert token_endpoint.calls == []
+        assert db.unlocks == [LOCK_KEY]
+
+    @pytest.mark.asyncio
+    async def test_a_cas_lost_to_a_revoke_reports_the_revoke(
+        self, store, db, token_endpoint
+    ):
+        """Under the lock the generation cannot move, so a failed CAS means the
+        commit's other guard fired: the status left the servable set."""
+        store.row = _row(expires_in=120, generation=3)
+
+        def _revoked_mid_flight():
+            store.row = _row(
+                expires_in=3600, generation=3, status="revoked",
+                access_token="access-surrendered",
+            )
+
+        token_endpoint.on_call = _revoked_mid_flight
+
+        with pytest.raises(TokenUnavailable) as excinfo:
+            await ensure_fresh_access_token(CONNECTION_ID)
+
+        # Not the still-unexpired bearer of a connection the user gave up.
+        assert excinfo.value.reason == "revoked"
+        assert db.unlocks == [LOCK_KEY]
+
+    @pytest.mark.asyncio
     async def test_missing_token_endpoint_needs_reauth(
         self, store, db, token_endpoint
     ):
@@ -769,6 +1013,23 @@ class TestLoser:
 
         assert excinfo.value.reason == "refresh_in_progress"
 
+    @pytest.mark.asyncio
+    async def test_a_newer_generation_on_a_revoked_row_is_not_usable_either(
+        self, store, db, token_endpoint, short_poll
+    ):
+        """Usability is status AND clock: the winner's rotation can be followed
+        by a disconnect, leaving a fresh, unexpired, unspendable bearer."""
+        store.row = _row(expires_in=-5, generation=3)
+        store.script[2] = _row(
+            expires_in=3600, generation=4, status="revoked",
+            access_token="access-surrendered",
+        )
+
+        with pytest.raises(TokenUnavailable) as excinfo:
+            await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert excinfo.value.reason == "refresh_in_progress"
+
 
 # ---------------------------------------------------------------------------
 # Ambiguous refresh — never retried
@@ -776,16 +1037,27 @@ class TestLoser:
 
 
 class TestAmbiguousRefresh:
+    """The classification is by *what was on the wire*, not by exception family.
+
+    A refresh token is one-time under rotation, so the only safe question is
+    whether the request could have reached the AS. Anything that failed after
+    the send — a lost response, a mid-stream reset — must be assumed to have
+    spent it, because replaying it is what trips an AS's replay detection and
+    commonly costs the whole grant.
+    """
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "failure",
         [
             httpx2.ReadTimeout("token endpoint timed out"),
-            httpx2.ConnectTimeout("token endpoint connect timed out"),
+            httpx2.ReadError("connection reset waiting for the response"),
+            httpx2.WriteError("connection reset mid-request"),
+            httpx2.RemoteProtocolError("server disconnected without a response"),
             OAuthHopBlocked("token endpoint hop blocked mid-flight"),
         ],
     )
-    async def test_timeout_flips_to_ambiguous_and_keeps_the_old_token(
+    async def test_a_post_send_failure_flips_to_ambiguous_and_keeps_the_old_token(
         self, store, db, token_endpoint, failure
     ):
         store.row = _row(expires_in=120)
@@ -797,6 +1069,33 @@ class TestAmbiguousRefresh:
         assert store.marks == ["refresh_ambiguous"]
         assert store.commits == []
         assert len(token_endpoint.calls) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status_code", "marks"),
+        [
+            (502, ["refresh_ambiguous"]),
+            (504, ["refresh_ambiguous"]),
+            (429, []),
+            (500, []),
+            (503, []),
+        ],
+    )
+    async def test_a_5xx_is_split_by_who_answered(
+        self, store, db, token_endpoint, status_code, marks
+    ):
+        # A gateway 502/504 means the AS's own answer was lost behind it, so
+        # the grant may already be spent; a 429/500/503 IS the AS answering
+        # about this request, which it could not do having rotated the token.
+        store.row = _row(expires_in=120)
+        token_endpoint.status_code = status_code
+        token_endpoint.payload = {"error": "upstream"}
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.access_token == "access-old"
+        assert store.marks == marks
+        assert store.commits == []
 
     @pytest.mark.asyncio
     async def test_ambiguous_refresh_is_never_retried(
@@ -834,12 +1133,27 @@ class TestAmbiguousRefresh:
         assert db.lock_attempts == []
 
     @pytest.mark.asyncio
-    async def test_transport_error_is_not_ambiguous(
-        self, store, db, token_endpoint
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            httpx2.ConnectError("connection refused"),
+            httpx2.ConnectTimeout("token endpoint connect timed out"),
+            httpx2.PoolTimeout("no connection slot free"),
+        ],
+    )
+    async def test_a_pre_send_failure_is_not_ambiguous(
+        self, store, db, token_endpoint, failure
     ):
-        """A refused connection cannot have consumed the refresh token."""
+        """No connection was ever established, so nothing could be consumed.
+
+        The timeouts belong here for the same reason ConnectError does — a
+        connect that never completed and a pool slot that never came free both
+        put zero bytes on the wire. Classifying them as ambiguous would let one
+        slow AS walk the sweeper's whole batch into ``refresh_ambiguous``, a
+        state nothing ever re-attempts.
+        """
         store.row = _row(expires_in=120)
-        token_endpoint.raises = httpx2.ConnectError("connection refused")
+        token_endpoint.raises = failure
 
         token = await ensure_fresh_access_token(CONNECTION_ID)
 
@@ -853,6 +1167,53 @@ class TestAmbiguousRefresh:
         assert len(token_endpoint.calls) == 2
 
     @pytest.mark.asyncio
+    async def test_a_pre_send_hop_block_is_retried_not_burned(
+        self, store, db, token_endpoint
+    ):
+        """The pin runs before the POST, so a blocked hop consumed nothing.
+
+        ``pin_public_url`` raises the same error for a permanent policy
+        rejection and for a resolver hiccup ("DNS resolution failed"). Reading
+        either as ambiguous lets one second of DNS trouble put the connection
+        into ``refresh_ambiguous`` — a state nothing ever retries, which then
+        forces a re-auth the moment the access token expires.
+        """
+        store.row = _row(expires_in=120)
+        token_endpoint.raises = OAuthHopBlocked(
+            "egress to 'auth.demo.test' is blocked: DNS resolution failed",
+            request_sent=False,
+        )
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.access_token == "access-old"
+        assert store.marks == []  # status untouched — the next call may retry
+
+        token_endpoint.raises = None
+        again = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert again.access_token == "access-new"
+        assert len(token_endpoint.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_refused_redirect_stays_ambiguous(
+        self, store, db, token_endpoint
+    ):
+        # The hop block's other raise site, and the reason the tag defaults to
+        # "sent": the response came back, so the AS saw the grant and may have
+        # rotated it behind the redirect.
+        store.row = _row(expires_in=120)
+        token_endpoint.raises = OAuthHopBlocked(
+            "POST https://auth.demo.test/token answered a redirect (302); "
+            "redirects are refused on OAuth hops"
+        )
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.access_token == "access-old"
+        assert store.marks == ["refresh_ambiguous"]
+
+    @pytest.mark.asyncio
     async def test_transport_error_on_an_expired_token_reports_expired(
         self, store, db, token_endpoint
     ):
@@ -864,6 +1225,328 @@ class TestAmbiguousRefresh:
 
         assert excinfo.value.reason == "expired"
         assert store.marks == []
+
+
+# ---------------------------------------------------------------------------
+# Failure statuses — fenced on the generation they describe
+# ---------------------------------------------------------------------------
+
+
+class TestFailureWritesAreFenced:
+    """A refresh outcome describes ONE bundle, so it may only land on that one.
+
+    ``upsert_connection`` takes no advisory lock, so a user reconnecting while a
+    refresh is in flight writes a fresh bundle and bumps the generation
+    underneath it. An unfenced failure write then flips the just-repaired
+    connection to ``needs_reauth`` / ``refresh_ambiguous`` — the user reconnects,
+    watches it work, and sees it break again seconds later.
+    """
+
+    @staticmethod
+    def _reconnect(store):
+        """The user's reconnect landing in the window before the write."""
+
+        def _land():
+            store.row = _row(
+                expires_in=3600, generation=9, access_token="access-reconnected"
+            )
+
+        return _land
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_refresh_does_not_flip_a_reconnected_bundle(
+        self, store, db, token_endpoint
+    ):
+        store.row = _row(expires_in=120, generation=3)
+        token_endpoint.status_code = 400
+        token_endpoint.payload = {"error": "invalid_grant"}
+        store.on_mark = self._reconnect(store)
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        # The stale needs_reauth was refused, and the caller answers with the
+        # bundle that actually exists rather than raising over it.
+        assert store.refused_marks == ["needs_reauth"]
+        assert store.marks == []
+        assert store.row.status is ConnectionStatus.CONNECTED
+        assert token.access_token == "access-reconnected"
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_refresh_does_not_flip_a_reconnected_bundle(
+        self, store, db, token_endpoint
+    ):
+        store.row = _row(expires_in=120, generation=3)
+        token_endpoint.raises = httpx2.ReadTimeout("token endpoint timed out")
+        store.on_mark = self._reconnect(store)
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.refused_marks == ["refresh_ambiguous"]
+        assert store.marks == []
+        assert store.row.status is ConnectionStatus.CONNECTED
+        # Not "access-old": our ambiguity is about a refresh token the reconnect
+        # has already replaced, so the new bearer is the honest answer.
+        assert token.access_token == "access-reconnected"
+
+    @pytest.mark.asyncio
+    async def test_a_missing_token_endpoint_does_not_flip_a_reconnected_bundle(
+        self, store, db, token_endpoint
+    ):
+        # This one never reaches the network, so the reconnect is the only thing
+        # that moves — and the fence is all that stands between it and a
+        # needs_reauth written over a healthy connection.
+        store.row = _row(expires_in=120, generation=3, as_metadata={"issuer": ISSUER})
+        store.on_mark = self._reconnect(store)
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.refused_marks == ["needs_reauth"]
+        assert store.marks == []
+        assert token.access_token == "access-reconnected"
+        assert token_endpoint.calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_unrefreshable_expired_token_does_not_flip_a_reconnect(
+        self, store, db, token_endpoint
+    ):
+        # The pre-lock verdict: expired, nothing to refresh with. It is read
+        # off a row that a reconnect can replace just as easily.
+        store.row = _row(expires_in=-5, generation=3, refresh_token=None)
+        store.on_mark = self._reconnect(store)
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.refused_marks == ["needs_reauth"]
+        assert store.marks == []
+        assert token.access_token == "access-reconnected"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_write_still_raises_when_nothing_usable_replaced_it(
+        self, store, db, token_endpoint
+    ):
+        """A moved generation is not by itself good news.
+
+        The replacement can be a revoked or already-expired row, and then the
+        original failure is still the truth — the fence must not turn "the
+        bundle moved" into "everything is fine".
+        """
+        store.row = _row(expires_in=-5, generation=3)
+        token_endpoint.status_code = 400
+        token_endpoint.payload = {"error": "invalid_grant"}
+        store.on_mark = lambda: setattr(
+            store, "row", _row(expires_in=3600, generation=9, status="revoked")
+        )
+
+        with pytest.raises(TokenUnavailable) as excinfo:
+            await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert excinfo.value.reason == "needs_reauth"
+        assert store.refused_marks == ["needs_reauth"]
+
+    @pytest.mark.asyncio
+    async def test_an_unmoved_generation_writes_through_the_fence(
+        self, store, db, token_endpoint
+    ):
+        # The transitions themselves are pinned by the sections above, which
+        # pass unchanged; what is new here is what the write carries.
+        store.row = _row(expires_in=120, generation=3)
+        token_endpoint.status_code = 400
+        token_endpoint.payload = {"error": "invalid_grant"}
+
+        with pytest.raises(TokenUnavailable):
+            await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.marks == ["needs_reauth"]
+        assert store.refused_marks == []
+        # The generation the outcome was computed from...
+        assert store.mark_generations == [3]
+        # ...and the connection already holding the refresh lock, like every
+        # other write on this path — never a second pool acquire.
+        assert store.mark_conns == [db.last_conn]
+
+    @pytest.mark.asyncio
+    async def test_the_refresh_path_never_uses_the_unfenced_writer(
+        self, store, db, token_endpoint
+    ):
+        # mark_status has one legitimate caller left — disconnect_server, which
+        # is writing the terminal state rather than a refresh outcome.
+        store.row = _row(expires_in=120)
+        token_endpoint.status_code = 401
+        token_endpoint.payload = {"error": "invalid_grant"}
+
+        with pytest.raises(TokenUnavailable):
+            await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert store.unfenced_marks == []
+
+
+# ---------------------------------------------------------------------------
+# The hop-block raise sites — where the block happened IS the retry decision
+# ---------------------------------------------------------------------------
+
+
+class _FakeUpstream:
+    """The streamed side of a hop response: status, headers, chunked body."""
+
+    def __init__(self, *, status=200, headers=None, chunks=(), stall_after=False):
+        self.status_code = status
+        self.headers = httpx2.Headers(
+            headers or {"content-type": "application/json"}
+        )
+        self.request = httpx2.Request("POST", "https://auth.demo.test/token")
+        self._chunks = list(chunks)
+        self._stall_after = stall_after
+        self.served = 0
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            self.served += len(chunk)
+            yield chunk
+        if self._stall_after:
+            await asyncio.sleep(3600)
+
+
+def _hop_client(upstream: _FakeUpstream):
+    @asynccontextmanager
+    async def _stream(method, url, **kwargs):
+        yield upstream
+
+    return SimpleNamespace(stream=_stream)
+
+
+class TestHopBlockTagging:
+    """``pinned_request`` refuses hops on both sides of the send.
+
+    The classification above can only be as good as this tag, so it is pinned at
+    the source: everything downstream reads ``request_sent``, not the message.
+    """
+
+    PINNED = PinnedTarget(
+        url="https://203.0.113.10/token",
+        host="auth.demo.test",
+        ip="203.0.113.10",
+        authority="auth.demo.test",
+    )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_pin_is_tagged_as_never_sent(self, monkeypatch):
+        async def _blocked(url, **kwargs):
+            raise EgressBlockedError(
+                "egress to 'auth.demo.test' is blocked: DNS resolution failed"
+            )
+
+        monkeypatch.setattr(http, "pin_public_url", _blocked)
+
+        with pytest.raises(OAuthHopBlocked) as excinfo:
+            # No client is passed: reaching one would already be the bug.
+            await http.pinned_request(None, "POST", "https://auth.demo.test/token")
+
+        assert excinfo.value.request_sent is False
+
+    @pytest.mark.asyncio
+    async def test_a_refused_redirect_is_tagged_as_sent(self, monkeypatch):
+        async def _pinned(url, **kwargs):
+            return self.PINNED
+
+        monkeypatch.setattr(http, "pin_public_url", _pinned)
+
+        with pytest.raises(OAuthHopBlocked) as excinfo:
+            await http.pinned_request(
+                _hop_client(
+                    _FakeUpstream(
+                        status=302,
+                        headers={"Location": "https://elsewhere.test/token"},
+                    )
+                ),
+                "POST",
+                "https://auth.demo.test/token",
+            )
+
+        assert excinfo.value.request_sent is True
+
+    def test_an_unlabelled_block_is_assumed_sent(self):
+        # The pessimistic default is what keeps a new raise site from silently
+        # licensing a replay of a one-time grant.
+        assert OAuthHopBlocked("some new hop refusal").request_sent is True
+
+    @pytest.mark.asyncio
+    async def test_an_oversized_hop_body_is_refused_mid_stream(self, monkeypatch):
+        # A hop answer is KB-scale JSON; buffering whatever the server sends
+        # would let one malicious AS spend a worker's memory.
+        async def _pinned(url, **kwargs):
+            return self.PINNED
+
+        monkeypatch.setattr(http, "pin_public_url", _pinned)
+        flood = _FakeUpstream(chunks=[b"x" * 262_144] * 5)
+
+        with pytest.raises(OAuthHopBlocked) as excinfo:
+            await http.pinned_request(
+                _hop_client(flood), "GET", "https://auth.demo.test/metadata"
+            )
+
+        assert "bytes" in str(excinfo.value)
+        assert excinfo.value.request_sent is True
+        # The cap fired mid-stream: the flood was not drained to completion.
+        assert flood.served <= http.HOP_MAX_BYTES + 262_144
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_hop_stream_hits_the_wall_clock(self, monkeypatch):
+        # The read timeout is an idle timeout — every byte resets it, so only
+        # the hop-wide deadline bounds a server that trickles forever.
+        async def _pinned(url, **kwargs):
+            return self.PINNED
+
+        monkeypatch.setattr(http, "pin_public_url", _pinned)
+        monkeypatch.setattr(http, "HOP_DEADLINE_SECONDS", 0.05)
+
+        with pytest.raises(OAuthHopBlocked) as excinfo:
+            # The outer wait_for is the test's own guard: a regression that
+            # loses the hop deadline fails here in seconds instead of hanging.
+            await asyncio.wait_for(
+                http.pinned_request(
+                    _hop_client(_FakeUpstream(chunks=[b"{"], stall_after=True)),
+                    "GET",
+                    "https://auth.demo.test/metadata",
+                ),
+                timeout=5,
+            )
+
+        assert "deadline" in str(excinfo.value)
+        assert excinfo.value.request_sent is True
+
+    @pytest.mark.asyncio
+    async def test_a_bounded_body_round_trips_with_wire_framing_stripped(
+        self, monkeypatch
+    ):
+        # The rebuilt response carries decoded content, so the wire-framing
+        # fields (content-encoding et al.) must not survive to confuse a
+        # reader into decoding twice.
+        async def _pinned(url, **kwargs):
+            return self.PINNED
+
+        monkeypatch.setattr(http, "pin_public_url", _pinned)
+
+        response = await http.pinned_request(
+            _hop_client(
+                _FakeUpstream(
+                    headers={
+                        "content-type": "application/json",
+                        "content-encoding": "gzip",
+                        "content-length": "9999",
+                    },
+                    chunks=[b'{"ok":', b" true}"],
+                )
+            ),
+            "POST",
+            "https://auth.demo.test/token",
+        )
+
+        assert response.json() == {"ok": True}
+        assert response.headers["content-type"] == "application/json"
+        assert "content-encoding" not in response.headers
+        # httpx restates content-length for the rebuilt body; the wire's
+        # value (9999) must not be the one that survived.
+        assert response.headers["content-length"] == "12"
 
 
 # ---------------------------------------------------------------------------
@@ -997,6 +1680,218 @@ class TestGenerationCas:
         assert landed is True
         [sql] = cas.sql
         assert "refresh_token = CASE WHEN %s::text IS NULL THEN refresh_token" in sql
+
+
+# ---------------------------------------------------------------------------
+# mark_status — revoked is terminal
+# ---------------------------------------------------------------------------
+
+
+class _StatusCursor:
+    """Mimics the mark_status UPDATE's WHERE clause."""
+
+    def __init__(self, state: dict, log: list[str]):
+        self._state = state
+        self._log = log
+        self.rowcount = 0
+
+    async def __aenter__(self) -> "_StatusCursor":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def execute(self, sql, params=None):
+        self._log.append(" ".join(sql.split()))
+        # The guard parameter is unpacked as optional so that dropping it (and
+        # its WHERE clause) reads here as "no guard" — a resurrected row — not
+        # as an unpacking error.
+        new_status, connection_id, *guard = params
+        state = self._state
+        blocked = bool(guard) and state["status"] == "revoked" and guard[0] != "revoked"
+        if connection_id == state["connection_id"] and not blocked:
+            state["status"] = new_status
+            self.rowcount = 1
+        else:
+            self.rowcount = 0
+
+
+class TestMarkStatusTerminal:
+    """``revoked`` is the one status no write may move a row out of.
+
+    Every other status write here is racing a disconnect: a refresh that was
+    already in flight resolves afterwards and marks its outcome, and both
+    ``needs_reauth`` and ``refresh_ambiguous`` would put the row back somewhere
+    a later resolve treats as live — ``refresh_ambiguous`` is servable outright,
+    and a re-auth on ``needs_reauth`` revives the grant the user surrendered.
+    """
+
+    @pytest.fixture
+    def status_db(self, monkeypatch):
+        state = {"connection_id": CONNECTION_ID, "status": "connected"}
+        log: list[str] = []
+
+        @asynccontextmanager
+        async def _conn(conn=None):
+            yield SimpleNamespace(cursor=lambda *a, **k: _StatusCursor(state, log))
+
+        monkeypatch.setattr(mcp_oauth_db, "get_db_connection", _conn)
+        return SimpleNamespace(state=state, sql=log)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status",
+        [
+            ConnectionStatus.NEEDS_REAUTH,
+            ConnectionStatus.REFRESH_AMBIGUOUS,
+            ConnectionStatus.REVOKED,
+        ],
+    )
+    async def test_a_live_row_takes_any_transition(self, status_db, status):
+        assert await mcp_oauth_db.mark_status(CONNECTION_ID, status) is True
+        assert status_db.state["status"] == status.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status",
+        [ConnectionStatus.NEEDS_REAUTH, ConnectionStatus.REFRESH_AMBIGUOUS],
+    )
+    async def test_a_revoked_row_is_never_resurrected(self, status_db, status):
+        status_db.state["status"] = "revoked"
+
+        assert await mcp_oauth_db.mark_status(CONNECTION_ID, status) is False
+        assert status_db.state["status"] == "revoked"
+
+    @pytest.mark.asyncio
+    async def test_revoking_a_revoked_row_still_succeeds(self, status_db):
+        # Disconnect must stay idempotent — the guard is about leaving the
+        # terminal state, not about writing it again.
+        status_db.state["status"] = "revoked"
+
+        assert (
+            await mcp_oauth_db.mark_status(CONNECTION_ID, ConnectionStatus.REVOKED)
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_guard_rides_in_the_statement(self, status_db):
+        """A read-then-write would reopen the window this exists to close."""
+        await mcp_oauth_db.mark_status(CONNECTION_ID, ConnectionStatus.NEEDS_REAUTH)
+
+        [sql] = status_db.sql
+        assert "AND (status <> 'revoked' OR %s::text = 'revoked')" in sql
+
+
+class _FencedStatusCursor:
+    """Mimics the mark_status_if_generation UPDATE's WHERE clause."""
+
+    def __init__(self, state: dict, log: list[str]):
+        self._state = state
+        self._log = log
+        self.rowcount = 0
+
+    async def __aenter__(self) -> "_FencedStatusCursor":
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+    async def execute(self, sql, params=None):
+        flat = " ".join(sql.split())
+        self._log.append(flat)
+        # The trailing params are bound to whichever guards the statement
+        # actually carries, so dropping one reads here as "unguarded" — the way
+        # Postgres would run it — instead of shifting the remaining values into
+        # the wrong comparison.
+        new_status, connection_id, *rest = params
+        generation = rest.pop(0) if "AND token_generation = %s" in flat else None
+        terminal_guard = rest.pop(0) if "%s::text = 'revoked'" in flat else None
+        state = self._state
+        stale = generation is not None and generation != state["token_generation"]
+        blocked = (
+            terminal_guard is not None
+            and state["status"] == "revoked"
+            and terminal_guard != "revoked"
+        )
+        if connection_id == state["connection_id"] and not stale and not blocked:
+            state["status"] = new_status
+            self.rowcount = 1
+        else:
+            self.rowcount = 0
+
+
+class TestFencedStatusCas:
+    """The status write the refresh path uses: generation fence + terminal guard.
+
+    It is deliberately NOT ``mark_needs_reauth``: that one requires the row to be
+    exactly ``connected``, because a vendor 401 must never downgrade the strictly
+    more informative ``refresh_ambiguous``. A refresh outcome, holding the row
+    under the lock, may re-mark one.
+    """
+
+    @pytest.fixture
+    def cas(self, monkeypatch):
+        state = {
+            "connection_id": CONNECTION_ID,
+            "token_generation": 7,
+            "status": "connected",
+        }
+        log: list[str] = []
+
+        @asynccontextmanager
+        async def _conn(conn=None):
+            yield SimpleNamespace(
+                cursor=lambda *a, **k: _FencedStatusCursor(state, log)
+            )
+
+        monkeypatch.setattr(mcp_oauth_db, "get_db_connection", _conn)
+        return SimpleNamespace(state=state, sql=log)
+
+    @pytest.mark.asyncio
+    async def test_the_generation_it_read_takes_the_write(self, cas):
+        applied = await mcp_oauth_db.mark_status_if_generation(
+            CONNECTION_ID,
+            ConnectionStatus.REFRESH_AMBIGUOUS,
+            expected_generation=7,
+        )
+
+        assert applied is True
+        assert cas.state["status"] == "refresh_ambiguous"
+
+    @pytest.mark.asyncio
+    async def test_a_bundle_that_moved_refuses_the_write(self, cas):
+        # A reconnect landed while the refresh was failing: generation 8 is a
+        # bundle this outcome says nothing about.
+        cas.state["token_generation"] = 8
+
+        applied = await mcp_oauth_db.mark_status_if_generation(
+            CONNECTION_ID, ConnectionStatus.NEEDS_REAUTH, expected_generation=7
+        )
+
+        assert applied is False
+        assert cas.state["status"] == "connected"
+
+    @pytest.mark.asyncio
+    async def test_a_revoked_row_is_still_never_resurrected(self, cas):
+        cas.state["status"] = "revoked"
+
+        applied = await mcp_oauth_db.mark_status_if_generation(
+            CONNECTION_ID, ConnectionStatus.REFRESH_AMBIGUOUS, expected_generation=7
+        )
+
+        assert applied is False
+        assert cas.state["status"] == "revoked"
+
+    @pytest.mark.asyncio
+    async def test_both_guards_ride_in_one_statement(self, cas):
+        """A read-then-write would reopen the window this exists to close."""
+        await mcp_oauth_db.mark_status_if_generation(
+            CONNECTION_ID, ConnectionStatus.NEEDS_REAUTH, expected_generation=7
+        )
+
+        [sql] = cas.sql
+        assert "AND token_generation = %s" in sql
+        assert "AND (status <> 'revoked' OR %s::text = 'revoked')" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -1264,6 +2159,7 @@ class FakeDisconnectDb:
         self.conn = SimpleNamespace(transaction=self._transaction)
         self.depth = 0
         self.writes: list[tuple[str, object, int]] = []
+        self.args: dict[str, tuple] = {}
 
     @asynccontextmanager
     async def _transaction(self):
@@ -1280,6 +2176,7 @@ class FakeDisconnectDb:
     def write(self, name: str):
         async def _recorded(*args, conn=None, **kwargs):
             self.writes.append((name, conn, self.depth))
+            self.args[name] = args
             return 1
 
         return _recorded
@@ -1300,8 +2197,15 @@ def disconnect_db(monkeypatch) -> FakeDisconnectDb:
         lifecycle, "revoke_grants_for_connection", fake.write("revoke_grants")
     )
     monkeypatch.setattr(
+        "src.server.database.mcp_tool_schemas."
+        "delete_user_and_workspace_tool_schemas_and_bump",
+        fake.write("purge_both_tiers"),
+    )
+    # Patched only so a regression to either narrower write shows up in the
+    # trace rather than as a stray database call.
+    monkeypatch.setattr(
         "src.server.database.mcp_tool_schemas.delete_user_tool_schemas",
-        fake.write("delete_schemas"),
+        fake.write("purge_user_tier_only"),
     )
     monkeypatch.setattr(
         "src.server.database.mcp_servers.bump_user_workspaces_mcp_version",
@@ -1333,15 +2237,33 @@ class TestDisconnectAtomicity:
 
         assert await lifecycle.disconnect_server(USER_ID, SERVER_NAME) is True
 
-        # Same connection, transaction open, for each of the three.
-        assert disconnect_db.trace[:3] == [
+        # Same connection, transaction open, for each — the purge carries the
+        # fan-out bump, so nothing is left to commit on its own afterwards.
+        assert disconnect_db.trace == [
             ("mark_status", True, 1),
             ("revoke_grants", True, 1),
-            ("delete_schemas", True, 1),
+            ("purge_both_tiers", True, 1),
         ]
-        # The fan-out is convergence across every workspace of the user, not
-        # part of the revoke — it commits on its own, after.
-        assert disconnect_db.trace[3:] == [("bump_versions", False, 0)]
+
+    async def test_the_purge_spans_both_snapshot_tiers(
+        self, disconnect_db, monkeypatch
+    ):
+        """The user-tier delete alone is not enough.
+
+        The per-workspace snapshot's fingerprint is OAuth-blind, so it survives
+        a disconnect unchanged; the resolved config meanwhile drops the
+        connection, and the surviving snapshot's tools would be generated
+        against the vendor directly, with no relay in front of them.
+        """
+        monkeypatch.setattr(
+            "src.server.database.mcp_oauth.get_connection",
+            _connected(_project(_row(), Secrets.NONE)),
+        )
+
+        await lifecycle.disconnect_server(USER_ID, SERVER_NAME)
+
+        assert disconnect_db.args["purge_both_tiers"] == (USER_ID, [SERVER_NAME])
+        assert "purge_user_tier_only" not in disconnect_db.args
 
     async def test_no_connection_writes_nothing(self, disconnect_db, monkeypatch):
         monkeypatch.setattr(
@@ -1350,3 +2272,60 @@ class TestDisconnectAtomicity:
 
         assert await lifecycle.disconnect_server(USER_ID, SERVER_NAME) is False
         assert disconnect_db.writes == []
+
+
+# ---------------------------------------------------------------------------
+# upsert_connection — refresh-token retention is scoped to the same grant
+# ---------------------------------------------------------------------------
+
+
+class _UpsertCursor:
+    """Captures the upsert SQL; answers with a fixed connection row."""
+
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def execute(self, sql, params=None):
+        self._log.append(sql)
+
+    async def fetchone(self):
+        return {"connection_id": CONNECTION_ID}
+
+
+class TestUpsertRetention:
+    @pytest.fixture
+    def upsert_sql(self, monkeypatch):
+        monkeypatch.setenv("BYOK_ENCRYPTION_KEY", "unit-test-key")
+        log: list[str] = []
+
+        @asynccontextmanager
+        async def _conn(conn=None):
+            yield SimpleNamespace(cursor=lambda *a, **k: _UpsertCursor(log))
+
+        monkeypatch.setattr(mcp_oauth_db, "get_db_connection", _conn)
+        return log
+
+    @pytest.mark.asyncio
+    async def test_retention_requires_the_same_grant_identity(self, upsert_sql):
+        # Keeping a refresh token across a re-registration would pair the old
+        # client's token with the new client's credentials, which the AS
+        # answers with invalid_grant — the retention arm must require issuer,
+        # URL, and client identity to all be unchanged.
+        await mcp_oauth_db.upsert_connection(
+            "user-1",
+            "srv",
+            server_url="https://mcp.example.com/mcp",
+            access_token="at",
+            refresh_token=None,
+        )
+        [sql] = upsert_sql
+        retention = sql.split("refresh_token = CASE", 1)[1].split("END,", 1)[0]
+        assert "as_metadata->>'issuer'" in retention
+        assert "server_url" in retention
+        assert "client_info->>'client_id'" in retention

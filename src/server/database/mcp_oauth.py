@@ -58,7 +58,7 @@ SERVABLE: frozenset[ConnectionStatus] = frozenset(
     {ConnectionStatus.CONNECTED, ConnectionStatus.REFRESH_AMBIGUOUS}
 )
 # Deterministic list form for `= ANY(%s)`; StrEnum members adapt as plain text.
-_SERVABLE_PARAM = sorted(s.value for s in SERVABLE)
+SERVABLE_PARAM = sorted(s.value for s in SERVABLE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,13 +160,27 @@ async def upsert_connection(
                     access_token = EXCLUDED.access_token,
                     -- Keep the stored refresh token when the re-auth exchange
                     -- returned none (many AS omit it if the prior grant is
-                    -- still valid). EXCLUDED.refresh_token is NULL exactly in
-                    -- that case, so COALESCE preserves the surviving token
-                    -- instead of nulling it. Mirrors commit_refresh.
-                    refresh_token = COALESCE(
-                        EXCLUDED.refresh_token,
-                        user_mcp_oauth_connections.refresh_token
-                    ),
+                    -- still valid) — but only while the row still describes the
+                    -- same grant. Rows here are never deleted, so a catalog
+                    -- entry deleted and recreated against a different provider
+                    -- lands on this same row: retaining unconditionally would
+                    -- hand provider A's refresh token to provider B's token
+                    -- endpoint on the next refresh. Same-client is part of
+                    -- same-grant: refresh tokens are bound to the client that
+                    -- obtained them, so after a re-registration the old
+                    -- client's token would only earn an invalid_grant. Nulling
+                    -- instead only costs a re-auth at expiry.
+                    refresh_token = CASE
+                        WHEN EXCLUDED.refresh_token IS NOT NULL
+                            THEN EXCLUDED.refresh_token
+                        WHEN user_mcp_oauth_connections.as_metadata->>'issuer'
+                             IS NOT DISTINCT FROM EXCLUDED.as_metadata->>'issuer'
+                         AND user_mcp_oauth_connections.server_url
+                             = EXCLUDED.server_url
+                         AND user_mcp_oauth_connections.client_info->>'client_id'
+                             IS NOT DISTINCT FROM EXCLUDED.client_info->>'client_id'
+                            THEN user_mcp_oauth_connections.refresh_token
+                        ELSE NULL END,
                     token_type = EXCLUDED.token_type,
                     scope = EXCLUDED.scope,
                     expires_at = EXCLUDED.expires_at,
@@ -175,6 +189,15 @@ async def upsert_connection(
                     client_secret = EXCLUDED.client_secret,
                     as_metadata = EXCLUDED.as_metadata,
                     resource_metadata = EXCLUDED.resource_metadata,
+                    -- Deliberately rewrites a terminal status: a legitimate
+                    -- reconnect lands on this same row and must go
+                    -- revoked→connected, which is why a freshly consented
+                    -- bundle is written here rather than through mark_status
+                    -- and its terminal guard. The residual interleaving —
+                    -- a revoke between the callback's catalog re-read and this
+                    -- write, ~1ms — is accepted: the resurrected row cannot
+                    -- serve (its grants stay revoked and URL binding fails at
+                    -- resolution), it is only visible to the refresh sweeper.
                     status = EXCLUDED.status,
                     updated_at = NOW()
                 RETURNING connection_id
@@ -347,7 +370,7 @@ async def commit_refresh(
                     refresh_token, refresh_token, enc_key,
                     expires_at, scope,
                     ConnectionStatus.CONNECTED.value,
-                    connection_id, expected_generation, _SERVABLE_PARAM,
+                    connection_id, expected_generation, SERVABLE_PARAM,
                 ),
             )
             committed = cur.rowcount == 1
@@ -364,7 +387,13 @@ async def mark_status(
 ) -> bool:
     """Transition durable status. Tokens are left in place: refresh_ambiguous
     keeps serving the old access token until expiry, and needs_reauth keeps
-    metadata for the reconnect flow."""
+    metadata for the reconnect flow.
+
+    ``revoked`` is terminal: a refresh already in flight when the user
+    disconnects would otherwise land its outcome on the surrendered row and put
+    it back in the servable set. Writing ``revoked`` onto ``revoked`` still
+    succeeds, so disconnect stays idempotent.
+    """
     status = ConnectionStatus(status)  # rejects anything outside the vocabulary
     async with get_db_connection(conn) as db:
         async with db.cursor() as cur:
@@ -373,15 +402,59 @@ async def mark_status(
                 UPDATE user_mcp_oauth_connections
                 SET status = %s, updated_at = NOW()
                 WHERE connection_id = %s
+                  AND (status <> 'revoked' OR %s::text = 'revoked')
                 """,
-                (status.value, connection_id),
+                (status.value, connection_id, status.value),
             )
             if cur.rowcount == 1:
                 logger.info(
                     f"[mcp_oauth_db] mark_status connection_id={connection_id} status={status}"
                 )
                 return True
+            logger.info(
+                f"[mcp_oauth_db] mark_status connection_id={connection_id} "
+                f"status={status} not applied"
+            )
             return False
+
+
+async def mark_status_if_generation(
+    connection_id: str,
+    status: ConnectionStatus | str,
+    *,
+    expected_generation: int,
+    conn=None,
+) -> bool:
+    """:func:`mark_status`, fenced on the bundle the caller's outcome describes.
+
+    A refresh outcome is about one bundle, and ``upsert_connection`` takes no
+    lock: a reconnect completing mid-refresh writes a fresh bundle and bumps the
+    generation, which the stale outcome would otherwise flip straight back out
+    of ``connected``. The status guard stays :func:`mark_status`'s "not revoked"
+    rather than :func:`mark_needs_reauth`'s stricter "still connected" — these
+    callers hold the row under the refresh lock and may legitimately re-mark a
+    ``refresh_ambiguous`` one.
+    """
+    status = ConnectionStatus(status)  # rejects anything outside the vocabulary
+    async with get_db_connection(conn) as db:
+        async with db.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE user_mcp_oauth_connections
+                SET status = %s, updated_at = NOW()
+                WHERE connection_id = %s
+                  AND token_generation = %s
+                  AND (status <> 'revoked' OR %s::text = 'revoked')
+                """,
+                (status.value, connection_id, expected_generation, status.value),
+            )
+            applied = cur.rowcount == 1
+            logger.info(
+                f"[mcp_oauth_db] mark_status_if_generation "
+                f"connection_id={connection_id} status={status} "
+                f"generation={expected_generation} applied={applied}"
+            )
+            return applied
 
 
 async def mark_needs_reauth(connection_id: str, *, expected_generation: int) -> bool:

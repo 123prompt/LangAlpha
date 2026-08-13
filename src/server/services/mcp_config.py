@@ -50,13 +50,17 @@ def _canonical_server_url(url: str | None) -> str:
         return ""
     try:
         parts = urlsplit(url.strip())
+        port = parts.port  # raises for out-of-range or non-numeric ports
     except ValueError:
         return url.strip()
     if not parts.scheme or not parts.hostname:
         return url.strip()
     scheme = parts.scheme.lower()
     host = parts.hostname.lower()
-    port = parts.port
+    if ":" in host:
+        # IPv6 literal (urlsplit strips the brackets) — restore them, or the
+        # host/port boundary becomes ambiguous and distinct endpoints collide.
+        host = f"[{host}]"
     netloc = host if port in (None, _DEFAULT_PORTS.get(scheme)) else f"{host}:{port}"
     path = parts.path.rstrip("/")
     query = f"?{parts.query}" if parts.query else ""

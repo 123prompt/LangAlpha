@@ -4,12 +4,14 @@ The hot path takes NO lock while the access token has >10 minutes left. When
 due, ``pg_try_advisory_lock`` (never blocking) elects one refresher across all
 workers; losers use the still-valid old token immediately, or briefly poll the
 row near expiry. The commit is a ``token_generation`` CAS so a stale winner
-can never clobber a newer bundle.
+can never clobber a newer bundle — and so is every failure status, because a
+reconnect can land its own fresh bundle while a refresh is still in flight.
 
-An ambiguous refresh HTTP timeout is NOT retryable — the refresh token may
-already be consumed server-side. The connection flips to ``refresh_ambiguous``
-(old access token keeps serving until expiry, UI warns); a definitive
-``invalid_grant`` flips to ``needs_reauth`` (blocks calls).
+A refresh failure that cannot be placed before the request left the wire is NOT
+retryable — the refresh token may already be consumed server-side. The
+connection flips to ``refresh_ambiguous`` (old access token keeps serving until
+expiry, UI warns); a definitive ``invalid_grant`` flips to ``needs_reauth``
+(blocks calls).
 """
 
 from __future__ import annotations
@@ -33,8 +35,10 @@ from src.server.database.mcp_oauth import (
     get_connection_by_id,
     mark_needs_reauth,
     mark_status,
+    mark_status_if_generation,
 )
 from src.server.database.egress_grants import revoke_grants_for_connection
+from src.server.services.mcp_config import same_consented_url
 from src.server.services.writer_guard import advisory_key
 from src.server.services.mcp_oauth.tokens import (
     TokenExchangeError,
@@ -89,6 +93,14 @@ def _expiry_seconds(row: ConnectionSummary) -> float | None:
 
 
 def _usable(row: ConnectionSummary, *, floor: float = 0.0) -> bool:
+    """Both halves of "may this row's bearer be served": status and validity.
+
+    Expiry alone is not enough — a disconnect leaves the access token unexpired,
+    so a fallback that only checked the clock would hand out a bearer for a
+    grant the user has surrendered.
+    """
+    if row.status not in SERVABLE:
+        return False
     remaining = _expiry_seconds(row)
     return remaining is None or remaining > floor
 
@@ -119,21 +131,29 @@ async def ensure_fresh_access_token(connection_id: str) -> AccessToken:
         # then re-auth.
         if remaining > 0:
             return _token_view(row)
-        await mark_status(connection_id, ConnectionStatus.NEEDS_REAUTH)
+        newer = await _mark_refresh_outcome(
+            connection_id, row, ConnectionStatus.NEEDS_REAUTH
+        )
+        if newer is not None:
+            return newer
         raise TokenUnavailable("needs_reauth", "access token expired, cannot refresh")
 
     return await _refresh_single_flight(connection_id, row)
 
 
 async def current_access_token(connection_id: str) -> AccessToken | None:
-    """The stored bearer as-is — no refresh, no status gate.
+    """The stored bearer as-is — no refresh, no freshness gate.
 
     For a caller that already sent a token and got a 401: the question is
     whether the stored bundle has since moved, which is about the row, not
-    about freshness.
+    about freshness. Servability is still required — a disconnect that lands
+    between the 401 and the caller's retry must win, or the retry sends one
+    post-revocation request with a rotated, still-vendor-valid bearer.
     """
     row = await get_connection_by_id(connection_id, secrets=Secrets.BEARER)
     if row is None or not row.access_token:
+        return None
+    if row.status not in SERVABLE:
         return None
     return _token_view(row)
 
@@ -167,6 +187,32 @@ def _token_view(row: BearerBundle) -> AccessToken:
     )
 
 
+async def _mark_refresh_outcome(
+    connection_id: str,
+    row: BearerBundle,
+    status: ConnectionStatus,
+    *,
+    conn=None,
+) -> AccessToken | None:
+    """Record a refresh failure against the exact bundle it describes.
+
+    Returns a token to serve instead when the write was refused because the
+    generation moved: a reconnect landed while we were failing, so its bundle
+    must neither inherit this outcome nor be reported as unusable.
+    """
+    applied = await mark_status_if_generation(
+        connection_id, status, expected_generation=row.token_generation, conn=conn
+    )
+    if applied:
+        return None
+    current = await get_connection_by_id(
+        connection_id, secrets=Secrets.BEARER, conn=conn
+    )
+    if current is not None and _usable(current):
+        return _token_view(current)
+    return None
+
+
 async def _refresh_single_flight(
     connection_id: str, row: BearerBundle
 ) -> AccessToken:
@@ -191,9 +237,34 @@ async def _refresh_single_flight(
             )
             if current is None:
                 raise TokenUnavailable("unknown_connection")
+            if current.status not in SERVABLE:
+                # The entry gate ran before the lock: a disconnect (or a 401
+                # report) may have landed in between, and refreshing now would
+                # spend the refresh token against a surrendered grant.
+                raise TokenUnavailable(str(current.status))
             fresh_remaining = _expiry_seconds(current)
             if fresh_remaining is None or fresh_remaining > REFRESH_MARGIN_SECONDS:
                 return _token_view(current)
+            if (
+                not current.refresh_token
+                or current.status == ConnectionStatus.REFRESH_AMBIGUOUS
+            ):
+                # The entry gate's other decision, re-made under the lock: a
+                # previous winner may have flipped this bundle to ambiguous (or
+                # a reconnect nulled its refresh token) between the entry read
+                # and this acquire. Ambiguous is servable but never retryable —
+                # the refresh token may already be consumed, and replaying it
+                # can revoke the whole grant.
+                if fresh_remaining > 0:
+                    return _token_view(current)
+                newer = await _mark_refresh_outcome(
+                    connection_id, current, ConnectionStatus.NEEDS_REAUTH, conn=conn
+                )
+                if newer is not None:
+                    return newer
+                raise TokenUnavailable(
+                    "needs_reauth", "access token expired, cannot refresh"
+                )
             return await _do_refresh(connection_id, current, conn=conn)
         finally:
             # The advisory lock is session-scoped to THIS connection and the
@@ -237,7 +308,11 @@ async def _do_refresh(
     """
     token_endpoint = row.as_metadata.get("token_endpoint")
     if not token_endpoint:
-        await mark_status(connection_id, ConnectionStatus.NEEDS_REAUTH, conn=conn)
+        newer = await _mark_refresh_outcome(
+            connection_id, row, ConnectionStatus.NEEDS_REAUTH, conn=conn
+        )
+        if newer is not None:
+            return newer
         raise TokenUnavailable("needs_reauth", "no token endpoint on record")
 
     client_info = registered_client(row.client_info, row.client_secret)
@@ -258,23 +333,31 @@ async def _do_refresh(
             timeout=REFRESH_TIMEOUT,
         )
     except TokenExchangeError as e:
-        if e.kind in (TokenFailure.TIMEOUT, TokenFailure.BLOCKED):
+        if e.kind in (TokenFailure.AMBIGUOUS, TokenFailure.BLOCKED):
             # Ambiguous: the AS may have rotated the refresh token already.
             # Retrying could burn the one-time token — flip to ambiguous and
             # keep serving the old access token until it expires.
             logger.warning("[mcp_oauth] ambiguous refresh for %s: %s", connection_id, e)
-            await mark_status(
-                connection_id, ConnectionStatus.REFRESH_AMBIGUOUS, conn=conn
+            newer = await _mark_refresh_outcome(
+                connection_id, row, ConnectionStatus.REFRESH_AMBIGUOUS, conn=conn
             )
+            if newer is not None:
+                return newer
             if _usable(row):
                 return _token_view(row)
             raise TokenUnavailable("needs_reauth", "ambiguous refresh, token expired")
         if e.kind is TokenFailure.REJECTED:
             logger.warning("[mcp_oauth] refresh rejected for %s (%s)", connection_id, e)
-            await mark_status(connection_id, ConnectionStatus.NEEDS_REAUTH, conn=conn)
+            newer = await _mark_refresh_outcome(
+                connection_id, row, ConnectionStatus.NEEDS_REAUTH, conn=conn
+            )
+            if newer is not None:
+                return newer
             raise TokenUnavailable("needs_reauth", "refresh token rejected")
-        # Transport failure (nothing could have been consumed) or a 5xx from an
-        # unwell AS: keep the status and ride the old token, retrying later.
+        # Never left the wire — a transport failure, or an endpoint the pin
+        # refused to dial — or a 5xx the AS itself emitted about this request:
+        # nothing was consumed, so keep the status and ride the old token,
+        # retrying later.
         logger.warning("[mcp_oauth] refresh failed for %s: %s", connection_id, e)
         if _usable(row):
             return _token_view(row)
@@ -292,12 +375,18 @@ async def _do_refresh(
         conn=conn,
     )
     if not committed:
-        # Lost the CAS (should not happen under the lock; defensive): serve
-        # whatever is now current.
+        # Lost the CAS. The generation cannot have moved under the lock, so the
+        # commit's other guard is the live one: the status left the servable set
+        # mid-refresh, i.e. the user disconnected. Answer with what the row now
+        # says rather than a transient-sounding reason.
         current = await get_connection_by_id(
             connection_id, secrets=Secrets.BEARER, conn=conn
         )
-        if current and _usable(current):
+        if current is None:
+            raise TokenUnavailable("unknown_connection")
+        if current.status not in SERVABLE:
+            raise TokenUnavailable(str(current.status))
+        if _usable(current):
             return _token_view(current)
         raise TokenUnavailable("refresh_in_progress")
     logger.info(
@@ -320,8 +409,9 @@ async def disconnect_server(user_id: str, server_name: str) -> bool:
     in the vendor's own connected-apps page; we only drop our copy.
     """
     from src.server.database.mcp_oauth import get_connection
-    from src.server.database.mcp_servers import bump_user_workspaces_mcp_version
-    from src.server.database.mcp_tool_schemas import delete_user_tool_schemas
+    from src.server.database.mcp_tool_schemas import (
+        delete_user_and_workspace_tool_schemas_and_bump,
+    )
     from src.server.database.pool import get_db_connection
 
     row = await get_connection(user_id, server_name)
@@ -337,12 +427,36 @@ async def disconnect_server(user_id: str, server_name: str) -> bool:
                 row.connection_id, ConnectionStatus.REVOKED, conn=conn
             )
             await revoke_grants_for_connection(row.connection_id, conn=conn)
-            await delete_user_tool_schemas(user_id, server_name, conn=conn)
-    # Outside: the fan-out touches every workspace of the user and is
-    # convergence, not part of the revoke.
-    await bump_user_workspaces_mcp_version(user_id)
+            # Both snapshot tiers, plus the fan-out bump. The per-workspace
+            # snapshot's fingerprint is OAuth-blind, so a surviving workspace
+            # row keeps publishing the connected tool set while the resolved
+            # config no longer carries a connection — the sandbox would dial
+            # the vendor directly, with no relay in front of it.
+            await delete_user_and_workspace_tool_schemas_and_bump(
+                user_id, [server_name], conn=conn
+            )
     logger.info(
         "[mcp_oauth] disconnected user=%s server=%s connection=%s",
         user_id, server_name, row.connection_id,
     )
+    return True
+
+
+async def revoke_if_consent_moved(
+    user_id: str, server_name: str, *, transport: str, url: str | None
+) -> bool:
+    """Revoke the OAuth connection when an edit moves it off its consented endpoint.
+
+    Every write that can redefine a catalog row goes through here, so the token
+    issued for the old host never carries to the new one; a transport away from
+    a remote scheme invalidates consent outright (no relay path exists).
+    """
+    from src.server.database.mcp_oauth import get_connection
+
+    connection = await get_connection(user_id, server_name)
+    if connection is None or connection.status == ConnectionStatus.REVOKED:
+        return False
+    if transport in ("http", "sse") and same_consented_url(connection.server_url, url):
+        return False
+    await disconnect_server(user_id, server_name)
     return True

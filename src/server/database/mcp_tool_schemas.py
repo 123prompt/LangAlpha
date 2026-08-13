@@ -20,6 +20,8 @@ from typing import Any
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from src.server.database.mcp_oauth import SERVABLE_PARAM
+from src.server.database.mcp_servers import _bump_user_versions, _bump_version
 from src.server.database.pool import get_db_connection
 
 
@@ -67,6 +69,18 @@ def _keep_on_downgrade(col: str, fresh: str = "") -> str:
     return f"{col} = CASE WHEN {_DOWNGRADE} THEN t.{col} ELSE {fresh or f'EXCLUDED.{col}'} END"
 
 
+@dataclass(frozen=True, slots=True)
+class SchemaWrite:
+    """A snapshot write's outcome: the cached row, or the status that vetoed it.
+
+    ``row is None`` means the user-tier connection guard refused the write —
+    ``connection_status`` is what the row said, or None if it was gone.
+    """
+
+    row: dict[str, Any] | None
+    connection_status: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Tier-parameterized implementations
 # ---------------------------------------------------------------------------
@@ -98,7 +112,9 @@ async def _upsert(
     error: str,
     schema_digest: str,
     observed_meta: dict[str, Any] | None,
-) -> dict[str, Any]:
+    connection_id: str | None = None,
+    conn=None,
+) -> SchemaWrite:
     columns = tier.columns
     values = [owner_id, server_name, config_hash, Json(tools or []), status, error]
     if tier.has_digest:
@@ -112,9 +128,30 @@ async def _upsert(
         _keep_on_downgrade("observed_meta"),
         _keep_on_downgrade("discovered_at", "NOW()"),
     ]
-    async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor(row_factory=dict_row) as cur:
+    async with get_db_connection(conn) as db:
+        async with db.transaction():
+            async with db.cursor(row_factory=dict_row) as cur:
+                if connection_id is not None:
+                    # A disconnect that commits mid-discovery must win. It
+                    # purges both snapshot tiers, so a write landing after it
+                    # resurrects an "ok" row for a grant the user surrendered —
+                    # and the caller's version bump then fans it out. FOR SHARE,
+                    # not a bare SELECT (which under READ COMMITTED reads the
+                    # pre-commit status and inserts anyway), is what makes both
+                    # commit orders correct: lock first and disconnect's status
+                    # UPDATE waits, then its DELETE takes these rows with it;
+                    # disconnect first and this read blocks, then sees 'revoked'
+                    # and skips. Covers the catalog delete/recreate variant too:
+                    # the revoked connection row outlives the catalog entry.
+                    await cur.execute(
+                        "SELECT status FROM user_mcp_oauth_connections "
+                        "WHERE connection_id = %s FOR SHARE",
+                        (connection_id,),
+                    )
+                    guard = await cur.fetchone()
+                    conn_status = guard["status"] if guard else None
+                    if conn_status not in SERVABLE_PARAM:
+                        return SchemaWrite(None, conn_status)
                 # Only the current config's snapshot is kept, so iterating on a
                 # server's config doesn't accumulate dead rows.
                 await cur.execute(
@@ -135,7 +172,7 @@ async def _upsert(
                     """,
                     values,
                 )
-                return _row_to_dict(tier, await cur.fetchone())
+                return SchemaWrite(_row_to_dict(tier, await cur.fetchone()))
 
 
 async def _delete(
@@ -149,27 +186,6 @@ async def _delete(
                 (owner_id, server_name),
             )
             return cur.rowcount
-
-
-async def _delete_and_bump(
-    tier: _SchemaTier, owner_id: str, server_names: list[str]
-) -> int:
-    # Imported here, not at module scope: ``mcp_servers`` re-exports this
-    # module's public names, so a top-level import would close the cycle.
-    from src.server.database.mcp_servers import _bump_user_versions, _bump_version
-
-    bump = _bump_version if tier is WORKSPACE_TIER else _bump_user_versions
-    async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    f"DELETE FROM {tier.table} "
-                    f"WHERE {tier.owner_col} = %s AND server_name = ANY(%s)",
-                    (owner_id, server_names),
-                )
-                deleted = cur.rowcount
-                await bump(cur, owner_id)
-                return deleted
 
 
 def _row_to_dict(tier: _SchemaTier, row: dict[str, Any]) -> dict[str, Any]:
@@ -207,11 +223,14 @@ async def upsert_tool_schemas(
     error: str = "",
     observed_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return await _upsert(
+    write = await _upsert(
         WORKSPACE_TIER, workspace_id, server_name, config_hash,
         tools=tools, status=status, error=error, schema_digest="",
         observed_meta=observed_meta,
     )
+    # In-sandbox discovery has no OAuth connection to check, so this tier passes
+    # no connection_id and its write is never skipped.
+    return write.row
 
 
 async def delete_tool_schemas(workspace_id: str, server_name: str) -> int:
@@ -228,7 +247,17 @@ async def delete_tool_schemas_and_bump(
     version, atomically — a mid-purge failure must never leave schemas
     partially deleted with the version un-bumped (live sessions would then skip
     re-resolution against the half-purged cache)."""
-    return await _delete_and_bump(WORKSPACE_TIER, workspace_id, server_names)
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM workspace_mcp_tool_schemas "
+                    "WHERE workspace_id = %s AND server_name = ANY(%s)",
+                    (workspace_id, server_names),
+                )
+                deleted = cur.rowcount
+                await _bump_version(cur, workspace_id)
+                return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -250,11 +279,22 @@ async def upsert_user_tool_schemas(
     error: str = "",
     schema_digest: str = "",
     observed_meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    connection_id: str | None = None,
+    conn=None,
+) -> SchemaWrite:
+    """Cache a host-side discovery snapshot, keyed by the server's fingerprint.
+
+    Pass ``connection_id`` whenever the caller holds one: the write is then
+    conditional on that connection still being servable when the transaction
+    commits, which is the only thing standing between a slow discovery and a
+    disconnect it overtakes. Pass ``conn`` to join a caller's transaction —
+    that is how the discovery path fences this write on the catalog fingerprint
+    still being current.
+    """
     return await _upsert(
         USER_TIER, user_id, server_name, config_hash,
         tools=tools, status=status, error=error, schema_digest=schema_digest,
-        observed_meta=observed_meta,
+        observed_meta=observed_meta, connection_id=connection_id, conn=conn,
     )
 
 
@@ -264,10 +304,42 @@ async def delete_user_tool_schemas(
     return await _delete(USER_TIER, user_id, server_name, conn=conn)
 
 
-async def delete_user_tool_schemas_and_bump(
-    user_id: str, server_names: list[str]
+async def delete_user_and_workspace_tool_schemas_and_bump(
+    user_id: str, server_names: list[str], *, conn=None
 ) -> int:
-    """User-tier twin of ``delete_tool_schemas_and_bump``: purge the named
-    servers' snapshots and fan the version bump out to every workspace of the
-    user, in one transaction."""
-    return await _delete_and_bump(USER_TIER, user_id, server_names)
+    """Purge an inherited server's snapshots in BOTH tiers, then fan the version
+    bump out to every workspace of the user, in one transaction.
+
+    Not the user tier alone: a user-level server caches host-side (OAuth)
+    discovery in the user tier but in-sandbox discovery under EACH workspace,
+    and a vault value change churns neither fingerprint — so a surviving
+    same-hash workspace row would still be served and discovery never rerun.
+
+    ``conn`` lets a caller that is already mid-transaction (disconnect) fold the
+    purge into it, so the credential revoke and the snapshot purge cannot commit
+    apart.
+    """
+    async with get_db_connection(conn) as db:
+        async with db.transaction():
+            async with db.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM user_mcp_tool_schemas "
+                    "WHERE user_id = %s AND server_name = ANY(%s)",
+                    (user_id, server_names),
+                )
+                deleted = cur.rowcount
+                # ALL the user's workspaces, not just the running ones — an idle
+                # sandbox would otherwise wake onto a stale snapshot. This also
+                # purges a workspace-local fork that shadows the inherited name;
+                # one needless rediscovery is cheaper than under-purging.
+                await cur.execute(
+                    """
+                    DELETE FROM workspace_mcp_tool_schemas
+                    WHERE server_name = ANY(%s) AND workspace_id IN
+                        (SELECT workspace_id FROM workspaces WHERE user_id = %s)
+                    """,
+                    (server_names, user_id),
+                )
+                deleted += cur.rowcount
+                await _bump_user_versions(cur, user_id)
+                return deleted

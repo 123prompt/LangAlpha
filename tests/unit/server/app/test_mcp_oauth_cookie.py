@@ -49,6 +49,10 @@ async def test_start_names_the_cookie_for_its_state(monkeypatch):
     assert cookie.startswith("mcp_oauth_cb_state-A=nonce-A")
     assert "path=/api/v1/mcp/oauth" in cookie.lower()
     assert "httponly" in cookie.lower()
+    # The cookie must not outlive the state record it authenticates.
+    from src.server.services.mcp_oauth.connect import STATE_TTL_SECONDS
+
+    assert f"max-age={STATE_TTL_SECONDS}" in cookie.lower()
 
 
 @pytest.mark.asyncio

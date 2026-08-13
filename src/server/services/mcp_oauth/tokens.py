@@ -43,14 +43,38 @@ class TokenFailure(Enum):
     """Why a token request produced no bundle.
 
     What separates them is whether the server may already have consumed the
-    grant: ``BLOCKED``/``TIMEOUT`` are ambiguous, ``REJECTED`` is definitive,
-    ``RETRYABLE`` (transport error, or a 5xx) leaves it unspent.
+    grant: ``BLOCKED``/``AMBIGUOUS`` cannot rule it out, ``REJECTED`` is
+    definitive, ``RETRYABLE``/``BLOCKED_PRE_SEND`` are failures that provably
+    happened before the request was transmitted.
+
+    ``BLOCKED_PRE_SEND`` is retryable exactly like ``RETRYABLE``; it is named
+    apart only so the connect flow can still tell the user which endpoint we
+    refused to dial.
     """
 
     BLOCKED = auto()
-    TIMEOUT = auto()
+    BLOCKED_PRE_SEND = auto()
+    AMBIGUOUS = auto()
     REJECTED = auto()
     RETRYABLE = auto()
+
+
+# Failures that provably happened before anything reached the wire: the
+# connection was never established (ConnectError/ConnectTimeout), no pool slot
+# was ever obtained (PoolTimeout), or we refused to send what we built
+# (LocalProtocolError). Everything else — a lost response, a mid-stream reset —
+# leaves an outstanding request the AS may have honored.
+_PRE_SEND_ERRORS = (
+    httpx2.ConnectError,
+    httpx2.ConnectTimeout,
+    httpx2.PoolTimeout,
+    httpx2.LocalProtocolError,
+)
+# The AS's own answer about this grant: it refused it and consumed nothing.
+_REJECTED_STATUSES = frozenset({400, 401})
+# A gateway that lost the AS's response — the grant may well have been spent
+# behind it, unlike a 429/500/503 the AS itself emitted about this request.
+_AMBIGUOUS_STATUSES = frozenset({502, 504})
 
 
 class TokenExchangeError(Exception):
@@ -148,19 +172,30 @@ async def exchange_token(
                 client, "POST", token_endpoint, headers=headers, data=data
             )
     except OAuthHopBlocked as e:
-        raise TokenExchangeError(TokenFailure.BLOCKED, str(e)) from e
-    except httpx2.TimeoutException as e:
-        raise TokenExchangeError(TokenFailure.TIMEOUT, f"timeout: {e}") from e
-    except Exception as e:
-        raise TokenExchangeError(TokenFailure.RETRYABLE, str(e)) from e
-
-    if response.status_code != 200:
-        raise TokenExchangeError(
-            TokenFailure.REJECTED
-            if response.status_code in (400, 401)
-            else TokenFailure.RETRYABLE,
-            f"status {response.status_code}",
+        # The pin refuses before the send; a redirect is refused after it. Only
+        # the latter leaves a request the AS may have honored.
+        kind = (
+            TokenFailure.BLOCKED if e.request_sent else TokenFailure.BLOCKED_PRE_SEND
         )
+        raise TokenExchangeError(kind, str(e)) from e
+    except _PRE_SEND_ERRORS as e:
+        raise TokenExchangeError(TokenFailure.RETRYABLE, str(e)) from e
+    except Exception as e:
+        # Assume sent. A read error or a mid-stream reset means the request went
+        # out and the answer was lost, so a retry would replay a refresh token a
+        # rotating AS has already burned — replay detection there commonly
+        # revokes the entire grant, not just the token.
+        raise TokenExchangeError(TokenFailure.AMBIGUOUS, str(e)) from e
+
+    status_code = response.status_code
+    if status_code != 200:
+        if status_code in _REJECTED_STATUSES:
+            kind = TokenFailure.REJECTED
+        elif status_code in _AMBIGUOUS_STATUSES:
+            kind = TokenFailure.AMBIGUOUS
+        else:
+            kind = TokenFailure.RETRYABLE
+        raise TokenExchangeError(kind, f"status {status_code}")
 
     token = await handle_token_response_scopes(response)
     return ExchangedToken(
@@ -170,9 +205,12 @@ async def exchange_token(
         # "" and None both mean "no refresh token"; collapse them here so the
         # column's NOT NULL-ness is the single answer to "can this refresh?".
         refresh_token=token.refresh_token or None,
+        # ``is not None``, not truthiness: expires_in=0 is an AS saying "already
+        # expired", and collapsing that to NULL stores the bearer as
+        # non-expiring — served forever, never refreshed.
         expires_at=(
             datetime.now(timezone.utc) + timedelta(seconds=token.expires_in)
-            if token.expires_in
+            if token.expires_in is not None
             else None
         ),
     )

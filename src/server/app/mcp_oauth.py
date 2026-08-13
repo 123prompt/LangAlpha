@@ -27,6 +27,7 @@ from src.server.services.mcp_oauth import (
     disconnect_server,
     start_connect,
 )
+from src.server.services.mcp_oauth.connect import STATE_TTL_SECONDS
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
@@ -45,7 +46,6 @@ router = APIRouter(prefix="/api/v1/mcp", tags=["MCP OAuth"])
 # concurrent flows and lets each callback delete exactly its own cookie.
 _OAUTH_COOKIE_PREFIX = "mcp_oauth_cb_"
 _OAUTH_COOKIE_PATH = "/api/v1/mcp/oauth"
-_OAUTH_COOKIE_MAX_AGE = 600  # mirrors the state record TTL
 _OAUTH_COOKIE_SECURE = SERVER_BASE_URL.lower().startswith("https")
 
 
@@ -85,7 +85,9 @@ async def oauth_start(
         response.set_cookie(
             _oauth_cookie_name(started.state),
             started.browser_nonce,
-            max_age=_OAUTH_COOKIE_MAX_AGE,
+            # The state record it binds to is what expires the flow; a cookie
+            # outliving it would only ever be sent at a state that is gone.
+            max_age=STATE_TTL_SECONDS,
             path=_OAUTH_COOKIE_PATH,
             httponly=True,
             secure=_OAUTH_COOKIE_SECURE,
