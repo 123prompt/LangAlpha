@@ -134,7 +134,7 @@ class PTCSandbox:
     #
     # ``self.config.mcp.servers`` holds the per-workspace EFFECTIVE set the
     # WorkspaceManager installs at session build: built-ins (minus disables) plus
-    # the workspace's user (``source='workspace'``) servers. Most host-side
+    # untrusted (``source`` 'workspace' or 'user') servers. Most host-side
     # operations must see ONLY the built-ins — user stdio servers are fetched by
     # npx/uvx at call time inside the sandbox, never pre-installed/pre-started on
     # the host path, and their secrets resolve vault-only (never host os.environ).
@@ -142,11 +142,11 @@ class PTCSandbox:
     # the same objects and byte-identical to pre-change behavior (regression #1).
 
     def _builtin_servers(self) -> list:
-        """Built-in servers only (``source != 'workspace'``) from the effective set."""
+        """Built-in servers only (trusted ``source``) from the effective set."""
         return [s for s in self.config.mcp.servers if not is_untrusted_server(s)]
 
     def _user_servers(self) -> list:
-        """User-configured servers (``source == 'workspace'``) from the effective set."""
+        """Untrusted servers (``source`` 'workspace' or 'user') from the effective set."""
         return [s for s in self.config.mcp.servers if is_untrusted_server(s)]
 
     async def _wait_ready(self) -> None:

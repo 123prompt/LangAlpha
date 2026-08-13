@@ -318,6 +318,15 @@ class TestTransportRouting:
         with pytest.raises(RuntimeError, match="'http'"):
             ns["_call_mcp_tool"]("fake", "t", {})
 
+    def test_legacy_sse_discovery_refuses_too(self, tmp_path):
+        # Discovery used to POST an sse server like streamable HTTP, so a
+        # connector saved as "connected" and then failed every call mid-turn.
+        ns, _ = _client_ns(tmp_path, "modern", transport="sse")
+        result = ns["discover"]("fake")
+        assert result["status"] == "error"
+        assert "'http'" in result["error"]
+        assert result["tools"] == []
+
 
 class TestCliDiscover:
     def test_cli_discover_runs_against_the_applied_config(self, tmp_path):

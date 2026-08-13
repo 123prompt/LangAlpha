@@ -132,8 +132,10 @@ def build_composite_registry(
 ) -> Any:
     """Append user-server schemas onto the frozen built-in registry.
 
-    ``user_servers`` are ``source='workspace'``, enabled, in resolver order
-    (built-ins config-order, then user servers alphabetical). ``tool_schemas``
+    ``user_servers`` are the untrusted (``source`` 'workspace' or 'user'),
+    enabled servers the CALLER selected — the filter lives in
+    ``WorkspaceManager``, not here — in resolver order (built-ins
+    config-order, then user servers alphabetical). ``tool_schemas``
     maps a server name to its sanitized ``[{name, description, input_schema}]``
     snapshot; only ``status='ok'`` servers appear. ``disabled_builtin_names``
     are built-ins a workspace turned off — excluded from tools/connectors/config

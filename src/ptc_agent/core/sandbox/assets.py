@@ -68,16 +68,17 @@ def _compute_tool_schema_hash(sandbox: "PTCSandbox") -> str:
 
 
 def _compute_user_mcp_config_hash(sandbox: "PTCSandbox") -> str:
-    """Hash user (``source='workspace'``) server CONFIG — never secret values.
+    """Hash untrusted (``source`` 'workspace'/'user') server CONFIG — never secrets.
 
         Captures transport/command/args/url, the full env/header maps (literal
         values AND ``${vault:NAME}`` ref strings — the stored values are never
-        resolved secrets), and the effective secret-less-discovery decision, so a
-        config-only edit — a literal ``MODE=prod`` -> ``staging`` change, a new
-        authenticated header, or a vault-ref retarget under the same key — always
-        re-uploads the regenerated ``mcp_client.py``. Shares
-        :func:`discovery_affecting_payload` with the per-server discovery-cache
-        key so the upload hash and the cache key can never disagree. Returns ""
+        resolved secrets), the effective secret-less-discovery decision, and
+        whether the server is relay-bound, so a config-only edit — a literal
+        ``MODE=prod`` -> ``staging`` change, a new authenticated header, a
+        vault-ref retarget under the same key, or a first OAuth connect — always
+        re-uploads the regenerated ``mcp_client.py``. Builds on
+        :func:`discovery_affecting_payload` (the per-server discovery-cache key)
+        and adds exactly one field it must never carry — see below. Returns ""
         when there are no user servers so builtin-only workspaces are untouched.
         """
     user_servers = sandbox._user_servers()
@@ -87,6 +88,23 @@ def _compute_user_mcp_config_hash(sandbox: "PTCSandbox") -> str:
     parts: list[str] = []
     for server in sorted(user_servers, key=lambda s: s.name):
         payload = discovery_affecting_payload(server, include_identity=True)
+        # Deliberate asymmetry with the discovery fingerprint: the two hashes
+        # serve different invalidation domains. Codegen branches on the binding
+        # — a bound server is emitted as a relay entry with url and headers
+        # dropped — so this hash must move when it flips. The vendor's
+        # tools/list answer does NOT depend on it, and binding state entering
+        # discovery_affecting_payload would leave every OAuth server's snapshot
+        # stale forever (pinned by test_ignores_the_resolve_time_oauth_binding
+        # in tests/unit/server/services/test_mcp_discovery.py).
+        #
+        # The BOOL, not the id: codegen only tests is-not-None, while the id
+        # rotates on every reconnect and would force uploads that change
+        # nothing. Written only when bound, so an unbound workspace's hash stays
+        # byte-identical to a pre-binding sandbox and never re-uploads.
+        # Always absent for 'workspace' servers: only catalog rows can carry a
+        # connection, and a stored workspace blob has the field stripped.
+        if getattr(server, "oauth_connection_id", None):
+            payload["oauth_bound"] = True
         parts.append(json.dumps(payload, sort_keys=True))
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
@@ -258,8 +276,9 @@ async def _compute_sandbox_manifest(
     # User-server config hash — GATED on the presence of user servers so a
     # builtin-only workspace's source_versions dict (and thus tool_modules
     # version) is byte-identical to pre-change. A config-only edit (transport
-    # /command/args/url/header-NAMES — never values) changes this hash and
-    # so re-uploads the regenerated mcp_client.py via the tool_modules diff.
+    # /command/args/url, or any stored env/header value — refs and literals,
+    # never resolved secrets) changes this hash and so re-uploads the
+    # regenerated mcp_client.py via the tool_modules diff.
     user_mcp_hash = sandbox._compute_user_mcp_config_hash()
     if user_mcp_hash:
         source_versions["user_mcp_config"] = user_mcp_hash

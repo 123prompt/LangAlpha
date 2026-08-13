@@ -126,8 +126,9 @@ class TestRelayBoundEmission:
             assert symbol in code, symbol
         # 401 recovery + typed reconnect errors read the machine-readable header.
         assert "x-relay-error" in code
-        # Outer timeout sits above the relay's 55s wall.
-        assert "httpx.Client(timeout=65.0)" in code
+        # Each tools/call send is budgeted above the relay's 55s wall.
+        assert "_HTTP_CALL_BUDGET = 65.0" in code
+        assert "httpx.Client(timeout=_HTTP_CALL_BUDGET)" in code
 
     def test_builtin_only_config_has_no_relay_binding(self):
         # The runtime module always ships the relay/vault helpers (static

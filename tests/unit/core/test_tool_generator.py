@@ -253,6 +253,30 @@ class TestGetParametersSchemaResolution:
         params = self._params({"weird": "not-a-dict"})
         assert params["weird"]["type"] == "any"
 
+    def test_a_malformed_properties_container_degrades_to_no_params(self):
+        # A discovery cache written before the schema sanitizer can hold
+        # ``"properties": []``; raising here wedges the whole workspace sync.
+        for properties in ([], "nope", None, 7):
+            tool = MCPToolInfo(
+                "t", "d", {"type": "object", "properties": properties}, "srv"
+            )
+            assert tool.get_parameters() == {}
+
+    def test_a_non_dict_input_schema_degrades_to_no_params(self):
+        for schema in ([], "nope", None):
+            assert MCPToolInfo("t", "d", schema, "srv").get_parameters() == {}
+
+    def test_a_non_list_required_marks_nothing_required(self):
+        # A bare ``"required": "symbol"`` would otherwise make every param whose
+        # name is a substring of it required.
+        tool = MCPToolInfo(
+            "t",
+            "d",
+            {"properties": {"sym": {"type": "string"}}, "required": "symbol"},
+            "srv",
+        )
+        assert tool.get_parameters()["sym"]["required"] is False
+
 
 class TestWireKeyRoundTrip:
     """Sanitized Python names must never leak onto the wire.
@@ -305,11 +329,9 @@ class TestWireKeyRoundTrip:
         module = gen.generate_tool_module("yf_price", [tool])
         assert '"symbol": symbol,' in module
 
-    def test_collision_after_sanitize_skips_later_param(self):
-        # `type` sanitizes to `type_`; a literal `type_` key then collides
-        # and must be dropped rather than shadow the first binding.
-        gen = ToolFunctionGenerator()
-        tool = _make_tool(
+    def _collision_tool(self):
+        # `type` sanitizes to `type_`, colliding with a literal `type_` key.
+        return _make_tool(
             name="probe",
             input_schema={
                 "type": "object",
@@ -317,14 +339,126 @@ class TestWireKeyRoundTrip:
                     "type": {"type": "string"},
                     "type_": {"type": "string"},
                 },
-                "required": ["type"],
+                "required": ["type", "type_"],
             },
             server_name="user_srv",
         )
-        module = gen.generate_tool_module("user_srv", [tool], untrusted=True)
+
+    def test_collision_after_sanitize_dedupes_instead_of_dropping(self):
+        # Dropping the loser shipped a wrapper that could never send a required
+        # field. Renaming it costs nothing: the wire key is what the server sees.
+        gen = ToolFunctionGenerator()
+        module = gen.generate_tool_module(
+            "user_srv", [self._collision_tool()], untrusted=True
+        )
         ast.parse(module)
+        assert "def probe(type_: str, type__: str)" in module
         assert "'type': type_," in module
-        assert "'type_': " not in module
+        assert "'type_': type__," in module
+
+    def test_deduped_wrapper_sends_both_wire_keys(self):
+        # The payload is the contract — pin the dict the wrapper actually builds.
+        gen = ToolFunctionGenerator()
+        module = gen.generate_tool_module(
+            "user_srv", [self._collision_tool()], untrusted=True
+        )
+        # No parent package, so the module's relative mcp_client import falls
+        # back to its stub — which the capture below replaces.
+        ns: dict = {"__name__": "gen_tools"}
+        exec(compile(module, "gen_tools", "exec"), ns)  # noqa: S102 - generated code
+        sent = {}
+        ns["_call_mcp_tool"] = lambda srv, tool, args: sent.update(args)
+        ns["probe"]("market", "equity")
+        assert sent == {"type": "market", "type_": "equity"}
+
+
+class TestNoneSemantics:
+    """None parts ways by requiredness: an optional param's None means "not
+    provided" (key dropped), while a required param is always sent — its None
+    is an explicit JSON null, and omitting the key would fail the server's
+    required-field check."""
+
+    def _sent(self, **call_kwargs) -> dict:
+        tool = _make_tool(
+            name="probe",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "cursor": {"type": ["string", "null"]},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["cursor"],
+            },
+            server_name="user_srv",
+        )
+        gen = ToolFunctionGenerator()
+        module = gen.generate_tool_module("user_srv", [tool], untrusted=True)
+        ns: dict = {"__name__": "gen_tools"}
+        exec(compile(module, "gen_tools", "exec"), ns)  # noqa: S102 - generated code
+        calls: list[dict] = []
+        ns["_call_mcp_tool"] = lambda srv, tool_name, args: calls.append(args)
+        ns["probe"](**call_kwargs)
+        assert len(calls) == 1
+        return calls[0]
+
+    def test_required_nullable_none_is_sent_as_an_explicit_null(self):
+        assert self._sent(cursor=None) == {"cursor": None}
+
+    def test_optional_none_drops_the_wire_key(self):
+        assert self._sent(cursor="abc") == {"cursor": "abc"}
+
+    def test_provided_optional_rides_along(self):
+        assert self._sent(cursor=None, limit=5) == {"cursor": None, "limit": 5}
+
+
+class TestUnusableParamNames:
+    """A param whose name cannot become an identifier decides the tool's fate.
+
+    Required: the wrapper could never send that field, so shipping it hands the
+    agent a permanently uncallable function — the whole tool is dropped.
+    Optional: the rest of the tool still works, so only the param is skipped.
+    """
+
+    def _tool(self, *, required: list[str]):
+        return _make_tool(
+            name="probe",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "!!!": {"type": "string"},
+                    "symbol": {"type": "string"},
+                },
+                "required": required,
+            },
+            server_name="user_srv",
+        )
+
+    def test_required_unusable_name_drops_the_whole_tool(self):
+        gen = ToolFunctionGenerator()
+        module = gen.generate_tool_module(
+            "user_srv", [self._tool(required=["!!!", "symbol"])], untrusted=True
+        )
+        ast.parse(module)
+        assert "def probe(" not in module
+
+    def test_optional_unusable_name_keeps_the_tool(self):
+        gen = ToolFunctionGenerator()
+        module = gen.generate_tool_module(
+            "user_srv", [self._tool(required=["symbol"])], untrusted=True
+        )
+        ast.parse(module)
+        assert "def probe(symbol: str)" in module
+        assert "'symbol': symbol," in module
+        assert "!!!" not in module
+
+    def test_dropped_tool_is_not_documented_as_callable(self):
+        # Docs and the wrapper module must agree, or the agent calls a name
+        # that does not exist.
+        gen = ToolFunctionGenerator()
+        doc = gen.generate_tool_documentation(
+            self._tool(required=["!!!"]), untrusted=True
+        )
+        assert doc.startswith("# probe (unavailable)")
 
 
 class TestDocsWrapperParity:

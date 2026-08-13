@@ -151,6 +151,36 @@ class TestPrepareEnvSafety:
         assert result == {"PATH": "/usr/bin"}
 
 
+class TestTransportCredentials:
+    """Configured headers must reach every remote transport, not just http."""
+
+    @pytest.mark.asyncio
+    async def test_sse_transport_gets_the_resolved_headers(self):
+        """An authenticated SSE server 401s without them."""
+        config = MCPServerConfig(
+            name="sse-server",
+            transport="sse",
+            url="https://mcp.example.com/sse",
+            headers={"Authorization": "Bearer ${SSE_TOKEN}"},
+        )
+        connector = MCPServerConnector(config)
+        captured: dict = {}
+
+        def _fake_sse_client(url, headers=None, **kwargs):
+            captured["url"] = url
+            captured["headers"] = headers
+            raise RuntimeError("stop after transport construction")
+
+        with patch.dict("os.environ", {"SSE_TOKEN": "tok_abc"}), patch(
+            "ptc_agent.core.mcp_registry.sse_client", _fake_sse_client
+        ), pytest.raises(RuntimeError, match="stop after"):
+            async with connector:
+                pass
+
+        assert captured["url"] == "https://mcp.example.com/sse"
+        assert captured["headers"] == {"Authorization": "Bearer tok_abc"}
+
+
 class TestFreezeAndGlobalRegistry:
     """Verify the frozen-snapshot path used at lifespan startup."""
 

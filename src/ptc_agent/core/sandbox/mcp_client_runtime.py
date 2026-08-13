@@ -47,6 +47,27 @@ _LEGACY_OFFER = "2025-11-25"
 _PROBE_TIMEOUT = 10.0
 _CALL_TIMEOUT = 120.0
 
+# HTTP wall clocks, in seconds. An HTTP handshake is multi-phase, so each phase
+# gets its own deadline carved from the outer budget: one clock shared across
+# phases lets a hung server/discover probe hand the legacy initialize an
+# already-expired deadline, and the fallback that exists for exactly that
+# server can then never send its first byte.
+_HTTP_EXCHANGE_BUDGET = 30.0  # a handshake or a tools/list, end to end
+_HTTP_PHASE_FLOOR = 10.0  # no phase starts on an expired clock
+_HTTP_CALL_BUDGET = 65.0  # one tools/call send; above the relay's 55s wall
+
+# Ceiling on what one reply may accumulate before the reader gives up, on both
+# transports: a server that floods otherwise OOM-kills the interpreter instead
+# of failing diagnosably. 16 MiB sits far above any real JSON-RPC reply.
+_REPLY_MAX_BYTES = 16 * 1024 * 1024
+# The stdout pump reads in pieces of at most this size so the budget above can
+# bite mid-line; readline() still returns early at each newline.
+_STDIO_CHUNK_CHARS = 65536
+# Cap on each retained stderr line (head kept — a crash line names its cause
+# first). The tail's deque bounds line COUNT; this bounds line size, so one
+# newline-free blob can't make the tail itself unbounded.
+_STDERR_LINE_MAX_BYTES = 4096
+
 # ---------------------------------------------------------------------------
 # Configuration. Shape produced by tool_generator.generate_client_config():
 #   {"working_dir": str,
@@ -583,6 +604,11 @@ def _legacy_init_request() -> dict:
 # stdio transport — subprocess lifecycle, line framing, negotiation ladder.
 # ---------------------------------------------------------------------------
 
+# Queued by the stdout pump on a _REPLY_MAX_BYTES breach; distinct from the
+# None EOF sentinel so the reader reports the cause instead of "closed
+# connection".
+_STDIO_OVERSIZE = object()
+
 
 def _kill_server(server_name: str, proc: subprocess.Popen) -> None:
     try:
@@ -609,8 +635,8 @@ def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout:
 
     Skips notifications and stale replies (abandoned ids from a prior timeout),
     answers server-initiated requests with -32601 (server->client requests are
-    deprecated in 2026-07-28), and kills the process on timeout / EOF / invalid
-    framing so the next call restarts cleanly. Lines come from the pump
+    deprecated in 2026-07-28), and kills the process on timeout / EOF / oversize
+    / invalid framing so the next call restarts cleanly. Lines come from the pump
     thread's queue, never select() — a burst of messages lands in Python's
     stdio buffer where select() on the fd would block forever.
     """
@@ -626,6 +652,19 @@ def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout:
             line = proc.mcp_stdout_queue.get(timeout=remaining)
         except queue.Empty:
             continue
+        if isinstance(line, str):
+            # Consumed — retire it from the pump's outstanding-bytes budget.
+            with proc.mcp_budget_lock:
+                proc.mcp_outstanding[0] -= len(line)
+        if line is _STDIO_OVERSIZE:
+            _kill_server(server_name, proc)
+            error_msg = (
+                f"MCP server {server_name}: unconsumed stdout exceeded "
+                f"{_REPLY_MAX_BYTES} bytes without a matching reply "
+                "[reply_too_large]"
+            )
+            print(f"ERROR: {error_msg}", file=sys.stderr)  # noqa: T201
+            raise RuntimeError(error_msg)
         if line is None:  # EOF sentinel from the pump thread
             _kill_server(server_name, proc)
             error_msg = f"MCP server {server_name} closed connection"
@@ -690,9 +729,20 @@ def _spawn_mcp_process(server_name: str, discovery: bool = False) -> subprocess.
     err_tail = collections.deque(maxlen=40)
 
     def _drain_stderr(p=proc, t=err_tail):
+        # Capped readline, not line iteration: a stderr stream that never
+        # newlines (a \r progress meter) would otherwise assemble one
+        # unbounded line in memory before the tail truncation could apply.
+        # The first piece of a line is exactly the head the tail keeps; the
+        # rest of an overlong line is read and dropped.
+        mid_line = False
         try:
-            for line in p.stderr:
-                t.append(line.rstrip("\n"))
+            while True:
+                piece = p.stderr.readline(_STDERR_LINE_MAX_BYTES)
+                if not piece:
+                    break
+                if not mid_line:
+                    t.append(piece.rstrip("\n")[:_STDERR_LINE_MAX_BYTES])
+                mid_line = not piece.endswith("\n")
         except (OSError, ValueError):
             pass
 
@@ -704,16 +754,47 @@ def _spawn_mcp_process(server_name: str, discovery: bool = False) -> subprocess.
     # slurped into Python's stdio buffer.
     out_queue = queue.Queue()
 
-    def _pump(p=proc, q=out_queue):
+    # The pump also bounds OUTSTANDING bytes — enqueued but not yet consumed by
+    # a reader — because unbounded queue depth is the stdio twin of an unbounded
+    # HTTP body. Readers retire what they dequeue, so a long-lived server may
+    # stream any total volume; only bytes piling up unconsumed (one giant reply,
+    # or junk with no reader waiting) breach the cap, kill the server, and let
+    # the next call respawn it with an empty queue.
+    budget_lock = threading.Lock()
+    outstanding = [0]
+
+    def _pump(p=proc, q=out_queue, lock=budget_lock, pending=outstanding):
+        # Capped readline pieces, not line iteration: charging only COMPLETED
+        # lines would let one no-newline flood assemble unbounded in memory
+        # before the cap could bite. Pieces charge as they arrive (so the cap
+        # bounds the partially-assembled line too); readline still returns the
+        # moment a newline lands, so small replies keep their latency.
+        buf: list[str] = []
         try:
-            for line in p.stdout:
-                q.put(line)
+            while True:
+                piece = p.stdout.readline(_STDIO_CHUNK_CHARS)
+                if not piece:
+                    break
+                with lock:
+                    pending[0] += len(piece)
+                    over = pending[0] > _REPLY_MAX_BYTES
+                if over:
+                    q.put(_STDIO_OVERSIZE)
+                    return
+                buf.append(piece)
+                if piece.endswith("\n"):
+                    q.put("".join(buf))
+                    buf = []
         except (OSError, ValueError):
             pass
+        if buf:
+            q.put("".join(buf))  # final unterminated line, as iteration yielded
         q.put(None)  # EOF sentinel
 
     threading.Thread(target=_pump, daemon=True).start()
     proc.mcp_stdout_queue = out_queue
+    proc.mcp_budget_lock = budget_lock
+    proc.mcp_outstanding = outstanding
 
     return proc
 
@@ -825,12 +906,20 @@ def _call_mcp_tool_stdio(server_name: str, tool_name: str, arguments: dict[str, 
 # ---------------------------------------------------------------------------
 
 
+# Protocol-owned header names a configured header map must never supply: the
+# config would silently desync the wire header from the body ``_meta`` (or
+# forge a session), and dict-key casing would even send both spellings.
+_RESERVED_MCP_HEADERS = frozenset(
+    {"mcp-protocol-version", "mcp-method", "mcp-name", "mcp-session-id"}
+)
+
+
 def _mcp_headers(method: str, mcp_name: str, proto: dict, extra: dict) -> dict:
     """Spec headers for one HTTP request. Modern adds Mcp-Method/Mcp-Name
     (MCP-Protocol-Version must equal the body _meta); legacy echoes the
-    captured Mcp-Session-Id. Configured headers are applied last.
-    Tool-declared x-mcp-header params are not emitted — a known limitation
-    for third-party servers that rely on them."""
+    captured Mcp-Session-Id. Configured headers are applied last, minus the
+    reserved protocol names. Tool-declared x-mcp-header params are not
+    emitted — a known limitation for third-party servers that rely on them."""
     headers = {"Accept": "application/json, text/event-stream"}
     headers["MCP-Protocol-Version"] = proto["version"]
     if proto["mode"] == "modern":
@@ -846,21 +935,39 @@ def _mcp_headers(method: str, mcp_name: str, proto: dict, extra: dict) -> dict:
             headers["Mcp-Name"] = mcp_name
     elif proto.get("session_id"):
         headers["Mcp-Session-Id"] = proto["session_id"]
-    headers.update(extra or {})
+    for name, value in (extra or {}).items():
+        if name.lower() in _RESERVED_MCP_HEADERS:
+            continue
+        headers[name] = value
     return headers
 
 
 # A single HTTP reply (JSON body or the SSE frames up to the matching message)
-# is read incrementally and bounded: a direct (non-relay) HTTP server is
-# untrusted, and httpx's read timeout resets on every byte — so without these a
-# flooding server OOMs the interpreter and a slow-drip server hangs it forever.
-# Relay-bound traffic is already time-capped by the relay's own wall clock; this
-# is the guard for everything else. 16 MiB sits far above any real JSON-RPC reply.
-_HTTP_REPLY_MAX_BYTES = 16 * 1024 * 1024
+# is read incrementally so _REPLY_MAX_BYTES and the deadline below can bite: a
+# direct (non-relay) HTTP server is untrusted, and httpx's read timeout resets
+# on every byte — so without these a flooding server OOMs the interpreter and a
+# slow-drip server hangs it forever. Relay-bound traffic is already time-capped
+# by the relay's own wall clock; this is the guard for everything else.
 
 
 def _deadline_exceeded(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() > deadline
+
+
+def _phase_deadline(
+    outer: float, *, cap: float | None = None, floor: float = 0.0
+) -> float:
+    """Deadline for the next phase of a multi-phase exchange.
+
+    ``cap`` bounds what a single phase may take out of the outer budget;
+    ``floor`` guarantees the phase after it a usable clock, because a slow
+    first phase must not silently expire the fallback that exists to rescue it.
+    """
+    now = time.monotonic()
+    remaining = outer - now
+    if cap is not None:
+        remaining = min(remaining, cap)
+    return now + max(remaining, floor)
 
 
 def _parse_http_reply(
@@ -876,8 +983,38 @@ def _parse_http_reply(
     """
     ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
     if ctype != "text/event-stream":
+        # A JSON body carries exactly one message, so unlike the SSE scan there
+        # is nothing to skip past: anything but the awaited reply is a broken
+        # server and gets a named refusal instead of flowing on as the result.
         body = _read_body_capped(response, server_name, deadline)
-        return json.loads(body)
+        try:
+            message = json.loads(body)
+        except json.JSONDecodeError:
+            msg = (
+                f"Invalid JSON from MCP server {server_name}: "
+                f"{body[:200]!r} [invalid_reply]"
+            )
+            raise RuntimeError(msg)
+        if not isinstance(message, dict):
+            msg = (
+                f"MCP server {server_name}: HTTP reply is not a JSON-RPC "
+                "message object [invalid_reply]"
+            )
+            raise RuntimeError(msg)
+        if "method" in message and "id" in message:
+            msg = (
+                f"MCP server {server_name}: server-initiated request "
+                f"{message['method']!r} is not supported by this client "
+                "[unsupported_server_request]"
+            )
+            raise RuntimeError(msg)
+        if "method" in message or message.get("id") != want_id:
+            msg = (
+                f"MCP server {server_name}: HTTP reply did not answer "
+                f"request id {want_id} [mismatched_reply]"
+            )
+            raise RuntimeError(msg)
+        return message
 
     def _frame_reply(payload):
         try:
@@ -900,33 +1037,55 @@ def _parse_http_reply(
         return None
 
     data_lines = []
+    line_parts: list[str] = []
     seen = 0
-    for raw in response.iter_lines():
+
+    def _consume_line(line):
+        """One framed SSE line; returns the matching reply or None."""
+        if line == "":
+            if data_lines:
+                reply = _frame_reply("\n".join(data_lines))
+                data_lines.clear()
+                return reply
+            return None
+        if line.startswith(":"):
+            return None  # comment / keep-alive priming
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip(" "))
+        # other SSE fields (event:, id:, retry:) never carry the payload
+        return None
+
+    # Chunked, never line-iterated: iter_lines() buffers an unterminated line
+    # without limit inside httpx, so a newline-free flood would blow past both
+    # guards below. Chunks arrive at the transport's read granularity, which
+    # the server does not control.
+    for chunk in response.iter_text():
         if _deadline_exceeded(deadline):
             raise RuntimeError(
                 f"MCP server {server_name}: SSE read exceeded the deadline "
                 "before a matching reply [stream_deadline]"
             )
-        line = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
-        seen += len(line) + 1
-        if seen > _HTTP_REPLY_MAX_BYTES:
+        seen += len(chunk)
+        if seen > _REPLY_MAX_BYTES:
             raise RuntimeError(
                 f"MCP server {server_name}: SSE stream exceeded "
-                f"{_HTTP_REPLY_MAX_BYTES} bytes without a matching reply "
+                f"{_REPLY_MAX_BYTES} bytes without a matching reply "
                 "[reply_too_large]"
             )
-        if line == "":
-            if data_lines:
-                reply = _frame_reply("\n".join(data_lines))
-                data_lines = []
-                if reply is not None:
-                    return reply
-            continue
-        if line.startswith(":"):
-            continue  # comment / keep-alive priming
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip(" "))
-        # other SSE fields (event:, id:, retry:) never carry the payload
+        while chunk:
+            newline = chunk.find("\n")
+            if newline < 0:
+                line_parts.append(chunk)
+                break
+            line_parts.append(chunk[:newline])
+            chunk = chunk[newline + 1 :]
+            line = "".join(line_parts).rstrip("\r")
+            line_parts.clear()
+            reply = _consume_line(line)
+            if reply is not None:
+                return reply
+    if line_parts:
+        _consume_line("".join(line_parts).rstrip("\r"))
     if data_lines:
         reply = _frame_reply("\n".join(data_lines))
         if reply is not None:
@@ -946,10 +1105,10 @@ def _read_body_capped(response, server_name: str, deadline: float | None) -> byt
                 "[stream_deadline]"
             )
         seen += len(chunk)
-        if seen > _HTTP_REPLY_MAX_BYTES:
+        if seen > _REPLY_MAX_BYTES:
             raise RuntimeError(
                 f"MCP server {server_name}: HTTP reply exceeded "
-                f"{_HTTP_REPLY_MAX_BYTES} bytes [reply_too_large]"
+                f"{_REPLY_MAX_BYTES} bytes [reply_too_large]"
             )
         chunks.append(chunk)
     return b"".join(chunks)
@@ -959,7 +1118,8 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
     """Negotiate (once per interpreter) and return the server's proto state.
 
     HTTP is stateless per POST, so a failed discover probe needs no restart —
-    the legacy initialize simply goes out as a fresh request.
+    the legacy initialize simply goes out as a fresh request, on a deadline of
+    its own so a probe that hung cannot condemn it.
     """
     proto = _PROTO.get(server_name)
     if proto is not None:
@@ -973,9 +1133,10 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
     url, _headers = _resolve_http(cfg, discovery=discovery)
 
     version = _MODERN_VERSIONS[0]
+    probe_note = ""
     try:
-        with httpx.Client(timeout=30.0) as client:
-            deadline = time.monotonic() + 30.0  # matches the client timeout above
+        with httpx.Client(timeout=_HTTP_EXCHANGE_BUDGET) as client:
+            outer = time.monotonic() + _HTTP_EXCHANGE_BUDGET
             probe = _modern_request("server/discover", {}, version)
             probe_headers = {
                 "Accept": "application/json, text/event-stream",
@@ -988,9 +1149,22 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
                 with client.stream("POST", url, json=probe, headers=probe_headers) as response:
                     if response.status_code < 400:
                         reply = _parse_http_reply(
-                            response, probe["id"], server_name, deadline
+                            response,
+                            probe["id"],
+                            server_name,
+                            # Mirrors the stdio probe budget: a silent or
+                            # drip-feeding server costs one bounded probe, never
+                            # the whole handshake.
+                            _phase_deadline(outer, cap=_PROBE_TIMEOUT),
                         )
-            except (httpx.HTTPError, RuntimeError, ValueError):
+            except (httpx.HTTPError, RuntimeError, ValueError) as probe_exc:
+                if "stream_deadline" in str(probe_exc):
+                    # Name the phase that actually stalled, or the fallback
+                    # below gets blamed for the probe's failure.
+                    probe_note = (
+                        " (the server/discover probe stalled first"
+                        " [discover_probe_timeout])"
+                    )
                 reply = None
             if isinstance(reply, dict) and "result" in reply:
                 supported = (reply["result"] or {}).get("supportedVersions") or []
@@ -1001,31 +1175,55 @@ def _ensure_http_server(server_name: str, discovery: bool = False) -> dict:
                     return proto
 
             init = _legacy_init_request()
-            init_headers = {"Accept": "application/json, text/event-stream"}
-            init_headers.update(_headers)
-            with client.stream("POST", url, json=init, headers=init_headers) as response:
-                _msg = _relay_error(response, server_name)
-                if _msg:
-                    raise RuntimeError(_msg)
-                response.raise_for_status()
-                session_id = response.headers.get("mcp-session-id")
-                reply = _parse_http_reply(response, init["id"], server_name, deadline)
+            relay_auth_retried = False
+            while True:
+                # Fresh per-attempt clock: the probe above (and a relay-auth
+                # retry below) already spent part of the outer budget, and an
+                # initialize born expired is refused before its first chunk.
+                init_deadline = _phase_deadline(outer, floor=_HTTP_PHASE_FLOOR)
+                init_headers = {"Accept": "application/json, text/event-stream"}
+                init_headers.update(_headers)
+                with client.stream("POST", url, json=init, headers=init_headers) as response:
+                    if (
+                        response.headers.get("x-relay-error") == "relay_auth"
+                        and not relay_auth_retried
+                    ):
+                        # Every execute_code runs in a fresh interpreter with an
+                        # empty _PROTO, so the handshake — not the tool call — is
+                        # where a concurrent host re-mint is usually raced. Re-read
+                        # the credential file and retry once, as tools/call does.
+                        relay_auth_retried = True
+                        url, _headers = _resolve_http(cfg, discovery=discovery)
+                        continue
+                    _msg = _relay_error(response, server_name)
+                    if _msg:
+                        raise RuntimeError(_msg)
+                    response.raise_for_status()
+                    session_id = response.headers.get("mcp-session-id")
+                    reply = _parse_http_reply(
+                        response, init["id"], server_name, init_deadline
+                    )
+                break
             if "error" in reply:
                 msg = f"MCP HTTP initialization failed: {reply['error']}"
                 raise RuntimeError(msg)
             adopted = (reply.get("result") or {}).get("protocolVersion") or _LEGACY_OFFER
             proto = {"mode": "legacy", "version": adopted, "session_id": session_id}
             notif_headers = _mcp_headers("notifications/initialized", "", proto, _headers)
-            client.post(
+            # Streamed and never read: the reply is discarded either way, and
+            # buffering it would hand an unbounded body to the interpreter.
+            with client.stream(
+                "POST",
                 url,
                 json={"jsonrpc": "2.0", "method": "notifications/initialized"},
                 headers=notif_headers,
-            )
+            ):
+                pass
         _PROTO[server_name] = proto
         return proto
 
     except Exception as e:  # noqa: BLE001 - Re-raising as RuntimeError with context
-        msg = f"Failed to initialize remote MCP server {server_name}: {e}"
+        msg = f"Failed to initialize remote MCP server {server_name}: {e}{probe_note}"
         raise RuntimeError(msg) from e
 
 
@@ -1050,17 +1248,21 @@ def _call_mcp_tool_http(server_name: str, tool_name: str, arguments: dict[str, A
         request = _build(proto)
         headers = _mcp_headers("tools/call", tool_name, proto, _headers)
 
-        # Each attempt streams the reply under a size cap + a total deadline: the
-        # 65s outer timeout sits strictly above the egress relay's 55s hard wall
-        # so relay budget errors stay typed, and the deadline bounds a direct
-        # server that drips bytes forever (httpx's read timeout can't). The two
-        # recovery paths — relay credential re-mint and legacy session expiry —
-        # each fire at most once, so the loop is bounded to three sends.
-        with httpx.Client(timeout=65.0) as client:
-            deadline = time.monotonic() + 65.0
+        # Each attempt streams the reply under a size cap + a deadline of its
+        # own: the 65s budget sits strictly above the egress relay's 55s hard
+        # wall so relay budget errors stay typed, and the deadline bounds a
+        # direct server that drips bytes forever (httpx's read timeout can't).
+        # It is re-armed per send because the session-expiry path spends a whole
+        # re-negotiation first — a retry inheriting the first attempt's clock
+        # would fall back under the relay's wall and turn a typed relay error
+        # into a local timeout. The two recovery paths — relay credential
+        # re-mint and legacy session expiry — each fire at most once, so the
+        # loop is bounded to three sends.
+        with httpx.Client(timeout=_HTTP_CALL_BUDGET) as client:
             relay_auth_retried = False
             session_reinited = False
             while True:
+                deadline = time.monotonic() + _HTTP_CALL_BUDGET
                 with client.stream("POST", url, json=request, headers=headers) as response:
                     relay_code = response.headers.get("x-relay-error")
                     if relay_code:
@@ -1110,6 +1312,21 @@ def _call_mcp_tool_http(server_name: str, tool_name: str, arguments: dict[str, A
 # ---------------------------------------------------------------------------
 
 
+def _legacy_sse_refusal(server_name: str) -> str:
+    """The single refusal text for legacy ``sse``, shared by calls and discovery.
+
+    The old client POSTed plain JSON-RPC, which never satisfied a real
+    legacy-SSE server's GET->endpoint-event->POST flow, so refusing breaks
+    nothing that worked — but both lanes must refuse together, or the connector
+    discovers "ok" at save time and dies on every call mid-turn.
+    """
+    return (
+        f"MCP server {server_name} uses legacy transport 'sse', which this "
+        "client does not support; change the server's transport to 'http' "
+        "(streamable HTTP)."
+    )
+
+
 def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
     """Call an MCP tool via the appropriate transport.
 
@@ -1124,15 +1341,7 @@ def _call_mcp_tool(server_name: str, tool_name: str, arguments: dict[str, Any]) 
     if transport == "http":
         return _call_mcp_tool_http(server_name, tool_name, arguments)
     if transport == "sse":
-        # The old client POSTed plain JSON-RPC, which never satisfied a real
-        # legacy-SSE server's GET->endpoint-event->POST flow — nothing working
-        # breaks by refusing outright.
-        msg = (
-            f"MCP server {server_name} uses legacy transport 'sse', which this "
-            "client does not support; change the server's transport to 'http' "
-            "(streamable HTTP)."
-        )
-        raise RuntimeError(msg)
+        raise RuntimeError(_legacy_sse_refusal(server_name))
     return _call_mcp_tool_stdio(server_name, tool_name, arguments)
 
 
@@ -1159,7 +1368,12 @@ def discover(server_name: str) -> dict:
         return {"server": server_name, "status": "error",
                 "error": "unknown server", "tools": []}
     try:
-        if cfg.transport in ("sse", "http"):
+        if cfg.transport == "sse":
+            # Refuse here too, so the connector saves as status=error with an
+            # actionable reason instead of discovering "ok" over a POST the
+            # call path will reject on every turn.
+            raise RuntimeError(_legacy_sse_refusal(server_name))
+        if cfg.transport == "http":
             raw = _discover_http(server_name)
         else:
             raw = _discover_stdio(server_name)
@@ -1201,10 +1415,11 @@ def _discover_http(server_name: str) -> list:
     else:
         req = _legacy_request("tools/list", {})
     hdrs = _mcp_headers("tools/list", "", proto, headers)
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(url, json=req, headers=hdrs)
-        response.raise_for_status()
-        result = _parse_http_reply(response, req["id"], server_name)
+    with httpx.Client(timeout=_HTTP_EXCHANGE_BUDGET) as client:
+        deadline = time.monotonic() + _HTTP_EXCHANGE_BUDGET
+        with client.stream("POST", url, json=req, headers=hdrs) as response:
+            response.raise_for_status()
+            result = _parse_http_reply(response, req["id"], server_name, deadline)
     if "error" in result:
         raise RuntimeError(f"tools/list error: {result['error']}")
     return (result.get("result") or {}).get("tools", [])

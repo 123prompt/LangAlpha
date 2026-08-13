@@ -7,6 +7,7 @@ audited read site correctly, and discover_user_mcp_schemas isolates per-server
 errors + parses file-IPC output.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -40,6 +41,12 @@ def _builtin(name, **kw):
 
 def _user(name, **kw):
     return MCPServerConfig(name=name, source="workspace", **kw)
+
+
+def _connector(name, **kw):
+    """A Connectors-tier (``source='user'``) server — the only tier that can
+    carry an OAuth binding."""
+    return MCPServerConfig(name=name, source="user", **kw)
 
 
 def _make_sandbox(config):
@@ -239,6 +246,51 @@ class TestManifestRegression:
             == _make_sandbox(_cfg(True))._compute_user_mcp_config_hash()
         )
 
+    def test_user_mcp_config_hash_changes_when_oauth_binding_attaches(self):
+        """A first OAuth connect flips codegen to a relay-bound entry (url and
+        headers dropped), so the manifest MUST churn — even though the vendor's
+        tool set, and therefore the discovery fingerprint, is unchanged."""
+        def _cfg(**extra):
+            return _make_config(
+                servers=[
+                    _connector(
+                        "notes",
+                        transport="http",
+                        url="https://example.test/mcp",
+                        headers={"Authorization": "${vault:K}"},
+                        **extra,
+                    )
+                ]
+            )
+
+        assert (
+            _make_sandbox(_cfg())._compute_user_mcp_config_hash()
+            != _make_sandbox(
+                _cfg(oauth_connection_id="conn-1")
+            )._compute_user_mcp_config_hash()
+        )
+
+    def test_user_mcp_config_hash_stable_across_oauth_id_rotation(self):
+        """The binding is hashed as a BOOL: a reconnect mints a new connection
+        id, but codegen only branches on is-not-None, so the generated client is
+        byte-identical and re-uploading it would be pure churn."""
+        def _cfg(connection_id):
+            return _make_config(
+                servers=[
+                    _connector(
+                        "notes",
+                        transport="http",
+                        url="https://example.test/mcp",
+                        oauth_connection_id=connection_id,
+                    )
+                ]
+            )
+
+        assert (
+            _make_sandbox(_cfg("conn-1"))._compute_user_mcp_config_hash()
+            == _make_sandbox(_cfg("conn-2"))._compute_user_mcp_config_hash()
+        )
+
     @pytest.mark.asyncio
     async def test_manifest_tool_modules_omits_user_key_builtin_only(self):
         """A builtin-only config's tool_modules.source_versions has NO
@@ -376,6 +428,90 @@ class TestManifestRegression:
         # …and the load-bearing non-.py seed is hashed, so it can't drop silently.
         assert "market_protocol/instruments.yaml" in files
         assert manifest["modules"]["internal_packages"]["version"]
+
+
+# ---------------------------------------------------------------------------
+# Warm-sandbox sync — the OAuth binding is a codegen input
+# ---------------------------------------------------------------------------
+
+
+class TestWarmSandboxOAuthBinding:
+    """A warm sandbox re-uploads its generated client when a server becomes
+    relay-bound.
+
+    The binding is invisible to every other version input — the tool set is the
+    vendor's either way, and the discovery fingerprint ignores it by design — so
+    the manifest diff is the only thing that can carry it into a live sandbox.
+    """
+
+    TOOLS = {
+        "notes": [SimpleNamespace(name="list_notes", input_schema={"type": "object"})]
+    }
+
+    def _sandbox(self, *, oauth_connection_id=None):
+        config = _make_config(
+            servers=[
+                _builtin("yfinance"),
+                _connector(
+                    "notes",
+                    transport="http",
+                    url="https://example.test/mcp",
+                    headers={"Authorization": "${vault:K}"},
+                    oauth_connection_id=oauth_connection_id,
+                ),
+            ]
+        )
+        sandbox = _make_sandbox(config)
+        sandbox.mcp_registry = MagicMock()
+        # Byte-identical schemas on both sides: only the binding differs.
+        sandbox.mcp_registry.get_all_tools = MagicMock(return_value=self.TOOLS)
+        return sandbox
+
+    async def _sync(self, sandbox, remote_manifest):
+        """Drive the real sync against a sandbox already holding
+        ``remote_manifest``, with every upload/exec seam stubbed."""
+        sandbox._wait_ready = AsyncMock()
+        sandbox.ensure_sandbox_ready = AsyncMock()
+        sandbox._prune_disabled_tool_modules = AsyncMock()
+        sandbox._read_unified_manifest = AsyncMock(return_value=remote_manifest)
+        sandbox._install_tool_modules = AsyncMock()
+        sandbox._start_internal_mcp_servers = AsyncMock()
+        sandbox._write_unified_manifest = AsyncMock()
+        sandbox._cleanup_legacy_manifests = AsyncMock()
+        sandbox._upload_mcp_server_files_impl = AsyncMock()
+        sandbox._upload_internal_packages = AsyncMock()
+        with patch(
+            "ptc_agent.core.sandbox.assets.run_layout_migrations", AsyncMock()
+        ):
+            return await sandbox.sync_sandbox_assets(reusing_sandbox=True)
+
+    @pytest.mark.asyncio
+    async def test_binding_flip_regenerates_the_client(self):
+        """Connect-then-sync on a warm sandbox: the manifest the sandbox wrote
+        before the connect no longer matches, so mcp_client.py is regenerated.
+        Without it the sandbox keeps dialing the vendor directly with the
+        headers the connection displaced."""
+        pre_connect = await self._sandbox()._compute_sandbox_manifest()
+
+        bound = self._sandbox(oauth_connection_id="conn-1")
+        result = await self._sync(bound, pre_connect)
+
+        assert "tool_modules" in result.refreshed_modules
+        bound._install_tool_modules.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unchanged_binding_regenerates_nothing(self):
+        """Negative control: a sync with nothing moved must stay a no-op, or the
+        assertion above would pass on an unconditional re-upload."""
+        settled = await self._sandbox(
+            oauth_connection_id="conn-1"
+        )._compute_sandbox_manifest()
+
+        same = self._sandbox(oauth_connection_id="conn-1")
+        result = await self._sync(same, settled)
+
+        assert result.refreshed_modules == []
+        same._install_tool_modules.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

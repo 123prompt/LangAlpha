@@ -138,6 +138,30 @@ def sanitize_tool_name(name: str) -> str | None:
     return candidate
 
 
+def unsalvageable_required_params(input_schema) -> list[str]:
+    """Required wire params whose name can never become a Python identifier.
+
+    Codegen drops such a param from the wrapper signature, so a tool that
+    REQUIRES one can never be called correctly — discovery drops the whole tool
+    instead of advertising it healthy. Name COLLISIONS are deliberately not
+    counted: two params that sanitize to the same identifier are salvageable
+    (codegen de-duplicates them) and the tool stays callable.
+    """
+    if not isinstance(input_schema, dict):
+        return []
+    properties = input_schema.get("properties")
+    required = input_schema.get("required")
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        return []
+    return [
+        name
+        for name in required
+        if isinstance(name, str)
+        and name in properties
+        and sanitize_tool_name(name) is None
+    ]
+
+
 def sanitize_tool_text(text: str | None, max_len: int = DEFAULT_TOOL_TEXT_MAX_LEN) -> str:
     """Make untrusted text safe to embed inside a triple-quoted docstring.
 

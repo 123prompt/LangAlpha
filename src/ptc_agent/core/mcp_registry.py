@@ -218,8 +218,12 @@ class MCPServerConnector:
                     msg = f"URL required for SSE transport: {self.config.name}"
                     raise ValueError(msg)
 
-                # SSE connections need discovery retry due to endpoint event timing.
-                async with Client(sse_client(url)) as client:
+                # SSE connections need discovery retry due to endpoint event
+                # timing. Headers are resolved exactly as on the http arm — an
+                # authenticated SSE server 401s without them.
+                async with Client(
+                    sse_client(url, headers=self._resolve_headers())
+                ) as client:
                     await self._serve(client, retry_discovery=True)
 
             else:

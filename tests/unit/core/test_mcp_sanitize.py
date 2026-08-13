@@ -15,6 +15,7 @@ from ptc_agent.core.mcp_sanitize import (
     sanitize_tool_name,
     sanitize_tool_set,
     sanitize_tool_text,
+    unsalvageable_required_params,
     vault_refs,
 )
 
@@ -155,6 +156,54 @@ class TestSanitizeToolSet:
         assert [t.name for t in result.kept] == ["ok"]
         assert result.skipped[0][0] == "!!!"
         assert "identifier" in result.skipped[0][1]
+
+
+class TestUnsalvageableRequiredParams:
+    """Only params that codegen can never emit count — the tool is uncallable
+    without them, so discovery drops it."""
+
+    def test_required_illegal_name_reported(self):
+        schema = {"properties": {"名前": {}}, "required": ["名前"]}
+        assert unsalvageable_required_params(schema) == ["名前"]
+
+    def test_optional_illegal_name_ignored(self):
+        schema = {"properties": {"ok": {}, "名前": {}}, "required": ["ok"]}
+        assert unsalvageable_required_params(schema) == []
+
+    def test_collisions_are_salvageable(self):
+        # Both sanitize to 'foo_bar'; codegen de-duplicates rather than drops.
+        schema = {
+            "properties": {"foo-bar": {}, "foo.bar": {}},
+            "required": ["foo-bar", "foo.bar"],
+        }
+        assert unsalvageable_required_params(schema) == []
+
+    def test_keyword_and_dashed_names_are_salvageable(self):
+        schema = {
+            "properties": {"class": {}, "start-date": {}, "2nd": {}},
+            "required": ["class", "start-date", "2nd"],
+        }
+        assert unsalvageable_required_params(schema) == []
+
+    def test_required_name_absent_from_properties_ignored(self):
+        # Codegen binds params from 'properties' only, so a required key with
+        # no property was never going to be emitted either way.
+        assert unsalvageable_required_params({"properties": {}, "required": ["!!!"]}) == []
+
+    @pytest.mark.parametrize(
+        "schema",
+        [
+            None,
+            [],
+            "oops",
+            {},
+            {"properties": {"名前": {}}},  # no required list
+            {"properties": [], "required": ["名前"]},  # malformed container
+            {"properties": {"名前": {}}, "required": "名前"},  # required not a list
+        ],
+    )
+    def test_malformed_inputs_return_empty(self, schema):
+        assert unsalvageable_required_params(schema) == []
 
 
 class TestSanitizeToolText:

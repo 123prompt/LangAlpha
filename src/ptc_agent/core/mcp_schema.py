@@ -111,26 +111,36 @@ class MCPToolInfo:
         stored ``default: null`` is not the same as no default), ``nullable``,
         ``enum`` and ``items_type`` — resolved by :func:`resolve_schema_type`
         so wrappers and docs can show real types and allowed values.
+
+        Total by construction: a schema is whatever a server (or a cache
+        written by an older one) says it is, and this runs inside workspace
+        asset sync — one ``"properties": []`` must degrade to "no parameters",
+        never raise and wedge every other server's sync.
         """
-        params = {}
+        params: dict[str, Any] = {}
 
-        if "properties" in self.input_schema:
-            required_params = self.input_schema.get("required", [])
+        schema = self.input_schema if isinstance(self.input_schema, dict) else {}
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return params
 
-            for param_name, param_info in self.input_schema["properties"].items():
-                if not isinstance(param_info, dict):
-                    param_info = {}
-                resolved = resolve_schema_type(param_info)
-                params[param_name] = {
-                    "type": resolved.type,
-                    "description": param_info.get("description", ""),
-                    "required": param_name in required_params,
-                    "default": param_info.get("default"),
-                    "has_default": "default" in param_info,
-                    "nullable": resolved.nullable,
-                    "enum": resolved.enum,
-                    "items_type": resolved.items_type,
-                }
+        required_raw = schema.get("required")
+        required_params = required_raw if isinstance(required_raw, list) else []
+
+        for param_name, param_info in properties.items():
+            if not isinstance(param_info, dict):
+                param_info = {}
+            resolved = resolve_schema_type(param_info)
+            params[param_name] = {
+                "type": resolved.type,
+                "description": param_info.get("description", ""),
+                "required": param_name in required_params,
+                "default": param_info.get("default"),
+                "has_default": "default" in param_info,
+                "nullable": resolved.nullable,
+                "enum": resolved.enum,
+                "items_type": resolved.items_type,
+            }
 
         return params
 

@@ -311,6 +311,10 @@ class Session:
         self._owns_mcp_registry = False
         self.mcp_tool_summary = None
         self.mcp_config_version = None
+        # The binding records what the (now gone) sandbox held; keeping it
+        # would violate that invariant and read as a teardown trigger on the
+        # next sync.
+        self.egress_binding = None
 
         self._initialized = False
         self._agent_md_dirty = True
@@ -353,6 +357,7 @@ class Session:
         self._owns_mcp_registry = False
         self.mcp_tool_summary = None
         self.mcp_config_version = None
+        self.egress_binding = None
         # Restore the pristine server list so a restart re-enters PTCSandbox with
         # the unresolved built-ins, not the stale per-workspace resolution.
         self.config.mcp.servers = list(self._pristine_mcp_servers)

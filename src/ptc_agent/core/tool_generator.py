@@ -172,7 +172,10 @@ except ImportError:
 
         # Generate functions for each tool
         for tool in tools:
-            code += self._generate_function(tool, server_name, untrusted)
+            function_code = self._generate_function(tool, server_name, untrusted)
+            if not function_code:
+                continue  # unshippable schema — see _bind_params
+            code += function_code
             code += "\n\n"
 
         return code
@@ -189,11 +192,13 @@ except ImportError:
                 trusted builtin output is unchanged
 
         Returns:
-            Python function code
+            Python function code, or "" when the tool cannot ship at all
         """
         # Generate function signature
         func_name = _safe_func_name(tool.name)
         bindings = self._bind_params(tool, server_name)
+        if bindings is None:
+            return ""
         param_str = self._render_signature_params(bindings)
 
         # Generate docstring
@@ -202,17 +207,18 @@ except ImportError:
         # Generate function body: the arg-dict KEY is always the WIRE name —
         # the server rejects a sanitized rename like ``type_``. For untrusted
         # servers the key is emitted via repr (the name is untrusted text);
-        # builtins keep the historical double-quoted literal.
-        if untrusted:
-            arg_dict_entries = [
-                f"        {b.wire!r}: {b.py}," for b in bindings
-            ]
-        else:
-            arg_dict_entries = [
-                f'        "{b.wire}": {b.py},' for b in bindings
-            ]
+        # builtins keep the historical double-quoted literal. Required and
+        # optional params part ways on None: an optional param's None means
+        # "not provided" and its key is dropped, while a required param is
+        # sent unconditionally — its None is an explicit JSON null, and
+        # omitting the key would fail the server's required-field check.
+        def _entries(bs: list[_ParamBinding]) -> str:
+            if untrusted:
+                return "\n".join(f"        {b.wire!r}: {b.py}," for b in bs)
+            return "\n".join(f'        "{b.wire}": {b.py},' for b in bs)
 
-        args_dict = "\n".join(arg_dict_entries)
+        required = [b for b in bindings if b.info["required"]]
+        optional = [b for b in bindings if not b.info["required"]]
 
         # Extract return type from description for better type hints
         return_type, _ = self._extract_return_info(tool.description)
@@ -229,38 +235,63 @@ except ImportError:
                 f'    return _call_mcp_tool("{server_name}", "{tool.name}", arguments)'
             )
 
+        if required:
+            body = "    arguments = {\n" + _entries(required) + "\n    }\n"
+        else:
+            body = "    arguments = {}\n"
+        if optional:
+            body += (
+                "\n"
+                "    # Optional params: None means \"not provided\" — drop the key.\n"
+                "    # (Required params above are always sent; their None is a JSON null.)\n"
+                "    optional = {\n" + _entries(optional) + "\n    }\n"
+                "    arguments.update({k: v for k, v in optional.items() if v is not None})\n"
+            )
+
         return f'''def {func_name}({param_str}) -> {return_type}:
     """{docstring}"""
-    arguments = {{
-{args_dict}
-    }}
-
-    # Remove None values
-    arguments = {{k: v for k, v in arguments.items() if v is not None}}
-
+{body}
 {call_line}'''
 
-    def _bind_params(self, tool: MCPToolInfo, server_name: str) -> list[_ParamBinding]:
+    def _bind_params(
+        self, tool: MCPToolInfo, server_name: str
+    ) -> list[_ParamBinding] | None:
         """Resolve each schema param to a (wire, py) name pair, schema order.
 
         Names are sanitized for EVERY server: a Python name must be a legal
         non-keyword identifier or the module is a SyntaxError, and the
         sanitizer is the identity on names that already are. Trust gates
         untrusted *text* (descriptions, enum values), never identifiers.
-        Unsalvageable or colliding names are skipped.
+
+        Two params can sanitize to one identifier (``type`` and ``type_`` both
+        -> ``type_``); the loser is renamed, not dropped, because the wire key
+        it sends is unaffected and dropping a REQUIRED param ships a wrapper
+        that can never satisfy the server. Returns ``None`` when a required
+        param has no salvageable identifier at all — then the tool itself must
+        not ship.
         """
         bindings: list[_ParamBinding] = []
         seen: set[str] = set()
         for wire, info in tool.get_parameters().items():
             py = sanitize_tool_name(wire)
-            if py is None or py in seen:
+            if py is None:
+                if info["required"]:
+                    logger.warning(
+                        "Dropped MCP tool: required param has no valid Python name",
+                        server=server_name,
+                        tool=tool.name,
+                        param=wire,
+                    )
+                    return None
                 logger.warning(
-                    "Skipped invalid/colliding MCP tool param",
+                    "Skipped invalid MCP tool param",
                     server=server_name,
                     tool=tool.name,
                     param=wire,
                 )
                 continue
+            while py in seen:
+                py += "_"
             seen.add(py)
             bindings.append(_ParamBinding(wire, py, info))
         return bindings
@@ -528,6 +559,14 @@ except ImportError:
         # wire name (`type`) for a wrapper whose param is `type_` send the
         # agent straight into a TypeError.
         bindings = self._bind_params(tool, tool.server_name)
+        if bindings is None:
+            # The wrapper module drops this tool, so the docs must not advertise
+            # it as callable. No schema text is echoed — the reason is structural.
+            return (
+                f"# {func_name} (unavailable)\n\n"
+                "This tool is not callable from the sandbox: a required "
+                "parameter of its schema has no valid Python name.\n"
+            )
         description = (
             sanitize_tool_text(tool.description) if untrusted else tool.description
         )

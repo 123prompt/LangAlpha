@@ -40,12 +40,15 @@ Returns:
     arguments = {
         "type": type_,
         "class": class_,
+    }
+
+    # Optional params: None means "not provided" — drop the key.
+    # (Required params above are always sent; their None is a JSON null.)
+    optional = {
         "tags": tags,
         "note": note,
     }
-
-    # Remove None values
-    arguments = {k: v for k, v in arguments.items() if v is not None}
+    arguments.update({k: v for k, v in optional.items() if v is not None})
 
     return _call_mcp_tool("probe", "probe_tool", arguments)
 
@@ -72,13 +75,16 @@ Returns:
     arguments = {
         "count": count,
         "ratio": ratio,
-        "flag": flag,
         "payload": payload,
-        "mode": mode,
     }
 
-    # Remove None values
-    arguments = {k: v for k, v in arguments.items() if v is not None}
+    # Optional params: None means "not provided" — drop the key.
+    # (Required params above are always sent; their None is a JSON null.)
+    optional = {
+        "flag": flag,
+        "mode": mode,
+    }
+    arguments.update({k: v for k, v in optional.items() if v is not None})
 
     return _call_mcp_tool("probe", "probe_tool_2", arguments)
 
@@ -124,12 +130,15 @@ Returns:
     arguments = {
         'type': type_,
         'class': class_,
+    }
+
+    # Optional params: None means "not provided" — drop the key.
+    # (Required params above are always sent; their None is a JSON null.)
+    optional = {
         'tags': tags,
         'note': note,
     }
-
-    # Remove None values
-    arguments = {k: v for k, v in arguments.items() if v is not None}
+    arguments.update({k: v for k, v in optional.items() if v is not None})
 
     return _call_mcp_tool('probe', 'probe_tool', arguments)
 
@@ -156,13 +165,16 @@ Returns:
     arguments = {
         'count': count,
         'ratio': ratio,
-        'flag': flag,
         'payload': payload,
-        'mode': mode,
     }
 
-    # Remove None values
-    arguments = {k: v for k, v in arguments.items() if v is not None}
+    # Optional params: None means "not provided" — drop the key.
+    # (Required params above are always sent; their None is a JSON null.)
+    optional = {
+        'flag': flag,
+        'mode': mode,
+    }
+    arguments.update({k: v for k, v in optional.items() if v is not None})
 
     return _call_mcp_tool('probe', 'probe_tool_2', arguments)
 
