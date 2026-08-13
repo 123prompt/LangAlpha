@@ -39,7 +39,7 @@ scrape_pages(urls: list[str], mode: str = "fast", extraction: str = "markdown",
 |---|---|---|
 | `mode` | `"fast"` | `"fast"` plain HTTP · `"browser"` JS rendering · `"stealth"` bot-protected sites |
 | `extraction` | `"markdown"` | `"markdown"` (article text, cleaned) · `"html"` (raw) · `"text"` (plain) |
-| `timeout` | `30.0` | Per-fetch **seconds**, 1–120 — seconds in every mode, not ms |
+| `timeout` | `30.0` | Per-fetch **seconds**, 1–60 — seconds in every mode, not ms |
 | `solve_cloudflare` | `False` | Only meaningful with `mode="stealth"` |
 | `urls` | — | `scrape_pages` only; **max 10** per call |
 

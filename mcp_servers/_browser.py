@@ -8,12 +8,18 @@ timeout otherwise cancels teardown mid-flight and orphans Chromium helpers.
 Sandbox-runnable: scrapling imports inside the functions that use it, the same
 rule the MCP server files follow. Logging is the caller's job — pass
 ``on_close_error`` to observe a teardown failure.
+
+``url_block_reason`` lives here rather than beside the crawler's copy because
+callers of these fetchers run in sandboxes, where only ``mcp_servers/`` and a
+couple of ``src`` packages exist.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 #: ``(exception, post_cancel)`` — ``post_cancel`` marks the shielded close task
 #: failing after the caller was already cancelled, where nothing can be raised.
@@ -22,6 +28,41 @@ CloseErrorHook = Callable[[BaseException, bool], None]
 
 def _page_html(page: Any) -> str:
     return page.body.decode(page.encoding or "utf-8", errors="replace")
+
+
+def url_block_reason(url: str) -> str | None:
+    """Why this URL must not be fetched, or None if it may be.
+
+    The scrapling tiers drive their own transports, so the httpx-level guard
+    never sees them and this is the whole SSRF check on this path. Semantics
+    match the crawler's ``_validate_url``: literal addresses only, since a
+    hostname's resolution is not known until the fetch. Total by construction —
+    a malformed URL is a reason string, never a raise.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+    except ValueError as e:
+        return f"unparseable URL ({e})"
+
+    if parsed.scheme not in ("http", "https"):
+        return f"URL must be http(s), got scheme {parsed.scheme!r}"
+    if hostname in ("", "localhost"):
+        return "access to localhost is not allowed"
+
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return None  # a name, not a literal address
+    if (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_unspecified
+    ):
+        return f"access to private/reserved address {hostname} is not allowed"
+    return None
 
 
 async def fetch_fast(url: str, *, timeout_s: float) -> tuple[Any, str, int]:

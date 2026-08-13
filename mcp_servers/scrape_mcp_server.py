@@ -8,7 +8,8 @@ scrapling CLI was built against; ``_bootstrap`` handles our own era split.
 
 Fetching and extraction live in ``_browser``/``_extract``, shared with the
 in-process crawler; this file owns the tool contract — argument validation,
-per-URL error envelopes and the process-wide concurrency gates.
+per-URL error envelopes, the concurrency gates and the call budget every
+argument combination has to fit.
 
 Tools: scrape_page, scrape_pages.
 """
@@ -16,7 +17,9 @@ Tools: scrape_page, scrape_pages.
 from __future__ import annotations
 
 import asyncio
+import math
 import re
+import sys
 from typing import Any, List, Optional
 
 try:
@@ -24,7 +27,12 @@ try:
 except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._bootstrap import MCPServer
 
-from mcp_servers._browser import fetch_fast, fetch_with_session, make_session
+from mcp_servers._browser import (
+    fetch_fast,
+    fetch_with_session,
+    make_session,
+    url_block_reason,
+)
 from mcp_servers._extract import to_markdown, to_text
 from mcp_servers._schemas import (
     ERROR_PROPS,
@@ -39,20 +47,30 @@ mcp = MCPServer("ScrapeMCP")
 
 _MODES = ("fast", "browser", "stealth")
 _EXTRACTIONS = ("markdown", "html", "text")
-_MAX_TIMEOUT_S = 120.0
+_MAX_TIMEOUT_S = 60.0
 _DEFAULT_TIMEOUT_S = 30.0
 _MAX_BULK_URLS = 10
 # Browser sessions are ~400MB each; the third-party server serialized too.
 _BROWSER_CONCURRENCY = 2
 _FAST_CONCURRENCY = 8
+# The client kills the whole server process once a call passes its own timeout
+# (mcp_client_runtime._CALL_TIMEOUT, 120s), losing every result in the batch
+# and orphaning any live browser, so no argument combination may reach it.
+_CALL_BUDGET_S = 110.0
+# Session start and teardown sit outside the page-load timeout scrapling
+# honors; fast mode only has to absorb redirect and retry overshoot.
+_BROWSER_GRACE_S = 15.0
+_FAST_GRACE_S = 5.0
 _MAX_CONTENT_CHARS = 400_000
 _MAX_DETAIL_CHARS = 300
 
-# Process-wide, not per-call. A semaphore built inside the handler bounds only
-# its own batch, so N concurrent tool calls could still open 2N browsers and
-# blow the memory budget the limit exists to protect. Safe to build at import:
-# asyncio binds the loop on first contended acquire, and the stdio server runs
-# a single loop for the life of the process.
+# Per interpreter, not per call — and not process-wide across executions. A
+# semaphore built inside the handler would bound only its own batch, but each
+# execute_code spawns a fresh interpreter with its own server process, so K
+# parallel executions on one sandbox still reach K x _BROWSER_CONCURRENCY
+# browsers; the memory ceiling that needs is not enforceable from here. Safe to
+# build at import: asyncio binds the loop on first contended acquire, and the
+# stdio server runs a single loop for the life of the process.
 _BROWSER_SEM = asyncio.Semaphore(_BROWSER_CONCURRENCY)
 _FAST_SEM = asyncio.Semaphore(_FAST_CONCURRENCY)
 
@@ -135,6 +153,38 @@ def _extract_title(html: str) -> str:
     return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
 
 
+def _slots(mode: str) -> int:
+    return _FAST_CONCURRENCY if mode == "fast" else _BROWSER_CONCURRENCY
+
+
+def _grace_s(mode: str) -> float:
+    return _FAST_GRACE_S if mode == "fast" else _BROWSER_GRACE_S
+
+
+def _waves(mode: str, url_count: int) -> int:
+    """Sequential rounds a batch needs — the gate admits _slots(mode) at a time."""
+    return math.ceil(url_count / _slots(mode))
+
+
+def _fetch_bound_s(mode: str, timeout_s: float) -> float:
+    """Wall time one fetch may take: the page-load timeout scrapling honors,
+    plus the session start and teardown that sit outside it. The admission
+    check and the runtime bound both read it here so they cannot disagree."""
+    return timeout_s + _grace_s(mode)
+
+
+def _report_close_error(exc: BaseException, post_cancel: bool) -> None:
+    """Browser teardown failed — a leaked Chromium survives it, and the sandbox
+    image has no reaper. stderr is the only sink here: the client tails server
+    stderr when a call fails, and this server configures no logging."""
+    when = "after cancellation" if post_cancel else "during teardown"
+    print(
+        f"ERROR: scrape browser close failed {when}: {type(exc).__name__}: {exc}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 async def _fetch_html(
     url: str, mode: str, timeout_s: float, solve_cloudflare: bool
 ) -> tuple[str, int]:
@@ -144,20 +194,34 @@ async def _fetch_html(
 
     session = make_session(mode, timeout_ms=timeout_s * 1000)
     fetch_kwargs = {"solve_cloudflare": solve_cloudflare} if mode == "stealth" else {}
-    _, html, status = await fetch_with_session(session, url, **fetch_kwargs)
+    _, html, status = await fetch_with_session(
+        session, url, on_close_error=_report_close_error, **fetch_kwargs
+    )
     return html, status
 
 
 async def _scrape_one(
     url: str, mode: str, extraction: str, timeout_s: float, solve_cloudflare: bool
 ) -> dict:
-    if not url.startswith(("http://", "https://")):
-        return _error("invalid_url", f"URL must be http(s), got: {url[:200]}", url=url)
+    blocked = url_block_reason(url)
+    if blocked:
+        return _error("invalid_url", f"{blocked}: {url[:200]}", url=url)
+    fetch_bound_s = _fetch_bound_s(mode, timeout_s)
     # Gate held across the fetch only: the extraction below is thread work
     # holding no browser, so releasing early lets the next URL start sooner.
     async with (_FAST_SEM if mode == "fast" else _BROWSER_SEM):
         try:
-            html, status = await _fetch_html(url, mode, timeout_s, solve_cloudflare)
+            html, status = await asyncio.wait_for(
+                _fetch_html(url, mode, timeout_s, solve_cloudflare),
+                timeout=fetch_bound_s,
+            )
+        # Nothing under us bounds a browser fetch: start() takes no timeout and
+        # the Cloudflare solver loops without a cap. _browser shields close()
+        # precisely so this cancellation tears the session down cleanly.
+        except asyncio.TimeoutError:
+            return _error(
+                "fetch_failed", f"timed out after {fetch_bound_s:.0f}s", url=url
+            )
         except Exception as e:  # noqa: BLE001 - per-URL failures become error dicts
             return _error("fetch_failed", f"{type(e).__name__}: {e}", url=url)
 
@@ -201,6 +265,27 @@ def _validate_args(mode: str, extraction: str, timeout: float) -> Optional[dict]
     return None
 
 
+def _check_budget(mode: str, timeout: float, url_count: int) -> Optional[dict]:
+    """Refuse argument combinations whose worst case outlives _CALL_BUDGET_S.
+
+    URLs run in waves of _slots(mode), each wave bounded by timeout + grace, so
+    it is the batch — not the per-URL cap — that can push a call into the
+    client's process kill. Rejecting is the honest answer: quietly shrinking
+    the timeout would return a batch of fetch_failed rows with no cause.
+    """
+    waves = _waves(mode, url_count)
+    if waves * _fetch_bound_s(mode, timeout) <= _CALL_BUDGET_S:
+        return None
+    allowed = _CALL_BUDGET_S / waves - _grace_s(mode)
+    fits = int(_CALL_BUDGET_S // _fetch_bound_s(mode, timeout)) * _slots(mode)
+    return _error(
+        "invalid_timeout",
+        f"{url_count} URLs in {mode} mode run {waves} rounds of {_slots(mode)}, "
+        f"which fits timeout<={allowed:.0f}s, got: {timeout}. Send at most "
+        f"{min(fits, _MAX_BULK_URLS)} URLs at this timeout, or lower the timeout.",
+    )
+
+
 @mcp.tool()
 async def scrape_page(
     url: str,
@@ -216,10 +301,10 @@ async def scrape_page(
     solve_cloudflare=true only when 'stealth' still returns a challenge page.
 
     Args:
-        url: Full http(s) URL.
+        url: Full http(s) URL. Localhost and private addresses are rejected.
         mode: fast|browser|stealth.
         extraction: markdown (default) | html (raw) | text (plain).
-        timeout: Per-fetch seconds, 1-120.
+        timeout: Per-fetch seconds, 1-60.
         solve_cloudflare: Solve Cloudflare challenges (stealth mode only).
 
     Returns:
@@ -228,7 +313,7 @@ async def scrape_page(
         On error: {error, detail} — invalid_url|invalid_mode|
         invalid_extraction|invalid_timeout|fetch_failed.
     """
-    bad = _validate_args(mode, extraction, timeout)
+    bad = _validate_args(mode, extraction, timeout) or _check_budget(mode, timeout, 1)
     if bad:
         return bad
     return await _scrape_one(url, mode, extraction, timeout, solve_cloudflare)
@@ -245,13 +330,15 @@ async def scrape_pages(
     """Scrape up to 10 web pages concurrently.
 
     Same modes as scrape_page; per-URL failures come back as {error, detail}
-    entries in results instead of failing the batch.
+    entries in results instead of failing the batch. browser and stealth fetch
+    2 URLs at a time, so a batch that could not finish in time is refused with
+    invalid_timeout — at the default timeout they take 4 URLs per call.
 
     Args:
-        urls: Full http(s) URLs, max 10 per call.
+        urls: Full http(s) URLs, max 10 per call (4 in browser/stealth).
         mode: fast|browser|stealth.
         extraction: markdown (default) | html (raw) | text (plain).
-        timeout: Per-fetch seconds, 1-120.
+        timeout: Per-fetch seconds, 1-60.
         solve_cloudflare: Solve Cloudflare challenges (stealth mode only).
 
     Returns:
@@ -270,6 +357,9 @@ async def scrape_pages(
         return _error(
             "invalid_urls", f"max {_MAX_BULK_URLS} URLs per call, got {len(urls)}"
         )
+    over = _check_budget(mode, timeout, len(urls))
+    if over:
+        return over
 
     # _scrape_one holds the concurrency gate itself, so the batch just fans out.
     results = await asyncio.gather(
