@@ -1,12 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { screen, fireEvent, waitFor, act } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import React from 'react';
+import { renderWithProviders } from '@/test/utils';
 import { SandboxSettingsContent } from '../SandboxSettingsPanel';
 import { api } from '@/api/client';
 
 // ---------------------------------------------------------------------------
-// Mocks — cover the full API surface SecretsTab uses
+// Mocks — cover the full API surface the vault tab uses. `formatApiErrorDetail`
+// stays real (spread from the original module): the panel formats its own load
+// failures with it.
 // ---------------------------------------------------------------------------
 
 const mockGetVaultSecrets = vi.fn();
@@ -17,20 +20,30 @@ const mockRevealVaultSecret = vi.fn();
 const mockGetVaultBlueprints = vi.fn();
 const mockGetSandboxStats = vi.fn();
 
-vi.mock('../../utils/api', () => ({
-  getVaultSecrets: (...args: any[]) => mockGetVaultSecrets(...args),
-  createVaultSecret: (...args: any[]) => mockCreateVaultSecret(...args),
-  updateVaultSecret: (...args: any[]) => mockUpdateVaultSecret(...args),
-  deleteVaultSecret: (...args: any[]) => mockDeleteVaultSecret(...args),
-  revealVaultSecret: (...args: any[]) => mockRevealVaultSecret(...args),
-  getVaultBlueprints: (...args: any[]) => mockGetVaultBlueprints(...args),
-  getSandboxStats: (...args: any[]) => mockGetSandboxStats(...args),
-  installSandboxPackages: vi.fn(),
-  refreshWorkspace: vi.fn(),
-}));
+vi.mock('../../utils/api', async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    getVaultSecrets: (...args: unknown[]) => mockGetVaultSecrets(...args),
+    createVaultSecret: (...args: unknown[]) => mockCreateVaultSecret(...args),
+    updateVaultSecret: (...args: unknown[]) => mockUpdateVaultSecret(...args),
+    deleteVaultSecret: (...args: unknown[]) => mockDeleteVaultSecret(...args),
+    revealVaultSecret: (...args: unknown[]) => mockRevealVaultSecret(...args),
+    getVaultBlueprints: (...args: unknown[]) => mockGetVaultBlueprints(...args),
+    getSandboxStats: (...args: unknown[]) => mockGetSandboxStats(...args),
+    installSandboxPackages: vi.fn(),
+    refreshWorkspace: vi.fn(),
+  };
+});
 
+// The real api module is imported for its error helpers, and its transport
+// layer reads `api.defaults.baseURL` at module scope — so the stub needs that
+// shape, not just the verbs.
 vi.mock('@/api/client', () => ({
-  api: { get: vi.fn(), post: vi.fn() },
+  api: {
+    get: vi.fn(), post: vi.fn(), put: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+    defaults: { baseURL: '' },
+  },
 }));
 
 // ---------------------------------------------------------------------------
@@ -58,7 +71,7 @@ function defaultStats() {
 }
 
 function renderVaultTab() {
-  const view = render(<SandboxSettingsContent workspaceId="ws-1" />);
+  const view = renderWithProviders(<SandboxSettingsContent workspaceId="ws-1" />);
   // Switch to the Vault tab
   fireEvent.click(screen.getByRole('button', { name: /vault/i }));
   return view;
@@ -223,11 +236,12 @@ describe('SecretsTab — value regex hint', () => {
 // Refresh after create — blueprint disappears
 // ---------------------------------------------------------------------------
 
-describe('SecretsTab — load generation guard', () => {
+describe('SecretsTab — stale load isolation', () => {
   it('discards stale load results when workspaceId changes mid-flight', async () => {
-    // Slow first blueprint fetch (ws-1), fast second (ws-2). If the stale
-    // resolution leaks through, ws-1's blueprint would appear after ws-2 rendered.
-    let resolveFirstBlueprint: ((v: any) => void) | null = null;
+    // Slow first blueprint fetch (ws-1), fast second (ws-2). The workspace id is
+    // part of the query key, so a late ws-1 resolution settles ws-1's cache
+    // entry — it must never paint over the ws-2 view now on screen.
+    let resolveFirstBlueprint: ((v: unknown) => void) | null = null;
     mockGetVaultSecrets.mockResolvedValue([]);
     mockGetVaultBlueprints
       .mockImplementationOnce(
@@ -237,10 +251,10 @@ describe('SecretsTab — load generation guard', () => {
         () => Promise.resolve({ blueprints: [], remaining_slots: 20 }),
       );
 
-    const { rerender } = render(<SandboxSettingsContent workspaceId="ws-1" />);
+    const { rerender } = renderWithProviders(<SandboxSettingsContent workspaceId="ws-1" />);
     fireEvent.click(screen.getByRole('button', { name: /vault/i }));
 
-    // Wait for the ws-1 load() to actually kick off before we swap props,
+    // Wait for the ws-1 fetch to actually kick off before we swap props,
     // so React's effect scheduling can't collapse both loads into a single call.
     await waitFor(() => expect(mockGetVaultBlueprints).toHaveBeenCalledTimes(1));
 
@@ -269,7 +283,7 @@ describe('SecretsTab — workspace change resets form', () => {
       .mockResolvedValueOnce({ blueprints: [X_BLUEPRINT], remaining_slots: 20 })
       .mockResolvedValueOnce({ blueprints: [], remaining_slots: 20 });
 
-    const { rerender } = render(<SandboxSettingsContent workspaceId="ws-1" />);
+    const { rerender } = renderWithProviders(<SandboxSettingsContent workspaceId="ws-1" />);
     fireEvent.click(screen.getByRole('button', { name: /vault/i }));
 
     // Open the add form on ws-1 and type a value
@@ -350,7 +364,7 @@ function deferred<T>() {
 }
 
 async function openTab(name: RegExp) {
-  render(<SandboxSettingsContent workspaceId="ws-1" />);
+  renderWithProviders(<SandboxSettingsContent workspaceId="ws-1" />);
   await waitFor(() => expect(mockGetSandboxStats).toHaveBeenCalled());
   fireEvent.click(screen.getByRole('button', { name }));
 }
@@ -538,7 +552,7 @@ describe('refresh is reachable while every other action is disabled', () => {
 
   it('does not show one workspace under another id while the switch loads', async () => {
     mockGetSandboxStats.mockResolvedValue(liveStats('running'));
-    const { rerender } = render(<SandboxSettingsContent workspaceId="ws-1" />);
+    const { rerender } = renderWithProviders(<SandboxSettingsContent workspaceId="ws-1" />);
     await waitFor(() => expect(screen.getByText(/sandbox-abc/i)).toBeInTheDocument());
 
     const pending = deferred<any>();

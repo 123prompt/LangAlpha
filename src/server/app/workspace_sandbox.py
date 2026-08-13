@@ -807,7 +807,9 @@ async def _preview_redirect(workspace_id: str, port: int, path: str = "") -> Res
     async def _resolve() -> Response:
         manager = WorkspaceManager.get_instance()
         try:
-            session = await manager.get_session_for_workspace(workspace_id)
+            session = await manager.get_session_for_workspace(
+                workspace_id, user_id=workspace.get("user_id")
+            )
         except Exception:
             raise HTTPException(status_code=503, detail="Sandbox not ready") from None
 

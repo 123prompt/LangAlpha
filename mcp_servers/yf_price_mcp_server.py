@@ -18,17 +18,26 @@ Tools:
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 from typing import Any, List, Optional
 
 import pandas as pd
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
 
 from mcp_servers._envelope import make_error, make_response, normalize_interval
+from mcp_servers._schemas import (
+    ERRORS,
+    INT,
+    OBJECT,
+    OBJECTS_BY_KEY,
+    RECORDS,
+    STR,
+    envelope_schema,
+    output_model,
+)
 from mcp_servers._yf_common import boundary, format_datetime, safe_detail
 
 SOURCE = "yfinance"
@@ -186,7 +195,17 @@ def _serialize_history(df: pd.DataFrame, price_divisor: float = 1.0) -> list[dic
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("YFinancePriceMCP")
+mcp = MCPServer("YFinancePriceMCP")
+
+
+_OUT_GET_STOCK_HISTORY = output_model(
+    "GetStockHistoryOut",
+    envelope_schema(
+        RECORDS,
+        frame=("symbol", "interval", "currency", "timezone"),
+        echo={"period": STR},
+    ),
+)
 
 
 @mcp.tool()
@@ -194,7 +213,7 @@ def get_stock_history(
     ticker: str,
     period: str = "1y",
     interval: str = "1d",
-) -> dict:
+) -> _OUT_GET_STOCK_HISTORY:
     """Historical OHLCV price bars for one stock — charts, returns, technicals.
 
     Args:
@@ -245,12 +264,22 @@ def get_stock_history(
         )
 
 
+_OUT_GET_MULTIPLE_STOCKS_HISTORY = output_model(
+    "GetMultipleStocksHistoryOut",
+    envelope_schema(
+        OBJECTS_BY_KEY,
+        frame=("interval",),
+        echo={"period": STR, "errors": ERRORS},
+    ),
+)
+
+
 @mcp.tool()
 def get_multiple_stocks_history(
     tickers: List[str],
     period: str = "1y",
     interval: str = "1d",
-) -> dict:
+) -> _OUT_GET_MULTIPLE_STOCKS_HISTORY:
     """Historical OHLCV bars for several stocks — compare price series.
 
     Args:
@@ -314,8 +343,18 @@ def get_multiple_stocks_history(
     return result
 
 
+_OUT_GET_DIVIDENDS_AND_SPLITS = output_model(
+    "GetDividendsAndSplitsOut",
+    envelope_schema(
+        OBJECT,
+        frame=("symbol", "currency", "timezone"),
+        echo={"dividend_count": INT, "split_count": INT},
+    ),
+)
+
+
 @mcp.tool()
-def get_dividends_and_splits(ticker: str) -> dict:
+def get_dividends_and_splits(ticker: str) -> _OUT_GET_DIVIDENDS_AND_SPLITS:
     """Full dividend and stock-split history for one ticker. Use for
     total-return, yield, and adjustment analysis.
 
@@ -366,8 +405,14 @@ def get_dividends_and_splits(ticker: str) -> dict:
         )
 
 
+_OUT_GET_MULTIPLE_STOCKS_DIVIDENDS = output_model(
+    "GetMultipleStocksDividendsOut",
+    envelope_schema(OBJECTS_BY_KEY, echo={"errors": ERRORS}),
+)
+
+
 @mcp.tool()
-def get_multiple_stocks_dividends(tickers: List[str]) -> dict:
+def get_multiple_stocks_dividends(tickers: List[str]) -> _OUT_GET_MULTIPLE_STOCKS_DIVIDENDS:
     """Dividend history for several stocks in one call. Use to compare payout
     histories across tickers.
 

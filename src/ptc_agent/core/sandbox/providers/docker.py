@@ -705,6 +705,12 @@ class DockerProvider(SandboxProvider):
             "Init": True,  # tini as PID 1 for zombie reaping
         }
 
+        # host.docker.internal resolves natively on Docker Desktop but not on
+        # Linux bridge networks; pin it so the egress relay's default base URL
+        # (see services/egress/reachability.py) works on both.
+        if self._config.network_mode != "none":
+            host_config["ExtraHosts"] = ["host.docker.internal:host-gateway"]
+
         # Publish proxy ports so preview URLs are reachable from the host.
         # Use dynamic host ports (HostPort: "") so multiple containers can
         # coexist without port conflicts.

@@ -33,6 +33,10 @@ ENV/
 .env
 .env.local
 .env.production
+.env.*.overlay
+.env.*.archive
+.env.*.retired
+.env*.bak*
 
 # Production deploy files
 docker-compose.prod.yml
@@ -107,3 +111,6 @@ TODO.md
 
 docs/pr_context/
 .astack/
+
+/deploy.sh
+/deploy/lib/

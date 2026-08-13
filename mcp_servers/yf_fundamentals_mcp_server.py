@@ -21,21 +21,36 @@ Tools:
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 import json
 from typing import List
 
 import pandas as pd
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
 
 from mcp_servers._envelope import make_error, make_response
+from mcp_servers._schemas import (
+    BOOL,
+    ERRORS,
+    OBJECT,
+    OBJECTS_BY_KEY,
+    RECORDS,
+    STR,
+    STR_LIST,
+    described,
+    envelope_schema,
+    output_model,
+)
 from mcp_servers._yf_common import boundary, format_datetime, safe_detail, serialize_records
 
 SOURCE = "yfinance"
+
+# Wording drift from the shared ``ERRORS`` descriptor, pinned here so the
+# published bytes stay stable; unify the two the next time schemas may move.
+_ERRORS = described(ERRORS, "Error envelopes for symbols omitted from data.")
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +74,7 @@ def _serialize_dataframe(df: pd.DataFrame) -> dict:
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("YFinanceFundamentalsMCP")
+mcp = MCPServer("YFinanceFundamentalsMCP")
 
 
 # ---------------------------------------------------------------------------
@@ -67,8 +82,20 @@ mcp = FastMCP("YFinanceFundamentalsMCP")
 # ---------------------------------------------------------------------------
 
 
+_OUT_GET_INCOME_STATEMENT = output_model(
+    "GetIncomeStatementOut",
+    envelope_schema(
+        OBJECTS_BY_KEY,
+        frame=("symbol",),
+        echo={"quarterly": BOOL},
+    ),
+)
+
+
 @mcp.tool()
-def get_income_statement(ticker: str, quarterly: bool = True) -> dict:
+def get_income_statement(
+    ticker: str, quarterly: bool = True
+) -> _OUT_GET_INCOME_STATEMENT:
     """Income statement (revenue, expenses, margins, net income). Use for
     profitability and top-line trends.
 
@@ -102,8 +129,18 @@ def get_income_statement(ticker: str, quarterly: bool = True) -> dict:
         )
 
 
+_OUT_GET_BALANCE_SHEET = output_model(
+    "GetBalanceSheetOut",
+    envelope_schema(
+        OBJECTS_BY_KEY,
+        frame=("symbol",),
+        echo={"quarterly": BOOL},
+    ),
+)
+
+
 @mcp.tool()
-def get_balance_sheet(ticker: str, quarterly: bool = True) -> dict:
+def get_balance_sheet(ticker: str, quarterly: bool = True) -> _OUT_GET_BALANCE_SHEET:
     """Balance sheet (assets, liabilities, equity). Use for leverage, liquidity,
     and capital-structure analysis.
 
@@ -137,8 +174,18 @@ def get_balance_sheet(ticker: str, quarterly: bool = True) -> dict:
         )
 
 
+_OUT_GET_CASH_FLOW = output_model(
+    "GetCashFlowOut",
+    envelope_schema(
+        OBJECTS_BY_KEY,
+        frame=("symbol",),
+        echo={"quarterly": BOOL},
+    ),
+)
+
+
 @mcp.tool()
-def get_cash_flow(ticker: str, quarterly: bool = True) -> dict:
+def get_cash_flow(ticker: str, quarterly: bool = True) -> _OUT_GET_CASH_FLOW:
     """Cash flow statement (operating, investing, financing). Use for cash
     generation and capex analysis.
 
@@ -172,8 +219,13 @@ def get_cash_flow(ticker: str, quarterly: bool = True) -> dict:
         )
 
 
+_OUT_GET_COMPANY_INFO = output_model(
+    "GetCompanyInfoOut", envelope_schema(OBJECT, frame=("symbol", "currency"))
+)
+
+
 @mcp.tool()
-def get_company_info(ticker: str) -> dict:
+def get_company_info(ticker: str) -> _OUT_GET_COMPANY_INFO:
     """Company profile and key statistics. Use for sector/industry, market cap,
     valuation ratios, and business summary.
 
@@ -222,8 +274,13 @@ def get_company_info(ticker: str) -> dict:
         )
 
 
+_OUT_GET_EARNINGS_DATES = output_model(
+    "GetEarningsDatesOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_earnings_dates(ticker: str) -> dict:
+def get_earnings_dates(ticker: str) -> _OUT_GET_EARNINGS_DATES:
     """Earnings announcement dates with EPS estimate vs. actual. Use for the
     earnings schedule and recent surprises.
 
@@ -253,8 +310,13 @@ def get_earnings_dates(ticker: str) -> dict:
         )
 
 
+_OUT_GET_EARNINGS_DATA = output_model(
+    "GetEarningsDataOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_earnings_data(ticker: str) -> dict:
+def get_earnings_data(ticker: str) -> _OUT_GET_EARNINGS_DATA:
     """Historical EPS estimate vs. actual per quarter. Use to review earnings
     beats/misses. Same data as get_earnings_history (analysis server).
 
@@ -288,12 +350,26 @@ def get_earnings_data(ticker: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_OUT_COMPARE_FINANCIALS = output_model(
+    "CompareFinancialsOut",
+    envelope_schema(
+        OBJECTS_BY_KEY,
+        echo={
+            "statement_type": STR,
+            "quarterly": BOOL,
+            "successful_tickers": STR_LIST,
+            "errors": _ERRORS,
+        },
+    ),
+)
+
+
 @mcp.tool()
 def compare_financials(
     tickers: List[str],
     statement_type: str = "income",
     quarterly: bool = True,
-) -> dict:
+) -> _OUT_COMPARE_FINANCIALS:
     """Financial statements for several companies for side-by-side comparison.
 
     Args:
@@ -367,8 +443,17 @@ def compare_financials(
     return result
 
 
+_OUT_COMPARE_VALUATIONS = output_model(
+    "CompareValuationsOut",
+    envelope_schema(
+        OBJECTS_BY_KEY,
+        echo={"successful_tickers": STR_LIST, "errors": _ERRORS},
+    ),
+)
+
+
 @mcp.tool()
-def compare_valuations(tickers: List[str]) -> dict:
+def compare_valuations(tickers: List[str]) -> _OUT_COMPARE_VALUATIONS:
     """Valuation multiples across several stocks for side-by-side comparison.
 
     Args:
@@ -438,8 +523,19 @@ def compare_valuations(tickers: List[str]) -> dict:
     return result
 
 
+_OUT_GET_MULTIPLE_STOCKS_EARNINGS = output_model(
+    "GetMultipleStocksEarningsOut",
+    envelope_schema(
+        OBJECTS_BY_KEY,
+        echo={"successful_tickers": STR_LIST, "errors": _ERRORS},
+    ),
+)
+
+
 @mcp.tool()
-def get_multiple_stocks_earnings(tickers: List[str]) -> dict:
+def get_multiple_stocks_earnings(
+    tickers: List[str],
+) -> _OUT_GET_MULTIPLE_STOCKS_EARNINGS:
     """Historical earnings (EPS estimate vs. actual) for several stocks at once.
 
     Args:

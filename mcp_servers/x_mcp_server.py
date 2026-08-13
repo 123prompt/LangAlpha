@@ -17,7 +17,22 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+
+try:
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
+except ModuleNotFoundError:  # imported as a package module (tests)
+    from mcp_servers._bootstrap import MCPServer
+
+from mcp_servers._schemas import (
+    ERROR_PROPS,
+    INT,
+    NULLABLE_STR,
+    OBJECT,
+    RECORDS,
+    described,
+    output_model,
+    union_schema,
+)
 
 X_API_BASE = "https://api.x.com/2"
 _HTTP_TIMEOUT = 30.0
@@ -62,7 +77,57 @@ async def _lifespan(app):
         _client = None
 
 
-mcp = FastMCP("XApiMCP", lifespan=_lifespan)
+mcp = MCPServer("XApiMCP", lifespan=_lifespan)
+
+# Published output schemas. X tools are off the market-data envelope contract:
+# their success shapes are tool-specific, so each frame is built by hand from
+# ``union_schema``. The error arm requires only `error`: rate_limited replies
+# carry no detail, and auth/http errors carry a structured (or null) detail
+# from the API — hence an untyped ``detail`` rather than the shared string one.
+_ERROR_PROPS = {
+    **ERROR_PROPS,
+    "detail": {
+        "description": (
+            "Error detail — string or structured payload from the upstream API "
+            "(error responses only)."
+        ),
+    },
+}
+
+
+def _x_schema(
+    properties: dict[str, Any], success_required: tuple[str, ...]
+) -> dict[str, Any]:
+    return union_schema(
+        properties,
+        success_required,
+        error_props=_ERROR_PROPS,
+        error_required=("error",),
+    )
+
+
+_OUT_SEARCH = output_model(
+    "XSearchOut",
+    _x_schema(
+        {
+            "posts": described(RECORDS, "Posts with author fields merged in."),
+            "next_token": described(
+                NULLABLE_STR, "Pagination cursor; null when no more pages."
+            ),
+            "result_count": INT,
+        },
+        ("posts", "result_count"),
+    ),
+)
+
+_OUT_USER = output_model("XUserOut", _x_schema({"user": OBJECT}, ("user",)))
+
+_OUT_POST = output_model(
+    "XPostOut",
+    _x_schema(
+        {"post": described(OBJECT, "Post with author fields merged in.")}, ("post",)
+    ),
+)
 
 
 def _resolve_token(bearer_token: Optional[str]) -> Optional[str]:
@@ -249,7 +314,7 @@ async def search_posts(
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
     next_token: Optional[str] = None,
-) -> dict:
+) -> _OUT_SEARCH:
     """Search recent X posts (last ~7 days) using X search syntax.
 
     Args:
@@ -289,7 +354,7 @@ async def search_all_posts(
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
     next_token: Optional[str] = None,
-) -> dict:
+) -> _OUT_SEARCH:
     """Full-archive X post search, back to March 2006. Use when `search_posts`
     (recent 7-day window) doesn't reach far enough back.
 
@@ -324,7 +389,7 @@ async def search_all_posts(
 async def get_user_by_username(
     username: str,
     bearer_token: Optional[str] = None,
-) -> dict:
+) -> _OUT_USER:
     """Look up an X user profile by handle (without @).
 
     Args:
@@ -368,7 +433,7 @@ async def get_user_by_username(
 async def get_tweet_by_id(
     tweet_id: str,
     bearer_token: Optional[str] = None,
-) -> dict:
+) -> _OUT_POST:
     """Fetch a single X post by its numeric id.
 
     Args:
@@ -413,7 +478,7 @@ async def get_conversation(
     bearer_token: Optional[str] = None,
     max_results: int = 50,
     next_token: Optional[str] = None,
-) -> dict:
+) -> _OUT_SEARCH:
     """Fetch replies to an X conversation thread (last ~7 days).
 
     Args:
@@ -447,4 +512,4 @@ async def get_conversation(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="stdio")

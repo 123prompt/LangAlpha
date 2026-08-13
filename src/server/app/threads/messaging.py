@@ -1167,7 +1167,7 @@ async def offload_thread(thread_id: str, x_user_id: CurrentUserId):
     await auth_api.require_thread_owner(thread_id, x_user_id)
     from src.server.handlers.thread_maintenance import trigger_offload
 
-    return await trigger_offload(thread_id)
+    return await trigger_offload(thread_id, user_id=x_user_id)
 
 
 @router.get("/{thread_id}/turns")

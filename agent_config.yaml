@@ -68,6 +68,12 @@ mcp:
   # MCP server configurations
   # Note: Filesystem is now a first-class tool (see filesystem section below)
   # Each server can have 'enabled: true/false' to enable/disable it (default: true)
+  #
+  # Third-party stdio servers: always launch isolated — uvx/npx with pinned
+  # versions — never from the shared environment, whose dependency pins
+  # (including the mcp SDK) will strand them on the next SDK major. Builtin
+  # servers under mcp_servers/ are era-proof via _bootstrap and run with
+  # `uv run python`.
   servers:
     # Price data MCP server for OHLCV time series.
     - name: "price_data"
@@ -171,16 +177,18 @@ mcp:
       args: ["run", "python", "mcp_servers/yf_market_mcp_server.py"]
       env: {}
 
-    # Scrapling web scraping MCP server
-    # Provides get, bulk_get, fetch, bulk_fetch, stealthy_fetch, bulk_stealthy_fetch
-    - name: "scrapling"
+    # In-house web scraping MCP server (mcp_servers/scrape_mcp_server.py).
+    # Imports scrapling as a library, so it runs under either mcp SDK era —
+    # the third-party `scrapling mcp` entrypoint is mcp 1.x-only and cannot
+    # start from an mcp 2.x environment.
+    - name: "scrape"
       enabled: true
-      description: "Web scraping with anti-bot bypass, CSS selection, and markdown extraction"
-      instruction: "Use for scraping web pages. Choose extraction_type='markdown' for readable content. Use 'get' for fast HTTP requests, 'fetch' for JS-rendered pages, 'stealthy_fetch' for Cloudflare-protected sites. Bulk variants accept multiple URLs for parallel scraping."
+      description: "Web scraping with anti-bot bypass and markdown extraction"
+      instruction: "Use scrape_page for one URL, scrape_pages for batches. Start with mode='fast'; use 'browser' for JS-rendered pages, 'stealth' for bot-protected sites (add solve_cloudflare=true if still blocked). extraction: markdown|html|text."
       tool_exposure_mode: "summary"
       transport: "stdio"
-      command: "scrapling"
-      args: ["mcp"]
+      command: "uv"
+      args: ["run", "python", "mcp_servers/scrape_mcp_server.py"]
       env: {}
 
     # X (Twitter) API MCP server — read-only post search, user lookup, tweet lookup, thread fetch.

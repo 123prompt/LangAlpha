@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.server.services.workspace_manager import WorkspaceManager
+from tests.unit.server.mcp_builders import resolved_mcp
 
 
 def _make_config():
@@ -64,16 +65,22 @@ def _make_session(*, version=None, summary=None):
     session._builtin_mcp_registry = session.mcp_registry
     session.mcp_tool_summary = summary
     session.mcp_config_version = version
+    session.egress_binding = None
     return session
 
 
-def _resolved(version, servers=None, user_names=None):
-    r = MagicMock()
-    r.version = version
-    r.servers = servers or []
-    r.builtin_names = frozenset()
-    r.user_names = frozenset(user_names or [])
-    return r
+def _srv(name, *, source="workspace", oauth_connection_id=None):
+    """A stand-in server config (MagicMock: only the read fields matter)."""
+    server = MagicMock()
+    server.name = name
+    server.source = source
+    server.oauth_connection_id = oauth_connection_id
+    return server
+
+
+def _resolved(version, servers=None):
+    """A real ResolvedMCP whose ``servers`` are workspace-local entries."""
+    return resolved_mcp(version=version, local=list(servers or []))
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +162,9 @@ class TestSessionCachesMcp:
             new_callable=AsyncMock,
             return_value=resolved,
         ) as mock_resolve, patch(
+            "src.server.services.workspace_manager.sync_egress_relay",
+            new=AsyncMock(return_value=True),
+        ), patch(
             "ptc_agent.core.mcp_registry.build_composite_registry",
             return_value=composite,
         ), patch(
@@ -171,6 +181,69 @@ class TestSessionCachesMcp:
         assert session.sandbox.mcp_registry is composite
         assert session.mcp_tool_summary == "SUMMARY"
         assert session.mcp_config_version == 2
+
+    @pytest.mark.asyncio
+    async def test_apply_session_mcp_withholds_the_stamp_on_a_refused_push(self):
+        """A refused relay-credential push must not be stamped as applied:
+        nothing else re-pushes the file, so the version stays None (the
+        busted-stamp idiom) and the next acquire re-resolves and retries.
+        The composite still installs — non-OAuth tools stay live."""
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=None, summary=None)
+        resolved = _resolved(2)
+
+        composite = MagicMock()
+        with patch(
+            "src.server.services.mcp_config.resolve_mcp_config",
+            new_callable=AsyncMock,
+            return_value=resolved,
+        ), patch(
+            "src.server.services.workspace_manager.sync_egress_relay",
+            new=AsyncMock(return_value=False),
+        ), patch(
+            "ptc_agent.core.mcp_registry.build_composite_registry",
+            return_value=composite,
+        ), patch(
+            "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+            return_value="SUMMARY",
+        ):
+            out = await wm._apply_session_mcp(
+                "ws", "user-1", session, ws_version=2
+            )
+
+        assert out is resolved
+        assert session.mcp_registry is composite
+        assert session.mcp_tool_summary == "SUMMARY"
+        assert session.mcp_config_version is None
+
+    @pytest.mark.asyncio
+    async def test_apply_session_mcp_withholds_the_stamp_when_the_sync_raises(self):
+        """The swallowed-exception path is a failed publication too — it must
+        leave the same retry signal as an explicit refusal."""
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=None, summary=None)
+        resolved = _resolved(2)
+
+        with patch(
+            "src.server.services.mcp_config.resolve_mcp_config",
+            new_callable=AsyncMock,
+            return_value=resolved,
+        ), patch(
+            "src.server.services.workspace_manager.sync_egress_relay",
+            new=AsyncMock(side_effect=RuntimeError("relay down")),
+        ), patch(
+            "ptc_agent.core.mcp_registry.build_composite_registry",
+            return_value=MagicMock(),
+        ), patch(
+            "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+            return_value="SUMMARY",
+        ):
+            out = await wm._apply_session_mcp(
+                "ws", "user-1", session, ws_version=2
+            )
+
+        assert out is resolved
+        assert session.mcp_config_version is None
 
     @pytest.mark.asyncio
     async def test_install_composite_builds_from_builtin_not_prior_composite(self):
@@ -200,6 +273,61 @@ class TestSessionCachesMcp:
             await wm._install_session_composite(session, resolved)
 
         assert captured["reg"] is builtin
+
+    @pytest.mark.asyncio
+    async def test_composite_prefers_the_user_tier_for_inherited_servers(self):
+        """A workspace snapshot of an inherited server is OAuth-blind and can
+        outlive a disconnect/reconnect; the host-side user snapshot is purged
+        and refreshed with the connection. The agent lane must serve the user
+        tier — the same precedence the effective-list API already used."""
+        from ptc_agent.config.core import MCPServerConfig
+        from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=1, summary="old")
+        inherited = MCPServerConfig(
+            name="robinhood", transport="http",
+            url="https://api.example.test/mcp", source="user",
+        )
+        resolved = resolved_mcp(version=2, inherited=[inherited])
+
+        def _row(tool_name):
+            return {
+                "server_name": "robinhood",
+                "status": "ok",
+                "config_hash": mcp_discovery_fingerprint(inherited),
+                "tools": [{"name": tool_name}],
+            }
+
+        captured = {}
+
+        def fake_build(reg, servers, schemas, disabled=frozenset()):
+            captured["schemas"] = schemas
+            return MagicMock()
+
+        with (
+            patch(
+                "src.server.database.mcp_tool_schemas.get_tool_schemas",
+                new=AsyncMock(return_value=[_row("stale_in_sandbox")]),
+            ),
+            patch(
+                "src.server.database.mcp_tool_schemas.get_user_tool_schemas",
+                new=AsyncMock(return_value=[_row("fresh_host_side")]),
+            ),
+            patch(
+                "ptc_agent.core.mcp_registry.build_composite_registry",
+                side_effect=fake_build,
+            ),
+            patch(
+                "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+                return_value="S",
+            ),
+        ):
+            await wm._install_session_composite(session, resolved, user_id="user-1")
+
+        assert [t["name"] for t in captured["schemas"]["robinhood"]] == [
+            "fresh_host_side"
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -352,24 +480,101 @@ class TestVersionDeltaBackgroundDiscovery:
         assert ws_id not in wm._mcp_discovery_tasks_by_ws
 
     @pytest.mark.asyncio
-    async def test_servers_needing_discovery_excludes_servers_with_tools(self):
-        """Only user servers without cached tools (pending/new) need discovery."""
+    async def test_servers_needing_discovery_settles_on_snapshot_not_tools(self):
+        """Settlement is the recorded ok-snapshot set, not the composite's tool
+        count — alpha is settled even though it contributes zero tools."""
         wm = WorkspaceManager.get_instance(config=_make_config())
         session = _make_session()
-        # Composite reports alpha has tools, beta has none.
+        session.mcp_settled_servers = {"alpha"}
+        # The registry would have called alpha unsettled (zero tools) — the
+        # predicate must not consult it.
         session.mcp_registry.get_all_tools = MagicMock(
-            return_value={"alpha": [MagicMock()], "beta": []}
+            return_value={"alpha": [], "beta": []}
         )
-        alpha = MagicMock()
-        alpha.name = "alpha"
-        alpha.source = "workspace"
-        beta = MagicMock()
-        beta.name = "beta"
-        beta.source = "workspace"
-        resolved = _resolved(2, servers=[alpha, beta])
+        resolved = _resolved(2, servers=[_srv("alpha"), _srv("beta")])
 
         needing = wm._servers_needing_discovery(session, resolved)
         assert [s.name for s in needing] == ["beta"]
+
+    @pytest.mark.asyncio
+    async def test_an_ok_empty_snapshot_settles_discovery(self):
+        """A server that legitimately advertises zero tools (or whose tools
+        were all sanitized out) has an ok snapshot and must NOT re-probe on
+        every acquire — its untrusted process would otherwise respawn forever."""
+        from ptc_agent.config.core import MCPServerConfig
+        from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=1, summary="old")
+        server = MCPServerConfig(
+            name="zerotool", transport="stdio", command="npx",
+            args=["-y", "zero-tool-server"], source="workspace",
+        )
+        resolved = resolved_mcp(version=2, local=[server])
+
+        with (
+            patch(
+                "src.server.database.mcp_tool_schemas.get_tool_schemas",
+                new=AsyncMock(return_value=[{
+                    "server_name": "zerotool",
+                    "status": "ok",
+                    "config_hash": mcp_discovery_fingerprint(server),
+                    "tools": [],
+                }]),
+            ),
+            patch(
+                "ptc_agent.core.mcp_registry.build_composite_registry",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+                return_value="S",
+            ),
+        ):
+            await wm._install_session_composite(session, resolved)
+
+        assert session.mcp_settled_servers == {"zerotool"}
+        assert wm._servers_needing_discovery(session, resolved) == []
+
+    @pytest.mark.asyncio
+    async def test_an_error_snapshot_still_needs_discovery(self):
+        """Error rows are not settlement — the next acquire retries them."""
+        from ptc_agent.config.core import MCPServerConfig
+        from src.server.services.mcp_discovery import mcp_discovery_fingerprint
+
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=1, summary="old")
+        server = MCPServerConfig(
+            name="flaky", transport="stdio", command="npx",
+            args=["-y", "flaky-server"], source="workspace",
+        )
+        resolved = resolved_mcp(version=2, local=[server])
+
+        with (
+            patch(
+                "src.server.database.mcp_tool_schemas.get_tool_schemas",
+                new=AsyncMock(return_value=[{
+                    "server_name": "flaky",
+                    "status": "error",
+                    "config_hash": mcp_discovery_fingerprint(server),
+                    "tools": [],
+                }]),
+            ),
+            patch(
+                "ptc_agent.core.mcp_registry.build_composite_registry",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+                return_value="S",
+            ),
+        ):
+            await wm._install_session_composite(session, resolved)
+
+        assert session.mcp_settled_servers == set()
+        assert [s.name for s in wm._servers_needing_discovery(session, resolved)] == [
+            "flaky"
+        ]
 
     @pytest.mark.asyncio
     @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
@@ -409,6 +614,9 @@ class TestVersionDeltaBackgroundDiscovery:
             new_callable=AsyncMock,
             return_value=resolved,
         ) as mock_resolve, patch(
+            "src.server.services.workspace_manager.sync_egress_relay",
+            new=AsyncMock(return_value=True),
+        ), patch(
             "ptc_agent.core.mcp_registry.build_composite_registry",
             return_value=MagicMock(),
         ), patch(
@@ -544,7 +752,7 @@ class TestDiscoveryKickSeesCachedSession:
         mock_session_mgr.get_session.return_value = session
 
         wm._mint_sandbox_tokens = AsyncMock(return_value={})
-        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, user_names=["alpha"]))
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, servers=[_srv("alpha")]))
         wm._servers_needing_discovery = MagicMock(return_value=[MagicMock(name="alpha")])
         wm._sync_sandbox_assets = AsyncMock()
         wm._restore_files = AsyncMock()
@@ -576,7 +784,7 @@ class TestDiscoveryKickSeesCachedSession:
         session.initialize = AsyncMock()
         mock_session_mgr.get_session.return_value = session
 
-        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, user_names=["alpha"]))
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, servers=[_srv("alpha")]))
         wm._servers_needing_discovery = MagicMock(return_value=[MagicMock(name="alpha")])
         wm._sync_sandbox_assets = AsyncMock()
         wm._maybe_migrate_sandbox = AsyncMock(return_value=None)
@@ -618,7 +826,7 @@ class TestDiscoveryKickSeesCachedSession:
         mock_session_mgr.get_session.return_value = session
 
         wm._mint_sandbox_tokens = AsyncMock(return_value={})
-        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, user_names=["alpha"]))
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1, servers=[_srv("alpha")]))
         wm._servers_needing_discovery = MagicMock(return_value=[MagicMock(name="alpha")])
         wm._sync_sandbox_assets = AsyncMock()
         wm._restore_files = AsyncMock()

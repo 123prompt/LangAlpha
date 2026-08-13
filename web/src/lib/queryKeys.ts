@@ -83,6 +83,19 @@ export const queryKeys = {
     // Effective per-workspace server list (builtins + workspace servers).
     workspace: (wsId: string) => [...queryKeys.mcp.all, 'workspace', wsId],
   },
+  userVault: {
+    all:     ['userVault'],
+    secrets: () => [...queryKeys.userVault.all, 'secrets'],
+  },
+  // Workspace-tier vault. Scoped under the workspace id so a mutation
+  // invalidates that workspace's secrets AND blueprints (the recommended-
+  // credentials list is derived from them) without touching a sibling's cache.
+  workspaceVault: {
+    all:         ['workspaceVault'],
+    byWorkspace: (wsId: string) => [...queryKeys.workspaceVault.all, wsId],
+    secrets:     (wsId: string) => [...queryKeys.workspaceVault.byWorkspace(wsId), 'secrets'],
+    blueprints:  (wsId: string) => [...queryKeys.workspaceVault.byWorkspace(wsId), 'blueprints'],
+  },
   marketData: {
     all:  ['marketData'],
     bars: (symbol: string, interval: string) => [...queryKeys.marketData.all, 'bars', symbol, interval],

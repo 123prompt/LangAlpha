@@ -104,6 +104,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Tells apart "Redis is slow" from "this worker's loop was blocked", which
     # read identically at the redis-py boundary.
     ("EventLoopLagMonitor", "src.observability.loop_lag"),
+    # Refreshes expiring MCP OAuth connections ahead of the hot path; the
+    # per-connection advisory try-lock dedups it across workers.
+    ("McpOAuthRefreshSweeper", "src.server.services.mcp_oauth.sweep"),
 )
 
 
@@ -613,6 +616,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error stopping PlatformSecretSweeper: {e}")
 
+    try:
+        from src.server.services.egress.relay import close_relay_client
+
+        await close_relay_client()
+    except Exception as e:
+        logger.warning(f"Error closing egress relay client: {e}")
+
     # 0.0b. Stop the turn-cancel nudge listener.
     try:
         from src.server.services.runs.cancel import TurnCancelListener
@@ -1010,7 +1020,10 @@ from src.server.app.vault import router as vault_router
 from src.server.app.memo import router as memo_router
 from src.server.app.memory import router as memory_router
 from src.server.app.workflows import include_workflow_router
+from src.server.app.egress_relay import router as egress_relay_router
 from src.server.app.mcp_catalog import router as mcp_catalog_router
+from src.server.app.mcp_oauth import router as mcp_oauth_router
+from src.server.app.user_vault import router as user_vault_router
 from src.server.app.mcp_servers import router as mcp_servers_router
 
 # Conditionally import ginlix-data WS proxy (only when GINLIX_DATA_WS_URL is set)
@@ -1091,7 +1104,16 @@ app.include_router(
 include_workflow_router(app)  # /api/v1/workflows/* - Reusable JavaScript workflows
 app.include_router(
     mcp_catalog_router
-)  # /api/v1/mcp/servers - User-level MCP server catalog (templates)
+)  # /api/v1/mcp/servers - User-level MCP servers (Connectors backing store)
+app.include_router(
+    mcp_oauth_router
+)  # /api/v1/mcp/servers/{name}/oauth + /api/v1/mcp/oauth/callback - MCP OAuth
+app.include_router(
+    user_vault_router
+)  # /api/v1/mcp/vault/secrets - User-level vault (merged into sandbox pushes)
+app.include_router(
+    egress_relay_router
+)  # /v1/egress/{grant_id} - Sandbox egress relay (relay-JWT auth, not user auth)
 app.include_router(
     mcp_servers_router
 )  # /api/v1/workspaces/{id}/mcp/servers - Per-workspace MCP server config

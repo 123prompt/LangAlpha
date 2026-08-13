@@ -109,7 +109,8 @@
     "workspaceGallery": "工作区总览",
     "collapse": "收起侧边栏",
     "expand": "展开侧边栏",
-    "resize": "调整侧边栏宽度"
+    "resize": "调整侧边栏宽度",
+    "connectors": "连接器"
   },
   "account": {
     "menuLabel": "账号菜单"
@@ -2582,6 +2583,156 @@
       "replayDone": "页面提示与快速上手指南将重新显示。",
       "reset": "重置新手引导",
       "resetDone": "新手引导已重置，提示与指南将重新开始。"
+    }
+  },
+  "mcp": {
+    "list": {
+      "title": "MCP 服务器",
+      "addServer": "添加服务器",
+      "importJson": "导入 JSON",
+      "importHint": "粘贴标准 mcpServers JSON 配置",
+      "atCap": "已达上限 {{max}}/{{max}} — 请先删除一个",
+      "loadFailed": "加载 MCP 服务器失败",
+      "empty": "还没有 MCP 服务器。添加一个或复制模板。"
+    },
+    "tab": {
+      "connectors": "连接器",
+      "connectorsHint": "用户级服务器、OAuth 连接与共享密钥",
+      "startingWorkspace": "工作区启动中 — 启动完成后将自动检查你的服务器。",
+      "workspaceStopped": "工作区已停止 — 保存服务器会自动重新启动并检查该服务器。",
+      "promoteExistsBefore": "连接器 ",
+      "promoteExistsAfter": " 已存在。用此服务器的当前配置覆盖它吗？",
+      "overwrite": "覆盖",
+      "savedWithWarnings": "服务器已保存（含提示）",
+      "promotedTitle": "已保存到连接器",
+      "promoteUpdatedTitle": "连接器已更新",
+      "promotedDesc": "“{{name}}”已在你的连接器中 — 可在那里管理并在任意工作区使用。",
+      "promoteFailed": "无法保存到连接器"
+    },
+    "row": {
+      "builtin": "内置",
+      "inherited": "继承",
+      "workspace": "工作区",
+      "inheritedHint": "继承自你的连接器 — 对所有工作区生效",
+      "overridesInherited": "覆盖继承项",
+      "overridesInheritedHint": "此工作区的同名副本在这里覆盖了连接器中的服务器",
+      "toolCount_other": "{{count}} 个工具",
+      "setupSecret": "设置 {{name}}",
+      "manageInConnectors": "在连接器中管理",
+      "reconnectInConnectors": "在连接器中重新连接",
+      "edit": "编辑",
+      "testConnection": "测试连接",
+      "saveToConnectors": "保存到连接器",
+      "delete": "删除",
+      "enableAria": "启用 {{name}}",
+      "disableAria": "禁用 {{name}}",
+      "actionsAria": "{{name}} 的操作"
+    },
+    "status": {
+      "connected": "已连接",
+      "error": "错误",
+      "needsSecret": "需要密钥",
+      "pending": "待检查",
+      "disabled": "已禁用",
+      "unknown": "未知",
+      "pendingHint": "等待发现 — 启动工作区或测试连接"
+    },
+    "lifecycle": {
+      "verifying": "验证中…",
+      "starting": "工作区启动中…",
+      "waiting": "等待工作区启动",
+      "applying": "应用到智能体…",
+      "appliesOnStart": "工作区启动后生效",
+      "ready": "就绪"
+    }
+  },
+  "vault": {
+    "addSecret": "添加密钥",
+    "valuePlaceholder": "密钥值",
+    "editValuePlaceholder": "新值（留空保持不变）",
+    "descriptionPlaceholder": "描述（可选）",
+    "update": "更新",
+    "edit": "编辑",
+    "delete": "删除",
+    "deleteConfirmYes": "确认",
+    "deleting": "删除中…",
+    "hideValue": "隐藏值",
+    "revealValue": "显示值",
+    "loadFailed": "加载密钥失败",
+    "nameInvalid": "名称只能使用字母、数字和下划线，且以字母或下划线开头",
+    "recommended": "推荐凭据",
+    "setUp": "设置",
+    "settingUp": "正在设置",
+    "docs": "文档",
+    "tokenFallback": "令牌",
+    "atCapHint": "密钥库已达上限 {{max}}/{{max}} — 请先删除一个密钥",
+    "valueHintInvalid": "这看起来不像有效的{{label}}",
+    "valueHintDocs": " — 请查看上方的文档链接。",
+    "valueHintStillSave": "你仍然可以保存。",
+    "workspace": {
+      "title": "密钥库",
+      "empty": "尚未存储密钥。为智能体代码添加 API 密钥或凭据。",
+      "usageTitle": "用法",
+      "usageAccess": "在代码中访问：",
+      "securityTitle": "安全",
+      "security1": "密钥使用 AES（pgcrypto）静态加密，绝不会以明文存储在我们的服务器上。",
+      "security2a": "AI 智能体无法直接读取密钥值 — 只能在沙箱代码中调用",
+      "security2b": "。",
+      "security3": "所有智能体输出都会经过泄漏检测扫描。工具结果中发现的任何密钥值都会在到达模型前自动脱敏。",
+      "security4a": "代码校验阻止直接访问内部密钥存储 — 仅允许使用",
+      "security4b": "API。"
+    }
+  },
+  "connectors": {
+    "title": "连接器",
+    "description": "在所有工作区中可供智能体使用的 MCP 服务器与凭据。",
+    "tabs": {
+      "servers": "服务器",
+      "secrets": "密钥"
+    },
+    "servers": {
+      "inheritHint": "在此开启的服务器对你的所有工作区生效；如需在单个工作区关闭，请前往该工作区的 MCP 标签页。关闭状态的服务器仅作为模板保留。",
+      "enabledState": "已在所有工作区开启",
+      "disabledState": "已关闭 — 不会被继承",
+      "empty": "还没有连接器。添加一个服务器或导入 JSON 配置。",
+      "toggleFailed": "无法更改服务器状态",
+      "enabledWithWarnings": "服务器已启用，但存在警告",
+      "deleteFailed": "无法删除服务器",
+      "deleteConfirm": "从连接器中删除“{{server}}”？所有工作区将立即停止继承它。",
+      "deleteConfirmYes": "删除",
+      "deleteConfirmNo": "取消",
+      "warningTitle": "服务器已保存（含提示）"
+    },
+    "oauth": {
+      "connected": "已连接",
+      "needsReauth": "需要重新连接",
+      "refreshAmbiguous": "请检查连接",
+      "revoked": "已断开",
+      "connect": "连接",
+      "reconnect": "重新连接",
+      "disconnect": "断开连接",
+      "refreshSchemas": "刷新工具",
+      "connectFailed": "无法发起连接",
+      "connectedTitle": "已连接",
+      "connectedDesc": "“{{server}}”已连接。开启后即可在工作区中使用。",
+      "callbackErrorTitle": "连接失败",
+      "disconnectedTitle": "已断开",
+      "disconnectedDesc": "“{{server}}”已断开。可随时重新连接；在此之前智能体调用将失败。",
+      "disconnectFailed": "无法断开连接",
+      "refreshedTitle": "工具已刷新",
+      "refreshedDesc": "“{{server}}”现提供 {{count}} 个工具。",
+      "refreshFailedStaleTitle": "工具未刷新",
+      "refreshFailedStaleDesc": "“{{server}}”的刷新未能完成。此前发现的 {{count}} 个工具仍可使用。",
+      "refreshFailed": "无法刷新工具"
+    },
+    "import": {
+      "disabledNudgeTitle": "导入的服务器为关闭状态",
+      "disabledNudgeDesc": "导入的服务器默认关闭。逐个开启后才会在你的工作区中生效。"
+    },
+    "secrets": {
+      "title": "密钥库",
+      "scopeHint": "此处的密钥用于你的连接器服务器，并在所有工作区可用。同名的工作区密钥会在该工作区内覆盖此处的值。",
+      "empty": "尚未存储密钥。为你的连接器添加 API 密钥或凭据。"
     }
   }
 }

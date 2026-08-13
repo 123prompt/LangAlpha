@@ -13,16 +13,16 @@ mcp_servers/AGENT_CONTRACT.md).
 from __future__ import annotations
 
 try:
-    import _bootstrap  # noqa: F401  # script launch: mcp_servers/ is sys.path[0]
+    from _bootstrap import MCPServer  # script launch: mcp_servers/ is sys.path[0]
 except ModuleNotFoundError:  # imported as a package module (tests)
-    from mcp_servers import _bootstrap  # noqa: F401
+    from mcp_servers._bootstrap import MCPServer
 
 import math
 
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
 
 from mcp_servers._envelope import make_error, make_response
+from mcp_servers._schemas import OBJECT, RECORDS, envelope_schema, output_model
 from mcp_servers._yf_common import boundary, clean_value, safe_detail, serialize_records
 
 SOURCE = "yfinance"
@@ -32,11 +32,16 @@ SOURCE = "yfinance"
 # MCP server + tools
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("YFinanceAnalysisMCP")
+mcp = MCPServer("YFinanceAnalysisMCP")
+
+
+_OUT_GET_ANALYST_RECOMMENDATIONS = output_model(
+    "GetAnalystRecommendationsOut", envelope_schema(RECORDS, frame=("symbol",))
+)
 
 
 @mcp.tool()
-def get_analyst_recommendations(ticker: str) -> dict:
+def get_analyst_recommendations(ticker: str) -> _OUT_GET_ANALYST_RECOMMENDATIONS:
     """Aggregated analyst recommendation counts by period. Use to gauge the
     buy/hold/sell balance over recent periods.
 
@@ -61,8 +66,13 @@ def get_analyst_recommendations(ticker: str) -> dict:
         )
 
 
+_OUT_GET_SUSTAINABILITY_DATA = output_model(
+    "GetSustainabilityDataOut", envelope_schema(OBJECT, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_sustainability_data(ticker: str) -> dict:
+def get_sustainability_data(ticker: str) -> _OUT_GET_SUSTAINABILITY_DATA:
     """ESG / sustainability scores for a company. Use for ESG risk context.
 
     Args:
@@ -92,8 +102,13 @@ def get_sustainability_data(ticker: str) -> dict:
         )
 
 
+_OUT_GET_INSTITUTIONAL_HOLDERS = output_model(
+    "GetInstitutionalHoldersOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_institutional_holders(ticker: str) -> dict:
+def get_institutional_holders(ticker: str) -> _OUT_GET_INSTITUTIONAL_HOLDERS:
     """Top institutional holders of a stock. Use to see which institutions hold
     the largest positions.
 
@@ -119,8 +134,13 @@ def get_institutional_holders(ticker: str) -> dict:
         )
 
 
+_OUT_GET_MUTUALFUND_HOLDERS = output_model(
+    "GetMutualfundHoldersOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_mutualfund_holders(ticker: str) -> dict:
+def get_mutualfund_holders(ticker: str) -> _OUT_GET_MUTUALFUND_HOLDERS:
     """Top mutual-fund holders of a stock. Use to see the largest fund
     positions.
 
@@ -145,8 +165,13 @@ def get_mutualfund_holders(ticker: str) -> dict:
         )
 
 
+_OUT_GET_INSIDER_TRANSACTIONS = output_model(
+    "GetInsiderTransactionsOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_insider_transactions(ticker: str) -> dict:
+def get_insider_transactions(ticker: str) -> _OUT_GET_INSIDER_TRANSACTIONS:
     """Recent insider buy/sell transactions. Use to track insider activity.
 
     Args:
@@ -171,8 +196,13 @@ def get_insider_transactions(ticker: str) -> dict:
         )
 
 
+_OUT_GET_INSIDER_ROSTER = output_model(
+    "GetInsiderRosterOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_insider_roster(ticker: str) -> dict:
+def get_insider_roster(ticker: str) -> _OUT_GET_INSIDER_ROSTER:
     """Current insiders and their holdings. Use to see who the insiders are and
     their share positions.
 
@@ -197,8 +227,13 @@ def get_insider_roster(ticker: str) -> dict:
         )
 
 
+_OUT_GET_NEWS = output_model(
+    "GetNewsOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_news(ticker: str, count: int = 10, tab: str = "news") -> dict:
+def get_news(ticker: str, count: int = 10, tab: str = "news") -> _OUT_GET_NEWS:
     """Latest news articles for a stock. Use to pull recent headlines and
     coverage.
 
@@ -225,8 +260,13 @@ def get_news(ticker: str, count: int = 10, tab: str = "news") -> dict:
         return make_error("upstream_error", safe_detail("News", e), symbol=symbol)
 
 
+_OUT_GET_ANALYST_PRICE_TARGETS = output_model(
+    "GetAnalystPriceTargetsOut", envelope_schema(OBJECT, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_analyst_price_targets(ticker: str) -> dict:
+def get_analyst_price_targets(ticker: str) -> _OUT_GET_ANALYST_PRICE_TARGETS:
     """Analyst price-target summary for a stock. Use for consensus target vs.
     current price.
 
@@ -260,8 +300,13 @@ def get_analyst_price_targets(ticker: str) -> dict:
         )
 
 
+_OUT_GET_UPGRADES_DOWNGRADES = output_model(
+    "GetUpgradesDowngradesOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_upgrades_downgrades(ticker: str) -> dict:
+def get_upgrades_downgrades(ticker: str) -> _OUT_GET_UPGRADES_DOWNGRADES:
     """History of analyst rating changes (upgrades/downgrades). Use to track
     how the sell-side rating evolved.
 
@@ -286,8 +331,13 @@ def get_upgrades_downgrades(ticker: str) -> dict:
         )
 
 
+_OUT_GET_EARNINGS_HISTORY = output_model(
+    "GetEarningsHistoryOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_earnings_history(ticker: str) -> dict:
+def get_earnings_history(ticker: str) -> _OUT_GET_EARNINGS_HISTORY:
     """Historical EPS estimate vs. actual with surprise. Use to review recent
     earnings beats/misses. Same data as get_earnings_data (fundamentals server).
 
@@ -311,8 +361,13 @@ def get_earnings_history(ticker: str) -> dict:
         )
 
 
+_OUT_GET_EARNINGS_ESTIMATES = output_model(
+    "GetEarningsEstimatesOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_earnings_estimates(ticker: str) -> dict:
+def get_earnings_estimates(ticker: str) -> _OUT_GET_EARNINGS_ESTIMATES:
     """Forward EPS estimates by period. Use for consensus EPS for coming
     quarters and years.
 
@@ -336,8 +391,13 @@ def get_earnings_estimates(ticker: str) -> dict:
         )
 
 
+_OUT_GET_REVENUE_ESTIMATES = output_model(
+    "GetRevenueEstimatesOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_revenue_estimates(ticker: str) -> dict:
+def get_revenue_estimates(ticker: str) -> _OUT_GET_REVENUE_ESTIMATES:
     """Forward revenue estimates by period. Use for consensus revenue for coming
     quarters and years.
 
@@ -361,8 +421,13 @@ def get_revenue_estimates(ticker: str) -> dict:
         )
 
 
+_OUT_GET_GROWTH_ESTIMATES = output_model(
+    "GetGrowthEstimatesOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_growth_estimates(ticker: str) -> dict:
+def get_growth_estimates(ticker: str) -> _OUT_GET_GROWTH_ESTIMATES:
     """Growth estimates for the stock vs. industry, sector, and index. Use to
     compare a name's growth outlook to its peers.
 
@@ -386,8 +451,13 @@ def get_growth_estimates(ticker: str) -> dict:
         )
 
 
+_OUT_GET_MAJOR_HOLDERS = output_model(
+    "GetMajorHoldersOut", envelope_schema(RECORDS, frame=("symbol",))
+)
+
+
 @mcp.tool()
-def get_major_holders(ticker: str) -> dict:
+def get_major_holders(ticker: str) -> _OUT_GET_MAJOR_HOLDERS:
     """Ownership breakdown (insider %, institution %, etc.). Use for a
     high-level ownership summary.
 

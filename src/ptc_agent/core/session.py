@@ -2,7 +2,8 @@
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import TracebackType
 
 import structlog
@@ -13,6 +14,20 @@ from .mcp_registry import MCPRegistry, get_global_registry
 from .sandbox import PTCSandbox
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class EgressBinding:
+    """What this process last pushed to a session's sandbox credential file.
+
+    ``jwt_exp`` (from the mint, never recomputed) drives the cheap remint
+    check; ``user_id`` lets the remint run on paths with no request user in
+    hand. Not liveness truth — the grant rows are.
+    """
+
+    grants: Mapping[str, str]
+    jwt_exp: float
+    user_id: str
 
 
 class Session:
@@ -52,6 +67,16 @@ class Session:
         # the current composite + summary.
         self.mcp_tool_summary: str | None = None
         self.mcp_config_version: int | None = None
+        # Untrusted servers with a current-fingerprint ok discovery snapshot,
+        # recorded at composite install. Settlement lives here rather than in
+        # the composite's tool lists: a server that legitimately advertises
+        # zero tools is settled too, and must not re-probe every acquire.
+        self.mcp_settled_servers: set[str] = set()
+
+        # Egress-relay binding for OAuth-connected servers: what THIS process
+        # last pushed to the sandbox. Execution context only — grant truth is
+        # the sandbox_egress_grants table (see services/egress/session_binding).
+        self.egress_binding: EgressBinding | None = None
 
         # The platform-secret fleet generation whose bindings were last applied
         # to this session's sandbox (the ``mcp_config_version`` analog) — lets
@@ -291,6 +316,10 @@ class Session:
         self._owns_mcp_registry = False
         self.mcp_tool_summary = None
         self.mcp_config_version = None
+        # The binding records what the (now gone) sandbox held; keeping it
+        # would violate that invariant and read as a teardown trigger on the
+        # next sync.
+        self.egress_binding = None
 
         self._initialized = False
         self._agent_md_dirty = True
@@ -333,6 +362,7 @@ class Session:
         self._owns_mcp_registry = False
         self.mcp_tool_summary = None
         self.mcp_config_version = None
+        self.egress_binding = None
         # Restore the pristine server list so a restart re-enters PTCSandbox with
         # the unresolved built-ins, not the stale per-workspace resolution.
         self.config.mcp.servers = list(self._pristine_mcp_servers)

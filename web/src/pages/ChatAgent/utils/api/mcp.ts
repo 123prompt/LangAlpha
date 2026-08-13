@@ -5,14 +5,17 @@ import { api } from '@/api/client';
 
 //
 // Per-workspace effective list mixes built-in servers with workspace-added
-// ones; the catalog holds reusable user templates that get copied into a
-// workspace via `from_template`. Env/header literal values are never echoed by
+// ones; the catalog holds reusable user templates managed in Connectors.
+// Env/header literal values are never echoed by
 // the backend — only `${vault:NAME}` reference names surface (as `*_refs`).
+
+/** The wire transports a user-configured server can speak. */
+export type McpTransport = 'stdio' | 'sse' | 'http';
 
 /** A full MCP server definition payload (matches backend `McpServerInput`). */
 export interface McpServerInput {
   name: string;
-  transport: 'stdio' | 'sse' | 'http';
+  transport: McpTransport;
   command?: string | null;
   args?: string[];
   url?: string | null;
@@ -39,11 +42,21 @@ export type McpStatus =
   | 'pending'
   | 'unknown';
 
+/** Lifecycle of a server's OAuth connection (absent = never connected). */
+export type McpOauthStatus =
+  | 'connected'
+  | 'needs_reauth'
+  | 'refresh_ambiguous'
+  | 'revoked';
+
 /** One row in the effective per-workspace MCP list. */
 export interface EffectiveServer {
   name: string;
-  origin: 'builtin' | 'workspace';
-  transport: string;
+  /** 'user' = inherited from the user's Connectors (manage at /connectors). */
+  origin: 'builtin' | 'workspace' | 'user';
+  /** Workspace-local fork that overrides a same-named inherited server. */
+  shadows_inherited?: boolean;
+  transport: McpTransport;
   enabled: boolean;
   editable: boolean;
   deletable: boolean;
@@ -70,7 +83,37 @@ export interface EffectiveServer {
   args: string[];
   url: string | null;
   config_version: number;
+  /**
+   * Inherited (origin='user') rows only: the owner's OAuth connection status,
+   * including 'revoked'. Absent/null = the server has no OAuth connection.
+   * OAuth rows are discovered host-side, never probed from the workspace.
+   */
+  oauth_status?: McpOauthStatus | null;
 }
+
+/**
+ * The config-shaped half of a server row: everything the create/edit modal
+ * reads, and nothing it doesn't. Both list surfaces hand their own row straight
+ * to the modal — an `EffectiveServer` and a `CatalogServer` are each
+ * structurally assignable to this — so neither has to fabricate the runtime
+ * fields (status, tool counts, permissions) it doesn't have.
+ */
+export type McpServerDraft = Pick<
+  EffectiveServer,
+  | 'name'
+  | 'transport'
+  | 'command'
+  | 'args'
+  | 'url'
+  | 'env'
+  | 'env_refs'
+  | 'headers'
+  | 'header_refs'
+  | 'description'
+  | 'instruction'
+  | 'tool_exposure_mode'
+  | 'discovery_uses_secrets'
+>;
 
 export interface EffectiveServerList {
   servers: EffectiveServer[];
@@ -92,19 +135,35 @@ export interface EffectiveServerList {
   sandbox_warming?: boolean;
 }
 
-/** A user catalog template row (masked — only vault refs surfaced). */
+/** A user catalog row, as returned to its owner. */
 export interface CatalogServer {
   name: string;
-  transport: string;
+  transport: McpTransport;
   command: string | null;
   args: string[];
   url: string | null;
   env_refs: string[];
   header_refs: string[];
+  /**
+   * The stored env/header reference maps — keys are the real var/header names,
+   * values the configured `${vault:NAME}` ref strings or plain literals (never
+   * resolved secrets). The edit form round-trips them; absent on older backends
+   * that returned only `env_refs`/`header_refs`.
+   */
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
   description: string;
   instruction: string;
   tool_exposure_mode: string;
   discovery_uses_secrets?: boolean;
+  /** True = inherited by every workspace of the user (Connectors toggle). */
+  enabled?: boolean;
+  /** OAuth connection status, when one exists for this server. */
+  oauth_status?: McpOauthStatus | null;
+  /** Host-side discovered tool count for the current config (OAuth servers). */
+  tool_count?: number | null;
+  /** Non-blocking policy nudges — present on create/update responses only. */
+  warnings?: string[] | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -135,13 +194,12 @@ export async function getWorkspaceMcpServers(workspaceId: string): Promise<Effec
   return data;
 }
 
-/** Add a server to a workspace — either a full def or `{ from_template }`. */
 export async function addWorkspaceMcpServer(
   workspaceId: string,
-  body: McpServerInput | { from_template: string },
+  body: McpServerInput,
 ) {
   const { data } = await api.post(`/api/v1/workspaces/${workspaceId}/mcp/servers`, body);
-  return data as { name: string; source: string; enabled: boolean };
+  return data as { name: string; source: string; enabled: boolean; warnings?: string[] };
 }
 
 export async function updateWorkspaceMcpServer(
@@ -153,7 +211,7 @@ export async function updateWorkspaceMcpServer(
     `/api/v1/workspaces/${workspaceId}/mcp/servers/${name}`,
     body,
   );
-  return data as { name: string; source: string; enabled: boolean };
+  return data as { name: string; source: string; enabled: boolean; warnings?: string[] };
 }
 
 export async function setWorkspaceMcpServerEnabled(
@@ -220,8 +278,8 @@ export async function importWorkspaceMcpServers(
 }
 
 /**
- * Promote a workspace server UP into the user's reusable template catalog (the
- * inverse of `from_template`). Only `${vault:NAME}` reference names travel —
+ * Promote a workspace server UP into the user's reusable template catalog.
+ * Only `${vault:NAME}` reference names travel —
  * secret values are workspace-scoped, so the template surfaces `needs_secret`
  * when later added to another workspace. `overwrite` replaces an existing
  * same-named template; without it a clash is a 409.
@@ -261,4 +319,54 @@ export async function updateMcpCatalogServer(
 export async function deleteMcpCatalogServer(name: string) {
   const { data } = await api.delete(`/api/v1/mcp/servers/${name}`);
   return data as { ok: boolean };
+}
+
+/** Enable/disable a catalog server for ALL the user's workspaces (inheritance). */
+export async function setMcpCatalogServerEnabled(name: string, enabled: boolean) {
+  const { data } = await api.patch(`/api/v1/mcp/servers/${name}/enabled`, { enabled });
+  return data as { name: string; enabled: boolean; warnings?: string[] };
+}
+
+/**
+ * Bulk-import a standard `mcpServers` JSON blob into the user catalog. Inline
+ * literal secrets are auto-extracted into the USER vault; imported rows land
+ * disabled (inert) until the user flips them live.
+ */
+export async function importMcpCatalogServers(payload: unknown): Promise<McpImportResult> {
+  const { data } = await api.post<McpImportResult>('/api/v1/mcp/servers/import', payload);
+  return data;
+}
+
+// --- User-level OAuth (Connectors) ---
+
+/** Phase 1 of the connect flow; the caller navigates to `authorize_url`. */
+export async function startMcpOauth(name: string, returnTo = '/connectors') {
+  const { data } = await api.post<{ authorize_url: string }>(
+    `/api/v1/mcp/servers/${name}/oauth/start`,
+    { return_to: returnTo },
+  );
+  return data;
+}
+
+export async function disconnectMcpOauth(name: string) {
+  const { data } = await api.delete(`/api/v1/mcp/servers/${name}/oauth`);
+  return data as { ok: boolean };
+}
+
+export interface McpOauthSchemaRefreshResult {
+  server_name: string;
+  status: string;
+  error: string;
+  tool_count: number;
+  discovered_at: string | null;
+}
+
+/** Host-side re-discovery of an OAuth server's tool schemas. */
+export async function refreshMcpOauthSchemas(
+  name: string,
+): Promise<McpOauthSchemaRefreshResult> {
+  const { data } = await api.post<McpOauthSchemaRefreshResult>(
+    `/api/v1/mcp/servers/${name}/oauth/refresh-schemas`,
+  );
+  return data;
 }

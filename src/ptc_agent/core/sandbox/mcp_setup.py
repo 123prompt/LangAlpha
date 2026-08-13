@@ -18,6 +18,7 @@ from ptc_agent.core.sandbox._defaults import DEFAULT_DEPENDENCIES
 from ptc_agent.core.sandbox.retry import RetryPolicy
 
 from ..mcp_sanitize import (
+    is_untrusted_server,
     sanitize_tool_name,
 )
 from typing import TYPE_CHECKING
@@ -163,11 +164,12 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
         )
     )
 
-    # Per-server source map (builtin vs untrusted workspace) drives codegen
-    # sanitization + neutral framing for user-server tools.
-    source_by_name = {
-        s.name: getattr(s, "source", "builtin")
-        for s in sandbox.config.mcp.servers
+    # Trust is computed ONCE here, per server, and passed across the codegen
+    # boundary as a bool — codegen never re-derives it from the raw source
+    # string (that duplication is how user-level servers once slipped through
+    # the workspace-only gates).
+    untrusted_by_name = {
+        s.name: is_untrusted_server(s) for s in sandbox.config.mcp.servers
     }
 
     # 2. Tool modules and documentation
@@ -216,10 +218,13 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
         )
 
     for server_name, tools in tools_by_server.items():
-        source = source_by_name.get(server_name, "builtin")
+        # Fail closed: a server present in the registry but missing from the
+        # trust map (config drift mid-sync) is treated as untrusted — a wrong
+        # guess here costs sanitization, not a docstring breakout.
+        untrusted = untrusted_by_name.get(server_name, True)
         # Generate Python module
         module_code = sandbox.tool_generator.generate_tool_module(
-            server_name, tools, source=source
+            server_name, tools, untrusted=untrusted
         )
         module_path = f"{work_dir}/tools/{server_name}.py"
         uploads.append(
@@ -240,13 +245,12 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
         # Generate documentation for each tool
         for tool in tools:
             doc = sandbox.tool_generator.generate_tool_documentation(
-                tool, source=source
+                tool, untrusted=untrusted
             )
-            # Untrusted workspace tool names could contain ``..`` or ``/`` and
-            # traverse out of the docs dir; use the sanitized identifier for
-            # the filename. Builtin names are already valid identifiers, so
-            # sanitize_tool_name leaves them unchanged (byte-identical path).
-            if source == "workspace":
+            # Untrusted tool names could contain ``..`` or ``/`` and traverse
+            # out of the docs dir; use the sanitized identifier for the
+            # filename. Builtin names are already valid identifiers.
+            if untrusted:
                 doc_name = sanitize_tool_name(tool.name) or "_invalid_tool"
             else:
                 doc_name = tool.name
@@ -472,7 +476,7 @@ async def _start_internal_mcp_servers(sandbox: "PTCSandbox") -> None:
 
 
 def _detect_missing_imports(sandbox: "PTCSandbox", stderr: str) -> list[str]:
-    """Extract missing module names from ImportError/ModuleNotFoundError.
+    """Extract missing module names from the executed script's own traceback.
 
         Args:
             stderr: Standard error output from code execution
@@ -482,14 +486,36 @@ def _detect_missing_imports(sandbox: "PTCSandbox", stderr: str) -> list[str]:
         """
     import re
 
+    # Whatever comes out of here is handed to `uv pip install` in the sandbox,
+    # so the input is trusted as narrowly as possible against two attacks:
+    #
+    # 1. Shell injection — the capture is a real dotted module path, never
+    #    "anything between the quotes". A name with a space or ``;`` fails to
+    #    match at all (and could never name an installable package anyway).
+    # 2. Dependency confusion — a third-party MCP server spawned during the run
+    #    shares this stderr stream and could inject a fake
+    #    "ModuleNotFoundError: No module named 'evil'" to make us install an
+    #    attacker-registered package (whose sdist build runs code). So only the
+    #    executed script's OWN unhandled exception is trusted: the FINAL
+    #    traceback block of stderr, and only when it carries a genuine frame
+    #    line. A server's mid-stream text, or a preceding block, is ignored.
+    marker = "Traceback (most recent call last):"
+    start = stderr.rfind(marker)
+    if start == -1:
+        return []
+    final_tb = stderr[start:]
+    if '\n  File "' not in final_tb:
+        # No real frame → not a Python interpreter traceback; don't trust it.
+        return []
+
     patterns = [
-        r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]",
-        r"ImportError: No module named ['\"]([^'\"]+)['\"]",
+        r"ModuleNotFoundError: No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
+        r"ImportError: No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
     ]
 
     matches = []
     for pattern in patterns:
-        matches.extend(re.findall(pattern, stderr))
+        matches.extend(re.findall(pattern, final_tb))
 
     # Handle submodule imports (e.g., "foo.bar" -> "foo")
     # Also deduplicate
@@ -518,7 +544,10 @@ async def _install_package(sandbox: "PTCSandbox", package: str) -> bool:
         assert sandbox.runtime is not None
         result = await sandbox._runtime_call(
             sandbox.runtime.exec,
-            f"uv pip install -q {package}",
+            # Quoted at the sink as well as filtered at the parser: this is the
+            # only place a caller-supplied name becomes shell text, so it should
+            # be safe for callers that don't come through _detect_missing_imports.
+            f"uv pip install -q {shlex.quote(package)}",
             retry_policy=RetryPolicy.SAFE,
         )
         exit_code = getattr(result, "exit_code", 1)

@@ -30,6 +30,7 @@ _ENTRYPOINT_SERVERS = [
     "yf_market_mcp_server",
     "yf_analysis_mcp_server",
     "yf_fundamentals_mcp_server",
+    "scrape_mcp_server",
 ]
 
 

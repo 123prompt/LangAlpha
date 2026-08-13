@@ -735,6 +735,19 @@ async def batch_update_sort_order(
         raise
 
 
+async def get_running_workspace_ids_for_user(user_id: str) -> List[str]:
+    """Ids of a user's running workspaces, for user-level best-effort fan-out
+    (e.g. pushing merged vault secrets to live sandboxes on mutation)."""
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT workspace_id FROM workspaces "
+                "WHERE user_id = %s AND status = 'running'",
+                (user_id,),
+            )
+            return [str(r[0]) for r in await cur.fetchall()]
+
+
 async def get_workspaces_by_status(
     status: str,
     limit: int = 100,
