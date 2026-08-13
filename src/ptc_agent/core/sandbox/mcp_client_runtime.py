@@ -67,6 +67,12 @@ _STDIO_CHUNK_CHARS = 65536
 # first). The tail's deque bounds line COUNT; this bounds line size, so one
 # newline-free blob can't make the tail itself unbounded.
 _STDERR_LINE_MAX_BYTES = 4096
+# Server-initiated requests answered with -32601 per reply read. The refusal
+# write is the one blocking stdin operation in the reader: a server that floods
+# requests while never draining stdin would wedge the writer against a full
+# pipe (~64 KiB) with the per-server lock held. 16 refusals ≈ 1.4 KiB of stdin
+# — nowhere near pipe capacity — and no legitimate server sends more per call.
+_REFUSAL_MAX = 16
 
 # ---------------------------------------------------------------------------
 # Configuration. Shape produced by tool_generator.generate_client_config():
@@ -641,6 +647,7 @@ def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout:
     stdio buffer where select() on the fd would block forever.
     """
     deadline = time.monotonic() + timeout
+    refusals = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -690,6 +697,15 @@ def _read_reply(server_name: str, proc: subprocess.Popen, want_id: int, timeout:
         if not isinstance(message, dict) or "id" not in message:
             continue  # notification (or junk) — never the reply
         if "method" in message:
+            refusals += 1
+            if refusals > _REFUSAL_MAX:
+                _kill_server(server_name, proc)
+                error_msg = (
+                    f"MCP server {server_name} sent more than {_REFUSAL_MAX} "
+                    "requests while a reply was pending [request_flood]"
+                )
+                print(f"ERROR: {error_msg}", file=sys.stderr)  # noqa: T201
+                raise RuntimeError(error_msg)
             refusal = {
                 "jsonrpc": "2.0",
                 "id": message["id"],

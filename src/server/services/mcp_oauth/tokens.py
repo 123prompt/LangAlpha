@@ -149,8 +149,9 @@ async def exchange_token(
 ) -> ExchangedToken:
     """POST one grant to the token endpoint. Raises :class:`TokenExchangeError`.
 
-    A malformed 200 body propagates as-is: it is a parse failure, not a
-    classified refusal, and each caller already has a catch-all for it.
+    A malformed 200 body raises AMBIGUOUS: the AS accepted the grant (a
+    rotating one may already have consumed the refresh token), we just could
+    not read the answer — the same posture as a lost response.
     """
     data, headers = build_context(
         client_metadata=client_info, client_info=client_info
@@ -197,7 +198,16 @@ async def exchange_token(
             kind = TokenFailure.RETRYABLE
         raise TokenExchangeError(kind, f"status {status_code}")
 
-    token = await handle_token_response_scopes(response)
+    try:
+        token = await handle_token_response_scopes(response)
+    except Exception as e:
+        # A 200 whose body we cannot parse is still a grant the AS honored.
+        # Letting the raw error escape would bypass the callers' classified
+        # handling and leave the row connected with a possibly-consumed
+        # refresh token — the next refresh would replay it.
+        raise TokenExchangeError(
+            TokenFailure.AMBIGUOUS, f"malformed token response: {e}"
+        ) from e
     return ExchangedToken(
         access_token=token.access_token,
         token_type=token.token_type or "Bearer",

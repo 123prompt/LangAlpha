@@ -169,11 +169,17 @@ async def upsert_connection(
                     -- same-grant: refresh tokens are bound to the client that
                     -- obtained them, so after a re-registration the old
                     -- client's token would only earn an invalid_grant. Nulling
-                    -- instead only costs a re-auth at expiry.
+                    -- instead only costs a re-auth at expiry. A row parked in
+                    -- refresh_ambiguous never retains: its stored token may
+                    -- already be consumed at the AS, and this write resets the
+                    -- row to connected — retaining would hand the next refresh
+                    -- a replay that trips the AS's reuse detection.
                     refresh_token = CASE
                         WHEN EXCLUDED.refresh_token IS NOT NULL
                             THEN EXCLUDED.refresh_token
-                        WHEN user_mcp_oauth_connections.as_metadata->>'issuer'
+                        WHEN user_mcp_oauth_connections.status
+                             <> 'refresh_ambiguous'
+                         AND user_mcp_oauth_connections.as_metadata->>'issuer'
                              IS NOT DISTINCT FROM EXCLUDED.as_metadata->>'issuer'
                          AND user_mcp_oauth_connections.server_url
                              = EXCLUDED.server_url

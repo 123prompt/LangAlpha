@@ -268,6 +268,14 @@ class TestSanitizeToolText:
         assert sanitize_tool_text("") == ""
         assert sanitize_tool_text(None) == ""
 
+    def test_non_string_input_collapses_to_empty(self):
+        # A hostile schema can put anything where a description belongs, and
+        # get_parameters forwards it raw; the sanitizer is the totality
+        # boundary — raising here would wedge wrapper generation for the
+        # whole workspace on one bad connector.
+        for value in (123, 1.5, True, ["x"], {"a": "b"}, b"bytes"):
+            assert sanitize_tool_text(value) == ""
+
     @pytest.mark.parametrize(
         "text",
         [

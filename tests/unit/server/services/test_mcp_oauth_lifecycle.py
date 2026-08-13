@@ -1071,6 +1071,23 @@ class TestAmbiguousRefresh:
         assert len(token_endpoint.calls) == 1
 
     @pytest.mark.asyncio
+    async def test_a_malformed_200_body_flips_to_ambiguous(
+        self, store, db, token_endpoint
+    ):
+        # A 200 the AS honored but whose body we cannot parse: the grant is
+        # spent under rotation, so it must classify AMBIGUOUS — escaping as a
+        # raw parse error would leave the row connected and the next refresh
+        # would replay the consumed token.
+        store.row = _row(expires_in=120)
+        token_endpoint.payload = {"weird": "body"}
+
+        token = await ensure_fresh_access_token(CONNECTION_ID)
+
+        assert token.access_token == "access-old"
+        assert store.marks == ["refresh_ambiguous"]
+        assert store.commits == []
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("status_code", "marks"),
         [
@@ -2329,3 +2346,20 @@ class TestUpsertRetention:
         assert "as_metadata->>'issuer'" in retention
         assert "server_url" in retention
         assert "client_info->>'client_id'" in retention
+
+    @pytest.mark.asyncio
+    async def test_retention_refuses_a_refresh_ambiguous_row(self, upsert_sql):
+        # An ambiguous row's stored token may already be consumed at the AS,
+        # and this write resets the row to connected — retaining would hand
+        # the next refresh a replay that trips reuse detection. Nulling costs
+        # only a re-auth at expiry, the documented ambiguous outcome.
+        await mcp_oauth_db.upsert_connection(
+            "user-1",
+            "srv",
+            server_url="https://mcp.example.com/mcp",
+            access_token="at",
+            refresh_token=None,
+        )
+        [sql] = upsert_sql
+        retention = sql.split("refresh_token = CASE", 1)[1].split("END,", 1)[0]
+        assert "<> 'refresh_ambiguous'" in retention

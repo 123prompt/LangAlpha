@@ -325,7 +325,7 @@ async def scrape_page(
         dict: {url, status, title, content, extraction, mode}. content is
         truncated to 400k chars.
         On error: {error, detail} — invalid_url|invalid_mode|
-        invalid_extraction|invalid_timeout|fetch_failed.
+        invalid_extraction|invalid_timeout|fetch_failed|extract_failed.
     """
     bad = _validate_args(mode, extraction, timeout) or _check_budget(mode, timeout, 1)
     if bad:

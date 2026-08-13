@@ -784,15 +784,46 @@ _EMISSION_PROBE_TOOL_2 = MCPToolInfo(
     server_name="probe",
 )
 
+# Third probe axis: the config/epilogue emission. One server per config
+# branch — builtin uv-stdio (path rewrite + env_keys), untrusted workspace
+# http (headers + secret-mode hint), OAuth relay-bound. Hash-relevant only;
+# never uploaded.
+_EMISSION_PROBE_SERVERS = [
+    MCPServerConfig(
+        name="probe_builtin",
+        transport="stdio",
+        command="uv",
+        args=["run", "python", "mcp_servers/probe_server.py"],
+        env={"PROBE_API_KEY": "${PROBE_API_KEY}"},
+    ),
+    MCPServerConfig(
+        name="probe_workspace",
+        transport="http",
+        url="https://probe.example/mcp",
+        headers={"Authorization": "${vault:PROBE_TOKEN}"},
+        source="workspace",
+    ),
+    MCPServerConfig(
+        name="probe_oauth",
+        transport="http",
+        url="https://probe.example/oauth",
+        source="workspace",
+        oauth_connection_id="probe-conn",
+    ),
+]
+
 
 def _emission_probe_text() -> str:
-    """Deterministic sample of this module's wrapper/doc emission.
+    """Deterministic sample of this module's wrapper/doc/config emission.
 
     Folded into ``MCP_CLIENT_CODEGEN_VERSION`` so an emission change reaches
     warm sandboxes automatically — without this, only runtime-file edits would
-    invalidate their cached wrapper modules. Pinned by the committed golden in
-    ``tests/unit/core/emission_probe_golden.txt`` so emission drift is a
-    visible diff, never a silent hash move.
+    invalidate their cached wrapper modules. The epilogue slice covers
+    ``generate_client_config`` and the epilogue template: trust flags, path
+    rewrites and relay binding are computed at generation time, so a
+    logic-only change there would otherwise never move the hash. Pinned by the
+    committed golden in ``tests/unit/core/emission_probe_golden.txt`` so
+    emission drift is a visible diff, never a silent hash move.
     """
     gen = ToolFunctionGenerator()
     probes = [_EMISSION_PROBE_TOOL, _EMISSION_PROBE_TOOL_2]
@@ -804,6 +835,9 @@ def _emission_probe_text() -> str:
             for tool in probes
             for untrusted in (False, True)
         )
+        + gen.generate_mcp_client_code(_EMISSION_PROBE_SERVERS, working_dir="/probe")[
+            len(client_runtime_source()) :
+        ]
     )
 
 

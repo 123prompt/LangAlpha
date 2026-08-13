@@ -221,9 +221,11 @@ def sanitize_tool_text(text: str | None, max_len: int = DEFAULT_TOOL_TEXT_MAX_LE
     Neutralizes triple-quote breakouts, escapes trailing backslashes that would
     eat the closing quotes, strips control characters, and length-caps. The
     result is plain data — it cannot terminate the docstring early or smuggle
-    code past the wrapper.
+    code past the wrapper. Total over untrusted input: a non-string (a hostile
+    schema can put a number or a dict where a description belongs) collapses to
+    "" instead of raising mid-codegen.
     """
-    if not text:
+    if not isinstance(text, str) or not text:
         return ""
     # Strip control chars except tab/newline (which docstrings tolerate).
     cleaned = "".join(

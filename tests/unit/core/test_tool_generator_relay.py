@@ -97,6 +97,19 @@ class TestCodegenVersion:
         ).hexdigest()[:12]
         assert MCP_CLIENT_CODEGEN_VERSION == f"5.{expected}"
 
+    def test_probe_covers_the_config_epilogue(self):
+        # Trust flags, uv-path rewrites and relay binding are computed at
+        # generation time in generate_client_config — a logic-only change
+        # there must move the version, which it can only do if the probe
+        # includes the emitted epilogue.
+        from ptc_agent.core.tool_generator import _emission_probe_text
+
+        probe = _emission_probe_text()
+        assert "_apply_config_dict" in probe
+        assert "relay_bound" in probe
+        assert "untrusted" in probe
+        assert "/probe/mcp_servers/probe_server.py" in probe
+
 
 class TestRelayBoundEmission:
     def test_oauth_server_carries_no_vendor_url(self):

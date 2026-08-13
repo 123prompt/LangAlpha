@@ -7,6 +7,7 @@ OOM-killed with nothing to report. The bound is reachable from background
 discovery too, which spawns through the same path.
 """
 
+import json
 import queue
 import threading
 import time
@@ -284,6 +285,27 @@ class TestReaderRefusal:
 
         assert "[reply_too_large]" in str(stdio_err.value)
         assert "[reply_too_large]" in str(http_err.value)
+
+    def test_a_request_flood_is_killed_at_the_refusal_cap(self, configured):
+        # The refusal write is the reader's one blocking stdin operation: a
+        # server that streams requests while never draining stdin would wedge
+        # the writer against a full pipe with the per-server lock held.
+        proc = _FakeProc()
+        proc.mcp_stdout_queue = queue.Queue()
+        proc.mcp_budget_lock = threading.Lock()
+        proc.mcp_outstanding = [10**9]
+        for i in range(m._REFUSAL_MAX + 5):
+            proc.mcp_stdout_queue.put(
+                json.dumps({"jsonrpc": "2.0", "id": i, "method": "roots/list"})
+            )
+        m._server_processes["srv"] = proc
+
+        with pytest.raises(RuntimeError, match=r"\[request_flood\]"):
+            m._read_reply("srv", proc, 10**6, 5.0)
+
+        assert proc.killed
+        assert "srv" not in m._server_processes
+        assert len(proc.stdin.written) == m._REFUSAL_MAX
 
 
 class _OversizeBody:

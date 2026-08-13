@@ -312,3 +312,10 @@ from tools.probe import probe_tool_2
 result = probe_tool_2(count=42, ratio=42.0, payload={})
 print(result)  # noqa: T201
 ```
+
+
+# --- Per-workspace configuration (generated epilogue). ---
+_apply_config_dict(json.loads("{\"result_body_max_bytes\": 65536, \"result_body_trace_budget_bytes\": 4194304, \"servers\": {\"probe_builtin\": {\"args\": [\"run\", \"python\", \"/probe/mcp_servers/probe_server.py\"], \"command\": \"uv\", \"env_keys\": [\"PROBE_API_KEY\"], \"transport\": \"stdio\", \"untrusted\": false}, \"probe_oauth\": {\"relay_bound\": true, \"transport\": \"http\", \"untrusted\": true}, \"probe_workspace\": {\"discovery_uses_secrets\": true, \"headers\": {\"Authorization\": \"${vault:PROBE_TOKEN}\"}, \"transport\": \"http\", \"untrusted\": true, \"url\": \"https://probe.example/mcp\"}}, \"working_dir\": \"/probe\"}"))
+
+if __name__ == "__main__":
+    _cli_main()
