@@ -20,6 +20,7 @@ import pytest
 from src.server.services.egress.relay_jwt import (
     ALGORITHM,
     AUDIENCE,
+    DEFAULT_TTL_SECONDS,
     ISSUER,
     LEEWAY_SECONDS,
     REMINT_THRESHOLD_SECONDS,
@@ -288,7 +289,7 @@ class TestValidityWindow:
 class TestNeedsRemint:
     def test_fresh_token_does_not_need_a_remint(self):
         now = 1_700_000_000
-        assert needs_remint(now + 2 * 60 * 60, now=now) is False
+        assert needs_remint(now + DEFAULT_TTL_SECONDS, now=now) is False
 
     def test_near_expiry_token_needs_a_remint(self):
         now = 1_700_000_000

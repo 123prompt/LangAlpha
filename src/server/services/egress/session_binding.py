@@ -10,8 +10,11 @@ retired grant cannot survive in a second channel.
 Multi-worker contract: the `sandbox_egress_grants` table is the truth about
 which grants exist — `EgressBinding` on the session is execution context only
 (what THIS process last pushed), so a worker that never bound anything still
-converges removals by reading the table. No cross-worker lock guards the
-credential-file push: the upload writes atomically (temp + same-dir rename in
+converges removals by reading the table. The grant replacement itself is
+whole-set, so it is fenced in the DB layer by a workspace advisory lock plus a
+`mcp_config_version` CAS; a worker whose resolve was superseded is told so and
+pushes nothing. No cross-worker lock guards the credential-file push: the
+upload writes atomically (temp + same-dir rename in
 `upload_egress_relay_credentials`), so two workers pushing the same workspace
 concurrently can only ever leave one complete file — last rename wins, both
 relay JWTs are valid, and the grant map converges on the next push.
@@ -37,14 +40,21 @@ async def sync_egress_relay(
     user_id: str | None,
     session: "Session",
     resolved: "ResolvedMCP",
-) -> None:
+) -> bool:
     """Converge grants + relay JWT + sandbox credential file to ``resolved``.
 
     One grant per OAuth-connected server in the resolved set; grants the
     workspace no longer resolves are retired in the same transaction (they are
     an authorization overhang otherwise — the sandbox may still hold their ids
     and a live JWT). Removal of the last OAuth server also deletes the
-    credential file, decided from the table so it converges on any worker.
+    credential file, decided from the table so it converges on any worker. A
+    no-op when ``resolved`` is already superseded by a newer config version.
+
+    Returns False only when a credential push was NEEDED and the sandbox
+    refused it — the one outcome the caller must not stamp as applied, since
+    nothing else retries a refused file. Settled non-push returns (relay
+    disabled, unowned resolve, superseded config) are True: re-running them
+    would produce the same decision, so a retry buys nothing.
     """
     oauth_servers = [s for s in resolved.servers if s.oauth_connection_id]
     if oauth_servers and not EGRESS_RELAY_SECRET:
@@ -53,17 +63,29 @@ async def sync_egress_relay(
             "EGRESS_RELAY_SECRET is unset — they stay unbound",
             [s.name for s in oauth_servers],
         )
-        return
-    # OAuth connections only resolve for authenticated users, so an anonymous
-    # turn can only ever be converging a removal.
-    if oauth_servers and not user_id:
-        return
+        return True
+    # The replacement below is whole-set, so a resolve with no owner is never
+    # authoritative: OAuth connections only resolve for an authenticated user,
+    # and an unowned resolve is indistinguishable from one that resolved empty
+    # because the owner was unknown — which would retire every live grant.
+    if not user_id:
+        return True
 
     synced = await sync_oauth_grants(
         user_id=user_id or "",
         workspace_id=workspace_id,
         connection_ids=[s.oauth_connection_id for s in oauth_servers],
+        config_version=resolved.version,
     )
+    # Superseded config: a newer sync owns the grant set, so returning here is
+    # what keeps a stale grant map out of the credential file. The near-miss in
+    # the other direction is benign — resolve reads the version before the rows,
+    # so a resolver can carry v1 with slightly newer rows — because the CAS only
+    # rejects genuinely stale replacements, and this worker's stamped v1 forces
+    # a re-resolve on its next acquire.
+    if synced is None:
+        return True
+
     grants: dict[str, str] = {}
     for srv in oauth_servers:
         grant_id = synced.grants.get(srv.oauth_connection_id)
@@ -78,7 +100,8 @@ async def sync_egress_relay(
         grants[srv.name] = grant_id
 
     if grants or synced.retired or session.egress_binding is not None:
-        await _push_credentials(workspace_id, session, user_id or "", grants)
+        return await _push_credentials(workspace_id, session, user_id or "", grants)
+    return True
 
 
 async def maybe_remint_egress_jwt(workspace_id: str, session: "Session") -> None:
@@ -96,10 +119,12 @@ async def maybe_remint_egress_jwt(workspace_id: str, session: "Session") -> None
     if not needs_remint(binding.jwt_exp):
         return
     try:
-        await _push_credentials(
+        # A refused push already logged its own warning; jwt_exp stays put, so
+        # the remint retries on the next warm acquire.
+        if await _push_credentials(
             workspace_id, session, binding.user_id, dict(binding.grants)
-        )
-        logger.info("[EGRESS] relay JWT reminted for workspace %s", workspace_id)
+        ):
+            logger.info("[EGRESS] relay JWT reminted for workspace %s", workspace_id)
     except Exception as e:
         logger.warning(
             "[EGRESS] relay JWT remint failed for %s: %s", workspace_id, e
@@ -111,11 +136,12 @@ async def _push_credentials(
     session: "Session",
     user_id: str,
     grants: dict[str, str],
-) -> None:
+) -> bool:
     """(Re)write the sandbox credential file; ``grants == {}`` deletes it.
 
     The binding records what the sandbox is known to hold, so it advances only
-    on a publication the sandbox confirmed. No cross-worker lock is needed: the
+    on a publication the sandbox confirmed — a refused upload returns False so
+    the caller keeps a retry signal. No cross-worker lock is needed: the
     upload replaces the file atomically, so a concurrent push can at worst
     overwrite this one's file with an equally-valid credential — never tear it.
     """
@@ -128,7 +154,7 @@ async def _push_credentials(
 
     sandbox = session.sandbox
     if sandbox is None:
-        return
+        return True
 
     payload, binding = None, None
     if grants:
@@ -157,5 +183,6 @@ async def _push_credentials(
             "[EGRESS] credential push failed for workspace %s — binding unchanged",
             workspace_id,
         )
-        return
+        return False
     session.egress_binding = binding
+    return True

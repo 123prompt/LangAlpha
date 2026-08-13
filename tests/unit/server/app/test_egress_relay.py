@@ -583,6 +583,31 @@ class TestGrantAuthorization:
         assert env.vendor.sends == 1
 
     @pytest.mark.asyncio
+    async def test_grant_id_spellings_collapse_to_one_canonical_key(
+        self, env, client
+    ):
+        """Postgres' uuid cast accepts every spelling of the same grant id, but
+        the limiter keys Redis by the string — an uncanonicalized id would mint
+        a fresh rate bucket per spelling."""
+        env.grant = _grant()
+        slot_keys: list[str] = []
+
+        @asynccontextmanager
+        async def _slot(grant_id: str):
+            slot_keys.append(grant_id)
+            yield
+
+        respelled = GRANT_ID.replace("-", "").upper()
+        with patch("src.server.app.egress_relay.acquire_slot", _slot):
+            resp = await _post(
+                client, token=_jwt(), path=f"/v1/egress/{respelled}"
+            )
+
+        assert resp.status_code == 200
+        assert slot_keys == [GRANT_ID]
+        assert env.grant_lookups == [GRANT_ID]
+
+    @pytest.mark.asyncio
     async def test_refresh_in_progress_is_a_503_not_a_reauth_prompt(self, env, client):
         from src.server.services.mcp_oauth.lifecycle import TokenUnavailable
 

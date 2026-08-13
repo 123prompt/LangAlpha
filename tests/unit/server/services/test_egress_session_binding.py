@@ -30,6 +30,7 @@ from src.server.services.egress.session_binding import (
 WS = "33333333-3333-4333-8333-333333333333"
 USER = "user-1"
 SECRET = "test-relay-secret-0123456789abcdef0123456789abcdef"
+VERSION = 7
 
 
 def _server(name: str, connection_id: str | None):
@@ -57,8 +58,8 @@ def _session(binding: EgressBinding | None = None):
     )
 
 
-def _resolved(*servers):
-    return SimpleNamespace(servers=list(servers))
+def _resolved(*servers, version: int = VERSION):
+    return SimpleNamespace(servers=list(servers), version=version)
 
 
 def _synced(grants: dict[str, str] | None = None, retired: int = 0):
@@ -106,7 +107,8 @@ class TestTeardown:
             await sync_egress_relay(WS, USER, session, _resolved())
 
         sync.assert_awaited_once_with(
-            user_id=USER, workspace_id=WS, connection_ids=[]
+            user_id=USER, workspace_id=WS, connection_ids=[],
+            config_version=VERSION,
         )
         session.sandbox.upload_egress_relay_credentials.assert_awaited_once_with(None)
         assert session.egress_binding is None
@@ -147,9 +149,47 @@ class TestTeardown:
         with patch(
             "src.server.services.egress.session_binding.sync_oauth_grants", _synced()
         ):
-            await sync_egress_relay(WS, USER, session, _resolved())
+            ok = await sync_egress_relay(WS, USER, session, _resolved())
 
+        assert ok is False
         assert session.egress_binding is binding
+
+
+# ---------------------------------------------------------------------------
+# Unknown owner — the whole-set replacement must not run without an identity.
+# ---------------------------------------------------------------------------
+
+
+class TestUnknownOwner:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner", [None, ""])
+    async def test_an_ownerless_resolve_never_reaches_the_grant_table(self, owner):
+        """A caller that lost the workspace owner resolves zero OAuth servers —
+        indistinguishable on the wire from a genuine removal, and the sync
+        retires the whole active set. It must stop before the table."""
+        session = _session(binding=None)
+        sync = _synced(retired=2)
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants", sync
+        ):
+            await sync_egress_relay(WS, owner, session, _resolved())
+
+        sync.assert_not_awaited()
+        session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_ownerless_resolve_with_oauth_servers_binds_nothing(
+        self, secret, relay_base
+    ):
+        session = _session(binding=None)
+        sync = _synced({"conn-1": "g-1"})
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants", sync
+        ):
+            await sync_egress_relay(WS, None, session, _resolved(_server("srv", "conn-1")))
+
+        sync.assert_not_awaited()
+        session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +213,8 @@ class TestBind:
         # Upsert AND retirement are one call — a workspace is never left with a
         # committed grant set that the retirement half hasn't caught up to.
         sync.assert_awaited_once_with(
-            user_id=USER, workspace_id=WS, connection_ids=["conn-a", "conn-b"]
+            user_id=USER, workspace_id=WS, connection_ids=["conn-a", "conn-b"],
+            config_version=VERSION,
         )
 
         payload = session.sandbox.upload_egress_relay_credentials.await_args.args[0]
@@ -236,8 +277,9 @@ class TestBind:
             "src.server.services.egress.session_binding.sync_oauth_grants",
             _synced({"conn-1": "g-1"}),
         ):
-            await sync_egress_relay(WS, USER, session, _resolved(srv))
+            ok = await sync_egress_relay(WS, USER, session, _resolved(srv))
 
+        assert ok is True
         session.sandbox.upload_egress_relay_credentials.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -254,8 +296,9 @@ class TestBind:
             "src.server.services.egress.session_binding.sync_oauth_grants",
             _synced({"conn-1": "g-1"}),
         ):
-            await sync_egress_relay(WS, USER, session, _resolved(srv))
+            ok = await sync_egress_relay(WS, USER, session, _resolved(srv))
 
+        assert ok is False  # the caller must keep a retry signal
         assert session.egress_binding is None
 
     @pytest.mark.asyncio
@@ -273,10 +316,68 @@ class TestBind:
                 "src.server.services.egress.session_binding.sync_oauth_grants", sync
             ),
         ):
-            await sync_egress_relay(WS, USER, session, _resolved(srv))
+            ok = await sync_egress_relay(WS, USER, session, _resolved(srv))
 
+        # Settled non-push: re-running would decide the same, so no retry signal.
+        assert ok is True
         sync.assert_not_awaited()
         session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Superseded resolve (the DB layer's version CAS refused the replacement)
+# ---------------------------------------------------------------------------
+
+
+class TestStaleResolver:
+    @pytest.mark.asyncio
+    async def test_a_refused_replacement_pushes_no_credentials(
+        self, secret, relay_base
+    ):
+        """None means a newer sync owns the grant set. Pushing anyway would
+        overwrite the sandbox's credential file with this worker's stale grant
+        map — the file is last-write-wins, so it would stick."""
+        srv = _server("srv", "conn-1")
+        session = _session()
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants",
+            AsyncMock(return_value=None),
+        ):
+            await sync_egress_relay(WS, USER, session, _resolved(srv))
+
+        session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
+        assert session.egress_binding is None
+
+    @pytest.mark.asyncio
+    async def test_a_refused_teardown_leaves_the_existing_binding_alone(
+        self, secret, relay_base
+    ):
+        """The teardown path is the dangerous one: `retired`/binding state would
+        otherwise drive a delete of a file the winning worker just wrote."""
+        binding = EgressBinding(grants={"srv": "g1"}, jwt_exp=9e9, user_id=USER)
+        session = _session(binding=binding)
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants",
+            AsyncMock(return_value=None),
+        ):
+            await sync_egress_relay(WS, USER, session, _resolved())
+
+        session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
+        assert session.egress_binding is binding
+
+    @pytest.mark.asyncio
+    async def test_the_resolved_version_is_what_gets_compared(self, secret, relay_base):
+        """Not the session's applied version or a re-read — the CAS is only
+        meaningful if it carries the version this exact set was resolved at."""
+        srv = _server("srv", "conn-1")
+        session = _session()
+        sync = _synced({"conn-1": "g-1"})
+        with patch(
+            "src.server.services.egress.session_binding.sync_oauth_grants", sync
+        ):
+            await sync_egress_relay(WS, USER, session, _resolved(srv, version=42))
+
+        assert sync.await_args.kwargs["config_version"] == 42
 
 
 # ---------------------------------------------------------------------------

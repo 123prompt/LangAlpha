@@ -13,6 +13,7 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
+from src.server.database.mcp_oauth import SERVABLE_PARAM
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,8 @@ async def sync_oauth_grants(
     user_id: str,
     workspace_id: str,
     connection_ids: Sequence[str],
-) -> GrantSync:
+    config_version: int,
+) -> GrantSync | None:
     """Make ``connection_ids`` exactly this workspace's active OAuth grants.
 
     One transaction: upsert a grant per connection, then revoke every other
@@ -54,10 +56,50 @@ async def sync_oauth_grants(
     steer a grant at a host the token wasn't issued for. Connections are
     likewise *selected* under the owner predicate rather than trusted, so an id
     that is absent or another user's simply produces no grant (and is then
-    retired like any other): a caller that guessed an id learns nothing.
+    retired like any other): a caller that guessed an id learns nothing. That
+    same SELECT carries the servable-status predicate, since the upsert's
+    ``status = 'active'`` would otherwise reactivate a grant on a connection
+    that has since been revoked or needs re-auth.
+
+    Returns None, having touched no grant row, when ``config_version`` no
+    longer matches ``workspaces.mcp_config_version`` — the caller resolved
+    against a superseded config and a newer sync owns the set. This is a
+    whole-set replacement, so two workers cannot be merged by row locks: the
+    stale one would reactivate what the fresh one just revoked.
     """
+    # Deferred like platform_secret_sweep's: writer_guard reaches back into
+    # src.server.database.pool, so importing it at module scope from the
+    # database layer would close a database → services → database loop.
+    from src.server.services.writer_guard import advisory_key
+
     async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
+            # Serialize this workspace's replacements across workers, THEN
+            # re-read the version under that lock. The lock alone would only
+            # order a stale writer last; the CAS alone could pass and then be
+            # overtaken. Together they make "CAS passed" mean no newer set can
+            # commit ahead of this one. Transaction-scoped, so a worker that
+            # dies mid-replacement releases it.
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (advisory_key("EG", workspace_id),),
+            )
+            await cur.execute(
+                "SELECT mcp_config_version FROM workspaces WHERE workspace_id = %s",
+                (workspace_id,),
+            )
+            ws_row = await cur.fetchone()
+            # A workspace that no longer exists matches no version, so it also
+            # replaces nothing.
+            live_version = ws_row["mcp_config_version"] if ws_row else None
+            if live_version != config_version:
+                logger.info(
+                    f"[egress_grants_db] stale grant replacement for workspace "
+                    f"{workspace_id} (resolved v{config_version}, live "
+                    f"v{live_version}) — left to the newer sync"
+                )
+                return None
+
             granted: dict[str, str] = {}
             if connection_ids:
                 await cur.execute(
@@ -69,6 +111,7 @@ async def sync_oauth_grants(
                            'active', NOW(), NOW()
                     FROM user_mcp_oauth_connections c
                     WHERE c.connection_id = ANY(%s::uuid[]) AND c.user_id = %s
+                      AND c.status = ANY(%s)
                     ON CONFLICT (workspace_id, kind, connection_id) DO UPDATE SET
                         destination_url = EXCLUDED.destination_url,
                         status = 'active',
@@ -77,7 +120,7 @@ async def sync_oauth_grants(
                     """,
                     (
                         user_id, workspace_id, GRANT_KIND_OAUTH_MCP,
-                        list(connection_ids), user_id,
+                        list(connection_ids), user_id, SERVABLE_PARAM,
                     ),
                 )
                 granted = {

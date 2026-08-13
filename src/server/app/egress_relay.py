@@ -96,9 +96,12 @@ async def relay(grant_id: str, request: Request) -> Response:
     resources = AsyncExitStack()
     try:
         # A malformed grant id answers the same uniform 404 as an unknown one
-        # (the column is a uuid) — never a 500 with a stack trace.
+        # (the column is a uuid) — never a 500 with a stack trace. Canonicalize,
+        # not just validate: the limiter keys Redis by this string while
+        # Postgres' uuid cast accepts every spelling (case, hyphens, braces), so
+        # a respelled id would otherwise mint itself a fresh rate bucket.
         try:
-            uuid.UUID(grant_id)
+            grant_id = str(uuid.UUID(grant_id))
         except ValueError:
             raise RelayRejection(404, RelayError.NOT_FOUND)
         try:

@@ -26,9 +26,16 @@ __all__ = [
 ISSUER = "langalpha"
 AUDIENCE = "langalpha-egress-relay"
 ALGORITHM = "HS256"  # fixed single-entry allowlist — never taken from the header
-DEFAULT_TTL_SECONDS = 2 * 60 * 60
+# Minted at session acquisition and re-minted only when the acquire-time check
+# finds the token under the threshold — so the credential life a turn can rely
+# on is the THRESHOLD (a warm acquire keeps anything above it), and the
+# threshold must cover the per-turn cap (config.yaml workflow_timeout=21600)
+# with margin or a long turn loses egress mid-run. TTL minus threshold is only
+# the remint cadence. Long tokens are free here: revocation is a per-request
+# grant lookup, never expiry.
+DEFAULT_TTL_SECONDS = 8 * 60 * 60
 LEEWAY_SECONDS = 30
-REMINT_THRESHOLD_SECONDS = 30 * 60
+REMINT_THRESHOLD_SECONDS = 21600 + 30 * 60  # turn cap + bringup/skew margin
 
 _REQUIRED_CLAIMS = ["iss", "aud", "sub", "workspace_id", "sandbox_id", "iat", "nbf", "exp", "jti"]
 
