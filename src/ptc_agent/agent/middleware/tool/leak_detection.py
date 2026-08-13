@@ -51,6 +51,8 @@ class LeakDetectionMiddleware(AgentMiddleware):
         """
         secrets: dict[str, str] = {}
 
+        from ptc_agent.core.mcp_sanitize import looks_like_secret
+
         for server in mcp_servers or []:
             if not server.enabled:
                 continue
@@ -66,6 +68,15 @@ class LeakDetectionMiddleware(AgentMiddleware):
                 elif isinstance(value, str) and len(value) >= 8:
                     # Literal value (not a placeholder)
                     secrets[key] = value
+            # Headers carry credentials the same way env does, but also plain
+            # protocol config ("application/json") that tool output quotes all
+            # the time — so unlike env, only credential-looking literals join.
+            # ${...} refs resolve elsewhere (vault covers their values).
+            for key, value in (getattr(server, "headers", None) or {}).items():
+                if not isinstance(value, str) or value.startswith("${"):
+                    continue
+                if len(value) >= 8 and looks_like_secret(key, value):
+                    secrets[f"{server.name}:{key}"] = value
 
         # Also check for GITHUB_TOKEN (injected separately by _build_sandbox_env_vars).
         # Use get_nested_config to match sandbox.py's resolution logic.

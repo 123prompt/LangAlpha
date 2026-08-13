@@ -174,11 +174,27 @@ def test_shipped_tiers_are_valid():
 def merge_probes(monkeypatch):
     import src.server.database.vault_secrets as vs
 
+    monkeypatch.setenv("BYOK_ENCRYPTION_KEY", "unit-test-key")
     ws = AsyncMock(return_value={})
     monkeypatch.setattr(vs, "_decrypted", ws)
     user = AsyncMock(return_value={})
     monkeypatch.setattr(uvs, "get_user_secrets_decrypted", user)
     return ws, user
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_encryption_means_no_secrets(merge_probes, monkeypatch):
+    """Key-less deployments can't have written a secret, so {} is the true
+    answer — and the DB is never touched."""
+    from src.server.database.vault_secrets import get_effective_secrets
+
+    monkeypatch.delenv("BYOK_ENCRYPTION_KEY")
+    ws, user = merge_probes
+    ws.return_value = {"API_KEY": "ws-value"}
+
+    assert await get_effective_secrets("ws-1", "user-1") == {}
+    ws.assert_not_awaited()
+    user.assert_not_awaited()
 
 
 @pytest.mark.asyncio

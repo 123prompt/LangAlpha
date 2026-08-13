@@ -31,6 +31,24 @@ VAULT_REF_RE = re.compile(r"\$\{vault:([A-Za-z_][A-Za-z0-9_]{0,127})\}")
 # Default bounds for untrusted tool text entering docstrings / docs / prompt.
 DEFAULT_TOOL_TEXT_MAX_LEN = 2048
 
+# An env/header literal reads as a credential when its key name does, or the
+# value is a long opaque token. Every lane that must separate credentials from
+# ordinary config (import-time vault extraction, output redaction) shares this
+# ONE heuristic so a value one lane vaults is never a value another serves.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(secret|token|password|passwd|pwd|apikey|api[_-]?key|access[_-]?key|"
+    r"authorization|auth|bearer|credential|cred|private[_-]?key|\bpat\b|\bkey\b)"
+)
+_OPAQUE_TOKEN_MIN_LEN = 20
+
+
+def looks_like_secret(key: str, value: str) -> bool:
+    """Heuristic: is this env/header literal a credential rather than config?"""
+    if _SECRET_KEY_RE.search(key or ""):
+        return True
+    v = value or ""
+    return len(v) >= _OPAQUE_TOKEN_MIN_LEN and " " not in v and not v.isdigit()
+
 
 @dataclass(frozen=True)
 class SanitizedToolSet:

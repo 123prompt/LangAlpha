@@ -15,7 +15,7 @@ from typing import Any
 from psycopg.rows import dict_row
 
 from src.server.database.pool import get_db_connection
-from src.server.database.encryption import get_encryption_key as _get_encryption_key
+from src.server.database.encryption import encryption_configured, get_encryption_key as _get_encryption_key
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +332,12 @@ async def get_effective_secrets(
     ``user_id`` is read off the workspace row when omitted; callers that
     already hold the owner should pass it.
     """
+    # A deployment without the encryption key cannot have written any vault
+    # secret (every write encrypts with it), so "no secrets" is the true
+    # answer here — unlike a lookup failure, which propagates.
+    if not encryption_configured():
+        return {}
+
     # Imported here: the user tier's module is built on this one's internals,
     # so a top-level import would close the cycle.
     from src.server.database.user_vault_secrets import get_user_secrets_decrypted

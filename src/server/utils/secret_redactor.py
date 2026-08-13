@@ -122,29 +122,69 @@ def get_redactor() -> SecretRedactor:
 
 
 async def get_vault_secrets_for_redaction(workspace_id: str) -> dict[str, str]:
-    """Get a workspace's effective vault secrets (user ∪ workspace) for redaction.
+    """The workspace's redactable secret set: effective vault secrets
+    (user ∪ workspace) plus credential-looking inline connector literals.
 
-    Tries the active sandbox session first (zero cost — it holds the same
-    merged set the push uploaded), falls back to DB for stopped workspaces.
+    Always reads the DB, never a live session's cached copy: that cache is
+    process-local and written once at upload, so a rotation handled by another
+    worker leaves this process holding the RETIRED value, which would scrub the
+    dead secret and pass the live one through in cleartext. A failed read
+    propagates: an empty dict means the workspace has no secrets, never "the
+    lookup failed" — callers serve file bytes on this answer, one of them on a
+    route whose only credential is the workspace UUID.
     """
-    # Fast path: read from active session (already in memory from push_vault_secrets)
-    try:
-        from src.server.services.workspace_manager import WorkspaceManager
+    from src.server.database.vault_secrets import get_effective_secrets
 
-        wm = WorkspaceManager.get_instance()
-        session = wm._sessions.get(workspace_id)
-        if session and session.sandbox:
-            secrets = getattr(session.sandbox, "vault_secrets", None)
-            if secrets is not None:
-                return secrets
-    except Exception:
-        pass
+    literals = await _connector_secret_literals(workspace_id)
+    vault = await get_effective_secrets(workspace_id)
+    return {**literals, **vault}
 
-    # Slow path: DB query for stopped workspaces (infrequent)
-    try:
-        from src.server.database.vault_secrets import get_effective_secrets
 
-        return await get_effective_secrets(workspace_id)
-    except Exception:
-        logger.warning("Failed to fetch vault secrets for redaction", workspace_id=workspace_id)
-        return {}
+async def _connector_secret_literals(workspace_id: str) -> dict[str, str]:
+    """Inline env/header literals from the workspace's connectors that read
+    as credentials.
+
+    The sanctioned home for these values is a ``${vault:NAME}`` ref, but the
+    API accepts plain literals too, and a literal the platform delivers into
+    every inheriting workspace deserves the same scrubbing a vault value gets.
+    Collection is over-broad on rows (both tiers, disabled included — a
+    credential on a disabled row is still a credential) and narrow on values:
+    ``looks_like_secret`` keeps ordinary config (``application/json``,
+    ``LOG_LEVEL=ERROR``) from being redacted out of served files.
+    """
+    from ptc_agent.core.mcp_sanitize import VAULT_REF_RE, looks_like_secret
+    from src.server.database.mcp_servers import (
+        list_catalog_servers,
+        list_workspace_servers,
+    )
+    from src.server.database.workspace import get_workspace
+
+    def _collect(server: str, mapping, out: dict[str, str]) -> None:
+        for key, value in (mapping or {}).items():
+            if not isinstance(value, str) or key in _NON_SECRET_KEYS:
+                continue
+            if VAULT_REF_RE.fullmatch(value):
+                continue  # resolves to a vault value the scan already covers
+            if len(value) < 8 or not looks_like_secret(key, value):
+                continue
+            out[f"mcp:{server}:{key}"] = value
+
+    entries: list[tuple[str, object, object]] = []
+    for row in await list_workspace_servers(workspace_id):
+        config = row.get("config") or {}
+        entries.append(
+            (row.get("name") or "", config.get("env"), config.get("headers"))
+        )
+    workspace = await get_workspace(workspace_id)
+    user_id = (workspace or {}).get("user_id")
+    if user_id:
+        for row in await list_catalog_servers(str(user_id)):
+            entries.append(
+                (row.get("name") or "", row.get("env"), row.get("headers"))
+            )
+
+    literals: dict[str, str] = {}
+    for server, env, headers in entries:
+        _collect(server, env, literals)
+        _collect(server, headers, literals)
+    return literals

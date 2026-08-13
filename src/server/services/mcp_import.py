@@ -18,26 +18,12 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import ValidationError
 
-from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
+# looks_like_secret decides which import-time literals get auto-extracted into
+# vault secrets; benign config (``MODE=prod``, ``LOG_LEVEL=ERROR``) stays an
+# inline literal so we don't clutter the vault. Defined in mcp_sanitize so the
+# redaction lanes apply the identical credential test.
+from ptc_agent.core.mcp_sanitize import VAULT_REF_RE, looks_like_secret
 from src.server.database.pool import get_db_connection
-
-# On bulk import, an env/header value is auto-extracted into a vault secret when
-# it looks like a credential — either the key name reads like one, or the value
-# is a long opaque token. Benign config (``MODE=prod``, ``LOG_LEVEL=ERROR``)
-# stays an inline literal so we don't clutter the vault.
-_SECRET_KEY_RE = re.compile(
-    r"(?i)(secret|token|password|passwd|pwd|apikey|api[_-]?key|access[_-]?key|"
-    r"authorization|auth|bearer|credential|cred|private[_-]?key|\bpat\b|\bkey\b)"
-)
-_OPAQUE_TOKEN_MIN_LEN = 20
-
-
-def looks_like_secret(key: str, value: str) -> bool:
-    """Heuristic: should this env/header literal be vaulted rather than inlined?"""
-    if _SECRET_KEY_RE.search(key or ""):
-        return True
-    v = value or ""
-    return len(v) >= _OPAQUE_TOKEN_MIN_LEN and " " not in v and not v.isdigit()
 
 
 def vault_secret_name(server_name: str, key: str, used: set[str]) -> str:
