@@ -2743,6 +2743,8 @@
       "disconnectFailed": "Could not disconnect",
       "refreshedTitle": "Tools refreshed",
       "refreshedDesc": "\"{{server}}\" now exposes {{count}} tools.",
+      "refreshFailedStaleTitle": "Tools not refreshed",
+      "refreshFailedStaleDesc": "The refresh of \"{{server}}\" did not complete. Its {{count}} previously discovered tools are still available.",
       "refreshFailed": "Could not refresh tools"
     },
     "import": {

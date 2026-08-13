@@ -434,6 +434,40 @@ describe('ConnectorServers — refresh tool schemas', () => {
     );
   });
 
+  it('does not claim success when an ok status carries error text (stale snapshot)', async () => {
+    // The schema cache keeps the last good `status`/`tools` when a re-discovery
+    // fails but always overwrites `error`. So status ok + non-empty error means
+    // THIS attempt failed and `tool_count` is the old number — the success
+    // toast would be an affirmative lie, and it's the only feedback channel.
+    catalogData = makeCatalog([makeOauthServer({ oauth_status: 'connected' })]);
+    mutateAsync.refresh.mockResolvedValue({
+      server_name: 'remote_connector',
+      status: 'ok',
+      error: 'connect to 10.0.0.5:8080 failed: connection refused',
+      tool_count: 7,
+      discovered_at: null,
+    });
+    renderWithProviders(<ConnectorServers />);
+
+    fireEvent.click(screen.getByText('Refresh tools'));
+
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'Tools not refreshed',
+          description: expect.stringContaining('7 previously discovered tools'),
+        }),
+      ),
+    );
+    // The raw error is an internal-reachability oracle — it must not reach copy.
+    const description = vi.mocked(toast).mock.calls[0][0].description as string;
+    expect(description).not.toContain('10.0.0.5');
+    expect(description).not.toContain('connection refused');
+    expect(toast).not.toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Tools refreshed' }),
+    );
+  });
+
   it('surfaces a resolved-but-failed refresh (HTTP 200 with a non-ok status)', async () => {
     // The refresh endpoint reports its own failure in the body rather than
     // rejecting — swallowing that would read to the user as a successful noop.
@@ -545,6 +579,35 @@ describe('ConnectorServers — create and edit', () => {
       ),
     );
     expect(mutateAsync.create).not.toHaveBeenCalled();
+  });
+
+  it('re-saves the stored env map on an unrelated edit instead of wiping it', async () => {
+    // The PUT is a full replacement, so whatever the modal submits IS the new
+    // row. The catalog response has to carry `env` for the form to hydrate it —
+    // with only `env_refs` the editor comes up blank and a description-only
+    // edit erases the server's settings across every workspace it feeds.
+    const stored = { API_TOKEN: '${vault:API_TOKEN}', REGION: 'us-east-1' };
+    catalogData = makeCatalog([
+      makeCatalogServer({ name: 'existing_server', env: stored, env_refs: ['API_TOKEN'] }),
+    ]);
+    mutateAsync.update.mockResolvedValue(makeCatalogServer({ name: 'existing_server' }));
+    renderWithProviders(<ConnectorServers />);
+
+    fireEvent.click(screen.getByText('Edit'));
+    fireEvent.change(await screen.findByPlaceholderText('What this server does'), {
+      target: { value: 'edited description' },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: /^save$/i }));
+
+    await waitFor(() =>
+      expect(mutateAsync.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: 'existing_server',
+          // The submitted body IS the new row — env must survive verbatim.
+          body: expect.objectContaining({ description: 'edited description', env: stored }),
+        }),
+      ),
+    );
   });
 });
 

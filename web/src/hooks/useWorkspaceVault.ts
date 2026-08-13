@@ -42,6 +42,9 @@ export function useCreateWorkspaceVaultSecret(workspaceId: string) {
       createVaultSecret(workspaceId, body),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaceVault.byWorkspace(workspaceId) });
+      // Server rows derive needs_secret from vault state, and a settled MCP
+      // list stops polling — without this the pill outlives the fix.
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
     },
   });
 }
@@ -58,6 +61,7 @@ export function useUpdateWorkspaceVaultSecret(workspaceId: string) {
     }) => updateVaultSecret(workspaceId, name, body),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaceVault.byWorkspace(workspaceId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
     },
   });
 }
@@ -68,6 +72,7 @@ export function useDeleteWorkspaceVaultSecret(workspaceId: string) {
     mutationFn: (name: string) => deleteVaultSecret(workspaceId, name),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaceVault.byWorkspace(workspaceId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.mcp.workspace(workspaceId) });
     },
   });
 }

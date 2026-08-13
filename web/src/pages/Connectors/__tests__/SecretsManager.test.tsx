@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { act, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import React from 'react';
 import { renderWithProviders } from '@/test/utils';
@@ -373,6 +373,58 @@ describe('SecretsManager via the user vault adapter — reveal', () => {
     fireEvent.click(screen.getByTitle('Reveal value'));
 
     await waitFor(() => expect(screen.getByText('decrypt failed')).toBeInTheDocument());
+    expect(screen.getByText('sk-…abcd')).toBeInTheDocument();
+  });
+
+  it('discards a reveal that resolves after the secret was deleted', async () => {
+    // The reveal cache is keyed by name: if a slow reveal resolved after the
+    // delete and still cached, a recreated same-name secret would display the
+    // deleted one's plaintext.
+    userVaultData = { secrets: [userSecret('RACE_TOKEN')], remaining_slots: 19 };
+    let resolveReveal!: (value: string) => void;
+    mockRevealUserVaultSecret.mockImplementation(
+      () => new Promise<string>((resolve) => { resolveReveal = resolve; }),
+    );
+    userVault.del.mockResolvedValue({ ok: true });
+    renderWithProviders(<ConnectorSecrets />);
+
+    fireEvent.click(screen.getByTitle('Reveal value'));
+    await waitFor(() => expect(mockRevealUserVaultSecret).toHaveBeenCalledWith('RACE_TOKEN'));
+
+    fireEvent.click(screen.getByTitle('Delete'));
+    fireEvent.click(screen.getByRole('button', { name: /^confirm$/i }));
+    await waitFor(() => expect(userVault.del).toHaveBeenCalledWith('RACE_TOKEN'));
+
+    await act(async () => { resolveReveal('stale-plaintext'); });
+
+    expect(screen.queryByText('stale-plaintext')).not.toBeInTheDocument();
+    expect(screen.getByText('sk-…abcd')).toBeInTheDocument();
+  });
+
+  it('discards a reveal that resolves after the secret was updated', async () => {
+    // The delete fence alone is not enough: an edit+save racing a slow reveal
+    // would otherwise repopulate the UI with the pre-edit plaintext.
+    userVaultData = { secrets: [userSecret('RACE_TOKEN')], remaining_slots: 19 };
+    let resolveReveal!: (value: string) => void;
+    mockRevealUserVaultSecret.mockImplementation(
+      () => new Promise<string>((resolve) => { resolveReveal = resolve; }),
+    );
+    userVault.update.mockResolvedValue({ name: 'RACE_TOKEN' });
+    renderWithProviders(<ConnectorSecrets />);
+
+    fireEvent.click(screen.getByTitle('Reveal value'));
+    await waitFor(() => expect(mockRevealUserVaultSecret).toHaveBeenCalledWith('RACE_TOKEN'));
+
+    fireEvent.click(screen.getByTitle('Edit'));
+    fireEvent.change(screen.getByPlaceholderText('New value (leave empty to keep current)'), {
+      target: { value: 'rotated-value' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /^update$/i }));
+    await waitFor(() => expect(userVault.update).toHaveBeenCalled());
+
+    await act(async () => { resolveReveal('pre-edit-plaintext'); });
+
+    expect(screen.queryByText('pre-edit-plaintext')).not.toBeInTheDocument();
     expect(screen.getByText('sk-…abcd')).toBeInTheDocument();
   });
 });

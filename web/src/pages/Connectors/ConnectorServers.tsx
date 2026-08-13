@@ -162,10 +162,24 @@ export function ConnectorServers() {
     setRefreshingName(name);
     try {
       const result = await refreshMutation.mutateAsync(name);
-      if (result.status === 'ok') {
+      if (result.status === 'ok' && !result.error) {
         toast({
           title: t('connectors.oauth.refreshedTitle'),
           description: t('connectors.oauth.refreshedDesc', {
+            server: name,
+            count: result.tool_count,
+          }),
+        });
+      } else if (result.status === 'ok') {
+        // The cache keeps `status`/`tools` from the last good snapshot on a
+        // failed re-discovery but always overwrites `error` — so an ok status
+        // carrying error text means this attempt failed and the count below is
+        // stale. Claiming success here would be a lie. The error string itself
+        // stays out of the copy: it can be a raw connection error against a
+        // user-chosen address, i.e. an internal-reachability oracle.
+        toast({
+          title: t('connectors.oauth.refreshFailedStaleTitle'),
+          description: t('connectors.oauth.refreshFailedStaleDesc', {
             server: name,
             count: result.tool_count,
           }),

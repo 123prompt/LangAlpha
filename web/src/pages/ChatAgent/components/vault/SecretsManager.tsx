@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { KeyRound, Plus } from 'lucide-react';
 import { ListEmpty, ListError, ListHeader, ListSkeleton } from '../mcp/McpPrimitives';
@@ -84,6 +84,9 @@ export function SecretsManager({
   const [mode, setMode] = useState<SecretsMode>(IDLE);
   const [revealing, setRevealing] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Record<string, string>>({});
+  // Bumped on every successful delete or update; a reveal resolving under an
+  // older epoch discards its value instead of caching it.
+  const revealEpoch = useRef(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -140,6 +143,9 @@ export function SecretsManager({
     try {
       await onUpdate(name, { ...(draft.value ? { value: draft.value } : {}), description: draft.description });
       setMode(IDLE);
+      // forget() alone is not enough: a reveal already in flight would
+      // re-cache the pre-edit plaintext when it resolves.
+      revealEpoch.current += 1;
       forget(name);
     } catch (err) {
       setError(formatApiErrorDetail(err));
@@ -155,6 +161,10 @@ export function SecretsManager({
     try {
       await onDelete(mode.name);
       setMode(IDLE);
+      // The reveal cache is keyed by name — left in place, a recreated
+      // same-name secret would display the deleted one's plaintext.
+      revealEpoch.current += 1;
+      forget(mode.name);
     } catch (err) {
       setError(formatApiErrorDetail(err));
     } finally {
@@ -169,9 +179,14 @@ export function SecretsManager({
     }
     setRevealing(name);
     setError(null);
+    const epoch = revealEpoch.current;
     try {
       const value = await onReveal(name);
-      setRevealed((prev) => ({ ...prev, [name]: value }));
+      // A delete that landed mid-reveal bumped the epoch — caching now would
+      // resurrect the deleted secret's plaintext under a recreated name.
+      if (revealEpoch.current === epoch) {
+        setRevealed((prev) => ({ ...prev, [name]: value }));
+      }
     } catch (err) {
       setError(formatApiErrorDetail(err));
     } finally {

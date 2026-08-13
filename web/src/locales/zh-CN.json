@@ -2721,6 +2721,8 @@
       "disconnectFailed": "无法断开连接",
       "refreshedTitle": "工具已刷新",
       "refreshedDesc": "“{{server}}”现提供 {{count}} 个工具。",
+      "refreshFailedStaleTitle": "工具未刷新",
+      "refreshFailedStaleDesc": "“{{server}}”的刷新未能完成。此前发现的 {{count}} 个工具仍可使用。",
       "refreshFailed": "无法刷新工具"
     },
     "import": {

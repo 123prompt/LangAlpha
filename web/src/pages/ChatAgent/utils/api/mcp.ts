@@ -135,7 +135,7 @@ export interface EffectiveServerList {
   sandbox_warming?: boolean;
 }
 
-/** A user catalog template row (masked — only vault refs surfaced). */
+/** A user catalog row, as returned to its owner. */
 export interface CatalogServer {
   name: string;
   transport: McpTransport;
@@ -144,6 +144,14 @@ export interface CatalogServer {
   url: string | null;
   env_refs: string[];
   header_refs: string[];
+  /**
+   * The stored env/header reference maps — keys are the real var/header names,
+   * values the configured `${vault:NAME}` ref strings or plain literals (never
+   * resolved secrets). The edit form round-trips them; absent on older backends
+   * that returned only `env_refs`/`header_refs`.
+   */
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
   description: string;
   instruction: string;
   tool_exposure_mode: string;
