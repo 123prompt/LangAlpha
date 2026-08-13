@@ -213,7 +213,8 @@ async def open_upstream(
     prepared: PreparedRelay, incoming_headers: dict[str, str]
 ) -> httpx.Response:
     """Send the canonical body to the pinned destination; one 401 retry when
-    the stored bundle has visibly rotated since we read it."""
+    the stored bundle has visibly rotated since we read it. A vendor redirect
+    is refused rather than followed or relayed on."""
     destination = prepared.grant["destination_url"]
     try:
         target = await pin_public_url(destination, require_https=True)
@@ -243,13 +244,28 @@ async def open_upstream(
                 content=prepared.canonical.body,
                 extensions=extensions,
             )
-            return await client.send(request, stream=True)
+            response = await client.send(request, stream=True)
         except httpx.HTTPError as e:
             logger.warning(
                 "[egress_relay] upstream unreachable for connection %s: %s",
                 connection_id, e,
             )
             raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
+        if response.has_redirect_location:
+            # Following the hop would carry the vendor bearer to whatever host
+            # the redirect names, but relaying the 3xx on is worse than useless:
+            # Location is not in RESPONSE_HEADER_ALLOWLIST, so the sandbox would
+            # raise a bare "redirect response" against the RELAY's own URL, with
+            # nothing pointing at the vendor. Name it as its own outcome instead.
+            # The target follows the destination-pin reason above and stays
+            # host-side, since the sandbox is never told the vendor's address.
+            await response.aclose()
+            logger.warning(
+                "[egress_relay] vendor redirected connection %s to %s",
+                connection_id, response.headers.get("location"),
+            )
+            raise RelayRejection(502, RelayError.VENDOR_REDIRECT)
+        return response
 
     response = await _send(headers)
     if response.status_code != 401:

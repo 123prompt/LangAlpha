@@ -307,6 +307,7 @@ _RELAY_ERROR_HINTS = {
     "refresh_in_progress": "the vendor token is being refreshed; retry in a few seconds",
     "destination_blocked": "the relay refused to dial this server's address",
     "upstream_unreachable": "the relay could not reach the vendor's server",
+    "vendor_redirect": "the vendor redirected this endpoint, so its URL has moved; update the server URL in Connectors",
     "limited_rate": "rate limit reached for this connection; retry shortly",
     "limited_concurrency": "too many concurrent calls for this connection; retry shortly",
     "relay_disabled": "the egress relay is disabled on this deployment",
