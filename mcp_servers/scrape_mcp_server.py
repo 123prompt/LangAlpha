@@ -20,6 +20,7 @@ import asyncio
 import math
 import re
 import sys
+import time
 from typing import Any, List, Optional
 
 try:
@@ -186,7 +187,11 @@ def _report_close_error(exc: BaseException, post_cancel: bool) -> None:
 
 
 async def _fetch_html(
-    url: str, mode: str, timeout_s: float, solve_cloudflare: bool
+    url: str,
+    mode: str,
+    timeout_s: float,
+    solve_cloudflare: bool,
+    close_deadline: float | None = None,
 ) -> tuple[str, int]:
     if mode == "fast":
         _, html, status = await fetch_fast(url, timeout_s=timeout_s)
@@ -195,13 +200,22 @@ async def _fetch_html(
     session = make_session(mode, timeout_ms=timeout_s * 1000)
     fetch_kwargs = {"solve_cloudflare": solve_cloudflare} if mode == "stealth" else {}
     _, html, status = await fetch_with_session(
-        session, url, on_close_error=_report_close_error, **fetch_kwargs
+        session,
+        url,
+        on_close_error=_report_close_error,
+        close_deadline=close_deadline,
+        **fetch_kwargs,
     )
     return html, status
 
 
 async def _scrape_one(
-    url: str, mode: str, extraction: str, timeout_s: float, solve_cloudflare: bool
+    url: str,
+    mode: str,
+    extraction: str,
+    timeout_s: float,
+    solve_cloudflare: bool,
+    close_deadline: float | None = None,
 ) -> dict:
     blocked = url_block_reason(url)
     if blocked:
@@ -212,7 +226,7 @@ async def _scrape_one(
     async with (_FAST_SEM if mode == "fast" else _BROWSER_SEM):
         try:
             html, status = await asyncio.wait_for(
-                _fetch_html(url, mode, timeout_s, solve_cloudflare),
+                _fetch_html(url, mode, timeout_s, solve_cloudflare, close_deadline),
                 timeout=fetch_bound_s,
             )
         # Nothing under us bounds a browser fetch: start() takes no timeout and
@@ -316,7 +330,12 @@ async def scrape_page(
     bad = _validate_args(mode, extraction, timeout) or _check_budget(mode, timeout, 1)
     if bad:
         return bad
-    return await _scrape_one(url, mode, extraction, timeout, solve_cloudflare)
+    # Teardown is charged to the same clock admission budgeted: a cancelled
+    # fetch's close wait may only spend what is left of the call budget.
+    close_deadline = time.monotonic() + _CALL_BUDGET_S
+    return await _scrape_one(
+        url, mode, extraction, timeout, solve_cloudflare, close_deadline
+    )
 
 
 @mcp.tool()
@@ -362,8 +381,15 @@ async def scrape_pages(
         return over
 
     # _scrape_one holds the concurrency gate itself, so the batch just fans out.
+    # One shared deadline: teardown in any wave draws down the same budget the
+    # admission check sized, so a wedged close cannot push the batch past the
+    # client's process kill.
+    close_deadline = time.monotonic() + _CALL_BUDGET_S
     results = await asyncio.gather(
-        *(_scrape_one(u, mode, extraction, timeout, solve_cloudflare) for u in urls),
+        *(
+            _scrape_one(u, mode, extraction, timeout, solve_cloudflare, close_deadline)
+            for u in urls
+        ),
         return_exceptions=True,
     )
     entries = [_as_entry(u, r) for u, r in zip(urls, results)]

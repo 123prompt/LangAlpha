@@ -345,3 +345,70 @@ async def test_hung_close_does_not_stall_the_caller(monkeypatch):
     assert html_body == "<html></html>"
     release.set()  # let the detached close finish so the loop drains clean
     await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_close_wait_is_capped_by_the_callers_deadline():
+    """With most of the call budget already spent, a hung close may only wait
+    out the remainder — never the full close deadline on top of it, which
+    chained across waves would cross the client's process kill."""
+    import time as _time
+
+    from mcp_servers import _browser
+
+    release = asyncio.Event()
+
+    class _Page:
+        body = b"<html></html>"
+        encoding = "utf-8"
+        status = 200
+
+    class _Session:
+        async def start(self):
+            pass
+
+        async def fetch(self, url, **kw):
+            return _Page()
+
+        async def close(self):
+            await release.wait()
+
+    # _CLOSE_DEADLINE_S stays at its shipped 15s; the caller's deadline wins.
+    await asyncio.wait_for(
+        _browser.fetch_with_session(
+            _Session(), "http://x", close_deadline=_time.monotonic() + 0.05
+        ),
+        timeout=2.0,
+    )
+    release.set()
+    await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_tools_charge_teardown_to_the_call_budget(monkeypatch):
+    """Both entry points hand the fetch an absolute deadline sized by
+    _CALL_BUDGET_S, so teardown draws down the budget admission checked."""
+    import time as _time
+
+    seen: dict[str, object] = {}
+
+    def fake_session(mode, **kw):
+        return object()
+
+    async def fake_fetch(session, url, **kwargs):
+        seen.update(kwargs)
+        return None, "<html></html>", 200
+
+    monkeypatch.setattr(srv, "make_session", fake_session)
+    monkeypatch.setattr(srv, "fetch_with_session", fake_fetch)
+
+    for call in (
+        lambda: srv.scrape_page("https://example.com", mode="browser"),
+        lambda: srv.scrape_pages(["https://example.com"], mode="browser"),
+    ):
+        seen.clear()
+        before = _time.monotonic()
+        await call()
+        after = _time.monotonic()
+        deadline = seen["close_deadline"]
+        assert before + srv._CALL_BUDGET_S <= deadline <= after + srv._CALL_BUDGET_S

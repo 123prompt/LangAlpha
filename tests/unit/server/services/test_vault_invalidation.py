@@ -16,6 +16,7 @@ tiers point at the real functions.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from unittest.mock import AsyncMock, MagicMock
 
@@ -242,6 +243,25 @@ async def test_unreferenced_secret_is_pushed_to_live_sandboxes(monkeypatch, prob
     )
 
     pushes.assert_awaited_once_with("ws-1", user_id="user-1")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_push_cannot_strand_the_bump(monkeypatch, probes, pushes):
+    """REGRESSION: the durable bump runs BEFORE the sandbox push. The push does
+    seconds of I/O in request context and a client disconnect cancels it with
+    CancelledError, which clears its ``except Exception`` — push-first left a
+    committed rotation with no convergence trigger, invisible to every later
+    read because fingerprints hash refs, not values."""
+    purge_bump, bump, _ = probes
+    monkeypatch.setattr(vi, "list_workspace_servers", AsyncMock(return_value=[]))
+    pushes.side_effect = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await vi.after_secret_change(
+            _tier(WORKSPACE_TIER, probes), "ws-1", "API_KEY", user_id="user-1"
+        )
+
+    bump.assert_awaited_once_with("ws-1")
 
 
 @pytest.mark.asyncio

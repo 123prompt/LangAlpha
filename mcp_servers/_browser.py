@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import time
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -111,6 +112,7 @@ async def fetch_with_session(
     url: str,
     *,
     on_close_error: CloseErrorHook | None = None,
+    close_deadline: float | None = None,
     **fetch_kwargs: Any,
 ) -> tuple[Any, str, int]:
     """Start a session, fetch one URL, then tear down without losing the browser.
@@ -135,9 +137,16 @@ async def fetch_with_session(
             session, "_is_alive", True
         ):
             session._is_alive = True  # unblock close()'s guard clause
+        # ``close_deadline`` (absolute time.monotonic()) lets the caller charge
+        # teardown to its own call budget: a fetch cancelled at its bound would
+        # otherwise ADD the full close wait on top, and chained across a batch's
+        # waves that overshoot crosses the client's whole-process kill.
+        wait_s = _CLOSE_DEADLINE_S
+        if close_deadline is not None:
+            wait_s = max(0.0, min(wait_s, close_deadline - time.monotonic()))
         close_task = asyncio.create_task(session.close())
         try:
-            await asyncio.wait_for(asyncio.shield(close_task), _CLOSE_DEADLINE_S)
+            await asyncio.wait_for(asyncio.shield(close_task), wait_s)
         except (TimeoutError, asyncio.CancelledError):
             close_task.add_done_callback(
                 lambda task: _report_post_cancel(task, on_close_error)

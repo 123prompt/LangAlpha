@@ -203,12 +203,19 @@ async def after_secret_change(
 ) -> None:
     """Push the new secret set to live sandboxes and invalidate MCP caches.
 
+    Durable half FIRST: the push does seconds of sandbox I/O in request
+    context, and a client disconnect cancels it with CancelledError — which
+    clears its ``except Exception`` — so push-then-bump could strand a
+    committed rotation with no convergence trigger at all. The push is only
+    the same-process fast path; the bump is what makes every other worker's
+    next sync deliver the value.
+
     ``value_changed`` is False for a description-only edit: nothing a server
     resolves has moved, so the cache half is skipped.
     """
-    await _push_secrets(tier, owner_id, user_id)
     if value_changed:
         await _invalidate_mcp(tier, owner_id, secret_name, user_id)
+    await _push_secrets(tier, owner_id, user_id)
 
 
 async def _push_secrets(tier: VaultTier, owner_id: str, user_id: str) -> None:
