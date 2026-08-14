@@ -223,124 +223,43 @@ async def enforce_chat_limit(
     )
 
 
-_BYOK_BALANCE_CACHE_TTL = 60  # seconds — negative balance changes slowly
-
-
 async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
-    """
-    Check credit quota via the auth/quota service. Raises HTTPException(429) if exceeded.
-    No-op in OSS mode.
+    """Check credit quota via the auth/quota service. Raises 429 if denied.
 
-    BYOK path: blocks only on negative balance; cached 60 s (balance changes
-    slowly — only on platform fallback completion).
-    Platform path: uncached real-time daily-credit check.
+    No-op in OSS mode. ``byok`` is forwarded, not branched on: which pools apply
+    to a key the user pays for themselves is the platform's rule to state, and
+    this service only relays the verdict it gets back.
     """
     if not _platform_gating_active():
         return
 
-    # BYOK fast path: cached negative-balance check (Redis, 60 s TTL).
-    if byok:
-        await _enforce_byok_negative_balance(user_id)
-        return
-
-    # Platform-served: uncached real-time quota check.
-    result = await _call_validate_for_user(user_id, check_quota="chat")
+    result = await _call_validate_for_user(user_id, check_quota="chat", byok=byok)
 
     if result is None:
         return  # Fail-open
 
     quota = result.get("quota")
-    if not quota:
+    if not quota or quota.get("allowed", True):
         return
 
-    if not quota.get("allowed", True):
-        # Forward platform's `message` and `limit_type` verbatim; no copy authored here.
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "message": quota.get("message"),
-                "type": quota.get("limit_type", "credit_limit"),
-                "used_credits": quota.get("used_credits"),
-                "credit_limit": quota.get("credit_limit"),
-                "remaining_credits": quota.get("remaining_credits"),
-                "retry_after": quota.get("retry_after", 30),
-            },
-            headers={
-                "Retry-After": str(quota.get("retry_after") or 30),
-                "X-RateLimit-Limit": str(quota.get("credit_limit", "")),
-                "X-RateLimit-Remaining": str(quota.get("remaining_credits", "")),
-            },
-        )
-
-
-async def _enforce_byok_negative_balance(user_id: str) -> None:
-    """Raise 429 when ``outstanding_debt > 0``. Cached 60 s.
-
-    Gates on ``outstanding_debt`` rather than ``remaining_credits`` because the
-    latter uses ``-1`` / ``-2`` as unlimited-tier sentinels.
-    """
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    cache_key = f"byok_balance:{user_id}"
-
-    if cache.enabled and cache.client:
-        try:
-            cached = await cache.get(cache_key)
-            if cached is not None:
-                if cached == "negative":
-                    raise HTTPException(
-                        status_code=429,
-                        detail={
-                            "message": "Outstanding credit balance. Please add credits to continue.",
-                            "type": "negative_balance",
-                            "retry_after": 30,
-                        },
-                        headers={"Retry-After": "30"},
-                    )
-                return  # cached "ok"
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.warning("BYOK balance cache read error, falling through: %s", e)
-
-    result = await _call_validate_for_user(user_id, check_quota="chat", byok=True)
-
-    if result is None:
-        return  # Fail-open
-
-    quota = result.get("quota") or {}
-    debt = int(quota.get("outstanding_debt") or 0)
-    is_negative = debt > 0
-
-    if cache.enabled and cache.client:
-        try:
-            await cache.set(
-                cache_key,
-                "negative" if is_negative else "ok",
-                ttl=_BYOK_BALANCE_CACHE_TTL,
-            )
-        except Exception as e:
-            logger.warning("BYOK balance cache write error: %s", e)
-
-    if is_negative:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "message": "Outstanding credit balance. Please add credits to continue.",
-                "type": "negative_balance",
-                "outstanding_debt": debt,
-                "used_credits": quota.get("used_credits"),
-                "credit_limit": quota.get("credit_limit"),
-                "remaining_credits": quota.get("remaining_credits"),
-                "retry_after": quota.get("retry_after", 30),
-            },
-            headers={
-                "Retry-After": str(quota.get("retry_after") or 30),
-                "X-RateLimit-Limit": str(quota.get("credit_limit", "")),
-                "X-RateLimit-Remaining": str(quota.get("remaining_credits", "")),
-            },
-        )
+    # Forward platform's `message` and `limit_type` verbatim; no copy authored here.
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "message": quota.get("message"),
+            "type": quota.get("limit_type", "credit_limit"),
+            "used_credits": quota.get("used_credits"),
+            "credit_limit": quota.get("credit_limit"),
+            "remaining_credits": quota.get("remaining_credits"),
+            "outstanding_debt": quota.get("outstanding_debt"),
+            "retry_after": quota.get("retry_after", 30),
+        },
+        headers={
+            "Retry-After": str(quota.get("retry_after") or 30),
+            "X-RateLimit-Limit": str(quota.get("credit_limit", "")),
+            "X-RateLimit-Remaining": str(quota.get("remaining_credits", "")),
+        },
+    )
 
 
 async def _call_validate_for_user(

@@ -116,8 +116,8 @@ async def create_thread_endpoint(
 
     # Same credit gate the follow-up /messages call enforces — a quota-blocked
     # client must not mint durable rows + platform title calls through this
-    # door. byok mirrors the message path: own-key users (BYOK or OAuth) are
-    # blocked only on negative balance, never the daily platform limit.
+    # door. byok is reported the same way the message path reports it, so both
+    # doors get the same verdict for the same user.
     if HOST_MODE != "oss":
         from src.server.database.api_keys import is_byok_active
         from src.server.database.oauth_tokens import has_any_oauth_token

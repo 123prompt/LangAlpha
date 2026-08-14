@@ -156,10 +156,11 @@ class AutomationExecutor:
             has_byok, has_oauth = await asyncio.gather(
                 is_byok_active(user_id), has_any_oauth_token(user_id)
             )
-            # has_cred drives the credit gate (BYOK negative-balance vs platform
-            # daily-credit). The workflow's is_byok only controls whether the
-            # BYOK ladder is attempted, so it keys off has_byok alone — passing
-            # has_cred would fire a futile BYOK prefetch for OAuth-only users.
+            # has_cred is what the credit gate reports: an OAuth turn pays its
+            # own vendor bill just as a BYOK one does. The workflow's is_byok is
+            # a different question — whether to attempt the BYOK ladder — so it
+            # keys off has_byok alone, or an OAuth-only user gets a futile
+            # BYOK prefetch.
             has_cred = has_byok or has_oauth
             await enforce_credit_limit(user_id, byok=has_cred)
 

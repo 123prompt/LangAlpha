@@ -231,16 +231,6 @@ class TestBurstReapHorizon:
         assert _burst_reap_horizon() == 42
 
 
-def _mock_cache_miss():
-    """Return a mock Redis cache that always misses (get→None, set→no-op)."""
-    cache = MagicMock()
-    cache.enabled = True
-    cache.client = MagicMock()
-    cache.get = AsyncMock(return_value=None)
-    cache.set = AsyncMock()
-    return cache
-
-
 @pytest.mark.asyncio
 async def test_call_validate_for_user_uses_x_service_token_header():
     """_call_validate_for_user sends X-Service-Token, not Authorization: Bearer."""
@@ -359,19 +349,22 @@ async def test_call_validate_for_user_fails_open_on_exception():
 
 
 class TestEnforceCreditLimitByok:
-    """Verify enforce_credit_limit behaviour under byok=True.
+    """BYOK turns take the same path as any other: relay the platform's verdict.
 
-    BYOK path goes through _enforce_byok_negative_balance which uses
-    Redis cache. Tests mock the cache as a miss so the HTTP call
-    to _call_validate_for_user is exercised.
+    Which pools apply to a key the user pays for themselves is a billing rule,
+    and it lives in the platform under a ``negative_balance`` limit_type. This
+    class previously asserted the opposite — that langalpha held the threshold
+    and blocked on ``outstanding_debt`` even when the platform said allowed.
     """
 
     @pytest.mark.asyncio
-    async def test_byok_outstanding_debt_raises_429(self):
-        """byok=True with outstanding_debt > 0 raises 429 with type=negative_balance."""
+    async def test_forwards_platform_denial(self):
+        """A platform denial reaches the client with its type and copy intact."""
         quota_response = {
             "quota": {
-                "allowed": True,
+                "allowed": False,
+                "limit_type": "negative_balance",
+                "message": "Outstanding credit balance. Top up to continue.",
                 "outstanding_debt": 100,
                 "retry_after": 30,
             }
@@ -381,122 +374,53 @@ class TestEnforceCreditLimitByok:
             patch(f"{MODULE}.HOST_MODE", "platform"),
             patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
             patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock, return_value=quota_response),
-            patch("src.utils.cache.redis_cache.get_cache_client", return_value=_mock_cache_miss()),
         ):
             from src.server.dependencies.usage_limits import enforce_credit_limit
 
             with pytest.raises(HTTPException) as exc_info:
                 await enforce_credit_limit("user-1", byok=True)
 
+            detail = exc_info.value.detail
             assert exc_info.value.status_code == 429
-            assert exc_info.value.detail["type"] == "negative_balance"
-            assert exc_info.value.detail["outstanding_debt"] == 100
+            assert detail["type"] == "negative_balance"
+            assert detail["outstanding_debt"] == 100
+            # Verbatim: authoring copy here is what put billing wording in OSS.
+            assert detail["message"] == "Outstanding credit balance. Top up to continue."
 
     @pytest.mark.asyncio
-    async def test_byok_unlimited_sentinel_does_not_block(self):
-        """Regression: remaining_credits=-1 (unlimited sentinel) MUST NOT block.
+    async def test_debt_alone_does_not_block_when_platform_allows(self):
+        """Carrying a balance is not itself a denial — only the platform decides.
 
-        Pre-fix bug: langalpha treated remaining_credits<0 as outstanding debt,
-        but ginlix-platform uses -1 for unlimited tiers. This caused BYOK users
-        on unlimited plans (or daily-unlimited plans) to be permanently blocked.
+        A user can owe and still be entitled to run (a grant nets it off), so a
+        client that blocked on the number alone turned an allowed turn away.
         """
-        quota_response = {
-            "quota": {
-                "allowed": True,
-                "remaining_credits": -1,  # unlimited sentinel
-                "outstanding_debt": 0,
-            }
-        }
+        quota_response = {"quota": {"allowed": True, "outstanding_debt": 100}}
 
         with (
             patch(f"{MODULE}.HOST_MODE", "platform"),
             patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
             patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock, return_value=quota_response),
-            patch("src.utils.cache.redis_cache.get_cache_client", return_value=_mock_cache_miss()),
         ):
             from src.server.dependencies.usage_limits import enforce_credit_limit
 
             await enforce_credit_limit("user-1", byok=True)
 
     @pytest.mark.asyncio
-    async def test_byok_zero_debt_passes(self):
-        """byok=True with outstanding_debt=0 should not raise, even if quota.allowed=False."""
-        quota_response = {
-            "quota": {
-                "allowed": False,
-                "remaining_credits": 0,
-                "outstanding_debt": 0,
-            }
-        }
-
-        with (
-            patch(f"{MODULE}.HOST_MODE", "platform"),
-            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
-            patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock, return_value=quota_response),
-            patch("src.utils.cache.redis_cache.get_cache_client", return_value=_mock_cache_miss()),
-        ):
-            from src.server.dependencies.usage_limits import enforce_credit_limit
-
-            await enforce_credit_limit("user-1", byok=True)
-
-    @pytest.mark.asyncio
-    async def test_byok_missing_debt_field_passes(self):
-        """Wire-compat: older platform builds without outstanding_debt → no block."""
-        quota_response = {
-            "quota": {
-                "allowed": False,
-                "remaining_credits": -1,  # would have blocked under old code
-            }
-        }
-
-        with (
-            patch(f"{MODULE}.HOST_MODE", "platform"),
-            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
-            patch(f"{MODULE}._call_validate_for_user", new_callable=AsyncMock, return_value=quota_response),
-            patch("src.utils.cache.redis_cache.get_cache_client", return_value=_mock_cache_miss()),
-        ):
-            from src.server.dependencies.usage_limits import enforce_credit_limit
-
-            await enforce_credit_limit("user-1", byok=True)
-
-    @pytest.mark.asyncio
-    async def test_byok_cache_hit_negative_raises_without_http(self):
-        """When cache says 'negative', skip HTTP call entirely and raise 429."""
-        cache = _mock_cache_miss()
-        cache.get = AsyncMock(return_value="negative")  # cache hit
-        mock_validate = AsyncMock()
+    async def test_byok_flag_reaches_the_platform(self):
+        """Forwarding ``byok`` is what lets the platform apply the BYOK rule."""
+        mock_validate = AsyncMock(return_value={"quota": {"allowed": True}})
 
         with (
             patch(f"{MODULE}.HOST_MODE", "platform"),
             patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
             patch(f"{MODULE}._call_validate_for_user", mock_validate),
-            patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache),
-        ):
-            from src.server.dependencies.usage_limits import enforce_credit_limit
-
-            with pytest.raises(HTTPException) as exc_info:
-                await enforce_credit_limit("user-1", byok=True)
-
-            assert exc_info.value.status_code == 429
-            mock_validate.assert_not_called()  # no HTTP call
-
-    @pytest.mark.asyncio
-    async def test_byok_cache_hit_ok_passes_without_http(self):
-        """When cache says 'ok', skip HTTP call entirely and allow."""
-        cache = _mock_cache_miss()
-        cache.get = AsyncMock(return_value="ok")  # cache hit
-        mock_validate = AsyncMock()
-
-        with (
-            patch(f"{MODULE}.HOST_MODE", "platform"),
-            patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
-            patch(f"{MODULE}._call_validate_for_user", mock_validate),
-            patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache),
         ):
             from src.server.dependencies.usage_limits import enforce_credit_limit
 
             await enforce_credit_limit("user-1", byok=True)
-            mock_validate.assert_not_called()
+
+        assert mock_validate.await_args.kwargs["byok"] is True
+        assert mock_validate.await_args.kwargs["check_quota"] == "chat"
 
     @pytest.mark.asyncio
     async def test_non_byok_allowed_false_raises_429(self):
