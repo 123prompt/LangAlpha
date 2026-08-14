@@ -25,6 +25,32 @@ from src.server.utils.api import get_current_user_id
 
 logger = logging.getLogger(__name__)
 
+
+class QuotaServiceUnavailable(Exception):
+    """The quota service could not be asked at all.
+
+    Distinct from it answering "no": a denial arrives as a 200 whose ``quota``
+    says ``allowed: false``. Everything else (transport failure, 5xx, a token
+    the service rejects) means we have no verdict, and only the caller knows
+    whether proceeding without one is acceptable.
+    """
+
+
+# One retry covers the common outage: the quota service deploys in place, so it
+# is unreachable for seconds, not minutes. Deterministic 4xx answers (a rejected
+# service token, a malformed request) are not retried — they will not change.
+#
+# Only ``strict`` callers retry. For everyone else an unanswered check already
+# means "carry on", so a second attempt buys a slightly better answer at the
+# cost of a second per call — including inside the always-on reconciler, which
+# probes once per owner. The caller that pays for accuracy is the one that
+# blocks on it.
+_VALIDATE_RETRY_BACKOFF = 1.0  # seconds
+
+# Long enough that a retry lands after an in-place restart, short enough that a
+# client which honours it does not look hung.
+_SERVICE_UNAVAILABLE_RETRY_AFTER = 15  # seconds
+
 # Default burst limit when the auth/quota service doesn't specify one
 _DEFAULT_MAX_CONCURRENT = int(os.getenv("BURST_MAX_CONCURRENT") or "10")
 # Margin past the workflow timeout before an unreleased slot is presumed leaked
@@ -229,14 +255,35 @@ async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
     No-op in OSS mode. ``byok`` is forwarded, not branched on: which pools apply
     to a key the user pays for themselves is the platform's rule to state, and
     this service only relays the verdict it gets back.
+
+    This is the one gate that fails **closed** (503). The others admit on an
+    unanswered check because the worst case is bounded and self-correcting; here
+    it is an unbounded spend by a user the service may well have been about to
+    refuse, landing on them later as debt they never agreed to.
     """
     if not _platform_gating_active():
         return
 
-    result = await _call_validate_for_user(user_id, check_quota="chat", byok=byok)
+    try:
+        result = await _call_validate_for_user(
+            user_id, check_quota="chat", byok=byok, strict=True
+        )
+    except QuotaServiceUnavailable as e:
+        logger.error("Credit gate closed — quota service gave no verdict (%s)", e)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                # Same wording the quota service uses for its own guard, so the
+                # user reads one sentence whichever side went dark.
+                "message": "Service temporarily unavailable. Please try again shortly.",
+                "type": "service_unavailable",
+                "retry_after": _SERVICE_UNAVAILABLE_RETRY_AFTER,
+            },
+            headers={"Retry-After": str(_SERVICE_UNAVAILABLE_RETRY_AFTER)},
+        ) from e
 
     if result is None:
-        return  # Fail-open
+        return  # OSS mode reached this only via a race on HOST_MODE; nothing to check.
 
     quota = result.get("quota")
     if not quota or quota.get("allowed", True):
@@ -266,8 +313,16 @@ async def _call_validate_for_user(
     user_id: str,
     check_quota: Optional[str] = None,
     byok: bool = False,
+    strict: bool = False,
 ) -> Optional[dict]:
-    """POST to the auth/quota service at /api/auth/validate. Returns None in OSS mode or on failure."""
+    """POST to the auth/quota service at /api/auth/validate.
+
+    Returns None in OSS mode. When the service cannot be reached, ``strict``
+    callers get :class:`QuotaServiceUnavailable` (after one retry) and everyone
+    else gets None on the first failure, which each of them reads as "carry on"
+    — see the fail-open notes at those call sites for why that is safe there and
+    not at the credit gate.
+    """
     if not _platform_gating_active():
         return None
 
@@ -284,21 +339,45 @@ async def _call_validate_for_user(
     if byok:
         body["byok"] = True
 
-    try:
-        resp = await client.post(
-            f"{AUTH_SERVICE_URL.rstrip('/')}/api/auth/validate",
-            json=body if body else None,
-            headers=headers,
-        )
+    url = f"{AUTH_SERVICE_URL.rstrip('/')}/api/auth/validate"
+    reason = "unknown"
+
+    for attempt in range(2 if strict else 1):
+        if attempt:
+            await asyncio.sleep(_VALIDATE_RETRY_BACKOFF)
+        try:
+            resp = await client.post(url, json=body if body else None, headers=headers)
+        except Exception as e:
+            reason = f"unreachable: {e}"
+            logger.warning("auth/quota service unreachable (attempt %d): %s", attempt + 1, e)
+            continue
+
         if resp.status_code == 200:
-            return resp.json()
+            try:
+                return resp.json()
+            except Exception as e:
+                # A 200 we cannot read is still no verdict: an interposed proxy
+                # serving its own HTML, a truncated body. It has to rejoin the
+                # no-verdict path here, or it escapes as an unhandled 500 and
+                # the gate that exists to fail closed fails differently instead.
+                reason = f"unparseable 200: {e}"
+                logger.warning(
+                    "auth/quota service returned an unreadable 200 (attempt %d): %s",
+                    attempt + 1, e,
+                )
+                continue
+
+        reason = f"HTTP {resp.status_code}"
         logger.warning(
-            "auth/quota service validate returned %d: %s", resp.status_code, resp.text[:200]
+            "auth/quota service validate returned %d (attempt %d): %s",
+            resp.status_code, attempt + 1, resp.text[:200],
         )
-        return None
-    except Exception as e:
-        logger.warning("auth/quota service unreachable, failing open: %s", e)
-        return None
+        if resp.status_code < 500:
+            break  # deterministic answer; a retry returns the same thing
+
+    if strict:
+        raise QuotaServiceUnavailable(reason)
+    return None
 
 
 async def enforce_workspace_limit(

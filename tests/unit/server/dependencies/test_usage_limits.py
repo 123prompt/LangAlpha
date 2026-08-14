@@ -326,21 +326,264 @@ async def test_call_validate_for_user_sends_check_quota_in_body():
 
 @pytest.mark.asyncio
 async def test_call_validate_for_user_fails_open_on_exception():
-    """Network errors return None (fail-open)."""
+    """Network errors return None (fail-open) for callers that don't ask to know."""
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
 
-    with (
-        patch(f"{MODULE}.HOST_MODE", "platform"),
-        patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
-        patch(f"{MODULE}._get_http_client", return_value=mock_client),
-        patch("os.getenv", return_value="token"),
-    ):
+    with _unreachable_service(mock_client):
         from src.server.dependencies.usage_limits import _call_validate_for_user
 
         result = await _call_validate_for_user("user-123")
 
     assert result is None
+
+
+# ===================================================================
+# Retry + strict mode: telling "no verdict" apart from "no"
+# ===================================================================
+
+
+def _unreachable_service(mock_client):
+    """Platform mode pointed at a mock transport, with the retry sleep removed."""
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    stack.enter_context(patch(f"{MODULE}.HOST_MODE", "platform"))
+    stack.enter_context(patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"))
+    stack.enter_context(patch(f"{MODULE}._get_http_client", return_value=mock_client))
+    stack.enter_context(patch(f"{MODULE}._VALIDATE_RETRY_BACKOFF", 0))
+    stack.enter_context(patch("os.getenv", return_value="token"))
+    return stack
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_is_retried_once_for_strict_callers():
+    """The quota service restarts in place, so the first failure means little."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+
+    with _unreachable_service(mock_client):
+        from src.server.dependencies.usage_limits import (
+            QuotaServiceUnavailable,
+            _call_validate_for_user,
+        )
+
+        with pytest.raises(QuotaServiceUnavailable):
+            await _call_validate_for_user("user-1", strict=True)
+
+    assert mock_client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fail_open_callers_do_not_retry():
+    """They already treat no answer as "carry on", so a second ask only costs.
+
+    Notably the always-on reconciler probes once per owner; retrying there
+    would add a second per owner to every cycle the service is down, to reach
+    the same fail-safe conclusion.
+    """
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+
+    with _unreachable_service(mock_client):
+        from src.server.dependencies.usage_limits import _call_validate_for_user
+
+        assert await _call_validate_for_user("user-1") is None
+
+    assert mock_client.post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_recovers_a_restarting_service():
+    """A blip on the first attempt must not cost the user their turn."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(
+        side_effect=[httpx.ConnectError("refused"), httpx.Response(200, json={"valid": True})]
+    )
+
+    with _unreachable_service(mock_client):
+        from src.server.dependencies.usage_limits import _call_validate_for_user
+
+        assert await _call_validate_for_user("user-1", strict=True) == {"valid": True}
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_service_token_is_not_retried():
+    """A 4xx is a decision, not a blip — asking twice returns the same answer."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=httpx.Response(403, text="Invalid service token"))
+
+    with _unreachable_service(mock_client):
+        from src.server.dependencies.usage_limits import (
+            QuotaServiceUnavailable,
+            _call_validate_for_user,
+        )
+
+        with pytest.raises(QuotaServiceUnavailable):
+            await _call_validate_for_user("user-1", strict=True)
+
+    assert mock_client.post.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_strict_callers_are_told_there_was_no_verdict():
+    """Returning None would be indistinguishable from OSS mode, which allows."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=httpx.Response(500, text="boom"))
+
+    with _unreachable_service(mock_client):
+        from src.server.dependencies.usage_limits import (
+            QuotaServiceUnavailable,
+            _call_validate_for_user,
+        )
+
+        with pytest.raises(QuotaServiceUnavailable):
+            await _call_validate_for_user("user-1", strict=True)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_200_is_no_verdict_and_still_retried():
+    """A 200 carrying a proxy's HTML is as empty as a connection refusal.
+
+    It reaches ``resp.json()`` rather than the transport ``except``, so without
+    its own guard it leaves the gate as an unhandled 500 instead of the 503 the
+    fail-closed contract promises.
+    """
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(
+        return_value=httpx.Response(200, text="<html>502 Bad Gateway</html>")
+    )
+
+    with _unreachable_service(mock_client):
+        from src.server.dependencies.usage_limits import (
+            QuotaServiceUnavailable,
+            _call_validate_for_user,
+        )
+
+        with pytest.raises(QuotaServiceUnavailable):
+            await _call_validate_for_user("user-1", strict=True)
+
+    assert mock_client.post.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_200_still_fails_open_for_everyone_else():
+    """Same asymmetry as every other no-verdict case, and the behaviour that
+    was in place before the credit gate learned to fail closed."""
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=httpx.Response(200, text="not json"))
+
+    with _unreachable_service(mock_client):
+        from src.server.dependencies.usage_limits import _call_validate_for_user
+
+        assert await _call_validate_for_user("user-1") is None
+
+
+# ===================================================================
+# The credit gate fails closed; the others do not
+# ===================================================================
+
+
+class TestCreditGateFailsClosed:
+    """An unanswered credit check blocks the turn.
+
+    Fail-open here means a user the service was about to refuse spends anyway,
+    and meets the bill later as debt they never agreed to. The capacity gates
+    below keep failing open on purpose: their worst case is a spare workspace.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unreachable_service_blocks_the_turn(self):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+
+        with _unreachable_service(mock_client):
+            from src.server.dependencies.usage_limits import enforce_credit_limit
+
+            with pytest.raises(HTTPException) as exc_info:
+                await enforce_credit_limit("user-1", byok=False)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail["type"] == "service_unavailable"
+        # Not 429: nothing says this user is over anything.
+        assert exc_info.value.headers["Retry-After"] == "15"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_200_blocks_the_turn_as_a_503(self):
+        """The whole point of the gate is *which* failure the user gets.
+
+        An unguarded decode error still refuses the turn, but as a 500 — which
+        carries no Retry-After, and which the automation executor counts as a
+        strike because it only exempts 503.
+        """
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(
+            return_value=httpx.Response(200, text="<html>502 Bad Gateway</html>")
+        )
+
+        with _unreachable_service(mock_client):
+            from src.server.dependencies.usage_limits import enforce_credit_limit
+
+            with pytest.raises(HTTPException) as exc_info:
+                await enforce_credit_limit("user-1", byok=False)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail["type"] == "service_unavailable"
+        assert exc_info.value.headers["Retry-After"] == "15"
+
+    @pytest.mark.asyncio
+    async def test_byok_turns_are_blocked_too(self):
+        """Own-key or not, an unanswered check is unanswered."""
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+
+        with _unreachable_service(mock_client):
+            from src.server.dependencies.usage_limits import enforce_credit_limit
+
+            with pytest.raises(HTTPException) as exc_info:
+                await enforce_credit_limit("user-1", byok=True)
+
+        assert exc_info.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_oss_mode_never_blocks(self):
+        """An OSS deployment has no quota service to be down."""
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+
+        with patch(f"{MODULE}.HOST_MODE", "oss"), patch(f"{MODULE}._get_http_client", return_value=mock_client):
+            from src.server.dependencies.usage_limits import enforce_credit_limit
+
+            await enforce_credit_limit("user-1", byok=False)
+
+        mock_client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_capacity_gate_still_fails_open(self):
+        """Deliberate asymmetry — this test exists so a later sweep can't 'fix' it."""
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+
+        with _unreachable_service(mock_client):
+            from src.server.dependencies.usage_limits import enforce_capacity
+
+            await enforce_capacity("user-1", "spec_performance")
+
+        # And unchanged in timing too: one attempt, exactly as before this gate
+        # learned to fail closed.
+        assert mock_client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_workspace_gate_still_fails_open(self):
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
+
+        with _unreachable_service(mock_client):
+            from src.server.dependencies.usage_limits import enforce_workspace_limit
+
+            assert await enforce_workspace_limit("user-1") == "user-1"
+
+        assert mock_client.post.await_count == 1
 
 
 # ===================================================================
