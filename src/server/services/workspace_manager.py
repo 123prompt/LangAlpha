@@ -44,7 +44,11 @@ from src.server.database.workspace import (
     create_workspace as db_create_workspace,
     delete_workspace as db_delete_workspace,
     get_workspace as db_get_workspace,
+    get_workspace_identity as db_get_workspace_identity,
     get_workspaces_by_status,
+    SandboxIdentityLostError,
+    try_bind_workspace_sandbox,
+    try_claim_workspace_for_replacement,
     try_claim_workspace_for_start,
     update_workspace_activity,
     update_workspace_status,
@@ -130,6 +134,11 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
 
         # Track last sync time per workspace for cooldown
         self._last_sync_at: Dict[str, float] = {}
+
+        # One provider kept solely to classify exceptions. Built on first use —
+        # constructing one opens an SDK client, so the alternative was leaking
+        # a client per failed teardown. See ``_is_sandbox_gone``.
+        self._error_classifier: Any = None
 
         # Strong refs to fire-and-forget background MCP discovery+re-sync tasks
         # (asyncio holds only weak refs to tasks). Discarded in each task's done
@@ -250,20 +259,168 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         self._pending_lazy_sync.discard(workspace_id)
         self._pending_tier_recheck.discard(workspace_id)
 
-    async def evict_session_if_present(self, workspace_id: str) -> bool:
-        """Evict this worker's cached session so the next acquisition re-inits.
+    async def _take_valid_cached_session(
+        self, workspace_id: str, mark: Callable[[str], None]
+    ) -> "Session | None":
+        """This worker's cached session if it is safe to hand out, else None.
 
-        The public entry point for out-of-band invalidation (e.g. the
-        platform-secret sweeper after a scrub-restart kills the session's exec
-        processes). Returns False without locking when nothing is cached.
+        Answers only "is this handle still valid" — readiness and sync policy
+        stay with the caller. Validity means initialized, holding a sandbox, and
+        matching the durable binding in Postgres: workers are spawn-isolated
+        with no cross-worker invalidation, and every warm fast path returns
+        without reading the row, so one narrow ``status, sandbox_id`` query is
+        what makes the cache safe to trust. Invalid sessions are retired here,
+        which is non-destructive — the sandbox they named may still be live and
+        owned by someone else.
+        """
+        session = self._sessions.get(workspace_id)
+        if session is None:
+            return None
+
+        logger.debug(
+            f"Found cached session for {workspace_id}, "
+            f"initialized={session._initialized}, "
+            f"has_sandbox={session.sandbox is not None}"
+        )
+        if not session._initialized or not session.sandbox:
+            return None
+
+        _t0 = time.time()
+        identity = await db_get_workspace_identity(workspace_id)
+        identity_ms = (time.time() - _t0) * 1000
+        stale_reason = self._identity_is_stale(workspace_id, session, identity)
+        mark("identity_check")
+        # Recorded here rather than through the caller's phase dict: every warm
+        # path returns before that dict is emitted, so the one query this adds
+        # to the hot path would otherwise be permanently unmeasured.
+        safe_record(
+            session_acquire_phase_duration_ms,
+            identity_ms,
+            {"phase": "identity_check", "session_path": "warm"},
+        )
+        if stale_reason is None:
+            return session
+
+        # The reason goes in the message, not only in `extra`: the root
+        # formatter is a plain %-format, so extras never reach the log file. An
+        # unattributable warning is what let the original bug serve 404s
+        # indefinitely with nothing in the logs pointing at the stale handle.
+        logger.warning(
+            f"Cached session for {workspace_id} is stale "
+            f"({stale_reason}); retiring and re-attaching",
+            extra={"workspace_id": workspace_id, "reason": stale_reason},
+        )
+        await self._retire_session(workspace_id, session, reason=stale_reason)
+        safe_add(session_path_counter, 1, {"path": "stale_reattach"})
+        return None
+
+    async def retire_session_if_present(
+        self, workspace_id: str, *, reason: str
+    ) -> bool:
+        """Forget this worker's cached session without touching the sandbox.
+
+        The out-of-band invalidation entry point: the sandbox stays alive (it may
+        be owned by another worker or still be the workspace's durable identity),
+        only this process's handle is dropped so the next acquisition re-attaches.
+        Returns False without locking when nothing is cached.
         """
         if workspace_id not in self._sessions:
             return False
         async with self._acquire_workspace_lock(workspace_id):
-            if workspace_id not in self._sessions:
+            session = self._sessions.get(workspace_id)
+            if session is None:
                 return False
-            await self._clear_session(workspace_id)
+            await self._retire_session(workspace_id, session, reason=reason)
         return True
+
+    async def _retire_session(
+        self, workspace_id: str, session: "Session", *, reason: str
+    ) -> None:
+        """Drop a session from both process caches, leaving the sandbox alive.
+
+        Both caches must go: popping only ``self._sessions`` leaves
+        ``SessionManager.get_session`` handing back the same ``Session`` with
+        ``_initialized=True``, so the re-attach silently no-ops and the stale
+        handle survives. Provider/MCP resources are deliberately NOT closed —
+        ``PTCSandbox.close()`` closes the shared SDK HTTP client, which would
+        abort in-flight work (a running graph, a background subagent) still
+        holding this session. They are released when the last holder drops it.
+        """
+        self._cancel_mcp_discovery(workspace_id)
+        if self._sessions.get(workspace_id) is session:
+            self._sessions.pop(workspace_id, None)
+        if SessionManager.get_cached_session(workspace_id) is session:
+            SessionManager.remove_session(workspace_id)
+        self._pending_lazy_sync.discard(workspace_id)
+        self._pending_tier_recheck.discard(workspace_id)
+        self._phase2_events.pop(workspace_id, None)
+        self._last_sync_at.pop(workspace_id, None)
+        logger.info(
+            f"Retired cached session for {workspace_id} "
+            f"(sandbox {self._session_sandbox_id(session)} left intact): {reason}",
+            extra={
+                "workspace_id": workspace_id,
+                "reason": reason,
+                "sandbox_id": self._session_sandbox_id(session),
+            },
+        )
+
+    @staticmethod
+    def _session_sandbox_id(session: "Session | None") -> str | None:
+        """The sandbox identity a cached session is bound to, if any."""
+        sandbox = getattr(session, "sandbox", None) if session is not None else None
+        sandbox_id = getattr(sandbox, "sandbox_id", None) if sandbox else None
+        return str(sandbox_id) if sandbox_id else None
+
+    # Statuses in which a workspace legitimately serves a cached session.
+    # Everything else means the durable state has moved past the handle this
+    # worker holds. 'flash' is a permanent status, not a transient one.
+    _SESSION_SERVING_STATUSES = frozenset({"running", "flash"})
+
+    def _identity_is_stale(
+        self, workspace_id: str, session: "Session", identity: Dict[str, Any] | None
+    ) -> str | None:
+        """Return a reason string when a cached session must not be handed out.
+
+        Postgres owns the workspace↔sandbox binding; this worker's cache is only
+        a handle. Deliberately does *not* require both ids to be non-None — a
+        half-known binding is itself an inconsistency, and treating it as "can't
+        tell, assume fine" is exactly how a deleted sandbox goes on serving 404s
+        indefinitely, since nothing else ever revisits the handle.
+
+        Status matters as much as identity, because the two transitions that
+        *replace* a sandbox — the replacement claim and a stop — both leave
+        ``sandbox_id`` untouched. During those windows the ids still agree while
+        the sandbox they name is being torn down, so an id-only check sees
+        nothing wrong. Retiring instead sends the caller down the slow path,
+        which already knows how to wait for the new sandbox.
+        """
+        if identity is None:
+            return "workspace row is gone"
+        status = identity.get("status")
+        if status not in self._SESSION_SERVING_STATUSES:
+            # 'starting' is legitimate for the worker that owns an in-flight
+            # lazy init; for anyone else it means a replacement was claimed and
+            # our handle names a doomed sandbox. Ownership is the membership,
+            # not the sandbox's readiness: Phase 2 runs outside the lock, so the
+            # owner's sandbox goes ready while the row is still 'starting' and
+            # it has yet to promote. Reading that window as "someone else
+            # claimed it" retires the owner's own session, and _retire_session
+            # drops the very membership that both the promotion and its revert
+            # are gated on — wedging the row in 'starting' until the reaper.
+            initializing_here = (
+                status == "starting" and workspace_id in self._pending_lazy_sync
+            )
+            if not initializing_here:
+                return f"workspace status is {status!r}"
+        db_sandbox_id = identity.get("sandbox_id")
+        local_sandbox_id = self._session_sandbox_id(session)
+        if db_sandbox_id != local_sandbox_id:
+            return (
+                f"sandbox identity moved (db={db_sandbox_id}, "
+                f"local={local_sandbox_id})"
+            )
+        return None
 
     async def _apply_session_platform_secret(
         self,
@@ -323,15 +480,24 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         Args:
             workspace_id: Workspace UUID.
             sandbox: Optional sandbox to push to directly.  When omitted the
-                sandbox is looked up from the session cache — this fails during
-                initial startup (session not cached yet), so callers that
-                already hold a sandbox reference should pass it explicitly.
+                sandbox is looked up from the session cache and identity-checked
+                against Postgres — that lookup finds nothing during initial
+                startup (session not cached yet), so callers that already hold a
+                sandbox reference should pass it explicitly.
             user_id: The workspace owner. Looked up from the workspace row
                 when omitted (one extra read).
         """
         if sandbox is None:
-            session = self._sessions.get(workspace_id)
-            if not session or not session.sandbox:
+            # Both cache-lookup callers are best-effort mutation fan-outs, so a
+            # superseded handle here writes the new secrets into a sandbox
+            # nothing points at while the live one keeps the old set — silently,
+            # since neither caller reports back. Declining leaves convergence to
+            # the version bump, which is what those callers already rely on.
+            identity = await db_get_workspace_identity(workspace_id)
+            session = self.get_session_if_ready(
+                workspace_id, expected_sandbox_id=(identity or {}).get("sandbox_id")
+            )
+            if session is None:
                 return
             sandbox = session.sandbox
 
@@ -806,16 +972,23 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         -> ``session.initialize`` (sized to ``tier`` / ``auto_stop_minutes``) ->
         install the MCP composite -> sync assets -> cache -> optionally kick
         background discovery -> run ``post_init(session)`` (seed agent.md for
-        create, restore files for recover/duplicate) -> flip the row to running
-        -> record the sync. Returns ``(session, workspace_record)`` where the
-        record is the row returned by ``update_workspace_status``.
+        create, restore files for recover/duplicate) -> bind the sandbox and flip
+        the row to running -> record the sync. Returns
+        ``(session, workspace_record)`` where the record is the row returned by
+        the binding compare-and-set.
 
-        The session is cached BEFORE the discovery kick so the background task's
-        liveness gate (``self._sessions.get(workspace_id) is session``) passes;
-        ``ws_version=None`` forces a fresh MCP resolve. On any failure the
-        half-built session is torn down via ``_clear_session`` (identity-guarded
-        pop + Daytona delete) so a partial provision never orphans a billed
-        sandbox, and the exception re-raises for the caller to mark the row.
+        The session is published to ``self._sessions`` only AFTER ``post_init``
+        and the guarded DB identity write both succeed — a session visible while
+        its row still names the previous sandbox looks stale to every concurrent
+        acquisition, which would retire it mid-restore and (because retirement
+        pops ``SessionManager`` too) leave ``_clear_session`` unable to find the
+        sandbox to delete: an orphaned, still-billed sandbox. Discovery is kicked
+        after publication for the same reason — its liveness gate is
+        ``self._sessions.get(workspace_id) is session``. ``ws_version=None``
+        forces a fresh MCP resolve. On any failure the half-built session is torn
+        down via ``_clear_session`` (identity-guarded pop + Daytona delete) so a
+        partial provision never orphans a billed sandbox, and the exception
+        re-raises for the caller to mark the row.
         """
         if core_config is None:
             core_config = self.config.to_core_config()
@@ -841,20 +1014,6 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 workspace_id, user_id, session.sandbox, reusing_sandbox=False
             )
 
-            # Cache the session BEFORE kicking discovery: the background task's
-            # liveness gate (``self._sessions.get(workspace_id) is session``)
-            # would otherwise see no cached session and exit permanently.
-            self._sessions[workspace_id] = session
-
-            if kick_discovery and resolved_mcp is not None:
-                self._kick_mcp_discovery(
-                    workspace_id,
-                    user_id,
-                    session,
-                    self._servers_needing_discovery(session, resolved_mcp),
-                    session.mcp_config_version or 0,
-                )
-
             await post_init(session)
 
             sandbox_id = (
@@ -866,31 +1025,59 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 raise RuntimeError("Fresh sandbox is missing its runtime identity")
 
             from src.server.services.platform_secret_rollout import (
-                certify_new_workspace_sandbox,
+                certify_platform_secrets,
             )
 
-            workspace = await certify_new_workspace_sandbox(
-                core_config,
-                workspace_id=workspace_id,
-                expected_previous_sandbox_id=expected_previous_sandbox_id,
+            # Verify, then bind. Statement order is what enforces "no workspace
+            # points at an uncertified sandbox"; the secret module contributes a
+            # generation and owns nothing else.
+            secret_version = await certify_platform_secrets(
+                core_config, runtime=session.sandbox.runtime
+            )
+            workspace = await try_bind_workspace_sandbox(
+                workspace_id,
                 sandbox_id=sandbox_id,
-                runtime=session.sandbox.runtime,
+                expected_previous_sandbox_id=expected_previous_sandbox_id,
+                platform_secret_version=secret_version,
             )
             if workspace is None:
-                workspace = await update_workspace_status(
-                    workspace_id=workspace_id,
-                    status="running",
-                    sandbox_id=sandbox_id,
+                # Another provisioner bound this workspace first. The unwind below
+                # deletes the sandbox we just built — mandatory, since nothing
+                # references it and it would bill forever — and the caller's retry
+                # attaches to the winner. Never re-issue the write: that is how two
+                # provisioners both "win" and one sandbox leaks.
+                logger.warning(
+                    f"Lost the sandbox-identity race for {workspace_id}; "
+                    f"discarding our sandbox {sandbox_id}",
+                    extra={"workspace_id": workspace_id, "sandbox_id": sandbox_id},
+                )
+                raise SandboxIdentityLostError(workspace_id, sandbox_id)
+
+            # Certified: the row now names THIS sandbox, so publishing the session
+            # can no longer be read as stale by a concurrent acquisition.
+            self._sessions[workspace_id] = session
+
+            if kick_discovery and resolved_mcp is not None:
+                self._kick_mcp_discovery(
+                    workspace_id,
+                    user_id,
+                    session,
+                    self._servers_needing_discovery(session, resolved_mcp),
+                    session.mcp_config_version or 0,
                 )
 
             self._record_sync(workspace_id)
             return session, workspace
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # Unwind a half-built provision: cancel discovery, drop the broken
             # cached session (identity-guarded), and destroy the Daytona sandbox
             # created before the failure so a partial provision never leaves an
             # orphaned, still-billed sandbox. Re-raise for the caller to mark the
             # row (error) and/or revert side effects.
+            #
+            # Cancellation has to unwind too: it is a BaseException, and a client
+            # disconnecting mid-provision is exactly when a sandbox exists that
+            # no row will ever name.
             await self._clear_session(workspace_id, evict_session=session)
             raise
 
@@ -943,25 +1130,64 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         return session
 
     async def _backup_files_to_db(
-        self, workspace_id: str, *, strict: bool = False
+        self,
+        workspace_id: str,
+        *,
+        strict: bool = False,
+        expected_sandbox_id: str | None = None,
+        session: Session | None = None,
     ) -> None:
         """Backup workspace files from sandbox to DB. Non-blocking on failure.
 
         ``strict=True`` raises instead of warning — for callers about to destroy
         the sandbox, where a missed backup is data loss rather than degraded sync.
+
+        The identity check is unconditional, and deliberately not opt-in:
+        ``sync_to_db`` *overwrites* the workspace's durable file copy, so running
+        it from a session bound to a superseded sandbox both misses the live
+        files and destroys the good copy. ``expected_sandbox_id`` is only an
+        optimization for callers that already hold the row; it is read from
+        Postgres otherwise.
         """
-        session = self._sessions.get(workspace_id)
+        # A caller that already holds the session must pass it: the cache is not
+        # populated until the end of a restart, so looking it up here would find
+        # nothing and fail a backup the caller could plainly have performed.
+        session = session or self._sessions.get(workspace_id)
         if not session or not getattr(session, "sandbox", None):
             if strict:
                 raise RuntimeError(
                     f"No attached session to back up workspace {workspace_id} from"
                 )
+            # Not silent: with N workers the request routinely lands on one that
+            # never held this workspace, and a non-strict caller may still tear
+            # the sandbox down afterwards. Whatever it holds unsynced is then
+            # gone, so the skip has to be attributable after the fact.
+            logger.warning(
+                f"Skipping file backup for {workspace_id}: no attached session "
+                "on this worker"
+            )
             return
+
+        if expected_sandbox_id is None:
+            identity = await db_get_workspace_identity(workspace_id)
+            expected_sandbox_id = (identity or {}).get("sandbox_id")
+
+        local_sandbox_id = self._session_sandbox_id(session)
+        if local_sandbox_id != expected_sandbox_id:
+            message = (
+                f"Refusing to back up workspace {workspace_id} from a stale "
+                f"session (attached={local_sandbox_id}, "
+                f"durable={expected_sandbox_id})"
+            )
+            if strict:
+                raise RuntimeError(message)
+            logger.warning(message)
+            return
+
         try:
             result = await FilePersistenceService.sync_to_db(
                 workspace_id, session.sandbox
             )
-            logger.debug(f"File backup completed for {workspace_id}: {result}")
         except Exception as e:
             if strict:
                 raise RuntimeError(
@@ -969,6 +1195,95 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                     f"sandbox teardown: {e}"
                 ) from e
             logger.warning(f"File backup failed for {workspace_id}: {e}")
+            return
+
+        # ``sync_to_db`` is per-file best-effort: it counts failures instead of
+        # raising, so an exception is not the only way a backup can be
+        # incomplete. A strict caller is about to delete the sandbox, so a
+        # nonzero count is data loss and must abort the teardown.
+        errors = int((result or {}).get("errors") or 0)
+        if errors:
+            message = (
+                f"File backup for {workspace_id} left {errors} file(s) unsaved "
+                f"({result})"
+            )
+            if strict:
+                raise RuntimeError(f"{message}; aborting before sandbox teardown")
+            logger.warning(message)
+            return
+
+        logger.debug(f"File backup completed for {workspace_id}: {result}")
+
+    @asynccontextmanager
+    async def _detached_runtime(self, sandbox_id: str):
+        """Yield a runtime for a sandbox this worker holds no session for.
+
+        The durable ``sandbox_id`` is the authority, not the local cache, so
+        lifecycle operations have to be able to reach a sandbox this process
+        never attached to. Owns the provider for the duration — every caller
+        needs the same create/get/close dance, and leaking the provider leaks
+        the SDK's HTTP client.
+        """
+        from ptc_agent.core.sandbox.providers import create_provider
+
+        provider = create_provider(self.config.to_core_config())
+        try:
+            yield await provider.get(sandbox_id)
+        finally:
+            await provider.close()
+
+    def _is_sandbox_gone(self, exc: Exception) -> bool:
+        """Whether *exc* means the sandbox no longer exists (vs. a live failure).
+
+        Holds one lazily-built provider rather than making a fresh one per call.
+        ``classify_error`` only reads structured metadata off the exception, but
+        constructing a provider opens an SDK client, and this is a sync method,
+        so it cannot await a close — building one per call leaked a client on
+        every failed teardown.
+        """
+        from ptc_agent.core.sandbox.runtime import SandboxFailureKind
+
+        if isinstance(exc, SandboxGoneError):
+            return True
+        if self._error_classifier is None:
+            from ptc_agent.core.sandbox.providers import create_provider
+
+            self._error_classifier = create_provider(self.config.to_core_config())
+        return (
+            self._error_classifier.classify_error(exc)
+            is SandboxFailureKind.SANDBOX_GONE
+        )
+
+    async def _detached_sandbox_teardown(
+        self, workspace_id: str, sandbox_id: str, *, delete: bool
+    ) -> None:
+        """Stop or delete a sandbox this worker holds no session for.
+
+        The durable ``sandbox_id`` is the authority, not the local cache: acting
+        on the cache alone lets a request that lands on a session-less worker
+        flip the row to ``stopped``/``deleted`` while the sandbox keeps running.
+        """
+        action = "delete" if delete else "stop"
+        try:
+            async with self._detached_runtime(sandbox_id) as runtime:
+                await (runtime.delete() if delete else runtime.stop())
+            logger.info(
+                f"Tore down detached sandbox {sandbox_id} for {workspace_id} "
+                f"({action})",
+                extra={
+                    "workspace_id": workspace_id,
+                    "sandbox_id": sandbox_id,
+                    "action": action,
+                },
+            )
+        except Exception as exc:
+            if not self._is_sandbox_gone(exc):
+                raise
+            logger.info(
+                f"Detached sandbox {sandbox_id} for {workspace_id} is already "
+                f"gone; nothing to tear down",
+                extra={"workspace_id": workspace_id, "sandbox_id": sandbox_id},
+            )
 
     async def _restore_files(self, workspace_id: str, sandbox: Any) -> None:
         """Restore backed-up files from DB to sandbox. Non-blocking on failure."""
@@ -1068,6 +1383,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         workspace: Dict[str, Any],
         *,
         expected_hash: str | None = None,
+        transition_already_owned: bool = False,
     ) -> Session | None:
         """Check if sandbox working directory matches config; migrate if not.
 
@@ -1077,6 +1393,11 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         Args:
             expected_hash: Pre-computed config hash (avoids recomputation when
                 the caller already checked it, e.g. in ``_restart_workspace``).
+            transition_already_owned: The caller already holds this workspace's
+                lifecycle transition, so there is nothing left to fence. True on
+                the restart path, where the row is ``starting`` and claimed by
+                this task — a replacement claim starts from ``running`` and
+                could never succeed there.
         """
         if expected_hash is None:
             expected_hash = self._compute_sandbox_config_hash(self.config)
@@ -1104,33 +1425,78 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             f"Migrating workspace {workspace_id} sandbox: {actual_wd} -> {expected_wd}"
         )
 
-        # 1. Backup files to DB (must succeed or we abort — data loss prevention)
+        old_sandbox_id = self._session_sandbox_id(session) or workspace.get("sandbox_id")
+
+        # 1. Backup files to DB (must succeed or we abort — data loss prevention).
+        # Strict, because step 2 deletes the sandbox. Migration is opportunistic,
+        # so an abort degrades to "reconnect on the old working dir", never to a
+        # failed request.
         try:
-            result = await FilePersistenceService.sync_to_db(
-                workspace_id, session.sandbox
+            await self._backup_files_to_db(
+                workspace_id,
+                strict=True,
+                expected_sandbox_id=old_sandbox_id,
+                session=session,
             )
-            logger.info(f"Pre-migration backup for {workspace_id}: {result}")
         except Exception:
             logger.error(
-                f"Migration aborted for {workspace_id}: file backup failed",
+                f"Migration aborted for {workspace_id}: pre-migration backup "
+                f"incomplete",
                 exc_info=True,
             )
             return None
 
-        # 2. Tear down old sandbox (delete, not just stop — we're replacing it)
-        self._sessions.pop(workspace_id, None)
-        try:
-            await SessionManager.cleanup_session(workspace_id)
-        except Exception as e:
-            # cleanup_session may fail after cleanup() but before del _sessions,
-            # leaving a stale entry.  Evict unconditionally so _recover_sandbox
-            # creates a fresh session.
-            SessionManager.remove_session(workspace_id)
-            logger.warning(f"Old sandbox cleanup failed for {workspace_id}: {e}")
+        # 2. Durably fence the replacement before teardown, then tear the old
+        # sandbox down (delete, not just stop — we're replacing it). Without the
+        # claim the row advertises running/<old id> while that sandbox is being
+        # deleted, so a request on another worker attaches to it and races us into
+        # provisioning a duplicate. Losing the claim means someone else already
+        # moved the workspace — leave the current session alone.
+        if not old_sandbox_id:
+            logger.warning(
+                f"Skipping migration for {workspace_id}: no sandbox to replace"
+            )
+            return None
+        if not transition_already_owned and not await try_claim_workspace_for_replacement(
+            workspace_id, old_sandbox_id
+        ):
+            logger.warning(
+                f"Skipping migration for {workspace_id}: could not claim the "
+                f"replacement (sandbox {old_sandbox_id})"
+            )
+            return None
 
-        # 3. Create fresh sandbox + restore files from DB
-        core_config = self.config.to_core_config()
-        new_session = await self._recover_sandbox(workspace_id, user_id, core_config)
+        # Everything past the claim runs under a compensator. The row now reads
+        # 'starting' and only this task can release it; returning or raising out
+        # of here without doing so leaves the workspace permanently unstartable,
+        # because the start path claims from 'stopped', never from 'starting'.
+        try:
+            self._sessions.pop(workspace_id, None)
+            try:
+                await SessionManager.cleanup_session(workspace_id)
+            except Exception as e:
+                # cleanup_session may fail after cleanup() but before del
+                # _sessions, leaving a stale entry.  Evict unconditionally so
+                # _recover_sandbox creates a fresh session.
+                SessionManager.remove_session(workspace_id)
+                logger.warning(f"Old sandbox cleanup failed for {workspace_id}: {e}")
+
+            # 3. Create fresh sandbox + restore files from DB
+            core_config = self.config.to_core_config()
+            new_session = await self._recover_sandbox(
+                workspace_id, user_id, core_config
+            )
+        except (Exception, asyncio.CancelledError):
+            # Files are backed up and the old sandbox is gone, so 'stopped' lets
+            # the next start self-heal. 'error' would be terminal — the start
+            # path refuses it outright.
+            #
+            # CancelledError is caught explicitly because it is a BaseException:
+            # a client disconnect or a shutdown landing mid-replacement would
+            # otherwise skip this and strand the row in 'starting', which no
+            # start can claim.
+            await update_workspace_status(workspace_id, "stopped")
+            raise
 
         # 4. Stamp DB so future reconnects skip migration.
         # Retry once on failure — an unstamped workspace would re-migrate every
@@ -1238,31 +1604,50 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             return False
         return session.sandbox.is_ready()
 
-    def get_session_if_ready(self, workspace_id: str) -> "Session | None":
-        """Return the cached session iff it's ready, else None (no I/O, no wake).
+    def get_session_if_ready(
+        self, workspace_id: str, *, expected_sandbox_id: str | None
+    ) -> "Session | None":
+        """Return the cached session iff it's ready and bound to *expected_sandbox_id*.
 
         One-shot replacement for the ``has_ready_session()`` + ``_sessions.get()``
         pair so callers (e.g. the unauthenticated public serve routes) avoid the
         TOCTOU window between the two and don't reach into the private map.
+
+        Still no I/O and no wake — the unauthenticated routes must never let a
+        UUID-only request start a sandbox. The identity fence is free for them
+        because they already hold the ``workspaces`` row, and without it this is
+        a serving path that skips the check every other cache boundary makes:
+        a share link would keep answering from a replaced sandbox with the same
+        false "File not found" this change exists to remove. ``expected_sandbox_id``
+        is keyword-only and mandatory so a new caller cannot omit the fence.
+
+        A mismatch only declines to serve; retiring is the async acquisition
+        path's job, and these routes fall back to the persisted copy anyway.
         """
         session = self._sessions.get(workspace_id)
         if session is None or not session._initialized or not session.sandbox:
             return None
         if not session.sandbox.is_ready():
             return None
+        if self._session_sandbox_id(session) != expected_sandbox_id:
+            return None
         return session
 
-    def get_applied_mcp_config_version(self, workspace_id: str) -> int | None:
+    def get_applied_mcp_config_version(
+        self, workspace_id: str, *, expected_sandbox_id: str | None
+    ) -> int | None:
         """The MCP config version the warm session has applied (no I/O, no lock).
 
-        Returns None when no ready session exists — the config isn't loaded
-        anywhere live yet. The effective-list endpoint surfaces this so the UI
-        shows a version-accurate "applied / still applying" state instead of a
-        best-effort timer.
+        None means nothing is loaded live *that this worker can vouch for*: no
+        ready session, or one bound to a sandbox the workspace has since
+        replaced. The version is a claim about what a running sandbox holds, so
+        reporting a superseded session's would name a number no live sandbox has
+        applied — and the UI reads it as ground truth for "applied / still
+        applying".
         """
-        if not self.has_ready_session(workspace_id):
-            return None
-        session = self._sessions.get(workspace_id)
+        session = self.get_session_if_ready(
+            workspace_id, expected_sandbox_id=expected_sandbox_id
+        )
         return session.mcp_config_version if session is not None else None
 
     async def proactively_apply_mcp_config(
@@ -1381,18 +1766,10 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         async with self._observed_lock(
             workspace_id, "workspace.session.acquire", cached_on_entry=_was_cached
         ):
-            # ── Fast path: check session cache before any DB call ──
-            if workspace_id in self._sessions:
-                session = self._sessions[workspace_id]
-                logger.debug(
-                    f"Found cached session for {workspace_id}, "
-                    f"initialized={session._initialized}, has_sandbox={session.sandbox is not None}"
-                )
-
-                if not session._initialized or not session.sandbox:
-                    # Session exists but not usable, fall through to status-based handling
-                    session = None
-                elif not session.sandbox.is_ready():
+            # ── Fast path: check session cache before any full-row DB call ──
+            session = await self._take_valid_cached_session(workspace_id, _mark)
+            if session is not None:
+                if not session.sandbox.is_ready():
                     if session.sandbox.has_failed():
                         # Lazy init completed with error — clear broken session
                         init_err = session.sandbox.init_error
@@ -2136,6 +2513,25 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         session = SessionManager.get_session(workspace_id, core_config)
         did_init = False
 
+        # ``SessionManager`` outlives ``self._sessions`` on purpose (stop_workspace
+        # leaves its entry so a restart can reuse it), so an already-initialized
+        # session here may still be bound to a sandbox this workspace has since
+        # replaced. Re-initializing is skipped for such a session, so validate the
+        # binding first or the stale handle gets promoted straight back into cache.
+        if session._initialized:
+            stale_reason = self._identity_is_stale(
+                workspace_id, session, dict(workspace)
+            )
+            if stale_reason is not None:
+                logger.warning(
+                    f"Discarding stale SessionManager session for "
+                    f"{workspace_id} on attach ({stale_reason})",
+                    extra={"workspace_id": workspace_id, "reason": stale_reason},
+                )
+                await self._retire_session(workspace_id, session, reason=stale_reason)
+                safe_add(session_path_counter, 1, {"path": "stale_reattach"})
+                session = SessionManager.get_session(workspace_id, core_config)
+
         if not session._initialized:
             sandbox_id = workspace.get("sandbox_id")
             try:
@@ -2164,6 +2560,49 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 ws_version=int(workspace.get("platform_secret_version") or 0),
             )
             mark("platform_secret")
+
+            # ``initialize`` BUILDS a sandbox when the row names none, so this
+            # path can provision without ever having gone through provisioning.
+            # Binding it is not optional bookkeeping: the row is what every
+            # other worker validates against, so leaving it NULL means the
+            # identity check calls this session stale on the very next request,
+            # retires it, and builds another sandbox — a fresh billed sandbox
+            # per request, each one abandoned with the files still in it.
+            live_sandbox_id = self._session_sandbox_id(session)
+            if live_sandbox_id and live_sandbox_id != sandbox_id:
+                from src.server.services.platform_secret_rollout import (
+                    certify_platform_secrets,
+                )
+
+                # Certify before binding, for the same reason provisioning does:
+                # statement order is what keeps a workspace from ever pointing
+                # at an uncertified sandbox. The resync above is what makes the
+                # certification pass for a sandbox built on this path.
+                secret_version = await certify_platform_secrets(
+                    core_config, runtime=session.sandbox.runtime
+                )
+                bound = await try_bind_workspace_sandbox(
+                    workspace_id,
+                    sandbox_id=live_sandbox_id,
+                    expected_previous_sandbox_id=sandbox_id,
+                    platform_secret_version=secret_version,
+                )
+                if bound is None:
+                    # Another worker bound first. Ours is real and unreferenced,
+                    # so it must not survive; the caller's retry attaches to the
+                    # winner. Same contract as _provision_sandbox_session.
+                    logger.warning(
+                        f"Lost the sandbox-identity race for {workspace_id} on "
+                        f"attach; discarding our sandbox {live_sandbox_id}",
+                        extra={
+                            "workspace_id": workspace_id,
+                            "sandbox_id": live_sandbox_id,
+                        },
+                    )
+                    await self._clear_session(workspace_id, evict_session=session)
+                    raise SandboxIdentityLostError(workspace_id, live_sandbox_id)
+                workspace = bound
+                mark("bind_attached_sandbox")
 
             # Resolve + install the per-workspace composite before asset sync so
             # codegen uploads user-server wrappers. Cheap; discovery kicked in
@@ -2515,6 +2954,9 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                     session,
                     workspace,
                     expected_hash=expected_hash,
+                    # This path owns the transition already: the row is
+                    # 'starting' and claimed by this task.
+                    transition_already_owned=True,
                 )
                 if migrated is not None:
                     return migrated
@@ -2598,16 +3040,52 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             # sandbox so it can't run against a dead sandbox / write orphan rows.
             self._cancel_mcp_discovery(workspace_id)
 
+            durable_sandbox_id = workspace.get("sandbox_id")
+
             try:
                 # Backup files to DB before stopping sandbox
-                await self._backup_files_to_db(workspace_id)
+                await self._backup_files_to_db(
+                    workspace_id, expected_sandbox_id=durable_sandbox_id
+                )
 
-                # Stop the session (stops sandbox, preserves data)
+                # Stop the session (stops sandbox, preserves data). Only the
+                # session bound to the DURABLE sandbox may be stopped this way —
+                # any other cached session belongs to a superseded sandbox, and
+                # stopping it would leave the real one running while the row says
+                # 'stopped'. Same shape when this worker holds no session at all.
                 session = self._sessions.get(workspace_id)
-                if session:
+                attached_sandbox_id = self._session_sandbox_id(session)
+                if session is not None and attached_sandbox_id == durable_sandbox_id:
                     await session.stop()
                     # Remove from cache (will be recreated on restart)
                     del self._sessions[workspace_id]
+                else:
+                    if session is not None:
+                        await self._retire_session(
+                            workspace_id,
+                            session,
+                            reason=(
+                                "stop_workspace saw a session bound to "
+                                f"{attached_sandbox_id}, durable is "
+                                f"{durable_sandbox_id}"
+                            ),
+                        )
+                    if durable_sandbox_id:
+                        try:
+                            await self._detached_sandbox_teardown(
+                                workspace_id, durable_sandbox_id, delete=False
+                            )
+                        except Exception as e:
+                            # Best-effort on purpose: this except-block marks the
+                            # row 'error', which the start path refuses outright.
+                            # Bricking a workspace over a provider blip is worse
+                            # than a sandbox that Daytona's own auto-stop will
+                            # reap — unlike delete, stop has a safety net.
+                            logger.warning(
+                                f"Could not stop detached sandbox "
+                                f"{durable_sandbox_id} for {workspace_id}: {e}; "
+                                "marking stopped and leaving it to auto-stop"
+                            )
 
                 self._pending_lazy_sync.discard(workspace_id)
                 self._last_sync_at.pop(workspace_id, None)
@@ -2651,19 +3129,13 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             if not sandbox_id:
                 raise RuntimeError("No sandbox associated with this workspace")
 
-            from ptc_agent.core.sandbox.providers import create_provider
-
-            provider = create_provider(self.config.to_core_config())
-            try:
-                runtime = await provider.get(sandbox_id)
+            async with self._detached_runtime(sandbox_id) as runtime:
                 if "archive" not in runtime.capabilities:
                     raise RuntimeError(
                         f"Provider does not support archiving "
                         f"(capabilities: {runtime.capabilities})"
                     )
                 await runtime.archive()
-            finally:
-                await provider.close()
 
             logger.info(f"Workspace {workspace_id} archived successfully")
             return workspace
@@ -2692,11 +3164,21 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             # sandbox so it can't run against a dead sandbox / write orphan rows.
             self._cancel_mcp_discovery(workspace_id)
 
+            durable_sandbox_id = workspace.get("sandbox_id")
+
             try:
                 # Backup files to DB before deleting (if sandbox is accessible)
-                await self._backup_files_to_db(workspace_id)
+                await self._backup_files_to_db(
+                    workspace_id, expected_sandbox_id=durable_sandbox_id
+                )
 
-                # Remove from local cache (SessionManager.cleanup_session handles actual cleanup)
+                # ``cleanup_session`` only deletes the sandbox this process is
+                # attached to. When that is not the durable one — a stale handle,
+                # or no session on this worker at all — the real sandbox has to be
+                # deleted through the provider or it keeps running and billing
+                # behind a soft-deleted row.
+                session = self._sessions.get(workspace_id)
+                attached_sandbox_id = self._session_sandbox_id(session)
                 self._sessions.pop(workspace_id, None)
 
                 self._pending_lazy_sync.discard(workspace_id)
@@ -2707,6 +3189,11 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                     await SessionManager.cleanup_session(workspace_id)
                 except Exception as e:
                     logger.warning(f"Error cleaning up from SessionManager: {e}")
+
+                if durable_sandbox_id and attached_sandbox_id != durable_sandbox_id:
+                    await self._detached_sandbox_teardown(
+                        workspace_id, durable_sandbox_id, delete=True
+                    )
 
                 # Soft delete in DB
                 await db_delete_workspace(workspace_id)

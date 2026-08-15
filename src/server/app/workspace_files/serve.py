@@ -10,6 +10,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException, Query
 
 from src.config.env import PDF_RENDER_INTERNAL_BASE
+from src.server.utils.error_sanitization import single_line
 from src.server.utils.http_headers import content_disposition
 from fastapi.responses import Response
 
@@ -20,7 +21,6 @@ from src.server.utils.secret_redactor import get_redactor, get_vault_secrets_for
 from src.utils.mime import resolve_content_type
 
 from ._shared import (
-    _acquire_sandbox,
     _is_text_content_type,
     _is_utf8,
     _get_work_dir,
@@ -190,41 +190,49 @@ async def _resolve_serve_bytes(
     """Resolve raw bytes + content type for a file, sandbox-first with DB fallback.
 
     Returns ``(content, content_type)`` or ``None`` when the file is missing.
-    Live bytes are read only when the sandbox is already warm in this worker
-    (``has_ready_session``); otherwise — including a stale ``running`` DB row
-    whose Daytona sandbox has auto-stopped — this falls back to the persisted
-    DB record. This keeps the unauthenticated route from ever waking or
-    recovering a sandbox (denial-of-wallet) from a UUID-only request.
+    Live bytes are read only from a session this worker already holds *and*
+    that still matches the row's binding; anything else — a replaced sandbox, a
+    stale ``running`` row whose sandbox auto-stopped, a cold worker — falls back
+    to the persisted DB record. This keeps the unauthenticated route from ever
+    waking or recovering a sandbox (denial-of-wallet) from a UUID-only request.
     """
     extension_mime = _guess_content_type(normalized_path)
 
-    # Live read only from an already-warm sandbox; short-circuit so the manager
-    # singleton is consulted only on the running path. A stale 'running' DB row
-    # whose Daytona sandbox auto-stopped has no warm session → DB fallback.
+    # Live read only from an already-warm sandbox, resolved in one shot so the
+    # handle is fenced against the row's binding: a session bound to a replaced
+    # sandbox must read as "not warm" here. Going through the acquisition path
+    # instead would retire that handle and re-attach — which is correct for an
+    # authenticated caller and exactly wrong for this route, since it starts or
+    # provisions a sandbox from a UUID-only request. A stale 'running' row whose
+    # sandbox auto-stopped has no warm session either → DB fallback.
     status = workspace.get("status")
-    warm = (
-        status == "running"
-        and WorkspaceManager.get_instance().has_ready_session(workspace_id)
+    session = (
+        WorkspaceManager.get_instance().get_session_if_ready(
+            workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
+        )
+        if status == "running"
+        else None
     )
-    if not warm:
-        return await _db_fallback_bytes(workspace_id, normalized_path, extension_mime)
-
-    # Warm sandbox — read live bytes without any Daytona start/reconnect. If
-    # the session died between has_ready_session() above and here (TOCTOU),
-    # _acquire_sandbox raises 503; absorb it and fall back to the DB record so
-    # the route keeps its uniform-404 posture instead of leaking a 503 that
-    # would confirm the workspace UUID is valid.
-    try:
-        sandbox = await _acquire_sandbox(workspace_id, workspace.get("user_id") or "")
-    except HTTPException:
+    sandbox = getattr(session, "sandbox", None) if session else None
+    if sandbox is None:
         return await _db_fallback_bytes(workspace_id, normalized_path, extension_mime)
     candidate, error = sandbox.validate_and_normalize_path(normalized_path)
     if error:
         return None
     try:
         content = await sandbox.adownload_file_bytes(candidate)
-    except RuntimeError:
-        return None
+    except RuntimeError as e:
+        # Deliberate residual: an unreachable sandbox is indistinguishable from a
+        # missing file on this route. It is unauthenticated, so distinguishing
+        # them (503 vs 404) would confirm that a guessed workspace UUID is real.
+        # Fall back to the persisted copy first so the common case still serves.
+        # Warning, not debug: the response deliberately hides the cause, which
+        # makes this line the only place it survives.
+        logger.warning(
+            f"Sandbox read failed for workspace {workspace_id}; "
+            f"serving the persisted copy instead: {single_line(str(e))}"
+        )
+        return await _db_fallback_bytes(workspace_id, normalized_path, extension_mime)
     if content is None:
         return None
     client_path = _to_client_path(sandbox, candidate)

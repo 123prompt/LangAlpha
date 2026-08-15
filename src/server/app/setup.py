@@ -34,11 +34,13 @@ os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
 
 from ptc_agent.core.sandbox.platform_secrets import PlatformSecretError
+from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.config.logging_config import configure_logging
 from src.config.settings import (
     get_allowed_origins,
@@ -47,6 +49,10 @@ from src.observability import init_otel, init_otel_runtime, shutdown_otel_runtim
 from src.server.services.runs.executor import LocalRunExecutor
 from src.server.services.background_registry_store import BackgroundRegistryStore
 from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-diag)
+from src.server.utils.error_sanitization import (
+    sandbox_unreachable_detail,
+    single_line,
+)
 
 # Phase 1: install fork-safe class-level instrumentor patches BEFORE FastAPI(...)
 # is constructed. FastAPIInstrumentor patches the FastAPI class — must run
@@ -984,6 +990,36 @@ app.add_middleware(
     ],  # Use the configured list of methods
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
 )
+
+
+# ============================================================================
+# Exception Handlers
+# ============================================================================
+
+
+async def _sandbox_unreachable_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Map an unreachable sandbox to 503 once, for every route.
+
+    The detail wording is a wire contract, not a message: the file panel
+    categorizes the error by matching this string, so it must stay identical
+    across producers rather than being re-spelled per route. It is built by
+    ``sandbox_unreachable_detail`` because the raw exception carries provider
+    URLs and SDK response bodies that must not leave the server.
+    """
+    # The exception is the live carrier: it quotes provider response bodies, so
+    # it can hold a newline and a forged entry. Starlette's path is already
+    # CR/LF-free (urlsplit drops them); it is escaped to keep the rule uniform.
+    logger.warning(
+        f"Sandbox unreachable for {single_line(request.url.path)}: {single_line(str(exc))}"
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": sandbox_unreachable_detail(exc)},
+    )
+
+
+app.add_exception_handler(SandboxGoneError, _sandbox_unreachable_handler)
+app.add_exception_handler(SandboxTransientError, _sandbox_unreachable_handler)
 
 
 # ============================================================================

@@ -34,6 +34,7 @@ def _ws(workspace_id=None, user_id=USER, status="running", **overrides):
         "user_id": user_id,
         "name": "Test Workspace",
         "status": status,
+        "sandbox_id": "sb-1",
         "config": None,
         "mcp_config_version": 3,
         **overrides,
@@ -266,7 +267,30 @@ async def test_list_surfaces_applied_config_version(client):
     assert body["config_version"] == 3
     # applied (2) < saved (3) ⇒ the UI reads "applying", not "synced".
     assert body["applied_config_version"] == 2
-    wm.get_applied_mcp_config_version.assert_called_once_with(ws["workspace_id"])
+    # Fenced on the row's binding: a version from a session holding a superseded
+    # sandbox is not something this worker can vouch for.
+    wm.get_applied_mcp_config_version.assert_called_once_with(
+        ws["workspace_id"], expected_sandbox_id="sb-1"
+    )
+
+
+def test_live_sandbox_declines_a_superseded_handle():
+    """Discovery probes a sandbox and persists the schemas under the workspace,
+    so a handle for a replaced sandbox would attribute a dead sandbox's toolset
+    to the live one. Declining leaves the rows ``pending``, which is recoverable.
+    """
+    from src.server.app.mcp_servers import _get_live_sandbox
+
+    ws = _ws(sandbox_id="sb-replaced")
+    wm = MagicMock()
+    wm.get_session_if_ready.return_value = None  # bound elsewhere ⇒ declined
+    with patch(
+        "src.server.app.mcp_servers.WorkspaceManager.get_instance", return_value=wm
+    ):
+        assert _get_live_sandbox(ws["workspace_id"], ws) is None
+    wm.get_session_if_ready.assert_called_once_with(
+        ws["workspace_id"], expected_sandbox_id="sb-replaced"
+    )
 
 
 @pytest.mark.asyncio

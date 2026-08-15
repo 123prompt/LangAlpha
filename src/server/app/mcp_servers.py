@@ -306,7 +306,7 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
     applied_version: int | None = None
     try:
         applied_version = WorkspaceManager.get_instance().get_applied_mcp_config_version(
-            workspace_id
+            workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
         )
     except Exception:
         logger.debug("[mcp] applied version lookup failed for %s", workspace_id)
@@ -845,16 +845,18 @@ def _get_live_sandbox(workspace_id: str, workspace: dict) -> Any | None:
     """Return the in-memory live sandbox if one is ready, else None.
 
     Reads the cached session directly (no lock, no acquire) so discovery never
-    races the warm/Phase-2 machinery. A stopped/cold workspace ⇒ None, which
-    ``discover_and_cache`` turns into ``pending`` rows.
+    races the warm/Phase-2 machinery, but fenced against the row's binding: a
+    handle for a replaced sandbox would have discovery probe the dead one and
+    persist its schemas under this workspace. A stopped/cold workspace, or a
+    superseded handle, ⇒ None, which ``discover_and_cache`` turns into
+    ``pending`` rows.
     """
     if not _sandbox_running(workspace):
         return None
     try:
-        wm = WorkspaceManager.get_instance()
-        if not wm.has_ready_session(workspace_id):
-            return None
-        session = wm._sessions.get(workspace_id)
+        session = WorkspaceManager.get_instance().get_session_if_ready(
+            workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
+        )
         return session.sandbox if session else None
     except Exception:
         logger.warning(
