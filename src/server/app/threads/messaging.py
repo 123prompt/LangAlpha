@@ -432,10 +432,8 @@ async def _handle_send_message(
         # supplied their own key (OAUTH or BYOK), not merely that a client object exists.
         is_byok = config.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK)
 
-        # Credit check: always enforce.
-        # - Platform-served (is_byok=False): block when daily limit reached.
-        # - BYOK/OAuth (is_byok=True): block only on negative balance (outstanding
-        #   debt from past platform usage, e.g. fallback routing).
+        # Credit check: always ask, whoever's key this is. Which pools apply to
+        # an own-key turn is the quota service's call, not ours.
         await enforce_credit_limit(user_id, byok=is_byok)
 
         # I6: Redis down at START = 503 before any durable row. Ordered after

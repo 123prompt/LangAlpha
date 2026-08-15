@@ -55,6 +55,15 @@ api.interceptors.response.use(
       error.retryAfter = parseInt(error.response.headers?.['retry-after'] as string, 10) || null;
     }
 
+    // Any gate that writes a structured `detail` wrote a sentence meant for the
+    // user. Without this, every call site that falls back to `err.message` shows
+    // axios's "Request failed with status code 503" and the explanation the
+    // server took care to send is dropped on the floor.
+    const structured = (error.response?.data as Record<string, unknown> | undefined)?.detail;
+    if (structured && typeof structured === 'object' && typeof (structured as Record<string, unknown>).message === 'string') {
+      error.message = (structured as Record<string, unknown>).message as string;
+    }
+
     // iOS Safari returns from a frozen tab with a stale token before Supabase's auto-refresh
     // runs, so a refetch hits a 401. Force-refresh once and replay the request.
     const config = error.config as RetriableRequestConfig | undefined;

@@ -21,7 +21,7 @@ import { shouldArmForStatus } from '../utils/reportBackSignal';
 import { useReportBackWatch } from './useReportBackWatch';
 import { useChatFeedback } from './useChatFeedback';
 import { toast } from '@/components/ui/use-toast';
-import { buildRateLimitError, type StructuredError } from '@/utils/rateLimitError';
+import { buildRateLimitError, type ErrorLinkSpec, type StructuredError } from '@/utils/rateLimitError';
 import { getStoredThreadId, setStoredThreadId } from './utils/threadStorage';
 import { type SubagentTokenUsage, ZERO_USAGE } from '../utils/tokenUsage';
 import { computeSteeringBoundary } from '../session/stream/steeringRollback';
@@ -1742,13 +1742,13 @@ export function useChatMessages(
               }
               setMessageError({
                 message: (errorInfo.message as string) || (err as Error).message || 'An error occurred.',
-                link: errorInfo.link as { url: string; label: string },
+                links: [errorInfo.link as ErrorLinkSpec],
               });
               setMessages((prev) => prev.filter((m) => m.id !== assistantMessageId));
             } else if (errObj.status === 403) {
               setMessageError({
                 message: (err as Error).message || 'Access denied.',
-                link: { url: '/setup/method', label: 'Configure providers' },
+                links: [{ url: '/setup/method', label: 'Configure providers' }],
               });
               setMessages((prev) => prev.filter((m) => m.id !== assistantMessageId));
             } else {

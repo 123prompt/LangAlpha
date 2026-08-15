@@ -128,6 +128,46 @@ describe('response interceptor behavior (429 handling)', () => {
     await expect(errorHandler(error)).rejects.toBe(error);
     expect(error.rateLimitInfo).toBeUndefined();
   });
+
+  it('surfaces a structured detail message on any status', async () => {
+    // The credit gate fails closed with a 503 the user is meant to read. Call
+    // sites fall back to err.message, which is axios's "Request failed with
+    // status code 503" unless the interceptor lifts the real sentence out.
+    const { api } = await import('../client');
+
+    const resInterceptors = api.interceptors.response as unknown as InterceptorManager<unknown>;
+    const errorHandler = resInterceptors.handlers[0].rejected;
+
+    const error: Record<string, unknown> = {
+      message: 'Request failed with status code 503',
+      response: {
+        status: 503,
+        data: { detail: { message: 'Service temporarily unavailable. Please try again shortly.', type: 'service_unavailable' } },
+      },
+    };
+
+    await expect(errorHandler(error)).rejects.toMatchObject({
+      message: 'Service temporarily unavailable. Please try again shortly.',
+    });
+    // Not a rate limit, so nothing pretends it is one.
+    expect(error.rateLimitInfo).toBeUndefined();
+  });
+
+  it('leaves the message alone when detail is a bare string', async () => {
+    const { api } = await import('../client');
+
+    const resInterceptors = api.interceptors.response as unknown as InterceptorManager<unknown>;
+    const errorHandler = resInterceptors.handlers[0].rejected;
+
+    const error: Record<string, unknown> = {
+      message: 'Request failed with status code 500',
+      response: { status: 500, data: { detail: 'Server error' } },
+    };
+
+    await expect(errorHandler(error)).rejects.toMatchObject({
+      message: 'Request failed with status code 500',
+    });
+  });
 });
 
 describe('response interceptor behavior (401 refresh-and-retry)', () => {
