@@ -1435,6 +1435,11 @@ def _discover_http(server_name: str) -> list:
     with httpx.Client(timeout=_HTTP_EXCHANGE_BUDGET) as client:
         deadline = time.monotonic() + _HTTP_EXCHANGE_BUDGET
         with client.stream("POST", url, json=req, headers=hdrs) as response:
+            # A relay rejection here would otherwise surface as a bare 502
+            # against the relay URL; decode it like the handshake path does.
+            _msg = _relay_error(response, server_name)
+            if _msg:
+                raise RuntimeError(_msg)
             response.raise_for_status()
             result = _parse_http_reply(response, req["id"], server_name, deadline)
     if "error" in result:

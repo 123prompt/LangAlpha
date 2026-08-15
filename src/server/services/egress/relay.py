@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -209,6 +210,29 @@ def _vendor_headers(
     return headers
 
 
+def _is_vendor_redirect(status: int) -> bool:
+    # Every 3xx names elsewhere instead of answering, except 304, which is a
+    # real response (caching passthrough). Relaying any other 3xx is useless to
+    # the sandbox: Location is stripped by the response allowlist, so
+    # raise_for_status there yields a bare "Redirect response" against the
+    # relay's own URL. Deliberately the whole range rather than the
+    # hop-following five — location-less, deprecated (305), reserved (306),
+    # and future codes all land on that same bare error if passed through.
+    return 300 <= status <= 399 and status != 304
+
+
+def _redirect_host(location: str | None) -> str:
+    # A vendor Location is untrusted and may embed signed query parameters or
+    # userinfo; even the host-side log keeps only the hostname.
+    if not location:
+        return "<missing>"
+    try:
+        host = urlsplit(location).hostname
+    except ValueError:
+        return "<unparseable>"
+    return host or "<relative>"
+
+
 async def open_upstream(
     prepared: PreparedRelay, incoming_headers: dict[str, str]
 ) -> httpx.Response:
@@ -251,18 +275,19 @@ async def open_upstream(
                 connection_id, e,
             )
             raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
-        if response.has_redirect_location:
+        if _is_vendor_redirect(response.status_code):
             # Following the hop would carry the vendor bearer to whatever host
             # the redirect names, but relaying the 3xx on is worse than useless:
             # Location is not in RESPONSE_HEADER_ALLOWLIST, so the sandbox would
             # raise a bare "redirect response" against the RELAY's own URL, with
-            # nothing pointing at the vendor. Name it as its own outcome instead.
-            # The target follows the destination-pin reason above and stays
-            # host-side, since the sandbox is never told the vendor's address.
+            # nothing pointing at the vendor. Name it as its own outcome
+            # instead. Only the target's host is kept even in the host-side
+            # log — a vendor Location can carry signed query parameters or
+            # userinfo, and the sandbox is never told any of it.
             await response.aclose()
             logger.warning(
-                "[egress_relay] vendor redirected connection %s to %s",
-                connection_id, response.headers.get("location"),
+                "[egress_relay] vendor redirected connection %s to host %s",
+                connection_id, _redirect_host(response.headers.get("location")),
             )
             raise RelayRejection(502, RelayError.VENDOR_REDIRECT)
         return response
