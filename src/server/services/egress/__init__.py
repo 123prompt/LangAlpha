@@ -31,6 +31,7 @@ class RelayError(StrEnum):
     # open_upstream
     DESTINATION_BLOCKED = "destination_blocked"
     UPSTREAM_UNREACHABLE = "upstream_unreachable"
+    VENDOR_REDIRECT = "vendor_redirect"
     # the route's own budgets
     LIMITED_RATE = "limited_rate"
     LIMITED_CONCURRENCY = "limited_concurrency"

@@ -307,6 +307,7 @@ _RELAY_ERROR_HINTS = {
     "refresh_in_progress": "the vendor token is being refreshed; retry in a few seconds",
     "destination_blocked": "the relay refused to dial this server's address",
     "upstream_unreachable": "the relay could not reach the vendor's server",
+    "vendor_redirect": "the vendor redirected this endpoint, so its URL has moved; update the server URL in Connectors",
     "limited_rate": "rate limit reached for this connection; retry shortly",
     "limited_concurrency": "too many concurrent calls for this connection; retry shortly",
     "relay_disabled": "the egress relay is disabled on this deployment",
@@ -1434,6 +1435,11 @@ def _discover_http(server_name: str) -> list:
     with httpx.Client(timeout=_HTTP_EXCHANGE_BUDGET) as client:
         deadline = time.monotonic() + _HTTP_EXCHANGE_BUDGET
         with client.stream("POST", url, json=req, headers=hdrs) as response:
+            # A relay rejection here would otherwise surface as a bare 502
+            # against the relay URL; decode it like the handshake path does.
+            _msg = _relay_error(response, server_name)
+            if _msg:
+                raise RuntimeError(_msg)
             response.raise_for_status()
             result = _parse_http_reply(response, req["id"], server_name, deadline)
     if "error" in result:

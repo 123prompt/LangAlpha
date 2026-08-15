@@ -1055,6 +1055,125 @@ class TestVendor401Disambiguation:
 
 
 # ===========================================================================
+# 5b. Vendor redirects
+# ===========================================================================
+
+
+class TestVendorRedirects:
+    """A vendor 3xx has no safe passthrough: following it would carry the
+    bearer to the host the vendor names, and relaying it strips Location (not
+    allowlisted), leaving the sandbox to raise a bare redirect error against
+    the relay's own URL. It gets its own code instead."""
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_is_named_rather_than_relayed_as_a_bare_3xx(
+        self, env, client
+    ):
+        env.set_vendor(
+            _vendor_json(status=307, headers={"location": f"https://{VENDOR_HOST}/mcp/"})
+        )
+
+        resp = await _post(client, token=_jwt())
+
+        assert resp.status_code == 502
+        assert _error(resp) == "vendor_redirect"
+
+    @pytest.mark.asyncio
+    async def test_the_redirect_target_stays_host_side(self, env, client):
+        # Same posture as destination_blocked: the sandbox is never told the
+        # vendor's address, so the code travels and the target does not.
+        env.set_vendor(
+            _vendor_json(
+                status=302, headers={"location": "https://elsewhere.example/mcp"}
+            )
+        )
+
+        resp = await _post(client, token=_jwt())
+
+        assert _error(resp) == "vendor_redirect"
+        assert "location" not in {k.lower() for k in resp.headers}
+        assert "elsewhere.example" not in resp.text
+        assert VENDOR_HOST not in resp.text
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_on_the_401_retry_is_caught_too(self, env, client):
+        # The guard sits in the send helper, not on the first response: a
+        # rotated-bundle retry is a second chance for the vendor to redirect.
+        env.set_vendor(
+            _vendor_json(status=401),
+            _vendor_json(status=308, headers={"location": f"https://{VENDOR_HOST}/v2"}),
+        )
+        env.connection = AccessToken(
+            access_token=ROTATED_TOKEN, token_type="Bearer", generation=2
+        )
+
+        resp = await _post(client, token=_jwt())
+
+        assert resp.status_code == 502
+        assert _error(resp) == "vendor_redirect"
+        assert env.vendor.sends == 2
+
+    @pytest.mark.asyncio
+    async def test_a_304_is_not_a_redirect(self, env, client):
+        # 304 is the one 3xx that answers rather than names elsewhere; the
+        # passthrough contract still owns it.
+        env.set_vendor(_vendor_json(status=304))
+
+        resp = await _post(client, token=_jwt())
+
+        assert resp.status_code == 304
+        assert _error(resp) is None
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_status_without_location_is_still_refused(
+        self, env, client
+    ):
+        # A 301 with no Location is malformed, but relaying it lands the
+        # sandbox on the same bare redirect error; the status alone decides.
+        env.set_vendor(_vendor_json(status=301))
+
+        resp = await _post(client, token=_jwt())
+
+        assert resp.status_code == 502
+        assert _error(resp) == "vendor_redirect"
+
+    @pytest.mark.asyncio
+    async def test_a_300_multiple_choices_is_refused_too(self, env, client):
+        # 300 may name a preferred target in Location; relayed with the header
+        # stripped it is just another bare redirect error in the sandbox.
+        env.set_vendor(
+            _vendor_json(
+                status=300, headers={"location": f"https://{VENDOR_HOST}/v2/mcp"}
+            )
+        )
+
+        resp = await _post(client, token=_jwt())
+
+        assert resp.status_code == 502
+        assert _error(resp) == "vendor_redirect"
+
+    @pytest.mark.asyncio
+    async def test_the_log_keeps_only_the_redirect_host(self, env, client, caplog):
+        # The Location value is vendor-controlled and can carry signed query
+        # parameters; even the host-side log must not retain them.
+        env.set_vendor(
+            _vendor_json(
+                status=302,
+                headers={"location": "https://elsewhere.example/hop?sig=SIGNEDSECRET"},
+            )
+        )
+
+        with caplog.at_level("WARNING", logger="src.server.services.egress.relay"):
+            resp = await _post(client, token=_jwt())
+
+        assert _error(resp) == "vendor_redirect"
+        log_text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "elsewhere.example" in log_text
+        assert "SIGNEDSECRET" not in log_text
+        assert "/hop" not in log_text
+
+
+# ===========================================================================
 # 6. Streaming
 # ===========================================================================
 
