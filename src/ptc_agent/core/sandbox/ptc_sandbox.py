@@ -21,6 +21,7 @@ from ptc_agent.core.sandbox.retry import RetryPolicy, async_retry_with_backoff
 from ptc_agent.core.sandbox.runtime import (
     PreviewInfo,
     RuntimeState,
+    SandboxFailureKind,
     SandboxGoneError,
     SandboxRuntime,
     SandboxTransientError,
@@ -150,17 +151,30 @@ class PTCSandbox:
         return [s for s in self.config.mcp.servers if is_untrusted_server(s)]
 
     async def _wait_ready(self) -> None:
-        """Wait for sandbox to be ready. Call at start of methods needing sandbox."""
+        """Wait for sandbox to be ready. Call at start of methods needing sandbox.
+
+        Raises typed sandbox errors, never a bare ``RuntimeError``: this runs
+        *before* the ``try`` that normalizes each operation's failures, so an
+        untyped error here escapes every classifier downstream — the HTTP layer
+        turns "sandbox isn't up yet" into a 500 instead of a 503, and the chat
+        funnel stops recognizing it as a sandbox condition at all.
+
+        The wording matters too. The file panel selects its "starting" card by
+        looking for that word in the detail, so only the genuinely-in-flight case
+        may claim it.
+        """
         if self._ready_event is None:
             # Not using lazy init - sandbox should already be ready
             if self.runtime is None:
-                raise RuntimeError("Sandbox not initialized")
+                raise SandboxTransientError("Sandbox is not initialized")
             return
 
         try:
             await asyncio.wait_for(self._ready_event.wait(), timeout=300)
         except asyncio.TimeoutError:
-            raise RuntimeError("Sandbox initialization timed out after 300s")
+            raise SandboxTransientError(
+                "Sandbox is still starting: initialization timed out after 300s"
+            )
 
         if self._init_error:
             raise self._init_error
@@ -214,6 +228,12 @@ class PTCSandbox:
         if self._init_task is not None:
             return  # Already started
 
+        # Bind the intended identity synchronously. ``reconnect`` only sets
+        # ``sandbox_id`` after ``provider.get`` returns, so without this a
+        # still-initializing sandbox has no identity for callers to validate
+        # against the workspace row — and a stale handle would be handed out on
+        # the "still initializing" fast path unchecked.
+        self.sandbox_id = sandbox_id
         self._ready_event = asyncio.Event()
         self._init_task = asyncio.create_task(
             self._lazy_reconnect(sandbox_id, on_state_observed=on_state_observed)
@@ -236,7 +256,9 @@ class PTCSandbox:
             # with no error, and concurrent _wait_ready() callers
             # proceed with a None runtime.
             logger.debug("Lazy sandbox init cancelled", sandbox_id=sandbox_id)
-            self._init_error = RuntimeError("Sandbox init was cancelled")
+            # Typed, because _wait_ready re-raises this verbatim — see its
+            # docstring on why a bare RuntimeError escapes every classifier.
+            self._init_error = SandboxTransientError("Sandbox init was cancelled")
         except Exception as e:
             logger.error("Lazy sandbox init failed", error=str(e))
             self._init_error = e
@@ -680,8 +702,25 @@ class PTCSandbox:
                 retry_policy=RetryPolicy.SAFE,
                 allow_reconnect=False,
             )
+        except SandboxTransientError:
+            # A transport blip is NOT a missing sandbox. Converting every failure
+            # here into SandboxGoneError made a network hiccup trigger recovery —
+            # which creates a replacement sandbox and abandons the real one, and
+            # several workers can do it at once.
+            raise
         except Exception as e:
-            raise SandboxGoneError(sandbox_id, f"not found: {e}") from e
+            # Only a positively identified absence may authorize Gone. The caller
+            # answers Gone by building a replacement and abandoning this sandbox,
+            # so an undecidable failure must not reach it: UNKNOWN is where a
+            # rotated or under-privileged provider key (401/403) lands, and there
+            # the sandbox is fine and the credential is not. Treating that as
+            # absence recreates a live sandbox on every request and leaks the
+            # original each time.
+            if self.provider.classify_error(e) is SandboxFailureKind.SANDBOX_GONE:
+                raise SandboxGoneError(sandbox_id, f"not found: {e}") from e
+            raise SandboxTransientError(
+                f"Could not reach sandbox {sandbox_id}: {e}"
+            ) from e
         _mark_rc("provider_get")
 
         assert self.runtime is not None
@@ -734,9 +773,16 @@ class PTCSandbox:
                 if state_value == "running":
                     break
             if state_value != "running":
-                raise SandboxGoneError(
-                    sandbox_id,
-                    f"stuck in state '{state_value}', expected 'running'",
+                # Transient, not gone: the state was just read back, which is
+                # positive evidence the sandbox exists. ``SandboxGoneError`` is
+                # the authorization to replace, and its handlers in
+                # ``workspace_manager`` call ``_clear_session`` first, which
+                # deletes the runtime — so calling a slow boot "gone" destroys a
+                # live sandbox and restores it from a DB backup. The word
+                # "starting" is load-bearing: it is what renders the retry card.
+                raise SandboxTransientError(
+                    f"Sandbox {sandbox_id} is still starting "
+                    f"(state '{state_value}' after ~20s)"
                 )
             _mark_rc("wait_starting")
         elif state_value == "stopping":
@@ -768,9 +814,11 @@ class PTCSandbox:
                     retry_policy=RetryPolicy.SAFE,
                 )
             else:
-                raise SandboxGoneError(
-                    sandbox_id,
-                    f"stuck in state '{state_value}', expected 'stopped'",
+                # Same reasoning as the 'starting' wait above: still mid-stop is
+                # a sandbox that exists, so this is a retry, not a replacement.
+                raise SandboxTransientError(
+                    f"Sandbox {sandbox_id} has not finished stopping "
+                    f"(state '{state_value}' after ~10s)"
                 )
             _mark_rc("wait_stopping")
         elif state_value == "archived":
@@ -1104,11 +1152,38 @@ class PTCSandbox:
             retry_policy=retry_policy,
             is_transient=self.provider.is_transient_error,
             on_transient=on_transient,
+            rebind=self._make_rebinder(self.runtime) if allow_reconnect else None,
             retries=retries,
             initial_delay_s=initial_delay_s,
             total_timeout=total_timeout,
             **kwargs,
         )
+
+    def _make_rebinder(
+        self, entry_runtime: SandboxRuntime | None
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Build the retry-loop hook that re-resolves a method onto a new runtime.
+
+        Callers pass already-bound methods (``sandbox.runtime.download_file``), so
+        after ``_ensure_sandbox_connected`` swaps ``self.runtime`` every remaining
+        attempt ran against the old runtime — whose provider had just been closed,
+        making retries 2-5 guaranteed failures.
+
+        Narrow by construction: rebinding happens only for a method bound to the
+        exact runtime this call started with. ``provider.create``/``provider.get``
+        are bound to the provider, so they are never touched.
+        """
+
+        def rebind(func: Callable[..., Any]) -> Callable[..., Any]:
+            current = self.runtime
+            if entry_runtime is None or current is None or current is entry_runtime:
+                return func
+            if getattr(func, "__self__", None) is not entry_runtime:
+                return func
+            replacement = getattr(current, getattr(func, "__name__", ""), None)
+            return replacement if callable(replacement) else func
+
+        return rebind
 
 
     # Bound concurrent discovery so a burst of servers can't exhaust the
