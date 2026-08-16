@@ -443,6 +443,15 @@ class SessionManager:
         return cls._sessions[conversation_id]
 
     @classmethod
+    def get_cached_session(cls, conversation_id: str) -> Session | None:
+        """Return the cached session without creating one.
+
+        Lets callers identity-check what this process has cached before evicting
+        it, so a concurrent replacement isn't thrown away.
+        """
+        return cls._sessions.get(conversation_id)
+
+    @classmethod
     def remove_session(cls, conversation_id: str) -> None:
         """Remove a session from cache without stopping it.
 

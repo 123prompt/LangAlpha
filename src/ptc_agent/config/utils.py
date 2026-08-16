@@ -320,6 +320,17 @@ def configure_structlog(level: str = "INFO") -> None:
             # NOTE: ConsoleRenderer formats exceptions itself; do NOT add
             # structlog.processors.format_exc_info upstream of it or structlog
             # warns about double-processing.
-            structlog.dev.ConsoleRenderer(),
+            #
+            # show_locals defaults to True, which writes every frame local into
+            # the log: a single handled `exc_info=True` becomes ~100 lines, and
+            # the locals go out verbatim — sandbox commands, script bodies,
+            # anything holding a token. Log output never passes through
+            # src/server/utils/secret_redactor.py (that covers user-facing file
+            # content), so this was the one path that could print a credential.
+            structlog.dev.ConsoleRenderer(
+                exception_formatter=structlog.dev.RichTracebackFormatter(
+                    show_locals=False
+                )
+            ),
         ],
     )

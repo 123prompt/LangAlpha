@@ -51,6 +51,8 @@ from src.server.models.workspace import (
     WorkspaceSpecRequest,
     WorkspaceUpdate,
 )
+from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from src.server.utils.error_sanitization import sandbox_unreachable_detail
 from src.server.models.workspace_refresh import WorkspaceRefreshResponse
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.workspace_status_pubsub import subscribe_to_status
@@ -71,6 +73,13 @@ async def _workspace_action_errors(action: str, workspace_id: str):
     try:
         yield
     except HTTPException:
+        raise
+    except (SandboxGoneError, SandboxTransientError):
+        # Before the RuntimeError arm, which these subclass. An unreachable
+        # sandbox is not a bad request: letting it fall through answered 400
+        # with the provider's raw text, which both loses the 503 the file panel
+        # keys on and ships request URLs and SDK bodies to the client. Re-raise
+        # for the app-level handler that owns the wording and the sanitizing.
         raise
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -856,8 +865,16 @@ async def refresh_workspace(
         session = await manager.get_session_for_workspace(
             workspace_id, user_id=x_user_id
         )
+    except (SandboxGoneError, SandboxTransientError):
+        # Same reasoning as _workspace_action_errors above: re-raise for the
+        # app-level handler that owns both the wording and the sanitizing,
+        # rather than spelling a fourth variant of this 503 here.
+        raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Sandbox not available: {e}")
+        # Everything else still answers 503, but never with the raw text: this
+        # is the same call _acquire_sandbox makes, and its exceptions quote
+        # provider URLs and sandbox ids.
+        raise HTTPException(status_code=503, detail=sandbox_unreachable_detail(e))
 
     sandbox = getattr(session, "sandbox", None)
     if sandbox is None:

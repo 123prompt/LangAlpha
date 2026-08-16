@@ -16,6 +16,7 @@ import pytest
 
 from src.server.services.workspace_manager import WorkspaceManager
 from tests.unit.server.mcp_builders import resolved_mcp
+from tests.unit.server.services.conftest import _patch_identity, _patch_sandbox_bind
 
 
 def _make_config():
@@ -56,6 +57,9 @@ def _make_session(*, version=None, summary=None):
     session.config = MagicMock()
     session.config.mcp = MagicMock(servers=[])
     session.sandbox = MagicMock()
+    # Must match _make_workspace's sandbox_id: every cached return validates the
+    # session's binding against the row before handing it out.
+    session.sandbox.sandbox_id = "sb-1"
     session.sandbox.is_ready = MagicMock(return_value=True)
     session.sandbox.has_failed = MagicMock(return_value=False)
     session.sandbox.ensure_sandbox_ready = AsyncMock()
@@ -97,23 +101,40 @@ class TestWarmCooldownNoQuery:
 
     @pytest.mark.asyncio
     @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
-    async def test_warm_cooldown_zero_workspace_queries(self, mock_get_ws):
-        """A ready cached session inside the 30s cooldown returns WITHOUT any
-        db_get_workspace read — so the version check adds zero per-turn queries."""
+    async def test_warm_cooldown_reads_identity_only(self, mock_get_ws):
+        """A ready cached session inside the 30s cooldown returns after exactly one
+        narrow ``status, sandbox_id`` read — never the full row.
+
+        The identity read is not optional: workers are spawn-isolated, so a
+        cached handle can name a sandbox Postgres has already replaced and every
+        warm path returns without consulting the row. What the hot path must
+        keep avoiding is ``db_get_workspace``, which drags the JSONB ``config``
+        and ``artifacts`` columns along with it.
+        """
         wm = WorkspaceManager.get_instance(config=_make_config())
         ws_id = str(uuid.uuid4())
         session = _make_session(version=0, summary="cached")
         wm._sessions[ws_id] = session
         wm._record_sync(ws_id)  # cooldown active
 
+        identity = AsyncMock(
+            return_value={"status": "running", "sandbox_id": "sb-1"}
+        )
         # resolve must NOT be called within cooldown.
-        with patch(
-            "src.server.services.mcp_config.resolve_mcp_config",
-            new_callable=AsyncMock,
-        ) as mock_resolve:
+        with (
+            patch(
+                "src.server.services.mcp_config.resolve_mcp_config",
+                new_callable=AsyncMock,
+            ) as mock_resolve,
+            patch(
+                "src.server.services.workspace_manager.db_get_workspace_identity",
+                identity,
+            ),
+        ):
             result = await wm.get_session_for_workspace(ws_id, user_id="user-1")
 
         assert result is session
+        identity.assert_awaited_once_with(ws_id)
         mock_get_ws.assert_not_awaited()
         mock_resolve.assert_not_awaited()
 
@@ -592,7 +613,8 @@ class TestVersionDeltaBackgroundDiscovery:
         wm._sessions[ws_id] = session
         wm._last_sync_at = {}  # cooldown expired → slow path runs
 
-        mock_get_ws.return_value = _make_workspace(ws_id, mcp_config_version=5)
+        workspace = _make_workspace(ws_id, mcp_config_version=5)
+        mock_get_ws.return_value = workspace
 
         # Assert the resolve does NOT run while the per-workspace lock is held.
         lock_held_during_resolve = {"value": False}
@@ -622,7 +644,7 @@ class TestVersionDeltaBackgroundDiscovery:
         ), patch(
             "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
             return_value="NEW",
-        ):
+        ), _patch_identity(workspace):
             await wm.get_session_for_workspace(ws_id, user_id="user-1")
 
         mock_resolve.assert_awaited_once()
@@ -648,12 +670,22 @@ class TestAppliedVersionAndProactiveApply:
     def test_applied_version_none_without_session(self):
         """No warm session ⇒ the config isn't loaded anywhere live ⇒ None."""
         wm = WorkspaceManager.get_instance(config=_make_config())
-        assert wm.get_applied_mcp_config_version("ws-x") is None
+        assert (
+            wm.get_applied_mcp_config_version("ws-x", expected_sandbox_id="sb-1")
+            is None
+        )
 
     def test_applied_version_reads_warm_session(self):
         wm = WorkspaceManager.get_instance(config=_make_config())
         wm._sessions["ws"] = _make_session(version=7, summary="s")
-        assert wm.get_applied_mcp_config_version("ws") == 7
+        assert wm.get_applied_mcp_config_version("ws", expected_sandbox_id="sb-1") == 7
+
+    def test_applied_version_none_when_session_holds_a_superseded_sandbox(self):
+        """The version claims what a LIVE sandbox applied. A session bound to a
+        replaced sandbox can only name a number no live sandbox has."""
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        wm._sessions["ws"] = _make_session(version=7, summary="s")
+        assert wm.get_applied_mcp_config_version("ws", expected_sandbox_id="sb-2") is None
 
     @pytest.mark.asyncio
     async def test_proactive_apply_warms_without_ready_session(self):
@@ -766,7 +798,8 @@ class TestDiscoveryKickSeesCachedSession:
 
         wm._kick_mcp_discovery = spy_kick
 
-        await wm._recover_sandbox(ws_id, "user-1", MagicMock())
+        with _patch_sandbox_bind(_make_workspace(ws_id)):
+            await wm._recover_sandbox(ws_id, "user-1", MagicMock())
 
         assert cached_at_kick["value"] is True
         assert wm._sessions.get(ws_id) is session
@@ -807,6 +840,84 @@ class TestDiscoveryKickSeesCachedSession:
         assert wm._sessions.get(ws_id) is session
 
     @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.SessionManager")
+    async def test_attach_binds_a_sandbox_it_had_to_build(self, mock_session_mgr):
+        """A row naming no sandbox must be bound to the one ``initialize`` builds.
+
+        ``session.initialize(sandbox_id=None)`` creates a sandbox, so this path
+        provisions without going through provisioning. If the binding is not
+        written back, the row still says NULL on the next request, the identity
+        check reads that as stale, retires the session, and builds another
+        sandbox — one billed sandbox per request, each abandoned with its files.
+        Regression: the identity fencing made this fatal rather than untidy.
+        """
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        ws_id = str(uuid.uuid4())
+
+        session = _make_session(version=1, summary="s")
+        session._initialized = False
+        session.sandbox.sandbox_id = "sb-built-by-initialize"
+        session.initialize = AsyncMock()
+        mock_session_mgr.get_session.return_value = session
+
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1))
+        wm._servers_needing_discovery = MagicMock(return_value=[])
+        wm._sync_sandbox_assets = AsyncMock()
+        wm._maybe_migrate_sandbox = AsyncMock(return_value=None)
+        wm._apply_session_platform_secret = AsyncMock()
+        wm._kick_mcp_discovery = MagicMock()
+
+        workspace = _make_workspace(ws_id, status="running", mcp_config_version=1)
+        workspace["sandbox_id"] = None
+        bound_row = dict(workspace, sandbox_id="sb-built-by-initialize")
+
+        with patch(
+            "src.server.services.workspace_manager.try_bind_workspace_sandbox",
+            AsyncMock(return_value=bound_row),
+        ) as mock_bind:
+            await wm._attach_running_session(
+                workspace, "user-1", None, lambda _stage: None
+            )
+
+        mock_bind.assert_awaited_once()
+        assert mock_bind.await_args.kwargs["sandbox_id"] == "sb-built-by-initialize"
+        # NULL-safe CAS: the fence is the value we read, so a concurrent binder
+        # that got there first makes this write lose rather than clobber.
+        assert mock_bind.await_args.kwargs["expected_previous_sandbox_id"] is None
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.SessionManager")
+    async def test_attach_does_not_rebind_when_the_row_already_matches(
+        self, mock_session_mgr
+    ):
+        """Reattaching to the sandbox the row already names must not write."""
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        ws_id = str(uuid.uuid4())
+
+        session = _make_session(version=1, summary="s")
+        session._initialized = False
+        session.initialize = AsyncMock()  # sandbox_id stays 'sb-1', as the row says
+        mock_session_mgr.get_session.return_value = session
+
+        wm._apply_session_mcp = AsyncMock(return_value=_resolved(1))
+        wm._servers_needing_discovery = MagicMock(return_value=[])
+        wm._sync_sandbox_assets = AsyncMock()
+        wm._maybe_migrate_sandbox = AsyncMock(return_value=None)
+        wm._apply_session_platform_secret = AsyncMock()
+        wm._kick_mcp_discovery = MagicMock()
+
+        workspace = _make_workspace(ws_id, status="running", mcp_config_version=1)
+        with patch(
+            "src.server.services.workspace_manager.try_bind_workspace_sandbox",
+            AsyncMock(),
+        ) as mock_bind:
+            await wm._attach_running_session(
+                workspace, "user-1", None, lambda _stage: None
+            )
+
+        mock_bind.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.update_workspace_status", new_callable=AsyncMock)
     @patch("src.server.services.workspace_manager.update_workspace_activity", new_callable=AsyncMock)
@@ -832,9 +943,13 @@ class TestDiscoveryKickSeesCachedSession:
         wm._restore_files = AsyncMock()
         wm._kick_mcp_discovery = MagicMock()
         wm._cancel_mcp_discovery = MagicMock()
-        mock_status.side_effect = RuntimeError("status write failed")
+        # The last step of a provision, i.e. genuinely after the kick.
+        wm._record_sync = MagicMock(side_effect=RuntimeError("sync stamp failed"))
 
-        with pytest.raises(RuntimeError, match="status write failed"):
+        with (
+            pytest.raises(RuntimeError, match="sync stamp failed"),
+            _patch_sandbox_bind(_make_workspace(ws_id)),
+        ):
             await wm._recover_sandbox(ws_id, "user-1", MagicMock())
 
         assert wm._sessions.get(ws_id) is None
@@ -936,8 +1051,9 @@ class TestSetWorkspaceSpecDiskGuard:
 
     @pytest.fixture(autouse=True)
     def _quiet_durable_probes(self):
-        """The spec-change activity guard also reads the run ledgers; keep
-        both quiet so these tests exercise only the disk-guard mechanics."""
+        """The spec-change activity guard also reads the run ledgers, and the
+        replacement is durably fenced before teardown; keep all three quiet so
+        these tests exercise only the disk-guard mechanics."""
         with (
             patch(
                 "src.server.database.runs.lifecycle.workspace_has_active_run",
@@ -947,7 +1063,13 @@ class TestSetWorkspaceSpecDiskGuard:
                 "src.server.database.runs.subagent_runs.count_open_runs_for_workspace",
                 new=AsyncMock(return_value=0),
             ),
+            patch(
+                "src.server.services.workspace_entitlements."
+                "try_claim_workspace_for_replacement",
+                new=AsyncMock(return_value={"status": "starting"}),
+            ) as claim,
         ):
+            self.claim = claim
             yield
 
     @staticmethod
@@ -985,6 +1107,9 @@ class TestSetWorkspaceSpecDiskGuard:
         wm._backup_files_to_db.assert_awaited_once()
         wm._recover_sandbox.assert_not_awaited()
         mock_session_mgr.cleanup_session.assert_not_called()
+        # Rejected before the replacement was claimed, so the row still
+        # advertises running/<old id> rather than being stranded at 'starting'.
+        self.claim.assert_not_awaited()
         # Tier set to target optimistically, then reverted to the original.
         assert mock_set_tier.await_args_list[0].args == (ws_id, "standard")
         assert mock_set_tier.await_args_list[-1].args == (ws_id, "max")
