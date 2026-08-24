@@ -13,6 +13,7 @@ from ptc_agent.core.mcp_sanitize import (
     discovery_should_use_secrets,
     is_untrusted_server,
     iter_arg_credentials,
+    iter_arg_flag_pairs,
     sanitize_tool_name,
     sanitize_tool_set,
     sanitize_tool_text,
@@ -134,6 +135,18 @@ class TestIterArgCredentials:
             "--config=/etc/app/settings_production.yaml",
         ]
         assert iter_arg_credentials(args) == []
+
+    def test_pairs_report_the_index_of_the_value(self):
+        """What the rewriting lanes need and the redaction lanes don't: vault
+        extraction replaces the element and the export scrub empties it, so
+        both need the position, not just the pair."""
+        args = ["-y", "srv", "--token", "tok_two_token_form", "--port", "8080"]
+        assert iter_arg_flag_pairs(args) == [(3, "token", "tok_two_token_form")]
+
+    def test_an_existing_vault_ref_is_not_a_pair_to_collect(self):
+        """Already-vaulted is already handled: re-collecting it would have the
+        extractor allocate a second secret holding the literal ``${vault:X}``."""
+        assert iter_arg_flag_pairs(["--token", "${vault:SVC_KEY}"]) == []
 
     def test_vault_refs_are_skipped(self):
         args = ["--token=${vault:MY_TOKEN}", "--secret", "${vault:OTHER}"]

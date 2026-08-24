@@ -736,7 +736,7 @@ async def test_schedule_session_mcp_refresh_drives_refresh(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_add_server_rejects_bash_command(client):
+async def test_add_server_rejects_empty_command(client):
     ws = _ws()
     base = _agent_config([])
     with (
@@ -745,7 +745,7 @@ async def test_add_server_rejects_bash_command(client):
     ):
         resp = await client.post(
             f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers",
-            json={"name": "evil", "transport": "stdio", "command": "bash"},
+            json={"name": "evil", "transport": "stdio", "command": ""},
         )
     assert resp.status_code == 422
 
@@ -1091,6 +1091,7 @@ def _catalog_row(name="remote_server", **kw):
         "headers": {"Authorization": "${vault:API_KEY}"},
         "description": "d", "instruction": "i", "tool_exposure_mode": "summary",
         "created_at": None, "updated_at": None,
+        "plugin_id": None, "plugin_name": None, "plugin_enabled": None,
     }
     base.update(kw)
     return base
@@ -1164,11 +1165,11 @@ async def test_promote_overwrite_updates_existing(client):
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
         patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=[_promotable_row()])),
-        patch("src.server.app.mcp_servers.update_catalog_server", new=update),
+        patch("src.server.services.mcp_catalog.update_catalog_server", new=update),
         patch("src.server.app.mcp_servers.create_catalog_server", new=create),
         # Pre-update read, then the committed read the consent check runs on.
         patch(
-            "src.server.app.mcp_servers.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=_catalog_row()),
         ),
         patch("src.server.database.mcp_oauth.get_connection", new=AsyncMock(return_value=None)),
@@ -1209,12 +1210,12 @@ async def test_promote_overwrite_revokes_when_consent_moves(client, promoted, re
             new=AsyncMock(return_value=[_promotable_row(**promoted)]),
         ),
         patch(
-            "src.server.app.mcp_servers.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_catalog_row()),
         ),
         # Pre-update read, then the committed read the consent check runs on.
         patch(
-            "src.server.app.mcp_servers.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(side_effect=[_catalog_row(), _catalog_row(**promoted)]),
         ),
         patch(
@@ -1268,12 +1269,12 @@ async def test_promote_overwrite_consent_check_reads_the_committed_row(client):
             new=AsyncMock(return_value=[_promotable_row(url=moved)]),
         ),
         patch(
-            "src.server.app.mcp_servers.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_catalog_row(url=moved)),
         ),
         # Pre-update read, then the restored row the racing PUT committed.
         patch(
-            "src.server.app.mcp_servers.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(side_effect=[_catalog_row(), _catalog_row()]),
         ),
         patch(
@@ -1317,11 +1318,11 @@ async def test_promote_overwrite_rediscovers_when_consent_survives(client):
             new=AsyncMock(return_value=[promoted]),
         ),
         patch(
-            "src.server.app.mcp_servers.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_catalog_row(headers={"X-New": "1"})),
         ),
         patch(
-            "src.server.app.mcp_servers.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(
                 side_effect=[_catalog_row(), _catalog_row(headers={"X-New": "1"})]
             ),
@@ -1364,11 +1365,11 @@ async def test_promote_overwrite_skips_rediscovery_when_consent_moved(client):
             new=AsyncMock(return_value=[_promotable_row(url=moved)]),
         ),
         patch(
-            "src.server.app.mcp_servers.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_catalog_row(url=moved)),
         ),
         patch(
-            "src.server.app.mcp_servers.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(side_effect=[_catalog_row(), _catalog_row(url=moved)]),
         ),
         patch(
@@ -1463,6 +1464,48 @@ async def test_promote_409_when_catalog_over_cap(client):
 
 
 # ---------------------------------------------------------------------------
+# POST adopt — user-level server DOWN into one workspace
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adopt_refuses_a_plugin_owned_server(client):
+    """Plugin-level disable acts through one predicate, and that predicate only
+    reaches the user tier. Letting a component move down here would put it
+    permanently beyond suppression, so the move is refused rather than turned
+    into a silent detach — the refusal names the plugin and the way out."""
+    ws = _ws()
+    insert = AsyncMock()
+    drop = AsyncMock()
+    with (
+        patch(
+            "src.server.app.mcp_servers.db_get_workspace",
+            new=AsyncMock(return_value=ws),
+        ),
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(
+                return_value=_catalog_row(
+                    plugin_id="11111111-1111-1111-1111-111111111111",
+                    plugin_name="acme-research",
+                )
+            ),
+        ),
+        patch("src.server.app.mcp_servers.insert_workspace_server", new=insert),
+        patch("src.server.app.mcp_servers.delete_catalog_server", new=drop),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}"
+            "/mcp/servers/remote_server/adopt"
+        )
+    assert resp.status_code == 409
+    assert "acme-research" in resp.json()["detail"]
+    # Refused before either half of the move ran, so no shadow state is left.
+    insert.assert_not_awaited()
+    drop.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # PUT edit
 # ---------------------------------------------------------------------------
 
@@ -1534,6 +1577,10 @@ async def test_patch_enable_builtin_deletes_marker(client):
     with (
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
+        patch(
+            "src.server.app.mcp_servers.list_user_builtin_disables",
+            new=AsyncMock(return_value=set()),
+        ),
         patch("src.server.app.mcp_servers.upsert_workspace_server", new=AsyncMock(return_value={})) as up,
         patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)) as dele,
     ):
@@ -1543,6 +1590,29 @@ async def test_patch_enable_builtin_deletes_marker(client):
         )
     assert resp.status_code == 200
     assert dele.await_count == 1 and up.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_patch_enable_builtin_conflicts_when_disabled_for_user(client):
+    """A workspace cannot re-enable what the account tier switched off: the
+    marker delete would report success and change nothing."""
+    ws = _ws()
+    base = _agent_config([_builtin("builtin_search")])
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch(
+            "src.server.app.mcp_servers.list_user_builtin_disables",
+            new=AsyncMock(return_value={"builtin_search"}),
+        ),
+        patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)) as dele,
+    ):
+        resp = await client.patch(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/builtin_search/enabled",
+            json={"enabled": True},
+        )
+    assert resp.status_code == 409
+    assert dele.await_count == 0
 
 
 @pytest.mark.asyncio

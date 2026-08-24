@@ -99,6 +99,28 @@ body.sidebar-resizing .sidebar-tracking {
   transition: none !important;
 }
 
+/* Desktop shell on macOS: reserves the strip the traffic lights float over, and
+   carries the window drag itself. It has to be a real element, since app-region
+   is unreliable on pseudo-elements, and it lives in the sidebar alone so the
+   main column keeps its full height.
+
+   Gated on `html.desktop-mac` like every other chrome rule (chrome.css,
+   App.css, the #window-drag block in index.html) rather than on a JS condition
+   in the sidebar. The class is stamped once before the bundle runs and cannot
+   change, so a React branch on it was a second mechanism for a decision that
+   already had one. Off the desktop shell this collapses to nothing and the
+   sidebar lays out exactly as before. */
+.sidebar-window-drag {
+  display: none;
+}
+
+html.desktop-mac .sidebar-window-drag {
+  display: block;
+  height: 38px;
+  flex-shrink: 0;
+  -webkit-app-region: drag;
+}
+
 .sidebar-panel-header {
   display: flex;
   align-items: center;

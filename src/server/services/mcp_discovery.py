@@ -192,7 +192,7 @@ async def _stale_server_names(
     its recomputed fingerprint differs (edited mid-discovery). Malformed rows
     count as stale — dropping a result is always safe; clobbering is not.
     Workspace-origin servers check ``workspace_mcp_servers``; inherited
-    (``source='user'``) servers check the owner's Connectors catalog — their
+    (``source='user'``) servers check the owner's Plugins catalog — their
     results cache under this workspace like any other, so the guard must know
     both tiers or every inherited discovery would be dropped as "deleted".
     """

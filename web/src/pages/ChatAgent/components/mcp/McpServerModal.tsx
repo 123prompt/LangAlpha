@@ -5,7 +5,7 @@ import { VaultSecretPicker } from './VaultSecretPicker';
 import { McpDiscoverResult } from './McpDiscoverResult';
 import { parseMcpServersJson } from './mcpImport';
 import {
-  ALLOWED_COMMANDS,
+  SUGGESTED_COMMANDS,
   EXPOSURE_MODES,
   TRANSPORTS,
   collectVaultRefs,
@@ -23,13 +23,14 @@ import {
  * Create/edit modal for a workspace (or catalog) MCP server.
  *
  * Transport selector drives conditional fields:
- *   - stdio → command (allowlist), args, env key/value editor
- *   - sse/http → url, headers key/value editor
+ *   - http/sse → url, headers key/value editor
+ *   - stdio → command (free text + suggestions), args, env key/value editor
  *
  * env/header values use `VaultSecretPicker` (emits `${vault:NAME}`).
- * `description` + `instruction` carry helper text marking them as untrusted,
- * user-provided context shown to the agent. An exposure-mode toggle picks
- * summary/detailed. "Test connection" runs the discovery probe.
+ * `description` + `instruction` both reach the agent's server manifest, so
+ * their helper text says what each one buys the user there rather than how the
+ * prompt layer treats it. An exposure-mode toggle picks summary/detailed.
+ * "Test connection" runs the discovery probe.
  */
 
 type Exposure = (typeof EXPOSURE_MODES)[number];
@@ -353,21 +354,31 @@ export function McpServerModal({
           {/* stdio fields */}
           {transport === 'stdio' ? (
             <>
-              <Field label="Command">
-                <select
+              <Field label="Command" hint="Whatever the server's own instructions say to run.">
+                {/* Free text with suggestions rather than a picker: servers are
+                    published as npx, uvx, docker, deno, or a plain binary, and
+                    a closed list turns every unlisted one into a dead end. */}
+                <input
+                  type="text"
                   value={command ?? ''}
                   onChange={(e) => setCommand(e.target.value)}
+                  list="mcp-command-suggestions"
+                  placeholder="npx"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
                   className="w-full px-3 py-2 text-sm rounded-md outline-none"
                   style={{
                     color: 'var(--color-text-primary)',
                     backgroundColor: 'var(--color-bg-card)',
                     border: '1px solid var(--color-border-muted)',
                   }}
-                >
-                  {ALLOWED_COMMANDS.map((c) => (
-                    <option key={c} value={c}>{c}</option>
+                />
+                <datalist id="mcp-command-suggestions">
+                  {SUGGESTED_COMMANDS.map((c) => (
+                    <option key={c} value={c} />
                   ))}
-                </select>
+                </datalist>
                 <FieldError error={errorFor('command')} />
               </Field>
 
@@ -416,7 +427,7 @@ export function McpServerModal({
           {/* Description + instruction */}
           <Field
             label="Description"
-            hint="Shown to the agent as untrusted, user-provided context."
+            hint="Helps the agent decide when to reach for this server."
           >
             <textarea
               value={description}
@@ -432,7 +443,7 @@ export function McpServerModal({
 
           <Field
             label="Instruction"
-            hint="Shown to the agent as untrusted, user-provided context."
+            hint="Extra guidance the agent reads before it calls this server's tools."
           >
             <textarea
               value={instruction}

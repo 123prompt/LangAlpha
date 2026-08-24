@@ -54,6 +54,7 @@ from src.server.models.workspace import (
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.utils.error_sanitization import sandbox_unreachable_detail
 from src.server.models.workspace_refresh import WorkspaceRefreshResponse
+from src.server.services.user_skills import sandbox_skill_sync_params
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.workspace_status_pubsub import subscribe_to_status
 
@@ -887,10 +888,16 @@ async def refresh_workspace(
     )
 
     try:
+        user_skill_params = await sandbox_skill_sync_params(
+            x_user_id,
+            manager.config.skills.sandbox_skills_base,
+            workspace_id=workspace_id,
+        )
         result = await sandbox.sync_sandbox_assets(
             skill_dirs=skill_dirs,
             reusing_sandbox=True,
             force_refresh=True,
+            **user_skill_params,
         )
     except Exception as e:
         logger.exception(f"Refresh failed for workspace {workspace_id}: {e}")

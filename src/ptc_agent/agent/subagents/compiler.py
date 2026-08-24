@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from ptc_agent.agent.middleware.skills.content import load_skill_content
-from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
+from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY, SkillDefinition
 from ptc_agent.agent.prompts import build_tool_summary_from_registry, get_loader
 from ptc_agent.agent.subagents.definition import SubagentDefinition
 
@@ -71,6 +71,8 @@ class SubagentCompiler:
         current_time: str | None = None,
         thread_id: str = "",
         config: AgentConfig | None = None,
+        skill_registry: dict[str, SkillDefinition] | None = None,
+        skill_dirs: list[str] | None = None,
     ) -> None:
         self._sandbox = sandbox
         self._mcp_registry = mcp_registry
@@ -79,6 +81,11 @@ class SubagentCompiler:
         self._current_time = current_time
         self._thread_id = thread_id
         self._config = config
+        # Per-build registry (feature gates + user disables + user skills),
+        # authoritative when provided; None (bare/test construction) keeps the
+        # global-registry behavior.
+        self._skill_registry = skill_registry
+        self._skill_dirs = skill_dirs
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -191,7 +198,9 @@ class SubagentCompiler:
             return ""
         parts: list[str] = []
         for skill_name in defn.preload_skills:
-            content = load_skill_content(skill_name)
+            content = load_skill_content(
+                skill_name, self._skill_dirs, registry=self._skill_registry
+            )
             if content:
                 parts.append(f"## Skill: {skill_name}\n\n{content}")
             else:
@@ -217,10 +226,13 @@ class SubagentCompiler:
                     available=list(self._tool_sets),
                 )
 
-        # 2. Resolve skills (both runtime and preload) → add skill tools
+        # 2. Resolve skills (both runtime and preload) → add skill tools.
+        # The per-build registry keeps a skill the main agent dropped (feature
+        # gate, user disable) from handing its tools to a subagent anyway.
+        registry = self._skill_registry if self._skill_registry is not None else SKILL_REGISTRY
         all_skill_names = set(defn.skills) | set(defn.preload_skills)
         for skill_name in all_skill_names:
-            skill = SKILL_REGISTRY.get(skill_name)
+            skill = registry.get(skill_name)
             if skill and skill.tools:
                 tools.extend(skill.tools)
 

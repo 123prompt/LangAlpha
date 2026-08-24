@@ -6,6 +6,7 @@ servers, and a workspace's DB-backed rows into one deterministic effective set:
 
     effective = built-ins (config order)
                 MINUS names disabled by a (source='builtin', enabled=false) row
+                MINUS names in user_mcp_builtin_disables (account-wide)
                 PLUS  enabled user-level servers (alphabetical)
                 MINUS names disabled by a (source='user', enabled=false) row
                 MINUS names shadowed by a workspace-local server
@@ -30,6 +31,7 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import cached_property
+from typing import Literal
 from urllib.parse import urlsplit
 
 from ptc_agent.config.core import MCPServerConfig
@@ -115,6 +117,15 @@ class ResolvedServer:
     # consumers tell "never OAuth" from "OAuth but disconnected". Only ever
     # set on ``USER``-origin entries.
     oauth_status: ConnectionStatus | None = None
+    # DISABLED built-ins only: whether the disable came from this workspace's
+    # marker row or the account-wide user disable. A scalar, not a new State —
+    # the enums are locked and both disables render the same, only the copy
+    # (and which toggle can undo it) differs.
+    disabled_scope: Literal["workspace", "user"] | None = None
+    # USER-origin rows installed by a plugin: the owning plugin's name,
+    # display only. Rides here rather than MCPServerConfig — provenance must
+    # never enter the config blob round-trip.
+    plugin_name: str | None = None
 
     @property
     def name(self) -> str:
@@ -172,7 +183,7 @@ class ServerRef:
     """A workspace-addressable MCP name, classified for the mutation endpoints.
 
     ``row`` is the workspace row for local/tombstone/marker refs and the
-    Connectors row for a live inherited one — whichever tier the ref resolved
+    Plugins row for a live inherited one — whichever tier the ref resolved
     from.
     """
 
@@ -243,13 +254,13 @@ async def classify_server_name(
 ) -> ServerRef | None:
     """Classify one MCP name for a workspace mutation, or ``None`` if unknown.
 
-    Reads the two mutable tiers directly (workspace rows, then the Connectors
+    Reads the two mutable tiers directly (workspace rows, then the Plugins
     catalog) rather than going through ``resolve_mcp_config`` — mutations need
     the raw row, not the merged set, and the built-in tier is checked by the
     caller against the process config. A workspace-local row wins over an
     inherited server of the same name (it is the fork); a stale
     ``source='builtin'`` marker only classifies as ``BUILTIN`` once the
-    Connectors tier has been ruled out.
+    Plugins tier has been ruled out.
     """
     from src.server.database.mcp_servers import (
         get_catalog_server,
@@ -283,13 +294,14 @@ async def resolve_mcp_config(
     """Resolve the effective MCP server set for ``workspace_id``.
 
     Built-ins come from ``base_config.mcp.servers`` (enabled ones, config
-    order); a ``(source='builtin', enabled=false)`` row removes a built-in by
-    name; enabled user-level servers are inherited (alphabetical) unless
-    tombstoned by a ``(source='user', enabled=false)`` row or shadowed by a
-    workspace-local server; ``source='workspace'`` enabled rows are appended
-    alphabetically. A workspace with zero rows AND zero inherited servers
-    returns the built-in objects unchanged (no copies) so the common case
-    stays byte-identical downstream.
+    order); a ``(source='builtin', enabled=false)`` row or an account-wide
+    ``user_mcp_builtin_disables`` row removes a built-in by name; enabled
+    user-level servers are inherited (alphabetical) unless tombstoned by a
+    ``(source='user', enabled=false)`` row or shadowed by a workspace-local
+    server; ``source='workspace'`` enabled rows are appended alphabetically.
+    A workspace with zero rows AND zero user-level state returns the built-in
+    objects unchanged (no copies) so the common case stays byte-identical
+    downstream.
     """
     import asyncio
 
@@ -297,6 +309,7 @@ async def resolve_mcp_config(
     from src.server.database.mcp_servers import (
         get_workspace_servers_and_version,
         list_enabled_user_servers,
+        list_user_builtin_disables,
     )
 
     # Built-ins from the global config, enabled only, in declaration order.
@@ -314,14 +327,15 @@ async def resolve_mcp_config(
     # mutations fan the bump out to every workspace of the user, so the same
     # ordering argument covers the user reads below.
     rows, version = await get_workspace_servers_and_version(workspace_id)
-    user_rows, connections = await asyncio.gather(
+    user_rows, connections, user_disabled_builtins = await asyncio.gather(
         list_enabled_user_servers(user_id),
         list_connections(user_id),
+        list_user_builtin_disables(user_id),
     )
 
     # Short-circuit: nothing user-level and no workspace rows ⇒ the effective
     # set IS the built-in list (same objects, no copies).
-    if not rows and not user_rows:
+    if not rows and not user_rows and not user_disabled_builtins:
         return ResolvedMCP(
             entries=tuple(
                 ResolvedServer(config=s, origin=Origin.BUILTIN, state=State.ACTIVE)
@@ -445,12 +459,19 @@ async def resolve_mcp_config(
     local_servers.sort(key=lambda s: s.name)
     disabled_local_servers.sort(key=lambda s: s.name)
 
+    plugin_name_by_server = {
+        row["name"]: row["plugin_name"]
+        for row in user_rows
+        if row.get("plugin_name")
+    }
+
     def _user_entry(cfg: MCPServerConfig, state: State) -> ResolvedServer:
         return ResolvedServer(
             config=cfg,
             origin=Origin.USER,
             state=state,
             oauth_status=oauth_status_by_name.get(cfg.name),
+            plugin_name=plugin_name_by_server.get(cfg.name),
         )
 
     # Entry order IS the API's row order: the running set first (built-ins,
@@ -460,6 +481,7 @@ async def resolve_mcp_config(
             ResolvedServer(config=s, origin=Origin.BUILTIN, state=State.ACTIVE)
             for s in builtin_servers
             if s.name not in disabled_builtins
+            and s.name not in user_disabled_builtins
         ),
         *(_user_entry(s, State.ACTIVE) for s in inherited_servers),
         *(
@@ -467,9 +489,18 @@ async def resolve_mcp_config(
             for s in local_servers
         ),
         *(
-            ResolvedServer(config=s, origin=Origin.BUILTIN, state=State.DISABLED)
+            ResolvedServer(
+                config=s,
+                origin=Origin.BUILTIN,
+                state=State.DISABLED,
+                # The user scope wins the label when both disables exist: the
+                # workspace toggle can't undo an account-wide disable anyway.
+                disabled_scope=(
+                    "user" if s.name in user_disabled_builtins else "workspace"
+                ),
+            )
             for s in builtin_servers
-            if s.name in disabled_builtins
+            if s.name in disabled_builtins or s.name in user_disabled_builtins
         ),
         *(_user_entry(s, State.TOMBSTONED) for s in tombstoned_inherited),
         *(

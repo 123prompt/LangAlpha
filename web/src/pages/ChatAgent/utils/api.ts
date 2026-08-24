@@ -20,3 +20,5 @@ export * from './api/userVault';
 export * from './api/memory';
 export * from './api/memos';
 export * from './api/mcp';
+export * from './api/skills';
+export * from './api/plugins';

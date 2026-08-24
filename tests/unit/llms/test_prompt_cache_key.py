@@ -38,6 +38,7 @@ def _make_llm(
     """
     llm = LLM.__new__(LLM)
     llm.sdk = sdk
+    llm.model = f"test-{sdk}-model-id"
     llm.provider = f"test-{sdk}"
     llm.provider_info = {"access_type": "platform"}
     llm.base_url = None

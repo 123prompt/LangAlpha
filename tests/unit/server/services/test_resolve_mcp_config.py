@@ -61,8 +61,10 @@ def _user_row(name, **overrides):
     return row
 
 
-async def _resolve(base, rows, version=0, user_rows=None, connections=None):
-    """Run resolve_mcp_config with all three DB reads mocked."""
+async def _resolve(
+    base, rows, version=0, user_rows=None, connections=None, user_disabled=None
+):
+    """Run resolve_mcp_config with all four DB reads mocked."""
     with (
         patch(
             "src.server.database.mcp_servers.get_workspace_servers_and_version",
@@ -75,6 +77,10 @@ async def _resolve(base, rows, version=0, user_rows=None, connections=None):
         patch(
             "src.server.database.mcp_oauth.list_connections",
             new=AsyncMock(return_value=list(connections or [])),
+        ),
+        patch(
+            "src.server.database.mcp_servers.list_user_builtin_disables",
+            new=AsyncMock(return_value=set(user_disabled or ())),
         ),
     ):
         return await resolve_mcp_config(base, "user-1", "ws-1")
@@ -480,6 +486,10 @@ class TestResolveInheritedLayer:
                 "src.server.database.mcp_oauth.list_connections",
                 new=AsyncMock(return_value=[]),
             ),
+            patch(
+                "src.server.database.mcp_servers.list_user_builtin_disables",
+                new=AsyncMock(return_value=set()),
+            ),
         ):
             resolved = await resolve_mcp_config(base, "user-1", "ws-1")
 
@@ -498,3 +508,53 @@ class TestResolveInheritedLayer:
         assert [s.name for s in resolved.servers] == ["alpha", "acme"]
         assert resolved.servers[1].source == "user"
         assert _names(resolved, Origin.USER, State.ACTIVE) == ["acme"]
+
+
+@pytest.mark.asyncio
+class TestUserBuiltinDisables:
+    async def test_user_disable_applies_on_the_short_circuit_path(self):
+        # No workspace rows, no user servers — the zero-state fast path must
+        # still consult the disable set, or a user whose only state is a
+        # disable would never see it applied.
+        base = _base_config(
+            MCPServerConfig(name="alpha"), MCPServerConfig(name="beta")
+        )
+
+        resolved = await _resolve(base, rows=[], user_disabled={"beta"})
+
+        assert [s.name for s in resolved.servers] == ["alpha"]
+        disabled = _entries(resolved, Origin.BUILTIN, State.DISABLED)
+        assert [e.name for e in disabled] == ["beta"]
+        assert disabled[0].disabled_scope == "user"
+
+    async def test_workspace_marker_cannot_reenable_user_disable(self):
+        # Both tiers are pure subtractions: an enabled builtin marker row is
+        # inert and must not undo the account-wide disable.
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("alpha", source="builtin", enabled=True, config=None)]
+
+        resolved = await _resolve(base, rows, user_disabled={"alpha"})
+
+        assert resolved.servers == []
+        disabled = _entries(resolved, Origin.BUILTIN, State.DISABLED)
+        assert [e.name for e in disabled] == ["alpha"]
+        assert disabled[0].disabled_scope == "user"
+
+    async def test_user_scope_wins_when_both_disables_exist(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("alpha", source="builtin", enabled=False, config=None)]
+
+        resolved = await _resolve(base, rows, user_disabled={"alpha"})
+
+        disabled = _entries(resolved, Origin.BUILTIN, State.DISABLED)
+        assert [e.name for e in disabled] == ["alpha"]
+        assert disabled[0].disabled_scope == "user"
+
+    async def test_workspace_disable_scope_is_workspace(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("alpha", source="builtin", enabled=False, config=None)]
+
+        resolved = await _resolve(base, rows)
+
+        disabled = _entries(resolved, Origin.BUILTIN, State.DISABLED)
+        assert disabled[0].disabled_scope == "workspace"

@@ -78,6 +78,8 @@ from .request_prep import (
     process_hitl_response,
     serialize_context_metadata,
     setup_steering_tracking,
+    turn_skill_names,
+    user_skill_commands,
 )
 from src.server.services.runs.admission import (
     RunScope,
@@ -248,6 +250,24 @@ async def astream_ptc_workflow(
         query_type, fork = _resolve_fork(request=request)
         is_checkpoint_replay = bool(request.checkpoint_id and not request.messages)
 
+        # Resolve LLM config (pre-resolved by the route handler, fallback for
+        # standalone use). Ahead of the metadata below on purpose: that block
+        # records the model and the detected slash command, and both are read
+        # off this config. Resolved late, the standalone path would stamp a
+        # skill the turn then refuses, because activation gates on the
+        # resolved registry while the metadata had nothing to gate on. The
+        # route already resolves before this generator runs, so this only
+        # moves the standalone path onto the ordering production has.
+        if config is None:
+            config = await resolve_llm_config(
+                setup.agent_config, user_id, request.llm_model, is_byok, mode="ptc",
+                reasoning_effort=getattr(request, "reasoning_effort", None),
+                fast_mode=getattr(request, "fast_mode", None),
+                thread_id=thread_id,
+                enabled_subagents=request.subagents_enabled,
+                workspace_id=workspace_id,
+            )
+
         # Persist query start
         feedback_action = None
         query_content = user_input
@@ -287,7 +307,11 @@ async def astream_ptc_workflow(
         # (serialize_context_metadata's slash-command branch already guards
         # on `not request.hitl_response`, so this is safe to call always.)
         if not request.hitl_response:
-            serialize_context_metadata(request, query_metadata, user_input, mode="ptc")
+            serialize_context_metadata(
+                request, query_metadata, user_input, mode="ptc",
+                extra_commands=user_skill_commands(config),
+                allowed_skills=turn_skill_names(config, "ptc"),
+            )
 
         if request.hitl_response:
             feedback_action, query_content, hitl_answers, interrupt_ids = (
@@ -355,16 +379,6 @@ async def astream_ptc_workflow(
         # Session and Graph Setup
         # =====================================================================
 
-        # Resolve LLM config (pre-resolved by route handler, fallback for standalone use)
-        if config is None:
-            config = await resolve_llm_config(
-                setup.agent_config, user_id, request.llm_model, is_byok, mode="ptc",
-                reasoning_effort=getattr(request, "reasoning_effort", None),
-                fast_mode=getattr(request, "fast_mode", None),
-                thread_id=thread_id,
-                enabled_subagents=request.subagents_enabled,
-            )
-
         # Propagate fetch model override to tool context
         apply_fetch_override(config)
 
@@ -372,6 +386,16 @@ async def astream_ptc_workflow(
 
         subagents = request.subagents_enabled or config.subagents.enabled
         sandbox_id = None
+
+        # The turn's skill state, folded to one value so the acquire can tell
+        # a warm sandbox its skills moved (upload/delete/disable) without any
+        # extra read — the bundle behind these fields was already loaded by
+        # the config resolve above.
+        from src.server.services.user_skills import skills_delivery_signature
+
+        skills_signature = skills_delivery_signature(
+            config.user_skill_dir, config.disabled_skills
+        )
 
         # ``workspace_manager`` and ``needs_startup`` were resolved above for
         # the pre-steering stale-cancel hook. Reuse them — recomputing here
@@ -384,7 +408,7 @@ async def astream_ptc_workflow(
         # session in memory). The extra "starting/ready" SSE pair is harmless.
         if not needs_startup:
             session = await workspace_manager.get_session_for_workspace(
-                workspace_id, user_id=user_id
+                workspace_id, user_id=user_id, skills_signature=skills_signature
             )
         else:
             yield f"id: 0\nevent: workspace_status\ndata: {json.dumps({'status': 'starting', 'workspace_id': workspace_id})}\n\n"
@@ -407,6 +431,7 @@ async def astream_ptc_workflow(
                     workspace_id,
                     user_id=user_id,
                     on_state_observed=_on_state,
+                    skills_signature=skills_signature,
                 )
             )
 
@@ -520,11 +545,16 @@ async def astream_ptc_workflow(
         # Only set on normal turns: HITL resumes and checkpoint replays carry no new
         # user message, so the middleware must not inject (mirrors the prior guard).
         if not request.hitl_response and not is_checkpoint_replay:
-            skill_contexts = prepare_skill_contexts(messages, request, mode="ptc")
+            skill_contexts = prepare_skill_contexts(
+                messages, request, mode="ptc",
+                extra_commands=user_skill_commands(config),
+                allowed_skills=turn_skill_names(config, "ptc"),
+            )
         else:
             skill_contexts = None
         skill_dirs = (
             [local_dir for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()]
+            + ([config.user_skill_dir] if config.user_skill_dir else [])
             if skill_contexts
             else None
         )
@@ -764,18 +794,27 @@ async def astream_ptc_workflow(
             # no longer drop the dispatch. This callback keeps only
             # best-effort sandbox housekeeping.
 
-            # Post-completion sandbox housekeeping (parallel)
+            # Post-completion sandbox housekeeping. Reconcile BEFORE the
+            # backup — the reconcile mutates the skills ledger and dirs, and
+            # the file backup should capture the converged state.
             ws_manager = WorkspaceManager.get_instance()
-            housekeeping = [ws_manager._backup_files_to_db(request.workspace_id)]
             if session and session.sandbox:
-                housekeeping.append(session.sandbox.sync_skills_lock())
-            results = await asyncio.gather(*housekeeping, return_exceptions=True)
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    task_name = "file backup" if i == 0 else "lock sync"
-                    logger.warning(
-                        f"[PTC_COMPLETE] {task_name} failed for {thread_id}: {result}"
-                    )
+                from src.server.services.user_skills.reconcile import (
+                    reconcile_workspace_skills,
+                )
+
+                await reconcile_workspace_skills(
+                    session.sandbox,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    source="post_turn",
+                )
+            try:
+                await ws_manager._backup_files_to_db(request.workspace_id)
+            except Exception as e:
+                logger.warning(
+                    f"[PTC_COMPLETE] file backup failed for {thread_id}: {e}"
+                )
 
         # Start workflow in background with event buffering
         await manager.start_run(

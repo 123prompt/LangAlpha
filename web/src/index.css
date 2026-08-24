@@ -5,6 +5,7 @@
 /* Tokens + global base/utilities - must be before @tailwind */
 @import './styles/tokens.css';
 @import './styles/animations.css';
+@import './styles/chrome.css';
 
 @tailwind base;
 @tailwind components;

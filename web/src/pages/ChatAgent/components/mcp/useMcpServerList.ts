@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatApiErrorDetail, type McpServerInput } from '../../utils/api';
 
 /**
- * The list controller both MCP surfaces run on: the user-level Connectors page
+ * The list controller both MCP surfaces run on: the user-level Plugins page
  * and the workspace settings MCP tab. Add/edit modal, import modal, in-flight
  * toggle and delete were written once per surface and had already drifted
  * apart; each surface now keeps only what is genuinely its own (OAuth

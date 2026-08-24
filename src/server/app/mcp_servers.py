@@ -30,13 +30,15 @@ from pydantic import ValidationError
 from src.server.database.mcp_servers import (
     MAX_MCP_SERVERS_PER_WORKSPACE,
     create_catalog_server,
+    delete_catalog_server,
     delete_workspace_server,
     get_catalog_server,
     get_workspace_servers_and_version,
     insert_workspace_server,
+    list_user_builtin_disables,
     list_workspace_servers,
+    set_catalog_server_enabled,
     set_workspace_server_enabled,
-    update_catalog_server,
     upsert_workspace_server,
 )
 from src.server.database.mcp_tool_schemas import get_tool_schemas, get_user_tool_schemas
@@ -46,6 +48,7 @@ from src.server.database.vault_secrets import (
     get_workspace_secret_names,
 )
 from src.server.database.workspace import get_workspace as db_get_workspace
+from src.server.services.mcp_catalog import apply_catalog_edit, detach_warning
 from src.server.services.mcp_config import (
     Origin,
     ResolvedServer,
@@ -88,15 +91,15 @@ _NOT_FOUND = "MCP server not found"
 _BUILTIN_EDIT = "Cannot edit a built-in server"
 _BUILTIN_DELETE = "Cannot delete a built-in server"
 _INHERITED_EDIT = (
-    "This server is inherited from your Connectors — edit it there, or add a "
+    "This server is inherited from your Plugins — edit it there, or add a "
     "copy to this workspace to fork it."
 )
 _INHERITED_DELETE = (
-    "This server is inherited from your Connectors — remove it there, or "
+    "This server is inherited from your Plugins — remove it there, or "
     "disable it for this workspace."
 )
 _INHERITED_DELETE_TOMBSTONE = (
-    "This server is inherited from your Connectors — remove it there, or "
+    "This server is inherited from your Plugins — remove it there, or "
     "re-enable it for this workspace."
 )
 
@@ -196,6 +199,8 @@ def _effective_server(
     origin = entry.origin
     return EffectiveServer(
         oauth_status=entry.oauth_status,
+        disabled_scope=entry.disabled_scope,
+        plugin_name=entry.plugin_name,
         name=srv.name,
         origin=origin,
         transport=srv.transport,
@@ -321,6 +326,38 @@ async def list_servers(workspace_id: str, user_id: CurrentUserId) -> EffectiveSe
     )
 
 
+async def _insert_local_fork(
+    workspace_id: str, server: McpServerInput
+) -> dict | None:
+    """Insert a ``source='workspace'`` row, replacing a tombstone squatter.
+
+    Conflict-safe insert first (ON CONFLICT DO NOTHING): two concurrent
+    creates of the same new name can't both win — the loser gets None, never
+    a silent UPDATE. A tombstone marker (``source='user'``, from disabling an
+    inherited server) squats the UNIQUE(workspace_id, name) slot — that one is
+    replaced with the local fork; real workspace rows stay None (⇒ 409). The
+    tombstone branch reads then upserts without a shared lock, so racing
+    creates over a tombstone are last-write-wins (same user only — callers
+    owner-check the workspace). Raises ValueError over cap.
+    """
+    row = await insert_workspace_server(
+        workspace_id, server.name, config=server.to_config_blob()
+    )
+    if row is not None:
+        return row
+    rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
+    existing = rows.get(server.name)
+    if existing is not None and existing["source"] == "user":
+        return await upsert_workspace_server(
+            workspace_id,
+            server.name,
+            source="workspace",
+            enabled=True,
+            config=server.to_config_blob(),
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # POST — add
 # ---------------------------------------------------------------------------
@@ -347,32 +384,7 @@ async def add_server(
         )
 
     try:
-        # Conflict-safe insert (ON CONFLICT DO NOTHING): two concurrent creates
-        # of the same new name can't both win — the loser gets a 409, never a
-        # silent UPDATE. None ⇒ the name already exists. The pre-check above
-        # only short-circuits built-ins. The tombstone-replace branch below is
-        # the deliberate exception: it reads then upserts without a shared lock,
-        # so racing creates over a tombstone are last-write-wins (same user
-        # only — the workspace is owner-checked above).
-        row = await insert_workspace_server(
-            workspace_id,
-            server.name,
-            config=server.to_config_blob(),
-        )
-        if row is None:
-            # A tombstone marker (source='user', from disabling an inherited
-            # server) squats the UNIQUE(workspace_id, name) slot — replace it
-            # with the local fork. Real workspace rows stay a 409.
-            rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
-            existing = rows.get(server.name)
-            if existing is not None and existing["source"] == "user":
-                row = await upsert_workspace_server(
-                    workspace_id,
-                    server.name,
-                    source="workspace",
-                    enabled=True,
-                    config=server.to_config_blob(),
-                )
+        row = await _insert_local_fork(workspace_id, server)
     except ValueError as e:
         # DB layer signals over-cap by raising ValueError under the advisory lock.
         raise HTTPException(status_code=409, detail=str(e))
@@ -411,6 +423,7 @@ async def promote_server(
     """
     await _require_owned_workspace(workspace_id, user_id)
     overwrite = bool(body and body.overwrite)
+    remove_source = bool(body and body.remove_source)
 
     if name in builtin_names():
         raise HTTPException(
@@ -433,43 +446,44 @@ async def promote_server(
 
     fields = server.to_catalog_fields()
 
-    if overwrite:
-        # Pre-update read: the rediscovery decision below needs the OLD
-        # fingerprint, and the update returns only the new row.
-        prior = await get_catalog_server(user_id, server.name)
-        row = await update_catalog_server(user_id, server.name, updates=fields)
-        if row is not None:
-            # Same consent rule as the catalog PUT: overwriting a template can
-            # move a connected server off its consented endpoint (or onto stdio,
-            # which has no relay path at all). The two writes are not atomic — a
-            # refresh racing the gap is caught by the consent re-check in
-            # refresh_user_tool_schemas.
-            from src.server.services.mcp_oauth.discovery import (
-                schedule_post_edit_rediscovery,
-            )
-            from src.server.services.mcp_oauth.lifecycle import (
-                revoke_if_consent_moved,
-            )
+    async def _finish(row: dict) -> CatalogServer:
+        """Shared tail for both the overwrite and create arms."""
+        if remove_source:
+            if existing["enabled"] and not row["enabled"]:
+                # A move keeps the server live. Promote mints inert templates
+                # (enabled is not part of the copied fields), but this row was
+                # running in the source workspace — landing it disabled would
+                # silently switch the server off everywhere. The DB toggle
+                # bumps every workspace's version in its own transaction.
+                await set_catalog_server_enabled(user_id, server.name, True)
+                row = {**row, "enabled": True}
+            # Drop the local fork so it doesn't shadow the template it just
+            # created. Ordered catalog-write-then-delete: a crash in between
+            # leaves the ordinary shadow state, which the resolver already
+            # renders and a later delete resolves.
+            await delete_workspace_server(workspace_id, name)
+            _schedule_proactive_apply(workspace_id, user_id)
+        return catalog_row_to_response(row)
 
-            # Fresh read, not the values we just wrote: this check is its own
-            # transaction, so a concurrent edit that already moved the row back
-            # onto the consented endpoint must not be revoked on stale values.
-            # A row deleted underneath us needs neither the revoke nor the
-            # rediscovery — DELETE revokes on both sides of its own drop.
-            committed = await get_catalog_server(user_id, server.name)
-            if committed is not None and not await revoke_if_consent_moved(
-                user_id,
-                server.name,
-                transport=committed["transport"],
-                url=committed.get("url"),
-            ):
-                # Consent survived the overwrite, so the connection lives on
-                # against a config whose discovery fingerprint may have moved —
-                # its cached snapshot serves only under the old one.
-                schedule_post_edit_rediscovery(
-                    user_id, server.name, prior=prior, updated=row
-                )
-            return catalog_row_to_response(row)
+    if overwrite:
+        # An overwrite is a catalog edit like the PUT, so it owes the same
+        # policy: it can move a connected server off its consented endpoint (or
+        # onto stdio, which has no relay path at all), and it forks a
+        # plugin-owned template the same way a hand edit does. The write and
+        # the revoke are not atomic — a refresh racing the gap is caught by the
+        # consent re-check in refresh_user_tool_schemas.
+        edit = await apply_catalog_edit(
+            user_id, server.name, fields, detach_plugin=True
+        )
+        if edit is not None:
+            response = await _finish(edit.row)
+            # Same forking as the PUT, so it says the same thing: a detach the
+            # user is not told about reads as one the plugin sanctioned.
+            if plugin := edit.detached_from_plugin:
+                response.warnings = (response.warnings or []) + [
+                    detach_warning(plugin)
+                ]
+            return response
         # Nothing to overwrite (raced delete / never existed) ⇒ fall through.
 
     if await get_catalog_server(user_id, server.name) is not None:
@@ -483,7 +497,103 @@ async def promote_server(
     except ValueError as e:
         # DB layer signals over-cap (or a raced duplicate) by raising ValueError.
         raise HTTPException(status_code=409, detail=str(e))
-    return catalog_row_to_response(row)
+    return await _finish(row)
+
+
+# ---------------------------------------------------------------------------
+# POST — adopt a user-level server DOWN into this workspace (move, not copy)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{workspace_id}/mcp/servers/{name}/adopt", status_code=201)
+@handle_api_exceptions("move user MCP server into workspace", logger)
+async def adopt_server(
+    workspace_id: str, name: str, user_id: CurrentUserId
+) -> dict:
+    """Move a user-level (Plugins) server into this workspace only.
+
+    The inverse of promote-with-remove_source: the catalog row becomes a
+    workspace-local fork here, then the catalog row is deleted (which also
+    clears the name's tombstones everywhere). OAuth-connected servers refuse
+    the move — connections exist only at the user tier, so moving would sever
+    the login. Plugin-owned servers refuse it too (see below). The fork lands
+    enabled regardless of the catalog flag: scoping a server to one workspace
+    is a statement of intent to use it here.
+    """
+    from src.server.database.mcp_oauth import ConnectionStatus, get_connection
+    from src.server.services.mcp_oauth.lifecycle import oauth_fence
+
+    await _require_owned_workspace(workspace_id, user_id)
+
+    row = await get_catalog_server(user_id, name)
+    if row is None:
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    if row["plugin_id"] is not None:
+        # Plugin-level disable acts through ONE predicate, on
+        # list_enabled_user_servers, and that predicate only reaches the user
+        # tier. A component moved down here would keep serving after its
+        # plugin was disabled, with nothing left at the user tier to suppress:
+        # this move is the one way out of the chokepoint the whole design
+        # rests on. The manifest still declares the component too, so the next
+        # plugin update re-creates the catalog row and the workspace fork
+        # starts shadowing it. Refuse, the same way an OAuth connection does,
+        # and leave detaching to the edit path that says so out loud.
+        owner = row["plugin_name"] or "a plugin"
+        raise HTTPException(
+            status_code=409,
+            detail=f"This server is installed by the plugin {owner!r}, which "
+            "manages it at the account level. Edit the server to detach it "
+            "from the plugin first, then move it. Uninstalling the plugin "
+            "removes the server instead.",
+        )
+    connection = await get_connection(user_id, name)
+    if connection is not None and connection.status is not ConnectionStatus.REVOKED:
+        raise HTTPException(
+            status_code=409,
+            detail="This server has an OAuth connection, which only exists at "
+            "the user level. Disconnect it first, then move the server.",
+        )
+
+    # Re-validate through the input model so the move can never mint a row
+    # that no longer passes (possibly tightened) policy.
+    try:
+        server = McpServerInput(
+            name=name,
+            **{
+                k: row[k]
+                for k in (
+                    "transport", "command", "args", "url", "env", "headers",
+                    "description", "instruction", "tool_exposure_mode",
+                    "discovery_uses_secrets",
+                )
+            },
+        )
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=_format_validation_error(e))
+
+    try:
+        ws_row = await _insert_local_fork(workspace_id, server)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if ws_row is None:
+        raise HTTPException(
+            status_code=409, detail=f"{name!r} already exists in this workspace"
+        )
+
+    # Fork first, catalog delete second: a crash in between leaves the shadow
+    # state the resolver already renders. The delete also purges the name's
+    # tombstones across every workspace and the user-tier discovery cache.
+    # Only a REVOKED connection can exist here, but the drop still takes the
+    # fence: a callback landing in the gap must not leave a live token behind a
+    # server that no longer exists.
+    async with oauth_fence(user_id, [name]):
+        await delete_catalog_server(user_id, name)
+    _schedule_proactive_apply(workspace_id, user_id)
+    return {
+        "name": ws_row["name"],
+        "source": ws_row["source"],
+        "enabled": ws_row["enabled"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +751,16 @@ async def set_enabled(
         # Built-ins are toggled by an explicit (source='builtin', enabled=false)
         # disable-marker row; enabling = delete the marker.
         if body.enabled:
+            if name in await list_user_builtin_disables(user_id):
+                # Deleting the marker would report success and change nothing:
+                # the account-level disable outranks every workspace.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This server is disabled for your account; enable it "
+                        "in Plugins first"
+                    ),
+                )
             await delete_workspace_server(workspace_id, name)
         else:
             await upsert_workspace_server(
@@ -747,12 +867,12 @@ async def discover_server(
         raise HTTPException(status_code=404, detail="MCP server not found")
     if entry.host_side_oauth:
         # OAuth servers are discovered host-side (on connect and via the
-        # Connectors refresh) — never probed from the sandbox; reconnecting,
+        # Plugins refresh) — never probed from the sandbox; reconnecting,
         # not probing, is the fix for a disconnected one.
         raise HTTPException(
             status_code=409,
             detail="OAuth servers are discovered host-side; manage the "
-            "connection from Connectors instead.",
+            "connection from Plugins instead.",
         )
     server = entry.config
 

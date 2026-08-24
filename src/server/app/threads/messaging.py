@@ -426,6 +426,7 @@ async def _handle_send_message(
             fast_mode=getattr(request, "fast_mode", None),
             thread_id=thread_id,
             enabled_subagents=request.subagents_enabled,
+            workspace_id=workspace_id,
         )
 
         # is_byok is True only when the stamped credential_source confirms the user

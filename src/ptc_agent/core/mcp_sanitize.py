@@ -50,6 +50,40 @@ def looks_like_secret(key: str, value: str) -> bool:
     return len(v) >= _OPAQUE_TOKEN_MIN_LEN and " " not in v and not v.isdigit()
 
 
+def iter_arg_flag_pairs(args) -> "list[tuple[int, str, str]]":
+    """``(value_index, flag, value)`` for space-separated ``--token VALUE`` pairs.
+
+    The one arg shape every lane agrees on, and the reason it is here rather
+    than inlined three times: vault extraction and the export scrub have to
+    rewrite the value, so they need its index, while output redaction only
+    needs the pair — but all three must reach the same verdict or one lane
+    serves a value another vaulted.
+
+    Key-signal only, deliberately: the element after a flag is usually a path,
+    a port, or a URL, and the opaque-value heuristic reads plenty of those as
+    credentials. The flag naming itself is the only signal narrow enough to act
+    on, so a bare positional secret is accepted as missed.
+    """
+    found: list[tuple[int, str, str]] = []
+    prev_flag = ""
+    for i, arg in enumerate(args or []):
+        if not isinstance(arg, str):
+            prev_flag = ""
+            continue
+        if arg.startswith("-"):
+            flag, sep, _ = arg.partition("=")
+            prev_flag = flag if not sep else ""
+            continue
+        if (
+            prev_flag
+            and _SECRET_KEY_RE.search(prev_flag)
+            and not VAULT_REF_RE.search(arg)
+        ):
+            found.append((i, prev_flag.lstrip("-"), arg))
+        prev_flag = ""
+    return found
+
+
 def iter_arg_credentials(args) -> "list[tuple[str, str]]":
     """Credential literals in a stdio arg list: ``--token=X`` and ``--token X``.
 
@@ -59,29 +93,18 @@ def iter_arg_credentials(args) -> "list[tuple[str, str]]":
     positional secret with no flag naming it is accepted as missed.
     """
     found: list[tuple[str, str]] = []
-    prev_flag = ""
     for arg in args or []:
-        if not isinstance(arg, str):
-            prev_flag = ""
+        if not isinstance(arg, str) or not arg.startswith("-"):
             continue
-        if arg.startswith("-"):
-            flag, sep, val = arg.partition("=")
-            if (
-                sep
-                and val
-                and not VAULT_REF_RE.search(val)
-                and _SECRET_KEY_RE.search(flag)
-            ):
-                found.append((flag.lstrip("-"), val))
-            prev_flag = flag if not sep else ""
-            continue
+        flag, sep, val = arg.partition("=")
         if (
-            prev_flag
-            and _SECRET_KEY_RE.search(prev_flag)
-            and not VAULT_REF_RE.search(arg)
+            sep
+            and val
+            and not VAULT_REF_RE.search(val)
+            and _SECRET_KEY_RE.search(flag)
         ):
-            found.append((prev_flag.lstrip("-"), arg))
-        prev_flag = ""
+            found.append((flag.lstrip("-"), val))
+    found.extend((flag, val) for _, flag, val in iter_arg_flag_pairs(args))
     return found
 
 

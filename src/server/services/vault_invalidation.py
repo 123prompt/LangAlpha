@@ -16,7 +16,7 @@ fires blindly rather than being skipped.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 from ptc_agent.config.core import MCPServerConfig
@@ -64,7 +64,7 @@ def refs_for_server(server: MCPServerConfig) -> set[str]:
 
 async def _workspace_servers(workspace_id: str, user_id: str) -> list[MCPServerConfig]:
     """Every server a WORKSPACE secret can satisfy: the workspace's own rows
-    plus the user connectors this workspace inherits.
+    plus the user plugins this workspace inherits.
 
     The inherited half is not optional. Both vault tiers resolve out of one
     merged namespace in the sandbox (workspace wins), so a workspace secret
@@ -146,7 +146,7 @@ class VaultTier:
     label: str
     log_prefix: str
     # Called with (owner_id, user_id): the workspace tier needs the owning user
-    # to reach the connectors its workspace inherits, and one signature for both
+    # to reach the plugins its workspace inherits, and one signature for both
     # tiers keeps the caller free of tier branching.
     servers: Callable[[str, str], Awaitable[list[MCPServerConfig]]]
     # Purges every snapshot tier the owner's discovery can land in — for the
@@ -218,6 +218,55 @@ async def after_secret_change(
     await _push_secrets(tier, owner_id, user_id)
 
 
+async def after_secrets_changed(
+    tier: VaultTier,
+    owner_id: str,
+    secret_names: Iterable[str],
+    *,
+    user_id: str,
+) -> None:
+    """``after_secret_change`` for a set of names written in one operation.
+
+    The purge stays per name — it is scoped to the servers that reference that
+    one credential, and collapsing it would leave the others' discovery
+    snapshots stale. Everything around it collapses: the row set the purge
+    scans is the same for every name, and scheduling applies and pushing to
+    live sandboxes both act on the owner's whole secret set, so running any of
+    them once per name multiplies the work by however many credentials a
+    plugin happens to declare, for no additional effect.
+    """
+    names = list(dict.fromkeys(secret_names))
+    if not names:
+        return
+    try:
+        servers = await tier.servers(owner_id, user_id)
+    except Exception:
+        # A fast path, not a new failure domain: hand the loop nothing and it
+        # reads per name exactly as before, fallback bump included.
+        servers = None
+    for name in names:
+        try:
+            await _purge_and_bump(tier, owner_id, name, user_id, servers=servers)
+        except Exception:
+            logger.warning(
+                f"{tier.log_prefix} MCP invalidation failed for {tier.label} "
+                f"{owner_id}; falling back to a bare config bump",
+                exc_info=True,
+            )
+            try:
+                await tier.bump(owner_id)
+            except Exception:
+                logger.error(
+                    f"{tier.log_prefix} {tier.label} {owner_id} is UNCONVERGED "
+                    f"after secret {name!r} changed: the fallback config bump "
+                    f"failed too, so live sandboxes keep serving the retired "
+                    f"value until the next config write for this {tier.label}",
+                    exc_info=True,
+                )
+    await _schedule_applies(tier, owner_id, user_id)
+    await _push_secrets(tier, owner_id, user_id)
+
+
 async def _push_secrets(tier: VaultTier, owner_id: str, user_id: str) -> None:
     """Push the merged secret set to whichever sandboxes are live in THIS
     process — a fast path only, and one that misses under multiple workers.
@@ -277,14 +326,24 @@ async def _invalidate_mcp(
 
 
 async def _purge_and_bump(
-    tier: VaultTier, owner_id: str, secret_name: str, user_id: str
+    tier: VaultTier,
+    owner_id: str,
+    secret_name: str,
+    user_id: str,
+    *,
+    servers: list[MCPServerConfig] | None = None,
 ) -> None:
     """The durable half — scan, purge, bump — as ONE failure domain, because a
-    partial result here is exactly what the caller's fallback bump covers."""
+    partial result here is exactly what the caller's fallback bump covers.
+
+    ``servers`` lets a batch caller hand the row set in once. The scan below is
+    per name; the rows it scans are not, and re-reading them per name is real
+    Postgres work in the install request path.
+    """
+    if servers is None:
+        servers = await tier.servers(owner_id, user_id)
     referencing = [
-        server
-        for server in await tier.servers(owner_id, user_id)
-        if secret_name in refs_for_server(server)
+        server for server in servers if secret_name in refs_for_server(server)
     ]
 
     # Only servers whose discovery runs WITH secrets can have a cached

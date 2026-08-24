@@ -593,7 +593,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   return (
     <div
       ref={containerRef}
-      className={`${isMobile ? 'h-full' : 'h-screen'} flex overflow-hidden`}
+      className="h-full flex overflow-hidden"
       style={{
         position: 'relative',
         backgroundColor: 'var(--color-bg-page)',
@@ -653,6 +653,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 files={panelFiles}
                 dropdownDirection="down"
                 mode={isFlash ? 'fast' : 'ptc'}
+                // The turn this composer sends lands in this workspace, so the
+                // slash menu has to be scoped to it too: without this it lists
+                // the account-level skills, hiding the workspace's own and
+                // still offering ones it has disabled.
+                selectedWorkspaceId={workspaceId}
                 minRows={2}
               />
             </div>

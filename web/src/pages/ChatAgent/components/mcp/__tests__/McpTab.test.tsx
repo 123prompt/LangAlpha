@@ -155,7 +155,7 @@ describe('McpTab — promote workspace server to template', () => {
     fireEvent.click(screen.getByText('save-template-fresh_server'));
 
     await waitFor(() =>
-      expect(mutateAsync.promote).toHaveBeenCalledWith({ name: 'fresh_server', overwrite: false }),
+      expect(mutateAsync.promote).toHaveBeenCalledWith({ workspaceId: 'ws-1', name: 'fresh_server', overwrite: false }),
     );
     // No overwrite confirm for a fresh name.
     expect(screen.queryByText(/already exists/i)).not.toBeInTheDocument();
@@ -176,12 +176,12 @@ describe('McpTab — promote workspace server to template', () => {
     fireEvent.click(screen.getByRole('button', { name: /overwrite/i }));
 
     await waitFor(() =>
-      expect(mutateAsync.promote).toHaveBeenCalledWith({ name: 'dup_server', overwrite: true }),
+      expect(mutateAsync.promote).toHaveBeenCalledWith({ workspaceId: 'ws-1', name: 'dup_server', overwrite: true }),
     );
   });
 
   it('surfaces a rejected promote as a toast rather than an unhandled rejection', async () => {
-    // The branch that moved Templates out to /connectors deleted this file's
+    // The branch that moved Templates out to the user tier deleted this file's
     // only toast-error assertion along with it; promote is McpTab's remaining
     // fire-and-report mutation, and a swallowed failure here reads as success.
     listData = makeList([makeServer('fresh_server')]);
@@ -197,7 +197,7 @@ describe('McpTab — promote workspace server to template', () => {
       expect(toast).toHaveBeenCalledWith(
         expect.objectContaining({
           variant: 'destructive',
-          title: 'Could not save to Connectors',
+          title: 'Could not save the server',
           description: 'connector catalog at cap',
         }),
       ),

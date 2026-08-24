@@ -9,7 +9,6 @@ import asyncio
 import hashlib
 import json
 import shlex
-import textwrap
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -109,11 +108,23 @@ def _compute_user_mcp_config_hash(sandbox: "PTCSandbox") -> str:
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
-async def _compute_skills_module(sandbox: "PTCSandbox", skill_roots: list[str]) -> dict[str, Any]:
+async def _compute_skills_module(
+    sandbox: "PTCSandbox",
+    skill_roots: list[str],
+    *,
+    managed_root: str | None = None,
+    disabled: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Compute a skills module manifest with content-based SHA-256 hashing.
 
         Unlike the legacy ``_compute_skills_manifest`` (size+mtime), this hashes
         actual file contents so the manifest is deterministic and portable.
+
+        ``managed_root`` marks which root holds the server-managed user tier —
+        its skills get ``owner:"user"`` / ``sourceType:MANAGED_SOURCE_TYPE``
+        lock entries so the sync may replace/prune them while the agent's own
+        installs stay protected. ``disabled`` names are excluded entirely, so
+        a disabled builtin leaves the local set (and hence the sandbox).
         """
 
     skills_base = f"{sandbox._work_dir}/.agents/skills"
@@ -133,6 +144,7 @@ async def _compute_skills_module(sandbox: "PTCSandbox", skill_roots: list[str]) 
             root = Path(root_str).expanduser()
             if not root.exists():
                 continue
+            is_managed_root = managed_root is not None and root_str == managed_root
 
             for skill_dir in root.iterdir():
                 if not skill_dir.is_dir():
@@ -141,6 +153,8 @@ async def _compute_skills_module(sandbox: "PTCSandbox", skill_roots: list[str]) 
                     continue
 
                 skill_name = skill_dir.name
+                if skill_name in disabled:
+                    continue
                 # Skip flash-only skills (not needed in sandbox)
                 if (
                     skill_name not in sandbox_skill_names
@@ -173,17 +187,29 @@ async def _compute_skills_module(sandbox: "PTCSandbox", skill_roots: list[str]) 
                 meta = parse_skill_metadata(content, sandbox_path, skill_name)
                 skills_metadata[skill_name] = dict(meta)
 
-                # Build lock entry for platform skill
-                from ptc_agent.agent.middleware.skills.lock import build_lock_entry
+                # Build lock entry: platform, or server-managed user tier
+                from ptc_agent.agent.middleware.skills.lock import (
+                    MANAGED_SOURCE_TYPE,
+                    build_lock_entry,
+                )
 
                 content_hash = f"sha256:{_sha256_file(skill_dir / 'SKILL.md')}"
-                lock_entry = build_lock_entry(
-                    meta,
-                    owner="platform",
-                    source="platform",
-                    source_type="platform",
-                    content_hash=content_hash,
-                )
+                if is_managed_root:
+                    lock_entry = build_lock_entry(
+                        meta,
+                        owner="user",
+                        source=f"user:{skill_name}",
+                        source_type=MANAGED_SOURCE_TYPE,
+                        content_hash=content_hash,
+                    )
+                else:
+                    lock_entry = build_lock_entry(
+                        meta,
+                        owner="platform",
+                        source="platform",
+                        source_type="platform",
+                        content_hash=content_hash,
+                    )
                 skills_metadata[skill_name]["lock_entry"] = dict(lock_entry)
 
         version = _hash_dict(files)
@@ -212,6 +238,8 @@ async def _compute_sandbox_manifest(
     sandbox: "PTCSandbox",
     *,
     skill_roots: list[str] | None = None,
+    managed_skill_root: str | None = None,
+    disabled_skills: frozenset[str] = frozenset(),
     tokens: dict | None = None,
     user_id: str | None = None,
     workspace_id: str | None = None,
@@ -290,7 +318,9 @@ async def _compute_sandbox_manifest(
 
     # ── Module: skills ──
     if skill_roots:
-        modules["skills"] = await sandbox._compute_skills_module(skill_roots)
+        modules["skills"] = await sandbox._compute_skills_module(
+            skill_roots, managed_root=managed_skill_root, disabled=disabled_skills
+        )
 
     # ── Module: tokens ──
     if tokens:
@@ -477,6 +507,8 @@ async def sync_sandbox_assets(
     sandbox: "PTCSandbox",
     *,
     skill_dirs: list[tuple[str, str]] | None = None,
+    user_skill_dir: tuple[str, str] | None = None,
+    disabled_skills: frozenset[str] = frozenset(),
     reusing_sandbox: bool = False,
     force_refresh: bool = False,
     tokens: dict | None = None,
@@ -492,6 +524,12 @@ async def sync_sandbox_assets(
 
         Args:
             skill_dirs: Ordered list of (local_path, sandbox_path) for skills.
+            user_skill_dir: (host cache view, sandbox base) for the user's
+                server-managed skill tier. A separate param, not another
+                ``skill_dirs`` entry, because the manifest computation must
+                know which root is managed to stamp the right lock ownership.
+            disabled_skills: Builtin skill names this user disabled — excluded
+                from the local set, so the prune removes them from the sandbox.
             reusing_sandbox: Whether reconnecting to an existing sandbox.
             force_refresh: Force re-upload of all modules regardless of manifest.
             tokens: Pre-minted OAuth tokens (from workspace_manager).
@@ -503,6 +541,12 @@ async def sync_sandbox_assets(
             SyncResult with list of refreshed module names.
         """
     await sandbox._wait_ready()
+
+    # Fold the managed user tier into the source list (last, so it can never
+    # be overridden); which root is managed travels separately.
+    managed_root = user_skill_dir[0] if user_skill_dir else None
+    if user_skill_dir:
+        skill_dirs = list(skill_dirs or []) + [user_skill_dir]
 
     async with sandbox._tool_refresh_lock:
         await sandbox.ensure_sandbox_ready()
@@ -526,6 +570,8 @@ async def sync_sandbox_assets(
             sandbox._prune_disabled_tool_modules(),
             sandbox._compute_sandbox_manifest(
                 skill_roots=skill_roots,
+                managed_skill_root=managed_root,
+                disabled_skills=disabled_skills,
                 tokens=tokens,
                 user_id=user_id,
                 workspace_id=workspace_id,
@@ -559,11 +605,27 @@ async def sync_sandbox_assets(
                     changed_modules.add(mod_name)
 
         if not changed_modules:
-            if "skills" in local_manifest["modules"]:
-                sandbox._skills_manifest = local_manifest["modules"]["skills"]
+            # `is None` guard (like the slow path): the cached manifest may
+            # already hold the merged local+agent-installed view — overwriting
+            # it with the local-only view would drop agent-installed skills
+            # from known_skills on every warm reuse.
+            if sandbox._skills_manifest is None and "skills" in local_manifest["modules"]:
+                skills_mod = local_manifest["modules"]["skills"]
+                if skill_dirs:
+                    # Cold process / reconnect: one lock read folds the
+                    # agent-installed entries in without a filesystem re-scan.
+                    sandbox_base = skill_dirs[-1][1].rstrip("/")
+                    existing_lock = await sandbox._download_skills_lock(sandbox_base)
+                    if existing_lock:
+                        sandbox._build_complete_skills_cache(
+                            skills_mod, {"skills": existing_lock}, sandbox_base
+                        )
+                if sandbox._skills_manifest is None:
+                    sandbox._skills_manifest = skills_mod
             return SyncResult(refreshed_modules=[], forced=False)
 
         refreshed: list[str] = []
+        skill_collisions: set[str] = set()
 
         # 4. Upload changed modules
         # Intent-based ordering: tool_modules after mcp_servers (derived from
@@ -572,8 +634,9 @@ async def sync_sandbox_assets(
 
         async def _do_skills_upload() -> None:
             """Skills sub-chain: collect → prune → upload (internally sequential)."""
-            local_skill_names = await sandbox._collect_local_skill_names(
-                [d for d, _ in skill_dirs]  # type: ignore[union-attr]
+            local_skill_names = await _collect_local_skill_names(
+                [d for d, _ in skill_dirs],
+                disabled=disabled_skills,
             )
             sandbox_base = skill_dirs[-1][1].rstrip("/")  # type: ignore[index]
 
@@ -585,11 +648,13 @@ async def sync_sandbox_assets(
             )
             skills_mod = local_manifest["modules"].get("skills", {})
             if skills_mod.get("files"):
-                merged_lock = await sandbox._upload_skills(
+                merged_lock, collisions = await sandbox._upload_skills(
                     skill_dirs,
                     manifest=skills_mod,  # type: ignore[arg-type]
                     existing_lock=existing_lock,
+                    disabled=disabled_skills,
                 )
+                skill_collisions.update(collisions)
                 # Build complete skills cache from merged lock data
                 if merged_lock:
                     sandbox._build_complete_skills_cache(
@@ -641,6 +706,18 @@ async def sync_sandbox_assets(
         # which includes user-installed skills from the lock file)
         if sandbox._skills_manifest is None and "skills" in local_manifest["modules"]:
             sandbox._skills_manifest = local_manifest["modules"]["skills"]
+
+        # A collision-skipped upload must not read as done: fold the skipped
+        # names into the written version so the next sync's freshly computed
+        # version (which never carries `collisions`) differs and retries.
+        # Converges once the colliding agent-installed skill is removed.
+        if skill_collisions:
+            mod = local_manifest["modules"]["skills"]
+            collision_key = ",".join(sorted(skill_collisions))
+            mod["collisions"] = sorted(skill_collisions)
+            mod["version"] = hashlib.sha256(
+                f"{mod['version']}|collisions:{collision_key}".encode()
+            ).hexdigest()
 
         # Steps 5+6: independent — parallelize
         await asyncio.gather(
@@ -704,7 +781,9 @@ async def _prune_disabled_tool_modules(sandbox: "PTCSandbox") -> None:
 
 
 async def _collect_local_skill_names(
-    sandbox: "PTCSandbox", local_skill_roots: list[str]
+    local_skill_roots: list[str],
+    *,
+    disabled: frozenset[str] = frozenset(),
 ) -> set[str]:
     def build() -> set[str]:
         sandbox_skill_names, all_registry_names = _get_sandbox_eligible_skills()
@@ -720,7 +799,9 @@ async def _collect_local_skill_names(
                 if not (skill_dir / "SKILL.md").exists():
                     continue
                 skill_name = skill_dir.name
-                # Skip flash-only skills so they get pruned from sandbox
+                # Skip disabled + flash-only skills so they get pruned from sandbox
+                if skill_name in disabled:
+                    continue
                 if (
                     skill_name not in sandbox_skill_names
                     and skill_name in all_registry_names
@@ -782,161 +863,6 @@ def _build_complete_skills_cache(
     sandbox._skills_manifest = {**skills_mod, "skills": all_skills}
 
 
-async def sync_skills_lock(sandbox: "PTCSandbox") -> None:
-    """Reconcile skills-lock.json with the actual filesystem state.
-
-        Bidirectional sync in a single sandbox exec (1 API call):
-        - **Remove** lock entries whose skill directories no longer exist
-        - **Add** lock entries for skill directories not yet in the lock
-          (parses SKILL.md frontmatter to populate name/description/metadata)
-
-        Fast path: if no lock file exists and no skill directories exist,
-        exits immediately.  If lock is perfectly in sync, no write occurs.
-
-        Intended to be called post-completion alongside file backup.
-        Self-healing in discovery.py serves as a fallback if this fails.
-        """
-    if not sandbox.runtime:
-        return
-    skills_base = f"{sandbox._work_dir}/.agents/skills"
-    lock_path = f"{skills_base}/skills-lock.json"
-
-    # Single inline Python script that runs entirely in the sandbox.
-    # Reads dirs + lock file, diffs, parses SKILL.md for new entries,
-    # writes updated lock — all in one exec round trip.
-    # Uses json.dumps() for path interpolation (not shlex.quote) because
-    # values appear as Python string literals inside python3 -c.
-    script = textwrap.dedent(f"""\
-            python3 -c '
-import json, os, re, hashlib, sys
-from datetime import datetime, timezone
-
-SKILLS_BASE = {json.dumps(skills_base)}
-LOCK_PATH = {json.dumps(lock_path)}
-
-# 1. List skill dirs (only dirs containing SKILL.md)
-dirs = set()
-if os.path.isdir(SKILLS_BASE):
-    for name in os.listdir(SKILLS_BASE):
-        p = os.path.join(SKILLS_BASE, name)
-        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "SKILL.md")):
-            dirs.add(name)
-
-# 2. Read existing lock
-lock_data = {{"version": 1, "skills": {{}}}}
-if os.path.isfile(LOCK_PATH):
-    try:
-        with open(LOCK_PATH) as f:
-            lock_data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        pass
-skills = lock_data.get("skills", {{}})
-
-# 3. Compute diff
-locked_names = set(skills.keys())
-to_remove = locked_names - dirs
-to_add = dirs - locked_names
-
-if not to_remove and not to_add:
-    print(json.dumps({{"status": "noop", "removed": 0, "added": 0}}))
-    sys.exit(0)
-
-# 4. Remove stale entries
-for name in to_remove:
-    del skills[name]
-
-# 5. Add new entries by parsing SKILL.md frontmatter
-now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-for name in sorted(to_add):
-    skill_md = os.path.join(SKILLS_BASE, name, "SKILL.md")
-    desc = ""
-    confirmed = False
-    meta = {{}}
-    license_val = None
-    allowed_tools = []
-    try:
-        with open(skill_md, errors="replace") as f:
-            content = f.read(1048576)  # 1MB cap
-        content = content.replace("\\r\\n", "\\n")
-        m = re.match(r"^---\\s*\\n(.*?)\\n---\\s*(?:\\n|$)", content, re.DOTALL)
-        if m:
-            # Minimal YAML-like parser for simple key: value frontmatter
-            # Avoids PyYAML dependency in sandbox
-            for line in m.group(1).splitlines():
-                line = line.strip()
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    k, v = k.strip(), v.strip()
-                    if k == "description":
-                        desc = v.strip("\\"\\x27")
-                        confirmed = True
-                    elif k == "license":
-                        license_val = v.strip("\\"\\x27") or None
-            confirmed = confirmed and bool(name)
-        content_hash = "sha256:" + hashlib.sha256(content.encode()).hexdigest()
-    except Exception:
-        content_hash = ""
-
-    skills[name] = {{
-        "name": name,
-        "description": desc,
-        "owner": "user",
-        "source": "local",
-        "sourceType": "local",
-        "computedHash": content_hash,
-        "confirmed": confirmed,
-        "license": license_val,
-        "metadata": meta,
-        "allowed_tools": allowed_tools,
-        "installedAt": now,
-        "updatedAt": now,
-    }}
-
-# 6. Write updated lock atomically
-lock_data["skills"] = skills
-os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
-tmp = LOCK_PATH + ".tmp"
-try:
-    with open(tmp, "w") as f:
-        json.dump(lock_data, f, sort_keys=True, indent=2, ensure_ascii=False)
-        f.write("\\n")
-    os.replace(tmp, LOCK_PATH)
-    print(json.dumps({{"status": "ok", "removed": len(to_remove), "added": len(to_add)}}))
-except OSError as e:
-    try:
-        os.unlink(tmp)
-    except OSError:
-        pass
-    print(json.dumps({{"status": "error", "error": str(e)}}))
-    sys.exit(1)
-'
-        """)
-
-    try:
-        result = await sandbox._runtime_call(
-            sandbox.runtime.exec,
-            script.strip(),
-            retry_policy=RetryPolicy.SAFE,
-        )
-        stdout = (getattr(result, "stdout", "") or "").strip()
-        if stdout:
-            try:
-                info = json.loads(stdout)
-                if info.get("status") == "ok":
-                    logger.info(
-                        "Skills lock synced",
-                        removed=info.get("removed", 0),
-                        added=info.get("added", 0),
-                        skills_base=skills_base,
-                    )
-                elif info.get("status") == "noop":
-                    logger.debug("Skills lock already in sync")
-            except json.JSONDecodeError:
-                pass
-    except Exception as e:
-        logger.debug("Skills lock sync failed (non-critical)", error=str(e))
-
-
 async def _prune_remote_skills(
     sandbox: "PTCSandbox",
     sandbox_base: str,
@@ -944,11 +870,12 @@ async def _prune_remote_skills(
     *,
     existing_lock: dict[str, Any] | None = None,
 ) -> None:
-    """Prune stale platform skills from sandbox, protecting user-installed ones.
+    """Prune stale server-authoritative skills, protecting agent-installed ones.
 
         Safe default: if lock is unavailable or a skill has no lock entry,
         it is preserved to prevent data loss on transient failures.
         """
+    from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
     assert sandbox.runtime is not None
     runtime = sandbox.runtime
     entries = await sandbox.als_directory(sandbox_base)
@@ -973,11 +900,17 @@ async def _prune_remote_skills(
         if lock_entry is None:
             # Not in lock — unknown origin, preserve (safe default)
             continue
-        if lock_entry.get("owner") == "user":
-            # User-installed — never prune
-            logger.debug("Preserving user-installed skill", skill=name)
+        if is_agent_installed(lock_entry):
+            # Agent-installed — no server-side source of truth, never prune
+            logger.debug("Preserving agent-installed skill", skill=name)
             continue
-        # Platform skill no longer in local set — stale, prune it
+        if is_linked(lock_entry):
+            # Two-way synced workspace skill — the reconciler is its sole
+            # writer/pruner; a disabled linked row keeps its files on purpose.
+            logger.debug("Preserving linked workspace skill", skill=name)
+            continue
+        # Platform or server-managed skill no longer in local set — stale
+        # (deleted or disabled server-side), prune it
         paths_to_remove.append(entry["path"])
 
     if not paths_to_remove:
@@ -1004,7 +937,8 @@ async def _upload_skills(
     *,
     manifest: dict[str, Any] | None = None,
     existing_lock: dict[str, Any] | None = None,
-) -> dict[str, Any] | None:
+    disabled: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Any] | None, set[str]]:
     """Upload skill files from local filesystem to sandbox.
 
         Uses a two-pass approach to fix override precedence:
@@ -1019,18 +953,23 @@ async def _upload_skills(
             existing_lock: Previously downloaded lock entries, or None for fresh sandbox.
 
         Returns:
-            Merged lock file dict if lock entries were written, else None.
+            ``(merged_lock_or_None, collisions)`` — the merged lock file dict if
+            lock entries were written, plus the names skipped because
+            agent-installed or two-way-synced content occupies them (the caller
+            folds these into the module version so the skipped upload retries).
         """
+    from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
+
     assert sandbox.runtime is not None
     runtime = sandbox.runtime
 
     if manifest is None:
         local_roots = [local_dir for local_dir, _ in local_skills_dirs]
-        manifest = await sandbox._compute_skills_module(local_roots)
+        manifest = await sandbox._compute_skills_module(local_roots, disabled=disabled)
 
     if not manifest.get("files"):
         logger.debug("No skills found; skipping upload")
-        return
+        return None, set()
 
     # Skills eligible for sandbox upload (exposure "ptc" or "both")
     sandbox_skill_names, all_registry_names = _get_sandbox_eligible_skills()
@@ -1075,6 +1014,8 @@ async def _upload_skills(
                 skill_name = skill_dir.name
                 if skill_name in ("", ".", ".."):
                     continue
+                if skill_name in disabled:
+                    continue
                 if (
                     skill_name not in sandbox_skill_names
                     and skill_name in all_registry_names
@@ -1096,12 +1037,62 @@ async def _upload_skills(
 
     await asyncio.to_thread(_plan_all)
 
+    # Never write over content this path does not own: a planned skill whose
+    # name an agent-installed or reconciler-linked skill already occupies is
+    # skipped this cycle (the caller version-stamps the collision so it
+    # retries once the name frees up). Same predicate pair as the prune side.
+    if existing_lock:
+        collisions = {
+            name
+            for name in final_skills
+            if name in existing_lock
+            and (
+                is_agent_installed(existing_lock[name])
+                or is_linked(existing_lock[name])
+            )
+        }
+    else:
+        # No lock means either a fresh sandbox or a failed read, and the two
+        # are indistinguishable here. Ownership is unknowable, so every name
+        # already on disk is treated as owned by someone else. A fresh sandbox
+        # has no dirs and uploads everything; a failed read defers to the next
+        # pass rather than writing over an agent's files. Prune takes the same
+        # posture on the same signal.
+        #
+        # The trade is deliberate: a sandbox whose lock was deleted outright
+        # stops refreshing its platform skills until it is recreated, because
+        # every name it holds now reads as foreign. Stale skills that log a
+        # warning every pass beat silently overwriting an agent's own files on
+        # a transient download failure.
+        sandbox_base = local_skills_dirs[-1][1].rstrip("/")
+        existing_dirs = {
+            e.get("name")
+            for e in (await sandbox.als_directory(sandbox_base) or [])
+            if e.get("is_dir")
+        }
+        collisions = {name for name in final_skills if name in existing_dirs}
+    if collisions:
+        for name in collisions:
+            del final_skills[name]
+        # One line, not one per name: an unreadable lock makes every skill on
+        # disk collide at once, and thirty identical warnings bury the flag
+        # that says which of the two branches produced them.
+        logger.warning(
+            "Skill upload skipped: the names are occupied by content this path "
+            "cannot prove it owns",
+            skills=sorted(collisions),
+            count=len(collisions),
+            lock_read=bool(existing_lock),
+        )
+
     if not final_skills:
         logger.debug("No skills to upload after planning")
-        return
+        return None, collisions
 
     # ── Pass 2: Execute (minimal sandbox I/O) ──
-    # 1. Single rm for clean slate (all skill dirs that will be uploaded)
+    # 1. Single rm for clean slate (all skill dirs that will be uploaded).
+    # Every surviving name is either lock-verified as ours or absent from the
+    # sandbox, so the rm only ever clears a dir this path is about to rewrite.
     rm_targets = [plan.sandbox_dir for plan in final_skills.values()]
     if rm_targets:
         rm_cmd = "rm -rf " + " ".join(shlex.quote(d) for d in rm_targets)
@@ -1151,36 +1142,41 @@ async def _upload_skills(
     )
 
     # --- Lock file merge + write ---
-    # Build platform lock entries from the manifest
+    # Build authoritative lock entries (platform + managed) from the manifest.
+    # Collision-skipped names stay OUT: their files were not written, so the
+    # lock must keep claiming the agent-installed entry, not the server one.
     platform_entries = {}
     skills_metadata = manifest.get("skills", {})
     for skill_name, skill_meta in skills_metadata.items():
+        if skill_name in collisions:
+            continue
         lock_entry = skill_meta.get("lock_entry")
         if lock_entry:
             platform_entries[skill_name] = lock_entry
 
     if platform_entries or existing_lock:
-        from ptc_agent.agent.middleware.skills.lock import (
-            LOCK_FILENAME,
-            merge_lock_files,
-            serialize_skills_lock,
-        )
+        # The write is a fresh read-merge-write inside the sandbox, under the
+        # same .skills-sync.flock the reconciler holds for its passes — a
+        # host-side merge over `existing_lock` would be a snapshot taken
+        # before the multi-second prune/upload above, and writing it blind
+        # would silently drop anything the reconciler committed in between
+        # (whose next prune pass could then delete content the lock should
+        # have protected).
+        from .skill_sync import merge_authoritative_entries
 
-        merged = merge_lock_files(platform_entries, existing_lock)
-        lock_content = serialize_skills_lock(merged)
-
-        # Write lock file to sandbox
-        sandbox_base = local_skills_dirs[-1][1].rstrip("/")
-        lock_path = f"{sandbox_base}/{LOCK_FILENAME}"
-        await sandbox._runtime_call(
-            runtime.upload_file,
-            lock_content.encode("utf-8"),
-            lock_path,
-            retry_policy=RetryPolicy.SAFE,
+        merged, lock_skipped = await merge_authoritative_entries(
+            sandbox, platform_entries
         )
+        if lock_skipped:
+            # A name this pass uploaded was claimed agent/linked since the
+            # collision check; the claim keeps the lock entry, and the
+            # reconciler's tree-hash check arbitrates the bytes next pass.
+            logger.warning(
+                "Skill lock entries ceded to concurrent agent/linked claims",
+                skills=sorted(lock_skipped),
+            )
         logger.debug(
-            "Skills lock file written",
-            path=lock_path,
+            "Skills lock file merged",
             platform_count=len(platform_entries),
             user_count=sum(
                 1
@@ -1188,6 +1184,6 @@ async def _upload_skills(
                 if e.get("owner") == "user"
             ),
         )
-        return dict(merged)
+        return dict(merged), collisions
 
-    return None
+    return None, collisions

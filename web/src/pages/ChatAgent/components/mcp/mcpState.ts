@@ -15,13 +15,13 @@ import type { EffectiveServer, McpOauthStatus, McpStatus } from '../../utils/api
  * The OAuth predicates are written as NEGATIONS of the states that need
  * nothing, never as an enumeration of the states that do — an enumeration is a
  * list someone has to remember to extend when a status is added, and the
- * Connectors page had already grown two of them.
+ * Plugins page had already grown two of them.
  */
 
 /**
  * The user-level OAuth connection is unusable (revoked / needs reauth / a
  * refresh whose outcome we can't prove). The only fix is reconnecting in
- * Connectors, so this dominates whatever workspace-local status is cached.
+ * the Plugins page, so this dominates whatever workspace-local status is cached.
  */
 export function isOauthBroken(
   status: McpOauthStatus | null | undefined,
@@ -61,7 +61,7 @@ export function isHostDiscovered(server: Pick<EffectiveServer, 'oauth_status'>):
  * Whether a row's workspace-local detail (tool count, discovery error, missing
  * secrets) is still worth showing. A broken OAuth connection makes all of it
  * stale — the cached status predates the disconnect — and rendering it beside
- * "Reconnect in Connectors" hands the user two contradictory next steps.
+ * "Reconnect in Plugins" hands the user two contradictory next steps.
  */
 export function showsWorkspaceDetail(server: EffectiveServer): boolean {
   return server.enabled && !isOauthBroken(server.oauth_status);

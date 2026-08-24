@@ -35,7 +35,7 @@ interface VaultSecretPickerProps {
   secretNames: string[];
   /**
    * Inline-create into the caller's vault tier — the workspace vault in the
-   * settings panel, the user vault on /connectors, so a ref always resolves
+   * settings panel, the user vault on /plugins, so a ref always resolves
    * where the server it belongs to runs.
    */
   createSecret: (body: { name: string; value: string }) => Promise<unknown>;

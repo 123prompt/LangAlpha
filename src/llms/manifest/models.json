@@ -236,12 +236,12 @@
       "thinking_level": "high"
     }
   },
-  "gemini-3-flash": {
-    "model_id": "gemini-3-flash-preview",
+  "gemini-3.7-flash": {
+    "model_id": "gemini-3.7-flash",
     "provider": "gemini",
     "visible": true,
     "speed": 5,
-    "intelligence": 3,
+    "intelligence": 4,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -379,162 +379,6 @@
     "input_modalities": [
       "text"
     ]
-  },
-  "doubao-seed-2.0-pro": {
-    "model_id": "doubao-seed-2-0-pro-260215",
-    "provider": "volcengine",
-    "visible": true,
-    "speed": 3,
-    "intelligence": 4,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "use_previous_response_id": false
-    },
-    "extra_body": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-  "doubao-seed-2.0-lite": {
-    "model_id": "doubao-seed-2-0-lite-260215",
-    "provider": "volcengine",
-    "visible": true,
-    "speed": 4,
-    "intelligence": 3,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "use_previous_response_id": false
-    },
-    "extra_body": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-  "doubao-seed-2.0-mini": {
-    "model_id": "doubao-seed-2-0-mini-260215",
-    "provider": "volcengine",
-    "visible": true,
-    "speed": 5,
-    "intelligence": 3,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "use_previous_response_id": false
-    },
-    "extra_body": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-  "doubao-seed-2.0-code": {
-    "model_id": "doubao-seed-2-0-code-preview-260215",
-    "provider": "volcengine",
-    "visible": true,
-    "speed": 4,
-    "intelligence": 4,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "use_previous_response_id": false
-    },
-    "extra_body": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-  "doubao-seed-2.0-pro-anthropic": {
-    "model_id": "doubao-seed-2-0-pro-260215",
-    "provider": "doubao-anthropic",
-    "visible": true,
-    "speed": 3,
-    "intelligence": 4,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-  "doubao-seed-2.0-lite-anthropic": {
-    "model_id": "doubao-seed-2-0-lite-260215",
-    "provider": "doubao-anthropic",
-    "visible": true,
-    "speed": 4,
-    "intelligence": 3,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-  "doubao-seed-2.0-mini-anthropic": {
-    "model_id": "doubao-seed-2-0-mini-260215",
-    "provider": "doubao-anthropic",
-    "visible": true,
-    "speed": 5,
-    "intelligence": 3,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
-  },
-  "doubao-seed-2.0-code-anthropic": {
-    "model_id": "doubao-seed-2-0-code-preview-260215",
-    "provider": "doubao-anthropic",
-    "visible": true,
-    "speed": 4,
-    "intelligence": 4,
-    "context": 256000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "parameters": {
-      "thinking": {
-        "type": "enabled"
-      }
-    }
   },
   "deepseek-v4-pro": {
     "model_id": "deepseek-v4-pro",
@@ -788,15 +632,18 @@
       "text"
     ]
   },
-  "qwen3.7-max": {
-    "model_id": "qwen3.7-max",
+  "qwen3.8-max": {
+    "model_id": "qwen3.8-max",
     "provider": "dashscope",
     "visible": true,
     "speed": 4,
     "intelligence": 5,
     "context": 1000000,
     "input_modalities": [
-      "text"
+      "text",
+      "image",
+      "pdf",
+      "video"
     ],
     "extra_body": {
       "enable_thinking": true
@@ -819,12 +666,12 @@
       "enable_thinking": true
     }
   },
-  "qwen3.6-plus": {
-    "model_id": "qwen3.6-plus",
+  "qwen3.7-flash": {
+    "model_id": "qwen3.7-flash",
     "provider": "dashscope",
     "visible": true,
-    "speed": 2,
-    "intelligence": 4,
+    "speed": 5,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -836,60 +683,18 @@
       "enable_thinking": true
     }
   },
-  "qwen3.5-plus": {
-    "model_id": "qwen3.5-plus",
-    "provider": "dashscope",
-    "visible": true,
-    "speed": 2,
-    "intelligence": 3,
-    "context": 1000000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.5-plus-coding": {
-    "model_id": "qwen3.5-plus",
-    "provider": "dashscope-coding",
-    "visible": true,
-    "speed": 2,
-    "intelligence": 3,
-    "context": 1000000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ]
-  },
-  "qwen3.6-flash": {
-    "model_id": "qwen3.6-flash",
-    "provider": "dashscope",
-    "visible": true,
-    "speed": 5,
-    "intelligence": 3,
-    "context": 1000000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.7-max-intl": {
-    "model_id": "qwen3.7-max",
+  "qwen3.8-max-intl": {
+    "model_id": "qwen3.8-max",
     "provider": "dashscope-intl",
     "visible": true,
     "speed": 4,
     "intelligence": 5,
     "context": 1000000,
     "input_modalities": [
-      "text"
+      "text",
+      "image",
+      "pdf",
+      "video"
     ],
     "extra_body": {
       "enable_thinking": true
@@ -912,41 +717,8 @@
       "enable_thinking": true
     }
   },
-  "qwen3.6-plus-intl": {
-    "model_id": "qwen3.6-plus",
-    "provider": "dashscope-intl",
-    "visible": true,
-    "speed": 2,
-    "intelligence": 4,
-    "context": 1000000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf",
-      "video"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.5-plus-intl": {
-    "model_id": "qwen3.5-plus",
-    "provider": "dashscope-intl",
-    "visible": true,
-    "speed": 2,
-    "intelligence": 3,
-    "context": 1000000,
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.6-flash-intl": {
-    "model_id": "qwen3.6-flash",
+  "qwen3.7-flash-intl": {
+    "model_id": "qwen3.7-flash",
     "provider": "dashscope-intl",
     "visible": true,
     "speed": 5,
@@ -955,55 +727,8 @@
     "input_modalities": [
       "text",
       "image",
-      "pdf"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.5-397b-a17b": {
-    "model_id": "qwen3.5-397b-a17b",
-    "provider": "dashscope",
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.5-122b-a10b": {
-    "model_id": "qwen3.5-122b-a10b",
-    "provider": "dashscope",
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.5-27b": {
-    "model_id": "qwen3.5-27b",
-    "provider": "dashscope",
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
-    ],
-    "extra_body": {
-      "enable_thinking": true
-    }
-  },
-  "qwen3.5-35b-a3b": {
-    "model_id": "qwen3.5-35b-a3b",
-    "provider": "dashscope",
-    "input_modalities": [
-      "text",
-      "image",
-      "pdf"
+      "pdf",
+      "video"
     ],
     "extra_body": {
       "enable_thinking": true

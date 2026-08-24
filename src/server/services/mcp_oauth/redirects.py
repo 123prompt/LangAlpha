@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from src.config.env import SERVER_BASE_URL
 
-DEFAULT_RETURN_TO = "/connectors"
+DEFAULT_RETURN_TO = "/plugins"
 
 
 def callback_uri() -> str:
@@ -100,7 +100,7 @@ def redirect_to(
     """The callback's answer: an allowlisted target carrying outcome params.
 
     ``params`` merge into whatever query the return path already carries, so a
-    ``return_to`` of ``/connectors?tab=oauth`` gains ``&mcp_error=…`` instead of
+    ``return_to`` of ``/plugins?tab=oauth`` gains ``&mcp_error=…`` instead of
     a second ``?``. Encoding is ``%20``-style to match what the UI parses.
     """
     target = sanitize_web_origin(web_origin) + sanitize_return_to(return_to)

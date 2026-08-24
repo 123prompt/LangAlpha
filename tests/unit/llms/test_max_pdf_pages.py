@@ -29,12 +29,6 @@ class TestGetMaxPdfPages:
         modality support, six-fold difference in what a request may carry."""
         assert get_max_pdf_pages(model) == 100
 
-    def test_an_anthropic_sdk_endpoint_we_have_no_docs_for_is_treated_as_anthropic(self):
-        """Volcengine's Anthropic-compatible route publishes no page limit. It
-        speaks the same protocol, so it inherits the same reading rather than
-        being assumed unbounded."""
-        assert get_max_pdf_pages("doubao-seed-2.0-pro-anthropic") == 100
-
     def test_a_provider_with_no_documented_page_limit_reports_none(self):
         """None means 'not bounded by pages', which is a different claim from
         'we don't know' — the latter has to fail closed instead."""

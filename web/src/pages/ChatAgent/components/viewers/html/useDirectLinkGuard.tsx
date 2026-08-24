@@ -20,19 +20,22 @@ import {
  * user gesture and isn't blocked.
  *
  * Returns the click handler to wire to the button and the dialog node to render.
+ * An absent `open` (the surface has nowhere to open — see HtmlActions) answers
+ * with an absent handler, so the guard never has to be asked about it twice.
  */
-export function useDirectLinkGuard(open: () => void, guard: boolean) {
+export function useDirectLinkGuard(open: (() => void) | undefined, guard: boolean) {
   const { t } = useTranslation();
   const [confirming, setConfirming] = useState(false);
 
   const request = useCallback(() => {
+    if (!open) return;
     if (guard) setConfirming(true);
     else open();
   }, [guard, open]);
 
   const confirm = useCallback(() => {
     setConfirming(false);
-    open();
+    open?.();
   }, [open]);
 
   const dialog = (
@@ -69,5 +72,5 @@ export function useDirectLinkGuard(open: () => void, guard: boolean) {
     </Dialog>
   );
 
-  return { request, dialog };
+  return { request: open ? request : undefined, dialog };
 }

@@ -16,6 +16,7 @@ import { isPlatformMode, APP_ENTRY_PATH } from './config/hostMode';
 import { AUTH_BROADCAST_CHANNEL, type AuthBroadcastMessage } from './lib/oauthPopup';
 import { OnboardingProvider, OnboardingHostGate } from './pages/Onboarding';
 import { ThreadLifecycleFeed } from './lib/threadLifecycle/ThreadLifecycleFeed';
+import { markBooted, watchStaleBuild } from './lib/staleBuild';
 import './App.css';
 
 // Login carries the market-tape canvas subsystem (~2k lines that only a
@@ -223,6 +224,16 @@ function AuthenticatedShell() {
 
 function App() {
   const { isLoggedIn, isInitialized } = useAuth();
+
+  // App, not AuthenticatedShell: this has to cover the logged-out routes too,
+  // and a stale /login chunk is just as fatal as a stale /dashboard one. Mount
+  // here means React rendered, so index.html must stop auto-reloading and start
+  // publishing instead — a reload from this point on would discard an agent turn
+  // or a half-written message.
+  useEffect(() => {
+    markBooted();
+    return watchStaleBuild();
+  }, []);
 
   if (!isInitialized) {
     return <PageLoading />;

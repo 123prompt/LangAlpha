@@ -6,6 +6,7 @@ import {
 } from '../utils/api';
 import { ListEmpty, ListSkeleton } from './mcp/McpPrimitives';
 import { McpTab } from './mcp/McpTab';
+import { SkillsTab } from './SkillsTab';
 import { OverviewTab } from './sandbox/OverviewTab';
 import { PackagesTab } from './sandbox/PackagesTab';
 import { StorageTab } from './sandbox/StorageTab';
@@ -106,9 +107,10 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
     { key: 'overview', label: 'Overview' },
     { key: 'vault', label: 'Vault' },
     { key: 'mcp', label: 'MCP' },
+    { key: 'skills', label: 'Skills' },
     { key: 'storage', label: 'Storage' },
     { key: 'packages', label: 'Packages' },
-    { key: 'tools', label: 'Tools & Skills' },
+    { key: 'tools', label: 'Runtime' },
   ];
 
   function openVaultTab(prefillSecretName?: string) {
@@ -171,6 +173,7 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
           {activeTab === 'mcp' && (
             <McpTab workspaceId={workspaceId} onOpenVaultTab={openVaultTab} />
           )}
+          {activeTab === 'skills' && <SkillsTab workspaceId={workspaceId} />}
           {activeTab === 'storage' && (
             isRunning ? (
               <StorageTab
@@ -203,7 +206,7 @@ export function SandboxSettingsContent({ workspaceId }: { workspaceId: string })
                 onRefresh={handleRefresh}
               />
             ) : (
-              <OfflineTabPlaceholder tabName="tools & skills" />
+              <OfflineTabPlaceholder tabName="runtime" />
             )
           )}
         </>

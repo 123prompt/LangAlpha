@@ -500,6 +500,13 @@ class LLM:
         # runs inside ModelResilienceMiddleware sees a substituted client, so a
         # capability read has to come off the client in hand rather than off a
         # name captured when the stack was built.
+        # ``pricing_model_id``/``pricing_provider`` are the same identity a
+        # manifest lookup would yield, carried explicitly because a user-defined
+        # model's key is its display name and resolves to nothing. Their config
+        # names the id and provider outright, which is a better billing source
+        # than the vendor echo. ``provider_route`` cannot stand in: it qualifies
+        # off-manifest endpoints by base_url to keep reasoning lineage separate,
+        # so it identifies a trust boundary, not a set of rates.
         billing_type = self._resolve_billing_type()
         existing = client.metadata or {}
         client.metadata = {
@@ -507,6 +514,8 @@ class LLM:
             "billing_type": billing_type,
             "provider_route": self._provider_route(),
             "manifest_model": self.custom_model_name,
+            "pricing_model_id": self.model,
+            "pricing_provider": self.provider,
         }
 
         return client
@@ -946,7 +955,7 @@ def get_input_modalities(
 # a single global cap can't be right: the same document is fine on Sonnet 5 and
 # rejected on Sonnet 4.6. OpenAI documents a size limit but no page limit, hence
 # None — "not bounded by pages" rather than "unknown".
-_ANTHROPIC_SDK_PROVIDERS = frozenset({"anthropic", "claude-oauth", "doubao-anthropic"})
+_ANTHROPIC_SDK_PROVIDERS = frozenset({"anthropic", "claude-oauth"})
 _GEMINI_MAX_PDF_PAGES = 1000
 _ANTHROPIC_MAX_PDF_PAGES_1M = 600
 _ANTHROPIC_MAX_PDF_PAGES = 100

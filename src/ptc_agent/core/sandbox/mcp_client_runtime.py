@@ -298,16 +298,16 @@ def _resolve_http(cfg, *, discovery=False):
 # runs inside the sandbox and cannot import server code, so the duplication is
 # structural; tests/unit/core/test_relay_error_hints.py fails on any drift.
 _RELAY_ERROR_HINTS = {
-    "needs_reauth": "the OAuth connection needs re-authorization; reconnect the server in Connectors",
+    "needs_reauth": "the OAuth connection needs re-authorization; reconnect the server in Plugins",
     "relay_auth": "this sandbox's relay credentials are invalid or expired",
     "bad_request": "the relay rejected this JSON-RPC frame as malformed or oversized",
-    "not_found": "no active grant for this server; reconnect it in Connectors",
+    "not_found": "no active grant for this server; reconnect it in Plugins",
     "method_blocked": "the HTTP method is not permitted by this connection's policy",
     "tool_blocked": "the tool is not permitted by this connection's policy",
     "refresh_in_progress": "the vendor token is being refreshed; retry in a few seconds",
     "destination_blocked": "the relay refused to dial this server's address",
     "upstream_unreachable": "the relay could not reach the vendor's server",
-    "vendor_redirect": "the vendor redirected this endpoint, so its URL has moved; update the server URL in Connectors",
+    "vendor_redirect": "the vendor redirected this endpoint, so its URL has moved; update the server URL in Plugins",
     "limited_rate": "rate limit reached for this connection; retry shortly",
     "limited_concurrency": "too many concurrent calls for this connection; retry shortly",
     "relay_disabled": "the egress relay is disabled on this deployment",
@@ -355,7 +355,7 @@ def _resolve_relay(cfg):
         raise RuntimeError(
             f"MCP server {cfg.name} is OAuth-connected but this sandbox has "
             "no relay credentials - the egress relay may be disabled, or the "
-            "binding failed at session start; check the connection in Connectors"
+            "binding failed at session start; check the connection in Plugins"
         )
     return base + "/v1/egress/" + str(grant_id), {"Authorization": "Bearer " + token}
 

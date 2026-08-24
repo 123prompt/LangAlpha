@@ -1,6 +1,6 @@
 """Scope-neutral bulk import of standard ``mcpServers`` JSON.
 
-Both import surfaces (per-workspace servers and the user-level Connectors
+Both import surfaces (per-workspace servers and the user-level Plugins
 catalog) accept the same blob with inline credentials and run the same
 per-entry gauntlet: skip reserved/duplicate names, enforce the scope's cap,
 rewrite credential-looking literals to ``${vault:NAME}`` refs, validate — all
@@ -22,7 +22,11 @@ from pydantic import ValidationError
 # vault secrets; benign config (``MODE=prod``, ``LOG_LEVEL=ERROR``) stays an
 # inline literal so we don't clutter the vault. Defined in mcp_sanitize so the
 # redaction lanes apply the identical credential test.
-from ptc_agent.core.mcp_sanitize import VAULT_REF_RE, looks_like_secret
+from ptc_agent.core.mcp_sanitize import (
+    VAULT_REF_RE,
+    iter_arg_flag_pairs,
+    looks_like_secret,
+)
 from src.server.database.pool import get_db_connection
 
 
@@ -226,9 +230,7 @@ def plan_vault_extraction(
 
     Pure apart from ``config``: nothing is written, and neither ``allocated``
     (literal → ref, committed entries only) nor ``used_secret_names`` is
-    mutated. Existing refs and benign literals are left alone. Bare
-    space-separated arg secrets (``--token VALUE``) are left as-is too — too
-    ambiguous to auto-extract without over-vaulting benign positionals.
+    mutated. Existing refs and benign literals are left alone.
     """
     secrets: list[PlannedSecret] = []
     refs: dict[str, str] = {}
@@ -256,7 +258,14 @@ def plan_vault_extraction(
                 _ref_for(v, str(k))
                 if isinstance(v, str)
                 and v.strip()
-                and not VAULT_REF_RE.fullmatch(v)
+                # ``search``, not ``fullmatch``: a reference almost never fills
+                # the field it sits in. ``Bearer ${vault:TOKEN}`` is the shape
+                # an auth header actually takes, and reading it as a literal
+                # vaults the template text — scheme word and all — under a new
+                # name, so the entry authenticates with the string
+                # ``Bearer ${vault:TOKEN}`` and the user's real secret is never
+                # consulted. Every other lane already matches this way.
+                and not VAULT_REF_RE.search(v)
                 and looks_like_secret(str(k), v)
                 else v
             )
@@ -283,6 +292,12 @@ def plan_vault_extraction(
                 new_args.append(arg)
                 continue
             new_args.append(f"{flag}={_ref_for(val, flag.lstrip('-') or 'arg')}")
+        # ``--token VALUE`` is the other half of the same credential, and the
+        # generated client resolves a whole-element ref the same way it
+        # resolves one inside ``--flag=``. Scanned on the original list, which
+        # new_args mirrors index for index.
+        for i, flag, val in iter_arg_flag_pairs(args):
+            new_args[i] = _ref_for(val, flag or "arg")
         config["args"] = new_args
 
     return _EntryPlan(secrets=tuple(secrets), refs=refs)

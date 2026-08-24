@@ -134,7 +134,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const {
     navPanelVisible,
     contentAreaRef,
-    navPanelVisibleRef,
     skipNavAnimRef,
     handleNavMinimize,
     handleNavExpand,
@@ -1247,12 +1246,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   return (
     <WorkspaceProvider workspaceId={workspaceId} downloadFile={null}>
-    <motion.div
+    {/* `h-full`, never `h-screen`: this fills the shell's content column, which
+        is the viewport only when nothing else is in it. Pinning it to 100vh
+        pushes it out of its own box the moment anything is (the offline
+        banner). It carried a 10px entrance slide too, which for a box that
+        exactly fills its scroll parent hung 10px past the bottom for the length
+        of the animation and flashed a scrollbar on every mount; the route-level
+        fade in Main.tsx already covers the transition. */}
+    <div
       ref={containerRef}
-      initial={navPanelVisibleRef.current ? false : { y: 10 }}
-      animate={{ y: 0 }}
-      transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
-      className={`flex w-full overflow-hidden ${isMobile ? 'h-full' : 'h-screen'}`}
+      className="flex w-full overflow-hidden h-full"
       style={{
         backgroundColor: 'var(--color-bg-page)',
       }}
@@ -1272,7 +1275,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       {/* Left Side: Topbar + Sidebar + Chat Window */}
       <div className="flex flex-col flex-1 min-w-0">
         {/* Top bar */}
-        <div className="flex items-center justify-between px-4 py-2 border-b min-w-0 flex-shrink-0" style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
+        {/* `drag` makes this the window's drag band inside the desktop shell.
+            It already spans the titlebar and is mostly empty, so the shell gets
+            a full-width band at no layout cost; the buttons in it opt out
+            through the global no-drag rule. */}
+        <div data-chrome="drag" className="flex items-center justify-between px-4 py-2 border-b min-w-0 flex-shrink-0" style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
           <div className="flex items-center gap-4 min-w-0 flex-shrink">
             <button
               onClick={() => {
@@ -1729,6 +1736,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       onModelChange={setInputModel}
                       threadModels={threadModels}
                       mode={isFlashMode ? 'fast' : 'ptc'}
+                      selectedWorkspaceId={workspaceId}
                     />
                   </>
                 ) : activeAgent && activeAgent.type !== WORKFLOW_TASK_TYPE ? (
@@ -1930,7 +1938,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         </>
       )}
 
-    </motion.div>
+    </div>
     </WorkspaceProvider>
   );
 }

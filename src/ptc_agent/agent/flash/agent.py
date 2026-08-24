@@ -27,6 +27,9 @@ from ptc_agent.agent.middleware import (
     ReasoningCompatibilityMiddleware,
 )
 from ptc_agent.agent.middleware.openai_prompt_caching import OpenAIPromptCachingMiddleware
+from ptc_agent.agent.middleware.skills.registry import (
+    build_effective_skill_registry,
+)
 from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
 from ptc_agent.agent.state import DeltaAgentState
 from ptc_agent.agent.prompts import format_current_time, get_loader
@@ -225,9 +228,26 @@ class FlashAgent:
             ProvenanceMiddleware(redactor=leak_detection.redact),
         ]
 
-        # Add dynamic skill loader middleware (Flash mode: inline SKILL.md)
+        # Add dynamic skill loader middleware (Flash mode: inline SKILL.md).
+        # Same per-user registry assembly as the PTC build: feature gates,
+        # builtin disables, user skills. Flash previously took the bare
+        # system-gated registry, so a per-user feature opt-out that hid a
+        # skill in PTC left it visible here.
+        skill_registry = build_effective_skill_registry(
+            "flash",
+            feature_resolver=self.config.feature_enabled,
+            disabled_skills=self.config.disabled_skills,
+            user_skills=self.config.user_skills,
+            user_skill_dir=self.config.user_skill_dir,
+            workspace_skill_dir=self.config.workspace_skill_dir,
+        )
+
         skill_loader_middleware = SkillsMiddleware(
+            skill_registry=skill_registry,
             mode="flash",
+            skill_dirs=[
+                d for d, _ in self.config.skills.local_skill_dirs_with_sandbox()
+            ],
         )
         shared_middleware.append(skill_loader_middleware)
         tools.extend(skill_loader_middleware.tools)  # LoadSkill tool

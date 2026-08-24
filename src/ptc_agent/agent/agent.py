@@ -81,7 +81,9 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
 from ptc_agent.agent.middleware.skills.discovery import SkillMetadata
-from ptc_agent.agent.middleware.skills.registry import get_skill_registry
+from ptc_agent.agent.middleware.skills.registry import (
+    build_effective_skill_registry,
+)
 from ptc_agent.agent.prompts import (
     build_tool_summary_from_registry,
     format_current_time,
@@ -634,11 +636,15 @@ class PTCAgent:
                 for name, meta in backend.skills_manifest["skills"].items()
             }
 
-        # Per-user feature resolution: inject this build's feature gate so a
-        # skill whose owning feature is off for this user drops out (the
-        # registry default only applies the system gate).
-        skill_registry = get_skill_registry(
-            "ptc", feature_resolver=self.config.feature_enabled
+        # Per-user registry: this build's feature gate (the registry default
+        # only applies the system gate), builtin disables, and user skills.
+        skill_registry = build_effective_skill_registry(
+            "ptc",
+            feature_resolver=self.config.feature_enabled,
+            disabled_skills=self.config.disabled_skills,
+            user_skills=self.config.user_skills,
+            user_skill_dir=self.config.user_skill_dir,
+            workspace_skill_dir=self.config.workspace_skill_dir,
         )
         # RunWorkflow is skill-gated: the run-workflow skill hides the tool from
         # model requests until the agent reads its SKILL.md. Drop the skill on
@@ -652,6 +658,10 @@ class PTCAgent:
             backend=backend,
             sources=skill_sources,
             known_skills=known_skills,
+            skill_dirs=[
+                d for d, _ in self.config.skills.local_skill_dirs_with_sandbox()
+            ],
+            disabled_skills=self.config.disabled_skills,
         )
         shared_middleware.append(skill_loader_middleware)
         tools.extend(skill_loader_middleware.tools)
@@ -710,6 +720,9 @@ class PTCAgent:
             "think": [think_tool],
             "todo": [TodoWrite],
         }
+        # The compiler gets its own registry: same per-user gates, but
+        # mode-unfiltered — subagent definitions may be flash-mode and preload
+        # flash-only skills the ptc-filtered registry above excludes.
         subagent_compiler = SubagentCompiler(
             sandbox=sandbox,
             mcp_registry=mcp_registry,
@@ -718,6 +731,17 @@ class PTCAgent:
             current_time=current_time,
             thread_id=short_thread_id,
             config=self.config,
+            skill_registry=build_effective_skill_registry(
+                None,
+                feature_resolver=self.config.feature_enabled,
+                disabled_skills=self.config.disabled_skills,
+                user_skills=self.config.user_skills,
+                user_skill_dir=self.config.user_skill_dir,
+                workspace_skill_dir=self.config.workspace_skill_dir,
+            ),
+            skill_dirs=[
+                d for d, _ in self.config.skills.local_skill_dirs_with_sandbox()
+            ],
         )
         if disable_subagents:
             # Recursion gate: no subagents compiled, none advertised in the

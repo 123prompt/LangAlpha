@@ -203,7 +203,10 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   // return fresh objects each render, so hooks below depend on the individual
   // (memoized) members rather than the machine itself.
   const mentions = useMentions({ textareaRef, message, setMessage, workspaceFiles });
-  const slash = useSlashCommands({ textareaRef, message, setMessage, mode });
+  // The workspace context scopes the slash menu: inside a workspace the
+  // enabled-skill list is the workspace-effective one (workspace-scoped
+  // skills included, its disables applied).
+  const slash = useSlashCommands({ textareaRef, message, setMessage, mode, workspaceId: selectedWorkspaceId });
   const {
     mentionedFiles, setMentionedFiles, pruneRemoved: pruneMentions, detectTrigger: detectMention,
     close: closeMentions, reset: resetMentions, handleKeyDown: mentionKeyDown, open: mentionsOpen,

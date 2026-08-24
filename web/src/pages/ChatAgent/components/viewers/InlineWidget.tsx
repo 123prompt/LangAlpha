@@ -66,12 +66,12 @@ export default function InlineWidget({ html, title, onSendPrompt, data }: Inline
   // Live report wins; cached height bridges the load; 150px is the cold guess.
   const displayHeight = height ?? lastKnownHeights.get(heightKey) ?? null;
 
+  // One action set for both surfaces, built on the inline srcDoc. The fullscreen
+  // variant is display markup for the dialog it is shown in and nothing else:
+  // opening, downloading or printing it would hand the user a document carrying
+  // the dialog's own layout, and on paper the box is 680px wide and neither the
+  // column cap nor the magnification means anything.
   const actions = useHtmlActions({ mode: 'widget', srcDoc, fileName: title });
-  const fullscreenActions = useHtmlActions({
-    mode: 'widget',
-    srcDoc: fullscreenSrcDoc,
-    fileName: title,
-  });
 
   // No max-height cap — widgets span naturally to fit content (charts, tables,
   // dashboards). The agent controls HTML output and the skill doc guides it to
@@ -121,7 +121,7 @@ export default function InlineWidget({ html, title, onSendPrompt, data }: Inline
           onOpenChange={setFullscreen}
           title={title || 'Widget'}
           srcDoc={fullscreenSrcDoc}
-          actions={fullscreenActions}
+          actions={actions}
         />
       )}
     </div>

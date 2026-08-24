@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { AnimatePresence } from 'framer-motion';
-import { Server, Cable } from 'lucide-react';
+import { Server, Blocks } from 'lucide-react';
 import {
   useWorkspaceMcpServers,
   useAddWorkspaceMcpServer,
@@ -37,9 +37,9 @@ import { useMcpServerList } from './useMcpServerList';
 
 /**
  * The "MCP" tab in the workspace settings panel — the workspace-scoped view.
- * User-level servers (and their OAuth lifecycle) are managed on /connectors;
+ * User-level servers (and their OAuth lifecycle) are managed on /plugins;
  * inherited rows render here with their per-workspace enable toggle (writing
- * the workspace tombstone) plus a "Manage in Connectors" deep link.
+ * the workspace tombstone) plus a "Manage in Plugins" deep link.
  *
  * The list mechanics (modals, toggle, delete) are the shared
  * `useMcpServerList`. Three UX guarantees are this component's own:
@@ -84,7 +84,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   const deleteMutation = useDeleteWorkspaceMcpServer(workspaceId);
   const discoverMutation = useDiscoverWorkspaceMcpServer(workspaceId);
   const importMutation = useImportWorkspaceMcpServers(workspaceId);
-  const promoteMutation = usePromoteMcpServerToTemplate(workspaceId);
+  const promoteMutation = usePromoteMcpServerToTemplate();
 
   // Template names drive the promote flow: an existing name needs an overwrite
   // confirm before clobbering. Cheap (60s staleTime), often already warm.
@@ -236,7 +236,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
   const doPromote = useCallback(
     async (name: string, overwrite: boolean) => {
       try {
-        await promoteAsync({ name, overwrite });
+        await promoteAsync({ workspaceId, name, overwrite });
         toast({
           title: overwrite ? t('mcp.tab.promoteUpdatedTitle') : t('mcp.tab.promotedTitle'),
           description: t('mcp.tab.promotedDesc', { name }),
@@ -249,7 +249,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
         });
       }
     },
-    [promoteAsync, t],
+    [promoteAsync, workspaceId, t],
   );
 
   const handlePromote = useCallback(
@@ -264,8 +264,8 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
     [templateNames, doPromote],
   );
 
-  const handleManageInConnectors = useCallback(() => {
-    navigate('/connectors');
+  const handleManageInPlugins = useCallback(() => {
+    navigate('/plugins?tab=mcp');
   }, [navigate]);
 
   async function handleDiscoverFromModal(body: McpServerInput) {
@@ -289,8 +289,8 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
             onImport={openImport}
             onAdd={openAdd}
           >
-            <HeaderButton variant="ghost" icon={Cable} onClick={handleManageInConnectors} title={t('mcp.tab.connectorsHint')}>
-              {t('mcp.tab.connectors')}
+            <HeaderButton variant="ghost" icon={Blocks} onClick={handleManageInPlugins} title={t('mcp.tab.pluginsHint')}>
+              {t('mcp.tab.plugins')}
             </HeaderButton>
           </ListToolbar>
 
@@ -337,7 +337,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
           ) : servers.length === 0 ? (
             <ListEmpty>{t('mcp.list.empty')}</ListEmpty>
           ) : (
-            <div className="flex flex-col gap-1.5">
+            <div className="flex flex-col [&>*+*]:mt-1.5">
               <AnimatePresence initial={false}>
                 {orderedServers.map((server) => (
                   <McpServerRow
@@ -355,7 +355,7 @@ export function McpTab({ workspaceId, onOpenVaultTab }: McpTabProps) {
                     onDelete={requestDelete}
                     onPromoteToTemplate={server.origin === 'workspace' ? handlePromote : undefined}
                     onSetupSecret={handleSetupSecret}
-                    onManageInConnectors={server.origin === 'user' ? handleManageInConnectors : undefined}
+                    onManageInPlugins={server.origin === 'user' ? handleManageInPlugins : undefined}
                   />
                 ))}
               </AnimatePresence>

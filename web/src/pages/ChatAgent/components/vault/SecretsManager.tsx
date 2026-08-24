@@ -9,7 +9,7 @@ import { SecretRow } from './SecretRow';
 
 /**
  * The one vault-secrets manager, shared by the two scopes: the workspace Vault
- * tab and the Connectors → Secrets page. It owns the entire add/edit/reveal/
+ * tab and the Plugins → Secrets page. It owns the entire add/edit/reveal/
  * delete state machine; callers supply the data and the four async operations
  * (React Query mutations on both sides) plus the scope-specific extras —
  * blueprints, prefill deep-link, hint copy, footer.

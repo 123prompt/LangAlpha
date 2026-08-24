@@ -5,6 +5,8 @@
  * useChatMessages (carve B); consumes the HistoryRuntime lane port.
  */
 
+import i18n from '@/i18n';
+import { isOnline } from '@/lib/network';
 import type { AssistantMessage } from '@/types/chat';
 import { replayThreadHistory } from '../../utils/api';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
@@ -926,7 +928,14 @@ export async function loadConversationHistory(
     const errMsg = (error as Error).message || '';
     const isNotFound = errMsg.includes('404');
     if (errMsg && !isNotFound) {
-      rt.setMessageError(errMsg || 'Failed to load conversation history');
+      // A dropped link surfaces here as the browser's own string — "Failed to
+      // fetch", "Load failed" — which we then render in red as if the request
+      // were rejected. It was not: the turn is usually still running and the
+      // reconnect resumes it from the cursor once the link returns. Say what
+      // actually happened instead of quoting the transport at the user.
+      rt.setMessageError(
+        isOnline() ? errMsg : i18n.t('chat.offlineHistoryLoad'),
+      );
     }
     rt.setIsLoadingHistory(false);
     rt.historyLoadingRef.current = false;

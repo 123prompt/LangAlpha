@@ -1079,7 +1079,7 @@ class TestReturnToAllowlist:
             "https://evil.test/phish",
             "http://evil.test",
             "evil.test",
-            "connectors",
+            "plugins",
             "\\\\evil.test",
             # Leading slash then backslash: browsers normalize '\' to '/', so
             # '/\evil.test' becomes protocol-relative '//evil.test' — off-app.
@@ -1090,7 +1090,10 @@ class TestReturnToAllowlist:
         assert sanitize_return_to(value) == DEFAULT_RETURN_TO
 
     @pytest.mark.parametrize(
-        "value", ["/connectors", "/settings/connectors", "/connectors?tab=oauth"]
+        # "/connectors" stays honored on purpose: return_to values parked in
+        # Redis before the Plugins rename must still round-trip (the SPA
+        # aliases the old route).
+        "value", ["/plugins", "/settings/plugins", "/plugins?tab=oauth", "/connectors"]
     )
     def test_same_app_relative_paths_are_honored(self, value):
         assert sanitize_return_to(value) == value
@@ -1106,12 +1109,12 @@ class TestReturnToAllowlist:
         self, redis, phase1, phase2
     ):
         started = await start_connect(
-            USER_ID, SERVER_NAME, return_to="/settings/connectors"
+            USER_ID, SERVER_NAME, return_to="/settings/plugins"
         )
 
         redirect = await _callback(started, code="auth-code-1")
 
-        assert redirect == f"/settings/connectors?mcp_connected={SERVER_NAME_Q}"
+        assert redirect == f"/settings/plugins?mcp_connected={SERVER_NAME_Q}"
 
     @pytest.mark.asyncio
     async def test_phase2_resanitizes_a_poisoned_record(self, redis, phase1, phase2):
@@ -1205,14 +1208,14 @@ class TestWebOriginCapture:
         started = await start_connect(
             USER_ID,
             SERVER_NAME,
-            return_to="/connectors",
+            return_to="/plugins",
             web_origin="http://127.0.0.1:5233",
         )
 
         redirect = await _callback(started, code="auth-code-1")
 
         assert redirect == (
-            f"http://127.0.0.1:5233/connectors?mcp_connected={SERVER_NAME_Q}"
+            f"http://127.0.0.1:5233/plugins?mcp_connected={SERVER_NAME_Q}"
         )
 
     @pytest.mark.asyncio

@@ -1,0 +1,23 @@
+.plugins-page {
+  height: 100%;
+  overflow-y: auto;
+  /* Ground behind the connector card grid — matches the Dashboard page root.
+     Aliases bg-page in dark; a distinct lighter canvas in light mode. */
+  background-color: var(--color-bg-canvas);
+  padding: clamp(16px, 3vw, 32px) clamp(16px, 3vw, 32px) 48px;
+}
+
+.plugins-container {
+  max-width: 672px;
+  margin: 0 auto;
+}
+
+.plugins-content {
+  min-height: 0;
+}
+
+@media (max-width: 767px) {
+  .plugins-page { padding: 16px 16px 48px; }
+  .plugins-tab-bar { scrollbar-width: none; -ms-overflow-style: none; }
+  .plugins-tab-bar::-webkit-scrollbar { display: none; }
+}

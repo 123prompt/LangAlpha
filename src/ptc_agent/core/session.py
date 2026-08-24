@@ -83,6 +83,16 @@ class Session:
         # the per-acquisition resync short-circuit without touching the provider.
         self.platform_secret_version: int | None = None
 
+        # The skills delivery signature (user-tier view dir + disabled names)
+        # this session's sandbox last synced under. Third stamp in the family
+        # above, but content-derived: the acquire path compares it against the
+        # value computed from the turn's already-loaded skill bundle and
+        # re-runs the asset sync on mismatch, so a warm sandbox converges on
+        # skill changes with no writer-side bump to forget. None means this
+        # process can't vouch for the sandbox — the next carrying acquire
+        # verifies once against the sandbox manifest and stamps.
+        self.skills_signature: str | None = None
+
         # agent.md cache with dirty flag (force first read)
         self._agent_md_cache: str | None = None
         self._agent_md_dirty: bool = True

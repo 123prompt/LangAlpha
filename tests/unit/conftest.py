@@ -39,3 +39,23 @@ def _reader_pool_follows_cache_client(monkeypatch):
         return getattr(cache, "client", None)
 
     monkeypatch.setattr(stream_pool, "get_stream_reader_client", _reader)
+
+
+@pytest.fixture(autouse=True)
+def _empty_user_skill_bundle(monkeypatch):
+    """Stub the per-turn user-skill bundle to empty for unit tests.
+
+    ``resolve_llm_config`` loads it from Postgres on every turn; unit tests
+    have no pool. Both binding sites are patched: the package attribute the
+    lazy imports resolve, and the defining module's global that
+    ``sandbox_skill_sync_params`` calls. Tests *about* the bundle itself put
+    the real function back — see ``server/services/user_skills/conftest.py``.
+    """
+    from src.server.services import user_skills
+    from src.server.services.user_skills import materialize
+
+    async def _empty(user_id, workspace_id=None):
+        return user_skills.EMPTY_USER_SKILL_BUNDLE
+
+    monkeypatch.setattr(user_skills, "load_user_skill_bundle", _empty)
+    monkeypatch.setattr(materialize, "load_user_skill_bundle", _empty)

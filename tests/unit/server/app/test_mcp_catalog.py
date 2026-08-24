@@ -20,6 +20,10 @@ from tests.conftest import create_test_app
 
 def _row(name="remote_server", **overrides):
     base = {
+        # The plugin LEFT JOIN is part of every catalog SELECT, so a real row
+        # always carries these two, NULL when it has no plugin owner.
+        "plugin_name": None,
+        "plugin_enabled": None,
         "user_mcp_server_id": "11111111-1111-1111-1111-111111111111",
         "user_id": "test-user-123",
         "name": name,
@@ -105,6 +109,28 @@ async def test_list_reports_hash_gated_tool_counts(client):
 
 
 @pytest.mark.asyncio
+async def test_all_scopes_asks_for_live_workspaces_only(client):
+    """The shared query defaults to every workspace a user ever had, because
+    vault invalidation has to sweep snapshots a soft-deleted workspace left
+    behind. This view renders scopes to a person, so it wants the live ones."""
+    local = AsyncMock(return_value=[])
+    with (
+        patch(
+            "src.server.app.mcp_catalog.list_catalog_servers",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "src.server.app.mcp_catalog.list_scope_markers_for_user",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch("src.server.app.mcp_catalog.list_local_servers_for_user", new=local),
+    ):
+        resp = await client.get("/api/v1/mcp/servers?all_scopes=true")
+    assert resp.status_code == 200
+    assert local.await_args.kwargs["live_only"] is True
+
+
+@pytest.mark.asyncio
 async def test_create_happy(client):
     with (
         patch(
@@ -143,14 +169,21 @@ async def test_create_duplicate_409(client):
 
 
 @pytest.mark.asyncio
-async def test_create_rejects_bash(client):
-    resp = await client.post(
-        "/api/v1/mcp/servers",
-        json={"name": "evil", "transport": "stdio", "command": "bash"},
-    )
-    assert resp.status_code == 422
-    # 422 detail is a flat string, not FastAPI's default list shape.
-    assert isinstance(resp.json()["detail"], str)
+async def test_create_accepts_any_command(client):
+    # A shell and a container runtime are both ordinary ways to launch a
+    # published MCP server, and the sandbox they land in already runs whatever
+    # the agent asks it to.
+    for command in ("bash", "docker"):
+        with patch(
+            "src.server.app.mcp_catalog.create_catalog_server",
+            new=AsyncMock(side_effect=ValueError("already exists")),
+        ):
+            resp = await client.post(
+                "/api/v1/mcp/servers",
+                json={"name": "srv", "transport": "stdio", "command": command},
+            )
+        # 409, not 422: it got past validation and reached the writer.
+        assert resp.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -175,7 +208,7 @@ async def test_create_over_cap_409(client):
 async def test_update_invalid_body_422_string_detail(client):
     resp = await client.put(
         "/api/v1/mcp/servers/remote_server",
-        json={"name": "remote_server", "transport": "stdio", "command": "bash"},
+        json={"name": "remote_server", "transport": "stdio", "command": ""},
     )
     assert resp.status_code == 422
     assert isinstance(resp.json()["detail"], str)
@@ -211,11 +244,11 @@ async def test_update_response_echoes_the_written_maps(client):
     written = {"Authorization": "${vault:API_KEY}", "X-Tenant": "acme"}
     with (
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row(headers=written)),
         ),
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch(
@@ -259,11 +292,11 @@ async def test_update_name_mismatch_409(client):
 async def test_update_missing_404(client):
     with (
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=None),
         ),
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=None),
         ),
     ):
@@ -299,12 +332,12 @@ async def test_update_revokes_when_consent_moves(client, edit, revokes):
     body = {"name": "remote_server", "transport": "http", **edit}
     with (
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         # Pre-update read, then the committed read the consent check runs on.
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(side_effect=[_row(), _row(**edit)]),
         ),
         patch(
@@ -335,12 +368,12 @@ async def test_update_consent_check_reads_the_committed_row(client):
     moved = "https://moved.example.com/mcp"
     with (
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row(url=moved)),
         ),
         # Pre-update read, then the restored row the racing PUT committed.
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(side_effect=[_row(), _row()]),
         ),
         patch(
@@ -400,11 +433,11 @@ async def test_update_warns_when_headers_meet_oauth(client, status, warned):
     }
     with (
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch(
@@ -441,11 +474,11 @@ async def test_update_without_headers_never_warns(client):
     lookup = AsyncMock(return_value=connection)
     with (
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch("src.server.app.mcp_catalog.get_connection", new=lookup),
@@ -501,11 +534,11 @@ async def test_update_rediscovers_when_fingerprint_moves_and_consent_stays(clien
     connection = _connected()
     with (
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row(headers={"X-New": "1"})),
         ),
         patch(
@@ -548,11 +581,11 @@ async def test_update_skips_rediscovery_when_fingerprint_is_unchanged(client):
     connection = _connected()
     with (
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row(description="edited")),
         ),
         patch(
@@ -592,11 +625,11 @@ async def test_update_skips_rediscovery_when_the_edit_revoked_consent(client):
     moved = "https://moved.example.com/mcp"
     with (
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(side_effect=[_row(), _row(url=moved)]),
         ),
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row(url=moved)),
         ),
         patch(
@@ -637,11 +670,11 @@ async def test_update_rediscovery_swallows_an_unusable_connection(client):
     connection = _connected()
     with (
         patch(
-            "src.server.app.mcp_catalog.get_catalog_server",
+            "src.server.services.mcp_catalog.get_catalog_server",
             new=AsyncMock(return_value=_row()),
         ),
         patch(
-            "src.server.app.mcp_catalog.update_catalog_server",
+            "src.server.services.mcp_catalog.update_catalog_server",
             new=AsyncMock(return_value=_row(headers={"X-New": "1"})),
         ),
         patch(
@@ -715,9 +748,9 @@ async def test_create_warns_when_recreate_lands_on_a_live_connection(client):
 @pytest.mark.asyncio
 async def test_delete_happy_and_404(client):
     # Delete must revoke any OAuth connection + its grants (no catalog FK), so
-    # the handler routes through disconnect_server before dropping the row —
-    # and again after it, to catch a callback that landed between the two
-    # transactions and left a connected row behind a deleted catalog entry.
+    # the handler wraps the drop in oauth_fence: a disconnect before it, and
+    # again after, to catch a callback that landed between the two transactions
+    # and left a connected row behind a deleted catalog entry.
     disconnect = AsyncMock(return_value=True)
     with (
         patch(
@@ -736,9 +769,10 @@ async def test_delete_happy_and_404(client):
         call("test-user-123", "remote_server"),
     ]
 
-    # 404 path: the pre-delete revoke is a deliberate side effect (a connection
-    # can outlive its catalog row), but nothing was deleted, so there is no gap
-    # to fence and the second call must not run.
+    # 404 path: the revoke is a deliberate side effect either way (a connection
+    # can outlive its catalog row). The fence closes on exit regardless of what
+    # the body found — an unconditional second pass is what makes it impossible
+    # to forget, and it costs one lookup that returns nothing.
     disconnect_missing = AsyncMock(return_value=False)
     with (
         patch(
@@ -752,7 +786,10 @@ async def test_delete_happy_and_404(client):
     ):
         missing = await client.delete("/api/v1/mcp/servers/ghost")
     assert missing.status_code == 404
-    disconnect_missing.assert_awaited_once_with("test-user-123", "ghost")
+    assert disconnect_missing.await_args_list == [
+        call("test-user-123", "ghost"),
+        call("test-user-123", "ghost"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -768,12 +805,15 @@ async def _toggle_patches(*, connection):
             "src.server.app.mcp_catalog.set_catalog_server_enabled",
             new=AsyncMock(return_value=True),
         ),
+        # Patched at the source modules: the revoke lives in
+        # mcp_oauth.lifecycle.revoke_live_grants, which both this route and the
+        # plugin-level toggle call, and which imports these lazily.
         patch(
-            "src.server.app.mcp_catalog.get_connection",
+            "src.server.database.mcp_oauth.get_connection",
             new=AsyncMock(return_value=connection),
         ),
         patch(
-            "src.server.app.mcp_catalog.revoke_grants_for_connection",
+            "src.server.database.egress_grants.revoke_grants_for_connection",
             new=revoke,
         ),
         patch(

@@ -138,8 +138,9 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
   // the sidebar-content-in mount animation choreograph the swap.
   if (collapsed) {
     return (
-      <aside className="sidebar">
+      <aside className="sidebar" data-chrome>
         <React.Fragment key="rail">
+        <div className="sidebar-window-drag" aria-hidden="true" />
         <button
           type="button"
           className="sidebar-logo"
@@ -191,9 +192,12 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
   }
 
   return (
-    <aside className="sidebar sidebar--panel">
+    <aside className="sidebar sidebar--panel" data-chrome>
       <React.Fragment key="panel">
-      <div className="sidebar-panel-header">
+      <div className="sidebar-window-drag" aria-hidden="true" />
+      {/* The brand row doubles as titlebar: the buttons inside it declare
+          no-drag for themselves, so only the gaps move the window. */}
+      <div className="sidebar-panel-header" data-chrome="drag">
         <button
           type="button"
           className="sidebar-brand"

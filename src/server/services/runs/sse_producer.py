@@ -953,22 +953,17 @@ class RunSSEProducer:
             try:
                 from src.server.services.persistence.usage import UsagePersistenceService
 
-                # Get token tracking from callback (already stored in self.token_callback)
+                # Snapshot under the tracker's lock: background subagent writers
+                # can still be appending records as the turn winds down.
                 per_call_records = None
                 if self.token_callback:
-                    per_call_records = self.token_callback.per_call_records
+                    per_call_records = self.token_callback.get_per_call_records()
 
                 # Get tool usage (non-destructive read, can be called multiple times)
                 tool_usage = self.get_tool_usage()
 
                 # Calculate credits if we have usage data
                 if per_call_records or tool_usage:
-                    # Calculate token usage for display
-                    token_usage = {}
-                    if per_call_records:
-                        from src.utils.tracking import calculate_cost_from_per_call_records
-                        token_usage = calculate_cost_from_per_call_records(per_call_records)
-
                     # Calculate total credits using same logic as persistence
                     credit_service = UsagePersistenceService(
                         thread_id=self.thread_id,
@@ -976,8 +971,12 @@ class RunSSEProducer:
                         user_id="temp"
                     )
 
+                    # One pricing pass, reused for the display payload. The
+                    # authoritative pass runs again at finalize (coordinator's
+                    # usage writer) against whatever records exist by then.
+                    token_usage = {}
                     if per_call_records:
-                        await credit_service.track_llm_usage(per_call_records)
+                        token_usage = await credit_service.track_llm_usage(per_call_records)
 
                     if tool_usage:
                         credit_service.record_tool_usage_batch(tool_usage)

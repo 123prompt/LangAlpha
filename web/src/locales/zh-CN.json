@@ -1,5 +1,15 @@
 {
   "common": {
+    "staleBuild": {
+      "title": "此标签页与服务器版本不一致",
+      "description": "服务器提供的版本与此标签页加载的版本不同，重新加载即可切换。",
+      "blockedTitle": "页面加载失败",
+      "blockedDescription": "此标签页打开期间应用版本已变更，请重新加载以继续。",
+      "reload": "重新加载"
+    },
+    "networkBanner": {
+      "offlineMessage": "网络已断开。恢复连接前，数据可能不是最新的。"
+    },
     "copy": "复制",
     "submit": "提交",
     "save": "保存",
@@ -110,7 +120,7 @@
     "collapse": "收起侧边栏",
     "expand": "展开侧边栏",
     "resize": "调整侧边栏宽度",
-    "connectors": "连接器"
+    "plugins": "插件"
   },
   "account": {
     "menuLabel": "账号菜单"
@@ -1073,9 +1083,6 @@
       "placeholderMobile": "向 AI 询问市场趋势……",
       "placeholderDesktop": "向 AI 询问市场趋势、特定股票或投资组合分析……"
     },
-    "networkBanner": {
-      "offlineMessage": "网络离线 — 重新连接前，仪表板数据可能已过时。"
-    },
     "newsFeedCard": {
       "tabMarket": "市场动态",
       "tabPortfolio": "我的持仓",
@@ -1229,6 +1236,7 @@
     "backToMain": "返回主对话",
     "backToFlash": "返回 Flash",
     "reconnecting": "重新连接中…",
+    "offlineHistoryLoad": "网络已断开，无法刷新此对话。恢复连接后会自动同步。",
     "jumpToLatest": {
       "aria": "滚动到最新消息"
     },
@@ -1623,6 +1631,7 @@
     "htmlSource": "源代码",
     "pdfPrintHint": "按 Cmd/Ctrl-P 将页面保存为 PDF。",
     "pdfGenerating": "正在生成 PDF…",
+    "pdfFailed": "无法保存 PDF，请重试。",
     "copyShareLink": "复制链接",
     "shareLinkCopied": "分享链接已复制到剪贴板",
     "shareLinkFailed": "无法复制链接",
@@ -2587,7 +2596,7 @@
   },
   "mcp": {
     "list": {
-      "title": "MCP 服务器",
+      "title": "连接器",
       "addServer": "添加服务器",
       "importJson": "导入 JSON",
       "importHint": "粘贴标准 mcpServers JSON 配置",
@@ -2596,33 +2605,34 @@
       "empty": "还没有 MCP 服务器。添加一个或复制模板。"
     },
     "tab": {
-      "connectors": "连接器",
-      "connectorsHint": "用户级服务器、OAuth 连接与共享密钥",
+      "plugins": "插件",
+      "pluginsHint": "用户级服务器、技能、OAuth 连接与共享密钥",
       "startingWorkspace": "工作区启动中 — 启动完成后将自动检查你的服务器。",
       "workspaceStopped": "工作区已停止 — 保存服务器会自动重新启动并检查该服务器。",
-      "promoteExistsBefore": "连接器 ",
+      "promoteExistsBefore": "服务器 ",
       "promoteExistsAfter": " 已存在。用此服务器的当前配置覆盖它吗？",
       "overwrite": "覆盖",
       "savedWithWarnings": "服务器已保存（含提示）",
-      "promotedTitle": "已保存到连接器",
-      "promoteUpdatedTitle": "连接器已更新",
-      "promotedDesc": "“{{name}}”已在你的连接器中 — 可在那里管理并在任意工作区使用。",
-      "promoteFailed": "无法保存到连接器"
+      "promotedTitle": "已保存到你的服务器",
+      "promoteUpdatedTitle": "服务器已更新",
+      "promotedDesc": "“{{name}}”已成为你的服务器，可在插件页管理并在任意工作区使用。",
+      "promoteFailed": "无法保存服务器"
     },
     "row": {
       "builtin": "内置",
       "inherited": "继承",
       "workspace": "工作区",
-      "inheritedHint": "继承自你的连接器 — 对所有工作区生效",
+      "inheritedHint": "继承自你的服务器，对所有工作区生效",
       "overridesInherited": "覆盖继承项",
-      "overridesInheritedHint": "此工作区的同名副本在这里覆盖了连接器中的服务器",
+      "overridesInheritedHint": "此工作区的同名副本在这里覆盖了你的用户级服务器",
+      "userDisabled": "已在插件页停用",
       "toolCount_other": "{{count}} 个工具",
       "setupSecret": "设置 {{name}}",
-      "manageInConnectors": "在连接器中管理",
-      "reconnectInConnectors": "在连接器中重新连接",
+      "manageInPlugins": "在插件页管理",
+      "reconnectInPlugins": "在插件页重新连接",
       "edit": "编辑",
       "testConnection": "测试连接",
-      "saveToConnectors": "保存到连接器",
+      "promoteToUser": "保存到你的服务器",
       "delete": "删除",
       "enableAria": "启用 {{name}}",
       "disableAria": "禁用 {{name}}",
@@ -2635,7 +2645,7 @@
       "pending": "待检查",
       "disabled": "已禁用",
       "unknown": "未知",
-      "pendingHint": "等待发现 — 启动工作区或测试连接"
+      "pendingHint": "等待发现。请启动工作区，或测试连接。"
     },
     "lifecycle": {
       "verifying": "验证中…",
@@ -2644,6 +2654,11 @@
       "applying": "应用到智能体…",
       "appliesOnStart": "工作区启动后生效",
       "ready": "就绪"
+    },
+    "discover": {
+      "failed": "发现失败",
+      "noTools": "已连接，未报告工具",
+      "toolCount_other": "已连接，{{count}} 个工具"
     }
   },
   "vault": {
@@ -2683,22 +2698,25 @@
       "security4b": "API。"
     }
   },
-  "connectors": {
-    "title": "连接器",
-    "description": "在所有工作区中可供智能体使用的 MCP 服务器与凭据。",
+  "plugins": {
+    "title": "插件",
+    "description": "在所有工作区中可供智能体使用的 MCP 服务器、技能与凭据。",
     "tabs": {
-      "servers": "服务器",
-      "secrets": "密钥"
+      "mcp": "连接器",
+      "skills": "技能",
+      "secrets": "密钥",
+      "plugins": "插件"
     },
     "servers": {
       "inheritHint": "在此开启的服务器对你的所有工作区生效；如需在单个工作区关闭，请前往该工作区的 MCP 标签页。关闭状态的服务器仅作为模板保留。",
       "enabledState": "已在所有工作区开启",
-      "disabledState": "已关闭 — 不会被继承",
-      "empty": "还没有连接器。添加一个服务器或导入 JSON 配置。",
+      "disabledState": "已关闭，不会被继承",
+      "empty": "还没有服务器。添加一个服务器或导入 JSON 配置。",
+      "emptyPluginOnly": "你现有的服务器都来自插件。可以在这里添加自己的服务器。",
       "toggleFailed": "无法更改服务器状态",
       "enabledWithWarnings": "服务器已启用，但存在警告",
       "deleteFailed": "无法删除服务器",
-      "deleteConfirm": "从连接器中删除“{{server}}”？所有工作区将立即停止继承它。",
+      "deleteConfirm": "从你的服务器中删除“{{server}}”？所有工作区将立即停止继承它。",
       "deleteConfirmYes": "删除",
       "deleteConfirmNo": "取消",
       "warningTitle": "服务器已保存（含提示）"
@@ -2731,8 +2749,215 @@
     },
     "secrets": {
       "title": "密钥库",
-      "scopeHint": "此处的密钥用于你的连接器服务器，并在所有工作区可用。同名的工作区密钥会在该工作区内覆盖此处的值。",
-      "empty": "尚未存储密钥。为你的连接器添加 API 密钥或凭据。"
+      "scopeHint": "此处的密钥用于你的 MCP 服务器，并在所有工作区可用。同名的工作区密钥会在该工作区内覆盖此处的值。",
+      "empty": "尚未存储密钥。为你的服务器添加 API 密钥或凭据。"
+    },
+    "mcp": {
+      "platform": "平台服务器",
+      "platformBadge": "平台",
+      "yours": "你的服务器"
+    },
+    "skills": {
+      "platform": "平台技能",
+      "yours": "你的技能",
+      "platformBadge": "平台",
+      "upload": "上传技能",
+      "inheritHint": "在此上传的技能对你的所有工作区可用。关闭状态的技能仍会在此列出，但不会出现在智能体的菜单中。",
+      "empty": "还没有技能。上传一个包含 SKILL.md 的 zip，教你的智能体一个新工作流。",
+      "toggleFailed": "无法更改技能状态",
+      "deleteFailed": "无法删除技能",
+      "commandFailed": "无法修改命令",
+      "editCommandHint": "点击编辑斜杠命令。回车保存，Esc 取消，留空恢复为技能名。",
+      "commandInputAria": "斜杠命令",
+      "deleteConfirm": "删除“{{skill}}”？所有工作区将立即停止使用它。",
+      "deleteConfirmYes": "删除",
+      "deleteConfirmNo": "取消",
+      "uploadTitle": "上传技能",
+      "uploadHint": "zip 根目录（或唯一的顶层文件夹内）需包含 SKILL.md，大小不超过 2 MB。",
+      "uploadDropzone": "将 .zip 拖到此处，或点击选择文件",
+      "uploadNotZip": "该文件不是 .zip 压缩包。",
+      "uploadTooLarge": "zip 超过 2 MB。",
+      "uploading": "上传中 {{percent}}%",
+      "uploadConfirm": "上传",
+      "workspaceSection": "当前工作区",
+      "workspaceHint": "在此上传的技能仅在当前工作区可用，并会覆盖插件页中的同名技能。",
+      "workspaceEmpty": "暂无工作区技能。上传包含 SKILL.md 的 zip 即可添加。",
+      "inheritedSection": "继承的技能",
+      "inheritedHint": "当前工作区可见的平台技能与插件页技能。在此关闭仅对当前工作区生效。",
+      "shadowsBadge": "覆盖用户技能",
+      "userDisabledBadge": "已在插件页停用"
+    },
+    "scope": {
+      "allWorkspaces": "所有工作区",
+      "allExcept": "所有工作区（除 {{count}} 个外）",
+      "activeIn": "生效于",
+      "futureHint": "新建工作区默认启用",
+      "moveToWorkspace": "移至工作区",
+      "moveToAll": "移至所有工作区",
+      "moveToAnother": "移至其他工作区",
+      "moveOauthBlocked": "请先断开 OAuth 连接，再将此服务器移至工作区",
+      "moveShadowBlocked": "账户层已存在同名项，请先删除或重命名其中一个",
+      "moveFailed": "移动失败",
+      "inWorkspace": "工作区：{{name}}",
+      "unknownWorkspace": "未知工作区",
+      "triggerAria": "范围：{{scope}}",
+      "movePluginBlocked": "由 {{plugin}} 安装；插件组件保留在账户层级"
+    },
+    "list": {
+      "title": "已安装插件",
+      "install": "安装插件",
+      "hint": "插件是 MCP 服务器和技能的组合包。其组件会带着插件名出现在 MCP 和技能标签页中；此处的开关会同时切换全部组件。",
+      "empty": "尚未安装插件。可以从 zip 文件或公开 git 地址安装。",
+      "atCap": "已达插件数量上限（{{max}}）"
+    },
+    "card": {
+      "serverCount_other": "{{count}} 个服务器",
+      "skillCount_other": "{{count}} 个技能",
+      "componentCount": "{{servers}}，{{skills}}",
+      "sourceZip": "zip",
+      "sourceRemote": "远程",
+      "disabledState": "已关闭，所有工作区中的组件均被停用",
+      "update": "更新",
+      "export": "导出",
+      "uninstall": "卸载",
+      "toggleFailed": "无法更新插件",
+      "updatedTitle": "{{plugin}} 已更新",
+      "updateFailed": "更新失败",
+      "exportFailed": "导出失败",
+      "uninstalledTitle": "{{plugin}} 已卸载",
+      "uninstalledDesc": "移除了 {{servers}} 和 {{skills}}。已自定义的组件被保留。",
+      "uninstallFailed": "卸载失败",
+      "uninstallConfirm": "卸载 {{plugin}}？其服务器和技能将从所有工作区移除。已自定义的组件会被保留。",
+      "uninstallConfirmYes": "卸载",
+      "uninstallConfirmNo": "保留"
+    },
+    "component": {
+      "fromPlugin": "由 {{plugin}} 提供",
+      "customize": "自定义",
+      "customizeHint": "将其从 {{plugin}} 分离以便编辑。此后插件更新将跳过它。",
+      "suppressed": "已停用：{{plugin}} 处于关闭状态",
+      "suppressedBadge": "插件已关闭"
+    },
+    "install": {
+      "title": "安装插件",
+      "stepSource": "选择来源",
+      "stepChoose": "选择插件",
+      "stepInstalling": "安装中",
+      "stepReport": "安装报告",
+      "stepBindings": "凭据",
+      "sourceZip": "上传 zip 文件",
+      "sourceGit": "从公开 git 地址安装",
+      "or": "或",
+      "installConfirm": "安装",
+      "notZip": "请选择 .zip 文件",
+      "chooseHint_other": "该来源包含 {{count}} 个插件，请选择要安装的插件。",
+      "tooLarge": "zip 超过 64 MB 限制",
+      "urlRequired": "请输入 git 地址或选择 zip 文件",
+      "notHttps": "git 地址必须以 https:// 开头",
+      "hasPlaceholder": "git 地址不能包含占位符或密钥",
+      "hasUserinfo": "请从 git 地址中移除用户名和密码",
+      "badHost": "无法访问该主机，请使用 github.com 等公开的 git 托管地址",
+      "badUrl": "git 地址格式无效",
+      "fetching": "正在获取插件",
+      "uploading": "上传中 {{percent}}%",
+      "reportInstalled": "已安装",
+      "reportSkipped": "已跳过",
+      "reportUpgradable": "需要确认",
+      "reportErrors": "错误",
+      "reportWarnings": "警告",
+      "specRef": "规范",
+      "reportNoChanges": "没有变化，该插件已是最新版本。",
+      "sseUpgradeHint": "这些服务器声明了旧版 SSE 传输。它们通过了 streamable HTTP 探测，可以用现代传输方式安装。",
+      "sseUpgradeConfirm": "以 streamable HTTP 安装",
+      "sseUpgradeFailed": "升级失败",
+      "droppedFiles": "未导入：{{files}}",
+      "continueToBindings": "继续",
+      "bindingsHint": "该插件声明了所需凭据。值会保存到你的保险库，不会以明文展示给智能体。也可以跳过，稍后在密钥标签页中设置。",
+      "bindingsSkip": "暂时跳过",
+      "bindingsSave": "保存 {{count}} 项",
+      "bindingPlaceholder": "粘贴值",
+      "bindingDocs": "获取方式",
+      "boundTitle": "凭据已保存",
+      "boundDesc": "已保存 {{count}} 项到保险库"
+    },
+    "groups": {
+      "tally": "{{enabled}} 个启用 · {{disabled}} 个停用",
+      "expandAria": "展开 {{title}}",
+      "collapseAria": "收起 {{title}}",
+      "selectAllAria": "全选 {{title}}",
+      "uploaded": "本地上传",
+      "openPlugin": "查看插件"
+    },
+    "bulk": {
+      "select": "选择",
+      "selected": "已选 {{count}} 项",
+      "enable": "启用 {{count}}",
+      "disable": "停用 {{count}}",
+      "delete": "删除 {{count}}",
+      "uninstall": "卸载 {{count}}",
+      "confirmDelete_other": "删除 {{count}} 项？此操作无法撤销。",
+      "confirmUninstall_other": "卸载 {{count}} 个插件？其服务器和技能将被移除。",
+      "progress": "正在处理 {{done}} / {{total}}",
+      "resultTitle": "批量操作完成",
+      "okPart": "{{count}} 项成功",
+      "failPart": "{{count}} 项失败",
+      "scope": "范围",
+      "scopeAria": "设置所选项的范围",
+      "scopeEverywhere": "全部工作区 ({{count}})",
+      "scopeOnlyIn": "仅限所选工作区 ({{count}})",
+      "scopeMoveTo": "移入工作区 ({{count}})",
+      "scopeApply": "应用到 {{count}} 项",
+      "noChanges": "所选项无需更改"
+    },
+    "filter": {
+      "placeholder": "筛选",
+      "clear": "清除筛选",
+      "noMatches": "无匹配项"
+    },
+    "addMenu": {
+      "add": "添加",
+      "installPlugin": "安装插件",
+      "addServer": "添加 MCP 服务器",
+      "importServers": "导入服务器",
+      "uploadSkill": "上传技能"
+    },
+    "stateFilter": {
+      "all": "全部",
+      "on": "开启",
+      "off": "关闭",
+      "attention": "需要处理"
+    },
+    "detail": {
+      "kindServer": "MCP 服务器",
+      "kindSkill": "技能",
+      "kindPlugin": "插件",
+      "tools": "工具",
+      "toolsEmpty": "尚未发现工具。服务器首次连接后即会显示。",
+      "discovered": "发现于 {{date}}",
+      "config": "配置",
+      "transport": "传输方式",
+      "url": "URL",
+      "command": "命令",
+      "envVars": "环境变量",
+      "headers": "请求头",
+      "info": "详情",
+      "origin": "来源",
+      "originPlatform": "平台",
+      "originUser": "自有",
+      "originWorkspace": "工作区",
+      "size": "大小",
+      "updated": "更新于",
+      "created": "添加于",
+      "skillSource": "SKILL.md",
+      "sourceLoadFailed": "无法加载技能源文件。",
+      "components": "组件",
+      "version": "版本",
+      "author": "作者",
+      "homepage": "主页",
+      "sourceLabel": "来源",
+      "installed": "安装于",
+      "openComponentAria": "打开 {{name}}",
+      "toolsFailed": "无法加载工具。请求失败，请重试。"
     }
   }
 }

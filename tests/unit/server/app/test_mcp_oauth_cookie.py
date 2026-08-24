@@ -101,7 +101,7 @@ async def test_callback_reads_the_cookie_named_for_its_state(monkeypatch):
     async def _complete(*, state, code, iss, error, error_description, browser_nonce):
         seen["state"] = state
         seen["browser_nonce"] = browser_nonce
-        return "/connectors?mcp_connected=srv"
+        return "/plugins?mcp_connected=srv"
 
     monkeypatch.setattr(mod, "complete_callback", _complete)
     # The browser carries BOTH flows' cookies; the callback must pick its own.
@@ -127,7 +127,7 @@ async def test_callback_without_state_reads_no_cookie(monkeypatch):
 
     async def _complete(*, state, code, iss, error, error_description, browser_nonce):
         seen["browser_nonce"] = browser_nonce
-        return "/connectors?mcp_error=missing_state"
+        return "/plugins?mcp_error=missing_state"
 
     monkeypatch.setattr(mod, "complete_callback", _complete)
     request = _request(cookies={"mcp_oauth_cb_state-A": "nonce-A"})

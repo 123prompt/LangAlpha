@@ -110,7 +110,7 @@ function CustomInner({ mode, onModeChange }: DashboardCustomProps) {
   const bottomGutter = editMode ? '6rem' : showFloatingChat ? '8rem' : '0';
 
   return (
-    <div className="dashboard-container min-h-screen">
+    <div className="dashboard-container min-h-full">
       <main
         ref={mainRef}
         className="flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden"

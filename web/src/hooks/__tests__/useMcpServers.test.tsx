@@ -254,7 +254,7 @@ describe('mcp mutations — invalidation', () => {
 
   it('catalog import invalidates the user vault too — the backend auto-vaults inline secrets', async () => {
     // Regression: the import only invalidated the catalog, so secrets the
-    // import created stayed invisible in Connectors → Secrets (and absent from
+    // import created stayed invisible in Plugins → Secrets (and absent from
     // the server modal's picker) until the 30s staleTime lapsed.
     const client = makeClient();
     const spy = vi.spyOn(client, 'invalidateQueries');

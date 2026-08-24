@@ -141,7 +141,7 @@ async def get_vault_secrets_for_redaction(workspace_id: str) -> dict[str, str]:
 
 
 async def _connector_secret_literals(workspace_id: str) -> dict[str, str]:
-    """Inline env/header/arg literals from the workspace's connectors that
+    """Inline env/header/arg literals from the workspace's plugins that
     read as credentials.
 
     The sanctioned home for these values is a ``${vault:NAME}`` ref, but the

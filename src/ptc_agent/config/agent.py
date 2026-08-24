@@ -277,6 +277,21 @@ class AgentConfig(BaseModel):
     # Per-user resolved feature flags, set by ``resolve_llm_config``. None
     # (entry points that skip resolution) falls back to system defaults.
     features: dict[str, bool] | None = Field(default=None, exclude=True)
+    # Per-user skill tier, set by ``resolve_llm_config``: uploaded skill specs
+    # (duck-typed name/description/command), the host dir materializing their
+    # bodies, and builtin skill names the user disabled. Not to be confused
+    # with ``SkillsConfig.user_skills_dir``, a config-file path.
+    user_skills: list[Any] = Field(default_factory=list, exclude=True)
+    disabled_skills: frozenset[str] = Field(default_factory=frozenset, exclude=True)
+    user_skill_dir: str | None = Field(default=None, exclude=True)
+    # Workspace-tier bodies: a second host dir, because the sandbox delivery
+    # path uploads ``user_skill_dir`` wholesale and must not touch these.
+    workspace_skill_dir: str | None = Field(default=None, exclude=True)
+    # Platform-skill command renames (skill name → alias); the alias replaces
+    # the registry command as the slash trigger for this user.
+    skill_command_overrides: dict[str, str] = Field(
+        default_factory=dict, exclude=True
+    )
     config_file_dir: Path | None = Field(
         default=None, exclude=True
     )  # For path resolution

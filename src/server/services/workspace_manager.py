@@ -54,6 +54,8 @@ from src.server.database.workspace import (
     update_workspace_status,
 )
 from src.server.services.persistence.file import FilePersistenceService
+from src.server.services.user_skills import sandbox_skill_sync_params
+from src.server.services.user_skills.reconcile import reconcile_workspace_skills
 from src.server.services.workspace_entitlements import WorkspaceEntitlementsMixin
 from src.server.services.workspace_status_pubsub import (
     publish_status_change,
@@ -868,12 +870,18 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             if reusing_sandbox and user_id:
                 tokens = await self._mint_sandbox_tokens(user_id, workspace_id)
 
+            user_skill_params = await sandbox_skill_sync_params(
+                user_id,
+                self.config.skills.sandbox_skills_base,
+                workspace_id=workspace_id,
+            )
             return await sandbox.sync_sandbox_assets(
                 skill_dirs=skill_dirs,
                 reusing_sandbox=reusing_sandbox,
                 tokens=tokens or None,
                 user_id=user_id,
                 workspace_id=workspace_id,
+                **user_skill_params,
             )
 
         tasks: list[Any] = [_timed("mint+manifest", _mint_and_sync_assets())]
@@ -1015,6 +1023,12 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             )
 
             await post_init(session)
+
+            # After post_init: recover/duplicate restore files there, and the
+            # reconcile must see the restored skill dirs + ledger.
+            await self._reconcile_skills(
+                workspace_id, user_id, session.sandbox, source="provision"
+            )
 
             sandbox_id = (
                 getattr(session.sandbox, "sandbox_id", None)
@@ -1650,6 +1664,85 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         )
         return session.mcp_config_version if session is not None else None
 
+    async def _reconcile_skills(
+        self,
+        workspace_id: str,
+        user_id: str | None,
+        sandbox: Any,
+        *,
+        source: str,
+    ) -> None:
+        """Two-way skill reconcile at a cold-bringup point.
+
+        Runs after asset sync + file restore so the pass sees the sandbox's
+        final state. The service serializes cross-worker via the SKILL_SYNC
+        advisory lock and never raises; anonymous sessions have no skill rows
+        to reconcile against.
+        """
+        if not user_id or sandbox is None:
+            return
+        await reconcile_workspace_skills(
+            sandbox, user_id=user_id, workspace_id=workspace_id, source=source
+        )
+
+    # Strong refs to in-flight fire-and-forget reconciles (the standard
+    # asyncio.create_task GC anchor); never consulted as state.
+    _skill_reconcile_tasks: set[asyncio.Task] = set()
+
+    @classmethod
+    def schedule_skill_reconcile(
+        cls, workspace_id: str, user_id: str, *, source: str
+    ) -> None:
+        """Fire-and-forget sync of a just-mutated workspace skill into a
+        running sandbox, so the change lands before the user's next turn.
+        Best-effort: an uninitialized manager, a stopped workspace, or a
+        ready session held by another worker picks the change up at its next
+        cold acquire or post-turn pass instead."""
+        try:
+            manager = cls.get_instance()
+        except Exception:
+            return
+
+        async def _run() -> None:
+            try:
+                await manager.reconcile_skills_if_running(
+                    workspace_id, user_id, source=source
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[skill_sync] proactive reconcile failed for "
+                    f"{workspace_id}: {e}"
+                )
+
+        task = asyncio.create_task(_run())
+        cls._skill_reconcile_tasks.add(task)
+        task.add_done_callback(cls._skill_reconcile_tasks.discard)
+
+    async def reconcile_skills_if_running(
+        self, workspace_id: str, user_id: str, *, source: str
+    ) -> None:
+        """Proactive reconcile after a Plugins-side workspace-skill mutation.
+
+        Only touches a sandbox this worker already holds ready (identity-fenced
+        via ``get_session_if_ready``); a stopped workspace — or one whose ready
+        session lives on another worker — picks the change up on its next cold
+        acquire or post-turn pass. Never wakes a sandbox.
+        """
+        ws = await db_get_workspace(workspace_id)
+        if not ws or not ws.get("sandbox_id"):
+            return
+        session = self.get_session_if_ready(
+            workspace_id, expected_sandbox_id=str(ws["sandbox_id"])
+        )
+        if session is None:
+            return
+        await reconcile_workspace_skills(
+            session.sandbox,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            source=source,
+        )
+
     async def proactively_apply_mcp_config(
         self, workspace_id: str, user_id: str | None = None
     ) -> None:
@@ -1711,6 +1804,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         workspace_id: str,
         user_id: str | None = None,
         on_state_observed: Callable[[str], None] | None = None,
+        skills_signature: str | None = None,
         _attempt: int = 0,
     ) -> Session:
         """Get or restart a session for a workspace.
@@ -1731,6 +1825,13 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 copy on the archived cold-start path without a separate
                 SDK probe. Ignored on the warm path and when creating a
                 fresh sandbox (no pre-existing state to observe).
+            skills_signature: The turn's skills delivery signature
+                (``skills_delivery_signature`` over the already-loaded
+                bundle). When it differs from the session's stamp, the warm
+                fast path is bypassed and Phase 2 re-runs the asset sync, so
+                a warm sandbox converges on skill changes. None (file routes,
+                ``/start``) keeps today's behavior: transitions still sync
+                unconditionally, only the warm compare is skipped.
 
         Returns:
             Initialized Session instance.
@@ -1799,8 +1900,19 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 else:
                     # Sandbox ready — check if sync is needed
                     needs_deferred_sync = workspace_id in self._pending_lazy_sync
+                    # Pure in-memory compare, like the relay-JWT check below:
+                    # the turn's skill state vs what this session last synced
+                    # under. A mismatch bypasses the cooldown — the cooldown
+                    # exists to avoid *redundant* Daytona calls, and this one
+                    # is known non-redundant.
+                    skills_stale = (
+                        skills_signature is not None
+                        and session.skills_signature != skills_signature
+                    )
                     needs_sync = (
-                        not self._sync_cooldown_ok(workspace_id) or needs_deferred_sync
+                        not self._sync_cooldown_ok(workspace_id)
+                        or needs_deferred_sync
+                        or skills_stale
                     )
                     if not needs_sync:
                         # Cooldown active, skip expensive Daytona calls — warm fast
@@ -1987,6 +2099,12 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                                             session.sandbox,
                                             reusing_sandbox=True,
                                         )
+                                        await self._reconcile_skills(
+                                            workspace_id,
+                                            workspace_user_id,
+                                            session.sandbox,
+                                            source="stopping_recovery",
+                                        )
                                     self._sessions[workspace_id] = session
                             except SandboxGoneError as e:
                                 logger.warning(
@@ -2073,6 +2191,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             mark=_mark,
             ws_mcp_version=ws_mcp_version,
             ws_platform_secret_version=ws_platform_secret_version,
+            skills_signature=skills_signature,
         )
 
         if _session_phases:
@@ -2166,6 +2285,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         mark: Callable[[str], None],
         ws_mcp_version: int | None = None,
         ws_platform_secret_version: int | None = None,
+        skills_signature: str | None = None,
     ) -> Session | None:
         """Run the post-lock sync/promote step and return the usable session.
 
@@ -2278,6 +2398,13 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                     mark("asset_sync")
                     await self._maybe_restore_files(workspace_id, session.sandbox)
                     mark("file_restore")
+                    await self._reconcile_skills(
+                        workspace_id,
+                        workspace_user_id,
+                        session.sandbox,
+                        source="lazy_phase2",
+                    )
+                    mark("skill_reconcile")
                     # Reseed auto-stop from the always-on flag now that the
                     # sandbox is actually up — the lazy restart deferred this
                     # (an interval write to a still-archived sandbox races the
@@ -2314,11 +2441,17 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                         )
                         await update_workspace_activity(workspace_id)
                         self._pending_lazy_sync.discard(workspace_id)
-                elif mcp_changed:
-                    # Warm re-sync path normally skips asset sync; a config-version
-                    # delta means wrappers changed, so push them now (off the lock,
-                    # bounded to changed modules by the manifest diff). No file
-                    # restore / promotion — the running session already owns those.
+                elif mcp_changed or (
+                    skills_signature is not None
+                    and session.skills_signature != skills_signature
+                ):
+                    # Warm re-sync path normally skips asset sync; run it when
+                    # wrappers changed (MCP config-version delta) or the turn's
+                    # skills delivery signature moved — an upload, delete, or
+                    # disable since this session last synced. Off the lock,
+                    # bounded to changed modules by the manifest diff. No file
+                    # restore / promotion — the running session already owns
+                    # those.
                     await self._sync_sandbox_assets(
                         workspace_id,
                         workspace_user_id,
@@ -2326,6 +2459,13 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                         reusing_sandbox=True,
                     )
                     mark("mcp_asset_sync")
+
+                # Stamp only after the branch above ran clean: a thrown sync
+                # leaves the old stamp, so the next acquire retries. When no
+                # branch fired the signatures already agree and this is a
+                # no-op.
+                if skills_signature is not None:
+                    session.skills_signature = skills_signature
 
                 # Kick background discovery for user servers still lacking ok
                 # schemas (new/pending/error). Never awaited here and never under
@@ -2623,6 +2763,14 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 reusing_sandbox=sandbox_id is not None,
             )
             mark("cold_asset_sync")
+
+            await self._reconcile_skills(
+                workspace_id,
+                workspace_user_id,
+                session.sandbox,
+                source="attach_running",
+            )
+            mark("skill_reconcile")
 
             # Cache the session BEFORE kicking discovery: the background task's
             # liveness gate (``self._sessions.get(workspace_id) is session``)
@@ -2945,6 +3093,9 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 )
                 if session.sandbox:
                     await self._maybe_restore_files(workspace_id, session.sandbox)
+                    await self._reconcile_skills(
+                        workspace_id, user_id, session.sandbox, source="restart"
+                    )
                 self._record_sync(workspace_id)
 
                 # Check if sandbox needs config migration (e.g., working dir change)

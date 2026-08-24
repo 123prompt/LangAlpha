@@ -112,7 +112,7 @@ function Dashboard({ layoutToggle }: DashboardProps = {}) {
   };
 
   return (
-    <div className="dashboard-container min-h-screen">
+    <div className="dashboard-container min-h-full">
       {/* Main content area */}
       <main ref={mainRef} className="flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden">
         <DashboardHeader onScrollToTop={handleScrollToTop} layoutToggle={layoutToggle} />

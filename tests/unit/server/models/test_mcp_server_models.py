@@ -12,7 +12,6 @@ import pytest
 from pydantic import ValidationError
 
 from src.server.models.mcp_server import (
-    ALLOWED_COMMANDS,
     McpServerInput,
     catalog_row_to_response,
     coerce_mcp_name,
@@ -97,19 +96,24 @@ def test_sse_requires_url():
 
 
 # ---------------------------------------------------------------------------
-# Command allowlist — no bash / no shells
+# Command — not filtered
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("cmd", sorted(ALLOWED_COMMANDS))
-def test_command_allowlist_accepts(cmd):
+# Every one of these is how some published MCP server documents its own launch.
+# The list is not a contract about what we run, it is the evidence that a
+# closed one would have made these uninstallable.
+@pytest.mark.parametrize(
+    "cmd",
+    ["npx", "uvx", "docker", "deno", "bun", "go", "java", "/usr/local/bin/srv", "./srv"],
+)
+def test_any_command_is_accepted(cmd):
     assert McpServerInput(**_stdio(command=cmd)).command == cmd
 
 
-@pytest.mark.parametrize("cmd", ["bash", "sh", "zsh", "/bin/bash", "curl", "rm"])
-def test_command_allowlist_rejects(cmd):
+def test_stdio_still_requires_a_command():
     with pytest.raises(ValidationError):
-        McpServerInput(**_stdio(command=cmd))
+        McpServerInput(**_stdio(command=""))
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +202,31 @@ def test_header_accepts_vault_ref():
     assert srv.headers["Authorization"] == "${vault:API_KEY}"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Bearer ${vault:API_KEY}",
+        "token ${vault:API_KEY}",
+        "${vault:USER}:${vault:PASS}",
+        "${vault:API_KEY} suffix",
+    ],
+)
+def test_header_accepts_a_ref_embedded_in_a_larger_value(value):
+    # `Bearer <token>` is how nearly every MCP server wants its Authorization
+    # header, and the sandbox substitutes refs in place rather than replacing
+    # the field. Requiring the whole value to be the reference meant the scheme
+    # word had to live inside the secret.
+    srv = McpServerInput(**_http(headers={"Authorization": value}))
+    assert srv.headers["Authorization"] == value
+
+
+def test_an_embedded_ref_does_not_excuse_the_rest_of_the_value():
+    with pytest.raises(ValidationError):
+        McpServerInput(
+            **_http(headers={"Authorization": "Bearer ${vault:OK} ${HOME}"})
+        )
+
+
 def test_header_rejects_bare_host_env_value():
     with pytest.raises(ValidationError):
         McpServerInput(**_http(headers={"Authorization": "${SECRET}"}))
@@ -262,6 +291,8 @@ def test_discovery_uses_secrets_defaults_off_and_round_trips():
 
 def test_catalog_row_discovery_uses_secrets_in_response():
     row = {
+        "plugin_name": None,
+        "plugin_enabled": None,
         "name": "remote_server",
         "transport": "http",
         "command": None,
@@ -341,6 +372,10 @@ def test_collect_vault_refs_dedupes_and_sorts():
 
 def _catalog_row(**overrides):
     row = {
+        # The plugin LEFT JOIN is part of every catalog SELECT, so a real row
+        # always carries these two, NULL when it has no plugin owner.
+        "plugin_name": None,
+        "plugin_enabled": None,
         "name": "remote_server",
         "transport": "http",
         "command": None,

@@ -191,6 +191,10 @@
 }
 
 /* Hidden source element — keeps original content for react-to-print PDF export */
+/* `.export-pdf-host` is the live portal this modal renders the source into. Its
+   own rules, and how it interacts with the shell's detached copy, live in
+   styles/printExport.css alongside every other export rule. */
+
 .export-preview-source {
   position: absolute !important;
   top: 0 !important;
@@ -472,14 +476,23 @@
 /* react-to-print prints the hidden source div via the browser's native engine.
    These rules ensure the PDF has light-mode colors and proper typography. */
 @media print {
+  /* Must stay in step with `A4_PAGE_RULE` (lib/pageGeometry.ts), which is the same
+     geometry for the routes that can inject it. This copy covers the one that
+     cannot: a plain Cmd+P of this document while the preview is up. The
+     reasoning behind `!important` is on that constant. */
   @page {
-    size: A4;
-    margin: 15mm; /* Paged.js @page{margin:0} is scoped to media=screen during print */
+    size: A4 !important;
+    margin: 15mm !important;
   }
 
   /* Unclip ancestor chain — react-to-print iframe inherits parent stylesheets.
-     The matching `color-scheme: light` lives in the pageStyle prop, not here —
-     see the comment on useReactToPrint in ExportPreviewModal.tsx. */
+     `color-scheme: light` deliberately does not live here. This file is a lazy
+     chunk and a stylesheet is loaded for the life of the document, so a
+     declaration in it reaches every later print, the app's own Ctrl+P included.
+     Each route states it where it is already scoped: the pageStyle prop for the
+     iframe, which react-to-print inlines and which therefore arrives even when
+     the iframe's re-fetch of this file fails, and printExport.css's
+     `:has(#export-pdf-root)` block for the shell render. */
   html, body {
     height: auto !important;
     overflow: visible !important;

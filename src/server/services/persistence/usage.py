@@ -115,19 +115,17 @@ class UsagePersistenceService:
                 "per_call_costs": [...]
             }
         """
-        from src.utils.tracking.core import calculate_cost_from_per_call_records
+        from src.utils.tracking.core import (
+            calculate_cost_from_per_call_records,
+            empty_usage_payload,
+        )
 
         if not per_call_records:
             logger.debug("[UsagePersistence] No per-call records to track")
-            self._token_usage = {
-                "by_model": {},
-                "total_cost": 0.0,
-                "cost_breakdown": {
-                    "input_cost": 0.0,
-                    "output_cost": 0.0,
-                    "cached_cost": 0.0
-                }
-            }
+            # Shared with the pricing pass rather than hand-written: a duplicate
+            # literal drifts the moment a key is added, leaving a degraded row
+            # indistinguishable from one an older writer produced.
+            self._token_usage = empty_usage_payload()
             self._token_credits = Decimal("0.0")
             return self._token_usage
 
@@ -169,11 +167,9 @@ class UsagePersistenceService:
             # is_byok hint instead of deriving from _has_platform_calls (which
             # was never updated).
             self._token_credits = Decimal("0.0")
-            return {
-                "by_model": {},
-                "total_cost": 0.0,
-                "cost_breakdown": {"input_cost": 0.0, "output_cost": 0.0, "cached_cost": 0.0}
-            }
+            # Same shape as every other exit, built without touching the pricing
+            # pass that just raised.
+            return empty_usage_payload()
 
     # ========== Infrastructure Usage Tracking ==========
 

@@ -122,7 +122,7 @@ async def oauth_callback(
         )
     except Exception:
         logger.exception("[mcp_oauth] callback crashed")
-        target = "/connectors?mcp_error=internal"
+        target = "/plugins?mcp_error=internal"
     # 303: the browser must GET the app route regardless of how it got here.
     resp = RedirectResponse(url=target, status_code=303)
     # The nonce is single-use — clear this flow's cookie so a later navigation

@@ -87,7 +87,7 @@ def _merge_subagent_usage(
     the prior run's usage until cleanup drops it after a successful persist.
     """
     task.per_call_records = (task.per_call_records or []) + (
-        tracker.per_call_records or []
+        tracker.get_per_call_records()
     )
     for name, count in tool_tracker.get_summary().items():
         task.tool_usage[name] = task.tool_usage.get(name, 0) + count
@@ -275,7 +275,7 @@ async def _run_background_task(
             label,
             display_id=task.display_id,
             result_type=type(result).__name__,
-            token_records=len(tracker.per_call_records or []),
+            token_records=tracker.record_count(),
         )
         return {"success": True, "result": result}
     except asyncio.CancelledError:

@@ -370,9 +370,9 @@ async function openTab(name: RegExp) {
 }
 
 describe('gated tabs render when the API reports the canonical running state', () => {
-  it('shows skills on the Tools & Skills tab', async () => {
+  it('shows skills on the Runtime tab', async () => {
     mockGetSandboxStats.mockResolvedValue(liveStats('running'));
-    await openTab(/tools & skills/i);
+    await openTab(/^runtime$/i);
     await waitFor(() => expect(screen.getByText(/demo-skill/i)).toBeInTheDocument());
   });
 
@@ -395,7 +395,7 @@ describe('gated tabs render when the API reports the canonical running state', (
 
   it('still hides the tabs when the sandbox is genuinely stopped', async () => {
     mockGetSandboxStats.mockResolvedValue(liveStats('stopped'));
-    await openTab(/tools & skills/i);
+    await openTab(/^runtime$/i);
     await waitFor(() => expect(screen.getByText(/start the workspace/i)).toBeInTheDocument());
     expect(screen.queryByText(/demo-skill/i)).not.toBeInTheDocument();
   });
@@ -501,7 +501,7 @@ describe('the client does not translate provider synonyms', () => {
 
   it('keeps the gated tabs closed on the raw synonym', async () => {
     mockGetSandboxStats.mockResolvedValue(liveStats('started'));
-    await openTab(/tools & skills/i);
+    await openTab(/^runtime$/i);
 
     await waitFor(() => expect(screen.getByText(/start the workspace/i)).toBeInTheDocument());
     expect(screen.queryByText(/demo-skill/i)).not.toBeInTheDocument();

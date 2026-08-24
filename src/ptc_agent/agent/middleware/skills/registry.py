@@ -6,6 +6,7 @@ loaded by the agent via the load_skill mechanism. Each skill contains a set
 of tools that are pre-registered but hidden until the skill is loaded.
 """
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -36,6 +37,11 @@ class SkillDefinition:
         exposure: Which agent mode(s) can use this skill ("ptc", "flash", or "both")
         system_gate: Deployment kill switch for skills owned by a config section
             rather than the feature catalog — False drops the skill everywhere.
+        source_dir: Absolute host directory containing ``<name>/SKILL.md`` for
+            user-tier skills — lets the loader read the body without any
+            ``skill_dirs`` search. None for platform skills.
+        origin: Whose content this is. "user" entries get trust framing in the
+            manifest and the user-tier wire shape in the API.
     """
 
     name: str
@@ -50,6 +56,8 @@ class SkillDefinition:
     # Per-user resolution happens at agent build (SkillsMiddleware injection).
     feature: str | None = None
     system_gate: Callable[[], bool] | None = None
+    source_dir: str | None = None
+    origin: Literal["platform", "user"] = "platform"
 
     def get_tool_names(self) -> list[str]:
         """Get list of tool names in this skill (including externally-registered ones)."""
@@ -402,6 +410,76 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         exposure="ptc",
     ),
 }
+
+
+def build_user_skill_definitions(
+    specs: Sequence[Any],
+    *,
+    source_dir: str | None,
+    workspace_source_dir: str | None = None,
+) -> dict[str, SkillDefinition]:
+    """Build registry entries for a user's uploaded skills.
+
+    ``specs`` is duck-typed (needs ``.name``/``.description``, optional
+    ``.command``/``.workspace_scoped``) so the server's spec dataclass never
+    has to be imported here. Every entry is docs-only (no tools), exposed in
+    both modes, and carries ``skill_md_path="skills/<name>/SKILL.md"`` so PTC
+    auto-load on ``Read`` of ``.agents/skills/<name>/SKILL.md`` matches with no
+    extra code.
+
+    The two tiers read from different host dirs (see
+    ``load_user_skill_bundle``); a spec whose tier has no dir is skipped
+    rather than pointed at the other one's.
+    """
+    out: dict[str, SkillDefinition] = {}
+    for spec in specs:
+        root = (
+            workspace_source_dir
+            if getattr(spec, "workspace_scoped", False)
+            else source_dir
+        )
+        if root is None:
+            continue
+        out[spec.name] = SkillDefinition(
+            name=spec.name,
+            description=spec.description,
+            tools=[],
+            skill_md_path=f"skills/{spec.name}/SKILL.md",
+            exposure="both",
+            command=getattr(spec, "command", None) or spec.name,
+            origin="user",
+            source_dir=root,
+        )
+    return out
+
+
+def build_effective_skill_registry(
+    mode: SkillMode | None,
+    *,
+    feature_resolver: Callable[[str], bool] | None = None,
+    disabled_skills: Iterable[str] = (),
+    user_skills: Sequence[Any] = (),
+    user_skill_dir: str | None = None,
+    workspace_skill_dir: str | None = None,
+) -> dict[str, SkillDefinition]:
+    """Assemble the per-build registry every agent surface consumes.
+
+    Mode + feature gating, minus the user's builtin disables, plus the user's
+    uploaded skills. The one assembly path shared by the PTC build, the Flash
+    build, and the subagent compiler, so a gate applied in one can't be missed
+    in another.
+    """
+    registry = get_skill_registry(mode, feature_resolver=feature_resolver)
+    for name in disabled_skills:
+        registry.pop(name, None)
+    registry.update(
+        build_user_skill_definitions(
+            user_skills,
+            source_dir=user_skill_dir,
+            workspace_source_dir=workspace_skill_dir,
+        )
+    )
+    return registry
 
 
 def get_skill_registry(

@@ -242,6 +242,22 @@ export function useChatMessages(
   // React can't dedup by id. Cleared on real thread switches (see line ~682)
   // and on load failure (the catch path below) so retries still work.
   const historyLoadedKeyRef = useRef<string | null>(null);
+  // Counts `online` events. The retry listener below can only bump
+  // reloadTrigger when no load is in flight, and a request issued against a
+  // dead link does not always fail fast enough to be out of the way — so the
+  // load itself re-checks this counter and re-fires when the link returned
+  // underneath it. Without that, the one `online` we get is dropped and the
+  // "it will catch up" message never comes true.
+  const onlineRetryEpochRef = useRef(0);
+  // Monotonic ownership token for this hook's stream session, bumped wherever a
+  // new turn takes it and wherever navigation gives it up. A reconnect retry
+  // outlives the turn that started it — it can sit in an offline slice for
+  // minutes — and every signal it could otherwise key off is reused: the next
+  // send clears wasStoppedRef, currentRunIdRef is null between that send and
+  // its metadata frame, and threadIdRef is back to its original value after a
+  // there-and-back navigation. Only a value that never goes backwards can tell
+  // "still my session" from "someone else's".
+  const sessionEpochRef = useRef(0);
 
   // Track all LLM models used in this thread (ordered, deduplicated)
   const [threadModels, setThreadModels] = useState<string[]>([]);
@@ -484,6 +500,7 @@ export function useChatMessages(
     mainStreamAbortRef,
     isReconnectingOwnerRef,
     wasStoppedRef,
+    sessionEpochRef,
     backgroundReconnectRef,
     setIsReconnecting,
     onFileArtifact,
@@ -613,6 +630,19 @@ export function useChatMessages(
         currentThreadId !== newThreadId;
 
       if (currentThreadId !== newThreadId) {
+        // Any change of the resolved id relinquishes whatever session the old
+        // one owned, so the token moves here rather than inside the narrower
+        // isThreadSwitch below: that predicate excludes '__default__' on either
+        // side, and a workspace with no stored thread resolves to exactly that,
+        // so an A → '__default__' → A trip would leave a parked reconnect retry
+        // looking at its own thread with an epoch it still matches, free to
+        // resume alongside the reconnect the return trip already started (two
+        // readers on one run, mainStreamAbortRef pointing at whichever
+        // registered last). Deliberately wider than it strictly needs to be:
+        // over-invalidating only makes a stale retry give up, which is the safe
+        // direction, and no retry can be running under a '__default__' id
+        // anyway (the loop breaks on one immediately).
+        sessionEpochRef.current += 1;
         setThreadId(newThreadId);
       }
 
@@ -760,6 +790,7 @@ export function useChatMessages(
       // (active_tasks above all) reflects the world at this instant, and the
       // mux attach may lag it by the whole history load.
       const snapshotAtMs = Date.now();
+      const onlineEpochAtStart = onlineRetryEpochRef.current;
       const status: WorkflowStatusResponse = await getWorkflowStatus(threadId).catch((statusErr: unknown) => {
         console.log('[Reconnect] Could not check workflow status:', (statusErr as Error).message);
         return { can_reconnect: false, status: 'error' } as WorkflowStatusResponse;
@@ -796,6 +827,26 @@ export function useChatMessages(
           ...(status.recent_report_back_run_ids ?? []),
           ...replayedRunIdsRef.current,
         ]);
+      }
+
+      // The link can come back mid-load, and the `online` that would normally
+      // re-fire this was dropped by the in-flight guard on the listener below —
+      // nothing else will, because a link that returns does not fire `online` a
+      // second time. Two shapes need the re-fire. A failed replay is the
+      // obvious one. The other is subtler: the status probe and the replay are
+      // deliberately sequential, so the link can return BETWEEN them, leaving a
+      // probe that failed against the dead link (`status: 'error'`, the
+      // client-only sentinel synthesized by the catch above) paired with a
+      // replay that succeeded against the live one. Trusting that snapshot's
+      // can_reconnect:false would leave an active turn unattached until the
+      // next navigation. Re-running is safe either way: the replay strips its
+      // own history bubbles before rebuilding, so it is not additive.
+      if (
+        onlineRetryEpochRef.current !== onlineEpochAtStart &&
+        (!loadOk || status.status === 'error')
+      ) {
+        setReloadTrigger((n) => n + 1);
+        return;
       }
 
       // Arm the report-back watch BEFORE the reconnect branch below, so it runs
@@ -952,9 +1003,46 @@ export function useChatMessages(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, threadId, reloadTrigger]);
 
+  // Opening a thread while offline fails its history load and tells the user it
+  // will catch up when the link returns. Nothing else makes that true: the
+  // banner clearing is the only other reaction to `online`, so without this the
+  // conversation stays stale until the user navigates away and back. The load
+  // effect deliberately leaves historyLoadedKeyRef clear on a failed load
+  // precisely so a reloadTrigger bump re-fires it.
+  useEffect(() => {
+    const retryFailedLoad = () => {
+      // Record the arrival before any guard can drop it — a load already in
+      // flight consumes this on its way out if it fails.
+      onlineRetryEpochRef.current += 1;
+      if (!workspaceId || !threadId || threadId === '__default__') return;
+      // A live stream owns the catch-up: the reconnect loop is itself waiting
+      // on this same `online`, and a history reload would fight it.
+      if (historyLoadingRef.current || isStreamingRef.current) return;
+      // A matching key means the last load succeeded — there is nothing stale
+      // to catch up, and re-firing would replay the thread for no reason.
+      if (historyLoadedKeyRef.current === `${workspaceId}::${threadId}::${reloadTrigger}`) return;
+      setReloadTrigger((n) => n + 1);
+    };
+    window.addEventListener('online', retryFailedLoad);
+    return () => window.removeEventListener('online', retryFailedLoad);
+  }, [workspaceId, threadId, reloadTrigger]);
+
   // The report-back watch survives thread navigation (so a flash report-back and a
   // live PTC stream coexist); useReportBackWatch owns its own unmount-time
   // teardown, so the thread-load effect above deliberately doesn't touch it.
+
+  // Leaving ChatAgent entirely gives up the session the same way navigating
+  // between threads does, but nothing above notices: the route changes without
+  // the resolved thread id changing, so a reconnect retry parked in an offline
+  // slice would still match every ownership check and open a reader into a hook
+  // nobody is rendering. Coming back mounts a fresh hook that reconnects on its
+  // own, and Stop reaches only that one, so the orphan runs to the end of the
+  // turn unabortable. Its own effect rather than the thread-load cleanup above,
+  // which also fires on every reloadTrigger bump and would abandon retries that
+  // are still legitimately ours.
+  useEffect(() => () => {
+    sessionEpochRef.current += 1;
+  }, []);
 
   /**
    * Subagent mux settlement (sink, positive per-task closure, drain dedup)
@@ -1298,6 +1386,7 @@ export function useChatMessages(
       // This demoted POST is now the active main turn; clear the stopped guard
       // and register its controller so stopWorkflow can abort it.
       wasStoppedRef.current = false;
+      sessionEpochRef.current += 1;
       backgroundReconnectRef.current = false;
       mainStreamAbortRef.current = steeringAbort;
       const refs = buildStreamRefs();
@@ -1573,6 +1662,7 @@ export function useChatMessages(
     // re-activate its card. The map is cleared only on a full history-backed reset.
     // Clear the stopped guard so a fresh send can finalize again on stop.
     wasStoppedRef.current = false;
+    sessionEpochRef.current += 1;
     backgroundReconnectRef.current = false;
     // This send opens a NEW backend turn rendered in-view; advance the
     // watermark so the next reactivation's staleness check doesn't mistake
@@ -1857,6 +1947,7 @@ export function useChatMessages(
     // from the primary again) succeed; a re-fired model_fallback re-sets it.
     setFallbackSuggestion(null);
     wasStoppedRef.current = false;
+    sessionEpochRef.current += 1;
     backgroundReconnectRef.current = false;
     acquireStreamOwnership(threadId);
     // Fresh AbortController so stopWorkflow can abort this resumed stream.
@@ -2257,6 +2348,7 @@ export function useChatMessages(
     // projection, and a re-run spawns fresh task ids — stale evidence for the
     // old ids is harmless, while wiping it could un-settle a live-closed sibling.
     wasStoppedRef.current = false;
+    sessionEpochRef.current += 1;
     backgroundReconnectRef.current = false;
     acquireStreamOwnership(threadId);
 

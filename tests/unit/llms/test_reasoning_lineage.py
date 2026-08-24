@@ -89,7 +89,7 @@ class TestNoAccidentalMerges:
         for a, b in (
             ("moonshot", "moonshot-coding"),
             ("minimax", "minimax-coding"),
-            ("doubao-anthropic", "doubao-coding"),
+            ("volcengine", "doubao-coding"),
             ("z-ai", "z-ai-coding"),
         ):
             if a in providers and b in providers:

@@ -12,8 +12,13 @@ body > :first-child {
   border: none !important;
   border-radius: 0 !important;
   box-shadow: none !important;
-  margin: 0 !important;
+  margin: 0 auto !important;
 }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border-elevated); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-tertiary); }
 </style>
 <script>
 (function(){

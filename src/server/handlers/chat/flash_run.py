@@ -73,6 +73,8 @@ from .request_prep import (
     process_hitl_response,
     serialize_context_metadata,
     setup_steering_tracking,
+    turn_skill_names,
+    user_skill_commands,
 )
 from src.server.services.runs.admission import (
     RunScope,
@@ -216,6 +218,27 @@ async def astream_flash_workflow(
         query_type, fork = _resolve_fork(request=request)
         is_checkpoint_replay = bool(request.checkpoint_id and not request.messages)
 
+        # Resolve LLM config (pre-resolved by the route handler, fallback for
+        # standalone use). Ahead of the metadata below on purpose: that block
+        # records the model and the detected slash command, and both are read
+        # off this config. Resolved late, the standalone path would stamp a
+        # skill the turn then refuses, because activation gates on the
+        # resolved registry while the metadata had nothing to gate on. The
+        # route already resolves before this generator runs, so this only
+        # moves the standalone path onto the ordering production has.
+        if config is None:
+            config = await resolve_llm_config(
+                setup.agent_config,
+                user_id,
+                request.llm_model,
+                is_byok,
+                mode="flash",
+                reasoning_effort=getattr(request, "reasoning_effort", None),
+                fast_mode=getattr(request, "fast_mode", None),
+                thread_id=thread_id,
+                workspace_id=workspace_id,
+            )
+
         # Persist query start (with attachment and context metadata for display
         # in history).  This block is flash-specific because of multimodal guard
         # differences vs PTC.
@@ -246,7 +269,11 @@ async def astream_flash_workflow(
                 )
 
         # Persist lightweight additional_context + slash command fallback
-        serialize_context_metadata(request, query_metadata, user_input, mode="flash")
+        serialize_context_metadata(
+            request, query_metadata, user_input, mode="flash",
+            extra_commands=user_skill_commands(config),
+            allowed_skills=turn_skill_names(config, "flash"),
+        )
 
         # Extract HITL answer metadata for persistence
         feedback_action = None
@@ -310,20 +337,6 @@ async def astream_flash_workflow(
         # =================================================================
         # Build Flash Agent Graph
         # =================================================================
-
-        # Resolve LLM config (pre-resolved by route handler, fallback for
-        # standalone use)
-        if config is None:
-            config = await resolve_llm_config(
-                setup.agent_config,
-                user_id,
-                request.llm_model,
-                is_byok,
-                mode="flash",
-                reasoning_effort=getattr(request, "reasoning_effort", None),
-                fast_mode=getattr(request, "fast_mode", None),
-                thread_id=thread_id,
-            )
 
         # Resolve timezone for metadata (observability only -- agent clock
         # uses DB user_profile)
@@ -390,11 +403,16 @@ async def astream_flash_workflow(
         # SkillsMiddleware, which dedups bodies already live in the thread. Only
         # set on normal turns; HITL/replay carry no new user message to attach to.
         if not request.hitl_response and not is_checkpoint_replay:
-            skill_contexts = prepare_skill_contexts(messages, request, mode="flash")
+            skill_contexts = prepare_skill_contexts(
+                messages, request, mode="flash",
+                extra_commands=user_skill_commands(config),
+                allowed_skills=turn_skill_names(config, "flash"),
+            )
         else:
             skill_contexts = None
         skill_dirs = (
             [local_dir for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()]
+            + ([config.user_skill_dir] if config.user_skill_dir else [])
             if skill_contexts
             else None
         )

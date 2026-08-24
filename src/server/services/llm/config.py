@@ -200,9 +200,9 @@ async def _resolve_custom_model_byok(
         # Rewrite ``provider`` to the candidate that actually held the key.
         # ``create_llm_from_custom`` reads SDK / default_headers /
         # use_response_api from the provider field, so if a custom model
-        # tagged ``dashscope`` resolves via its ``dashscope-coding``
+        # tagged ``z-ai`` resolves via its ``z-ai-coding``
         # sibling, we need the SDK to match the coding-plan endpoint —
-        # otherwise we'd build a Qwen client pointed at an
+        # otherwise we'd build a GLM client pointed at an
         # Anthropic-shaped URL and fail every request.
         if holding != provider:
             custom_config = {**custom_config, "provider": holding}
@@ -318,8 +318,8 @@ async def resolve_byok_llm_client(
         return None
     # base_url precedence: a user custom base_url on the holding slug wins;
     # otherwise the MODEL'S OWN provider endpoint (NOT the parent's, NOT the
-    # candidate's). This is the coding-variant fix: a dashscope-coding model
-    # (anthropic SDK) whose key lives under parent `dashscope` (openai SDK)
+    # candidate's). This is the coding-variant fix: a z-ai-coding model
+    # (anthropic SDK) whose key lives under parent `z-ai` (glm SDK)
     # must still build against the anthropic coding endpoint.
     base_url = byok_config.get("base_url") or mc.get_provider_info(provider).get("base_url")
     logger.debug(
@@ -775,6 +775,7 @@ async def resolve_llm_config(
     thread_id: str | None = None,
     *,
     enabled_subagents: list[str] | None = None,
+    workspace_id: str | None = None,
 ):
     """
     Resolve final LLM config with priority:
@@ -788,6 +789,9 @@ async def resolve_llm_config(
     points; all current callers pass it explicitly). ``enabled_subagents``
     threads the request's active subagent list so per-subagent model roles get
     their own credential resolution; ``None`` falls back to the config default.
+    ``workspace_id`` scopes the skill tier: workspace rows shadow user rows
+    and workspace disables apply; ``None`` (maintenance paths) resolves the
+    user tier alone.
     """
     from ptc_agent.config import LLMConfig
 
@@ -822,6 +826,18 @@ async def resolve_llm_config(
     )
     _cow()
     config.features = resolved_features
+
+    # Per-user skill tier: uploaded skills materialized to a host dir, plus
+    # builtin disables. One query + a prefs read; a skill-less user costs a
+    # single indexed SELECT and sets nothing.
+    from src.server.services.user_skills import load_user_skill_bundle
+
+    bundle = await load_user_skill_bundle(user_id, workspace_id)
+    config.user_skills = list(bundle.skills)
+    config.disabled_skills = bundle.disabled_builtins
+    config.user_skill_dir = bundle.dir
+    config.workspace_skill_dir = bundle.workspace_dir
+    config.skill_command_overrides = dict(bundle.command_overrides)
 
     # Bootstrap LLMConfig when agent_config.yaml has llm: null.
     # The user must have configured a model via the UI or per-request param.
