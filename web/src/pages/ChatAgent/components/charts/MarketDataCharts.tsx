@@ -445,7 +445,7 @@ export function StockPriceChart({ data }: DataProps): React.ReactElement {
         )}
         <OpenInMarketLink symbol={data.symbol as string} />
       </div>
-      <div ref={containerRef} className="[&_*]:outline-none" style={{ width: '100%', height: 360 }} />
+      <div ref={containerRef} style={{ width: '100%', height: 360 }} />
       <StockStatsCard stats={data.stats as Record<string, unknown> | undefined} />
     </div>
   );
@@ -1441,5 +1441,5 @@ function MiniCandlestick({ ohlcv, height = 180 }: MiniCandlestickProps): React.R
   }, [ohlcv, height, ct]);
 
   if (!ohlcv?.length) return null;
-  return <div ref={containerRef} className="[&_*]:outline-none" style={{ width: '100%', height }} />;
+  return <div ref={containerRef} style={{ width: '100%', height }} />;
 }

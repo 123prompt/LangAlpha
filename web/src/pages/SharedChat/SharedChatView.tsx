@@ -24,6 +24,7 @@ import {
   handleHistoryTodoUpdate,
   handleHistoryTaskArtifactStatus,
 } from '../ChatAgent/hooks/utils/historyEventHandlers';
+import type { PairState } from '../ChatAgent/hooks/utils/historyEventHandlers';
 import {
   getSharedThread,
   replaySharedThread,
@@ -43,12 +44,6 @@ type MessageRecord = Record<string, unknown>;
 /** SetMessages type matching historyEventHandlers' signature */
 type SetMessages = (updater: (prev: MessageRecord[]) => MessageRecord[]) => void;
 
-/** PairState type matching historyEventHandlers' PairState */
-interface PairState {
-  contentOrderCounter: number;
-  reasoningId: string | null;
-  toolCallId: string | null;
-}
 
 function updateMessage(messages: MessageRecord[], messageId: string, updater: (m: MessageRecord) => MessageRecord): MessageRecord[] {
   return messages.map((m) => (m.id === messageId ? updater(m) : m));
@@ -271,6 +266,7 @@ export default function SharedChatView() {
                 content_type: event.content_type as string,
                 tool_call_id: event.tool_call_id as string,
                 artifact: event.artifact,
+                status: event.status,
               },
               pairState,
               setMessages: setMessagesCompat,

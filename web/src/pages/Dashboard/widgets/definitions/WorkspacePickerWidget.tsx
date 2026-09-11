@@ -118,7 +118,7 @@ function WorkspacePickerWidget({ instance }: WidgetRenderProps<WorkspacePickerCo
   // slice locally to honor the widget's configured display limit.
   const { data, isLoading } = useWorkspaces({ limit: 100 });
   const displayLimit = instance.config.limit ?? 12;
-  const workspaces: WorkspaceRecord[] = ((data?.workspaces ?? []) as WorkspaceRecord[]).slice(0, displayLimit);
+  const workspaces: WorkspaceRecord[] = (data?.workspaces ?? []).slice(0, displayLimit);
 
   useWidgetContextExport(instance.id, {
     full: () => {

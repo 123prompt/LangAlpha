@@ -45,7 +45,9 @@ class CodeValidationMiddleware(AgentMiddleware):
             warning = self._check_code(code)
             if warning:
                 return ToolMessage(
-                    content=warning, tool_call_id=request.tool_call["id"]
+                    content=warning,
+                    tool_call_id=request.tool_call["id"],
+                    status="error",
                 )
         return handler(request)
 
@@ -57,6 +59,8 @@ class CodeValidationMiddleware(AgentMiddleware):
             warning = self._check_code(code)
             if warning:
                 return ToolMessage(
-                    content=warning, tool_call_id=request.tool_call["id"]
+                    content=warning,
+                    tool_call_id=request.tool_call["id"],
+                    status="error",
                 )
         return await handler(request)

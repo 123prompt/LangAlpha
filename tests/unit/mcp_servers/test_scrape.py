@@ -15,7 +15,7 @@ import asyncio
 
 import pytest
 
-from mcp_servers import scrape_mcp_server as srv
+from plugins.alternative_data import scrape_mcp_server as srv
 from mcp_servers._browser import url_block_reason
 
 

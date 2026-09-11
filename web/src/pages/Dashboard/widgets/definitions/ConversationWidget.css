@@ -175,7 +175,7 @@
 }
 
 .conversation-widget__chip:focus-visible {
-  outline: 2px solid var(--color-accent-primary);
+  outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
   border-color: var(--color-accent-overlay);
   color: var(--color-text-primary);

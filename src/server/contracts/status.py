@@ -100,20 +100,77 @@ def is_live(raw: Any) -> bool:
     return value is not None and str(value) in _LIVE
 
 
-def classify_interrupt_reason(interrupts: Any) -> str:
-    """Classify HITL interrupt payloads: user question vs plan review.
+# The credit gate's two wire spellings, declared rather than derived. Both are
+# matched outside Python — the resume query filters on them in SQL and the
+# stream reducer compares the error type in TypeScript — so neither may follow
+# a class name: a rename would silently stop the resume from finding anything
+# and the stopped task from ever reading as stopped. The frontend mirrors
+# CREDIT_STOP_ERROR_TYPE by hand in web/src/types/sse.ts, like the status
+# families above — change here first, then the mirror.
+INTERRUPT_REASON_CREDIT_PAUSE = "credit_pause"
+CREDIT_STOP_ERROR_TYPE = "credit_stop"
 
-    One authority for the ``interrupt_reason`` column spelling — the live
-    streaming path and the recovery scanner must never drift apart on it.
-    Accepts Interrupt objects or their dict form.
+# Every interrupt raised here names itself: the ones this codebase raises
+# directly carry ``type``, and the tool-approval middleware carries
+# ``name``/``args`` instead. Reading that discriminator IS the classification,
+# so the only thing spelled out below is which of the three questions the user
+# is being asked. Enumerating actions instead would rot on the next one added.
+_QUESTION_TYPE = "ask_user_question"
+
+# The ``interrupt_reason`` vocabulary, most specific first — one tuple serving
+# as both the closed value set and the precedence order, so a new reason cannot
+# be added without deciding what it outranks. ``credit_pause`` leads because it
+# is the one value with behaviour attached (the resume query selects on it), so
+# it must not lose to a proposal raised alongside it. ``_classify_one`` must
+# only ever return a member; ``.index`` below is what enforces that.
+INTERRUPT_REASONS = (
+    INTERRUPT_REASON_CREDIT_PAUSE,
+    "user_question",
+    "plan_review_required",
+    "approval_required",
+)
+
+
+def _action_requests(interrupts: Any):
+    """Every action request across every payload.
+
+    The approval middleware batches a turn's whole approval set into one
+    ``interrupt()``, so a payload's requests are siblings, not a leader and a
+    tail — reading only the first would let precedence depend on tool-call
+    order within a payload while claiming to be order-independent.
     """
     for intr in interrupts:
         value = getattr(intr, "value", None)
-        if value is None and isinstance(intr, dict):
-            value = intr.get("value")
         if isinstance(value, dict):
-            requests = value.get("action_requests", [])
-            if requests and isinstance(requests[0], dict):
-                if requests[0].get("type") == "ask_user_question":
-                    return "user_question"
-    return "plan_review_required"
+            yield from (
+                r for r in value.get("action_requests", ()) if isinstance(r, dict)
+            )
+
+
+def _classify_one(request: dict) -> Optional[str]:
+    kind = request.get("type")
+    if kind == INTERRUPT_REASON_CREDIT_PAUSE:
+        return INTERRUPT_REASON_CREDIT_PAUSE
+    if kind == _QUESTION_TYPE:
+        return "user_question"
+    if kind:
+        # A typed interrupt this function has not met. An interrupt always
+        # waits on the user, and past a question or a top-up the only shape
+        # left is "approve this", so the generalization holds where naming a
+        # specific action would be a guess.
+        return "approval_required"
+    name = request.get("name")
+    if name == "SubmitPlan":
+        return "plan_review_required"
+    return "approval_required" if name else None
+
+
+def classify_interrupt_reason(interrupts: Any) -> Optional[str]:
+    """Classify HITL interrupt payloads into the ``interrupt_reason`` column.
+
+    One authority for the spelling: the live streaming path and the recovery
+    scanner must never drift apart on it. ``None`` when no payload carries a
+    discriminator at all, which the column already stores as NULL.
+    """
+    reasons = [r for r in map(_classify_one, _action_requests(interrupts)) if r]
+    return min(reasons, key=INTERRUPT_REASONS.index, default=None)

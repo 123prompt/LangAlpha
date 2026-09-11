@@ -29,7 +29,7 @@ export const EMPTY_DRAFT: SecretDraft = {
 type DraftPatch = (patch: Partial<SecretDraft>) => void;
 
 const inputClass =
-  'w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--color-accent-primary)]';
+  'w-full px-3 py-2 text-sm rounded-md bg-transparent';
 const inputStyle: React.CSSProperties = {
   color: 'var(--color-text-primary)',
   border: '1px solid var(--color-border-muted)',

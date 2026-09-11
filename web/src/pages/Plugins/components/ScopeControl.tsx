@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { ArrowRightLeft, Check, ChevronDown, FolderOpen, Globe } from 'lucide-react';
+import { ArrowRightLeft, Check, ChevronDown, FolderOpen, Globe, Zap } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -28,6 +28,23 @@ export interface ScopeWorkspace {
   name: string;
 }
 
+/**
+ * Whether a row's checklist has to lock, from its *effective* state.
+ *
+ * A workspace can add a deny-marker for anything, but removing one goes
+ * through a re-enable that 409s whenever the account tier already subtracts
+ * the row -- by its own switch, or by the package that ships it being off.
+ * Reading only `enabled` leaves an interactive control that can make a change
+ * it cannot take back, so the two conditions live together here rather than
+ * being restated at each call site, where one of them kept being forgotten.
+ */
+export function scopeLocked(row: {
+  enabled?: boolean | null;
+  plugin_enabled?: boolean | null;
+}): boolean {
+  return !row.enabled || row.plugin_enabled === false;
+}
+
 export function ScopeControl({
   workspaces,
   scopeWorkspaceId,
@@ -37,6 +54,7 @@ export function ScopeControl({
   moveBlockedReason = null,
   moveToAllBlockedReason = null,
   busy = false,
+  flashWorkspace,
   onSetWorkspaceDisabled,
   onMove,
 }: {
@@ -57,16 +75,21 @@ export function ScopeControl({
    * offered. */
   moveToAllBlockedReason?: string | null;
   busy?: boolean;
+  /** Adds the Flash workspace to the checklist, and to nothing else. Only an
+   * MCP server with directly bound tools is reachable from Flash, so rows that
+   * cannot have any leave this unset. */
+  flashWorkspace?: ScopeWorkspace;
   onSetWorkspaceDisabled?: (workspaceId: string, disabled: boolean) => void;
   onMove?: (toWorkspaceId: string | null) => void;
 }) {
   const { t } = useTranslation();
   const isUserTier = scopeWorkspaceId === null;
+  const checklist = flashWorkspace ? [...workspaces, flashWorkspace] : workspaces;
   const scopeWorkspace = workspaces.find((w) => w.id === scopeWorkspaceId);
   const disabledSet = new Set(disabledWorkspaceIds);
   // Only disables that name a live workspace count toward the label — stale
   // rows for deleted workspaces would otherwise inflate "except N".
-  const activeDisables = workspaces.filter((w) => disabledSet.has(w.id));
+  const activeDisables = checklist.filter((w) => disabledSet.has(w.id));
 
   const label = isUserTier
     ? activeDisables.length > 0
@@ -76,7 +99,7 @@ export function ScopeControl({
   const Icon = isUserTier ? Globe : FolderOpen;
 
   const hasChecklist =
-    isUserTier && !!onSetWorkspaceDisabled && workspaces.length > 0;
+    isUserTier && !!onSetWorkspaceDisabled && checklist.length > 0;
   const moveTargets = workspaces.filter((w) => w.id !== scopeWorkspaceId);
   const hasMove =
     !!onMove &&
@@ -115,7 +138,7 @@ export function ScopeControl({
         {hasChecklist && (
           <>
             <DropdownMenuLabel>{t('plugins.scope.activeIn')}</DropdownMenuLabel>
-            {workspaces.map((ws) => {
+            {checklist.map((ws) => {
               const active = !disabledSet.has(ws.id);
               return (
                 <DropdownMenuItem
@@ -131,10 +154,21 @@ export function ScopeControl({
                     className="h-3.5 w-3.5 mr-2"
                     style={{ opacity: active ? 1 : 0 }}
                   />
+                  {ws === flashWorkspace ? (
+                    <Zap className="h-3.5 w-3.5 mr-1.5 shrink-0" />
+                  ) : null}
                   <span className="truncate">{ws.name}</span>
                 </DropdownMenuItem>
               );
             })}
+            {flashWorkspace && (
+              <DropdownMenuLabel
+                className="font-normal pt-0 max-w-[16rem] whitespace-normal"
+                style={{ color: 'var(--color-text-tertiary)' }}
+              >
+                {t('plugins.scope.flashNote')}
+              </DropdownMenuLabel>
+            )}
             <DropdownMenuLabel
               className="font-normal"
               style={{ color: 'var(--color-text-tertiary)' }}

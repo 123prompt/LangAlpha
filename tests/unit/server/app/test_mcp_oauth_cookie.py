@@ -33,11 +33,15 @@ def _set_cookies(response: Response) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_start_names_the_cookie_for_its_state(monkeypatch):
-    async def _start(user_id, name, *, return_to, web_origin):
+    async def _start(
+        user_id, name, *, return_to, web_origin, loopback_redirect, expected_url,
+        **_rest,
+    ):
         return StartedConnect(
             authorize_url="https://as.test/authorize?state=state-A",
             state="state-A",
             browser_nonce="nonce-A",
+            redirect_uri="https://api.example.com/api/v1/mcp/oauth/callback",
         )
 
     monkeypatch.setattr(mod, "start_connect", _start)
@@ -59,12 +63,25 @@ async def test_start_names_the_cookie_for_its_state(monkeypatch):
 async def test_two_concurrent_starts_do_not_share_a_cookie_name(monkeypatch):
     flows = iter(
         [
-            StartedConnect(authorize_url="u", state="state-A", browser_nonce="nonce-A"),
-            StartedConnect(authorize_url="u", state="state-B", browser_nonce="nonce-B"),
+            StartedConnect(
+                authorize_url="u",
+                state="state-A",
+                browser_nonce="nonce-A",
+                redirect_uri="https://api.example.com/api/v1/mcp/oauth/callback",
+            ),
+            StartedConnect(
+                authorize_url="u",
+                state="state-B",
+                browser_nonce="nonce-B",
+                redirect_uri="https://api.example.com/api/v1/mcp/oauth/callback",
+            ),
         ]
     )
 
-    async def _start(user_id, name, *, return_to, web_origin):
+    async def _start(
+        user_id, name, *, return_to, web_origin, loopback_redirect, expected_url,
+        **_rest,
+    ):
         return next(flows)
 
     monkeypatch.setattr(mod, "start_connect", _start)
@@ -82,9 +99,17 @@ async def test_two_concurrent_starts_do_not_share_a_cookie_name(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_loopback_start_sets_no_cookie(monkeypatch):
-    async def _start(user_id, name, *, return_to, web_origin):
+    async def _start(
+        user_id, name, *, return_to, web_origin, loopback_redirect, expected_url,
+        **_rest,
+    ):
         # Loopback callback → no nonce minted (see redirects.callback_is_loopback).
-        return StartedConnect(authorize_url="u", state="state-A", browser_nonce="")
+        return StartedConnect(
+            authorize_url="u",
+            state="state-A",
+            browser_nonce="",
+            redirect_uri="http://127.0.0.1:8788/mcp/callback",
+        )
 
     monkeypatch.setattr(mod, "start_connect", _start)
     response = Response()
@@ -135,3 +160,91 @@ async def test_callback_without_state_reads_no_cookie(monkeypatch):
     await mod.oauth_callback(request, state=None, code="code-1")
 
     assert seen["browser_nonce"] is None
+
+
+# ---------------------------------------------------------------------------
+# The desktop half of phase 1: which body key carries the shell's loopback URI,
+# and what the caller is told back about it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_body_key_that_carries_the_loopback_uri(monkeypatch):
+    """``redirect_uri`` in, ``loopback_redirect`` on: the SPA-to-service seam.
+
+    Renaming or mistyping either half leaves both suites green while every
+    desktop connect quietly degrades to the hosted callback -- which for the
+    vendors this exists for produces no error at all, because their consent
+    screen simply never redirects anywhere the shell can hear.
+
+    ``expected_url`` rides the same dict and fails the same silent way: a page
+    that names no address is let through by design, so a mistyped key turns the
+    gate off everywhere at once with nothing on either side to say so.
+    """
+    seen = {}
+
+    async def _start(
+        user_id, name, *, return_to, web_origin, loopback_redirect, expected_url,
+        **_rest,
+    ):
+        seen["loopback_redirect"] = loopback_redirect
+        seen["expected_url"] = expected_url
+        return StartedConnect(
+            authorize_url="u",
+            state="state-A",
+            browser_nonce="",
+            redirect_uri=loopback_redirect or "https://api.example.com/cb",
+        )
+
+    monkeypatch.setattr(mod, "start_connect", _start)
+
+    loopback = "http://127.0.0.1:8788/mcp/callback"
+    row_url = "https://mcp.demo.test/mcp"
+    await mod.oauth_start(
+        "srv",
+        "user-1",
+        _request(),
+        Response(),
+        {"redirect_uri": loopback, "expected_url": row_url},
+    )
+    assert seen["loopback_redirect"] == loopback
+    assert seen["expected_url"] == row_url
+
+    await mod.oauth_start("srv", "user-1", _request(), Response(), {})
+    assert seen["loopback_redirect"] is None
+    assert seen["expected_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_start_says_which_callback_it_actually_bound(monkeypatch):
+    """The shell armed a listener before this request and cannot otherwise tell.
+
+    A value that fails the loopback check degrades to the hosted callback by
+    design, and the request still answers 200. Without the echo the only symptom
+    is a listener held for five minutes on a code that was never coming.
+    """
+    hosted = "https://api.example.com/api/v1/mcp/oauth/callback"
+
+    async def _start(
+        user_id, name, *, return_to, web_origin, loopback_redirect, expected_url,
+        **_rest,
+    ):
+        return StartedConnect(
+            authorize_url="u",
+            state="state-A",
+            browser_nonce="",
+            redirect_uri=hosted,
+        )
+
+    monkeypatch.setattr(mod, "start_connect", _start)
+
+    body = await mod.oauth_start(
+        "srv",
+        "user-1",
+        _request(),
+        Response(),
+        {"redirect_uri": "http://127.0.0.1:8788/mcp/callback"},
+    )
+
+    assert body["redirect_uri"] == hosted, "the caller cannot see it was refused"
+    assert body["state"] == "state-A"

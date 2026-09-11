@@ -68,7 +68,8 @@ export function useToolCallAnnouncer(messages: unknown[]): string {
         seen.add(id);
         const toolName = (proc.toolName as string) || '';
         const toolCall = proc.toolCall as { args?: Record<string, unknown> } | undefined;
-        const baseTitle = getCompletedRowTitle(toolName, toolCall, t);
+        const artifact = (proc.toolCallResult as { artifact?: unknown } | undefined)?.artifact;
+        const baseTitle = getCompletedRowTitle(toolName, toolCall, t, artifact);
         announcementQueueRef.current.push({ label: baseTitle, failed: isFailed });
         enqueued++;
       }

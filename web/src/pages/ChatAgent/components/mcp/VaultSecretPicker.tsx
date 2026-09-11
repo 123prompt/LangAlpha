@@ -142,7 +142,7 @@ export function VaultSecretPicker({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, '').replace(/^[0-9]+/, ''))}
                 placeholder="SECRET_NAME"
-                className="w-full px-2 py-1 text-xs rounded bg-transparent outline-none font-mono"
+                className="w-full px-2 py-1 text-xs rounded bg-transparent font-mono"
                 style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
                 maxLength={64}
               />
@@ -151,7 +151,7 @@ export function VaultSecretPicker({
                 value={newValue}
                 onChange={(e) => setNewValue(e.target.value)}
                 placeholder="Secret value"
-                className="w-full px-2 py-1 text-xs rounded bg-transparent outline-none"
+                className="w-full px-2 py-1 text-xs rounded bg-transparent"
                 style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
                 maxLength={4096}
               />
@@ -197,7 +197,7 @@ export function VaultSecretPicker({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder="Literal value"
-          className="w-full px-2 py-1 text-xs rounded bg-transparent outline-none"
+          className="w-full px-2 py-1 text-xs rounded bg-transparent"
           style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
         />
       )}

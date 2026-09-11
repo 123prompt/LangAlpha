@@ -201,7 +201,7 @@ async def cancel_workflow(thread_id: str, run_id: Optional[str] = None) -> dict:
         return _cancel_outcome(
             cancelled=True,
             thread_id=thread_id,
-            message="Cancellation signal sent. Workflow will stop shortly.",
+            message="Cancellation signal sent. The turn will stop shortly.",
         )
 
     except Exception as e:
@@ -211,7 +211,7 @@ async def cancel_workflow(thread_id: str, run_id: Optional[str] = None) -> dict:
         # credential fragments, and this reply crosses to an authenticated
         # caller (src/server/AGENTS.md: sanitize before the wire).
         raise HTTPException(
-            status_code=500, detail="Failed to cancel workflow."
+            status_code=500, detail="Failed to cancel the turn."
         ) from e
 
 

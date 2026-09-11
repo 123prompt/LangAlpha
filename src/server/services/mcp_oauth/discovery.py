@@ -28,6 +28,7 @@ from src.server.database.mcp_tool_schemas import (
     upsert_user_tool_schemas,
 )
 from src.server.database.pool import get_db_connection
+from src.server.services.mcp_identity import bounded_identity
 from src.server.services.mcp_oauth.lifecycle import (
     TokenUnavailable,
     ensure_fresh_access_token,
@@ -89,6 +90,7 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
         mcp_discovery_fingerprint,
         sanitize_discovered_tools,
     )
+    from ptc_agent.core.mcp_schema import client_identity
     from src.server.services.mcp_oauth.http import pinned_discovery_client
     from src.server.utils.egress_guard import pin_public_url
 
@@ -173,6 +175,11 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
                 transport = streamable_http_client(url, http_client=http_client)
                 async with Client(transport) as client:
                     result = await client.list_tools(cache_mode="refresh")
+                    # The handshake already asked who this is; read it here
+                    # rather than reconnect later for a field the connection
+                    # is holding. Never raises, so it cannot demote a good
+                    # discovery to an error row.
+                    identity = client_identity(client)
     except Exception as e:
         logger.warning(
             "[mcp_oauth] discovery failed for %s: %s", server_name, e
@@ -203,7 +210,10 @@ async def refresh_user_tool_schemas(user_id: str, server_name: str) -> dict:
         tools=kept,
         status="ok",
         schema_digest=digest,
-        observed_meta={"skipped": [list(s) for s in skipped]},
+        observed_meta={
+            "skipped": [list(s) for s in skipped],
+            "server_info": bounded_identity(identity),
+        },
     )
     if prior is None or prior.get("schema_digest") != digest:
         # Tool surface changed → sessions must regenerate wrappers.

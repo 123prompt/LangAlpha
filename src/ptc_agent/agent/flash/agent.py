@@ -13,6 +13,7 @@ from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 
 from ptc_agent.agent.middleware import (
+    CreditGateMiddleware,
     EmptyToolCallRetryMiddleware,
     ToolArgumentParsingMiddleware,
     ToolErrorHandlingMiddleware,
@@ -22,23 +23,31 @@ from ptc_agent.agent.middleware import (
     SkillsMiddleware,
     AskUserMiddleware,
     LeakDetectionMiddleware,
-    MultimodalMiddleware,
+    MultimodalStripMiddleware,
     ProvenanceMiddleware,
     ReasoningCompatibilityMiddleware,
 )
-from ptc_agent.agent.middleware.openai_prompt_caching import OpenAIPromptCachingMiddleware
+from ptc_agent.agent.middleware.openai_prompt_caching import (
+    OpenAIPromptCachingMiddleware,
+)
+from ptc_agent.agent.middleware.direct_mcp import (
+    DirectMcpPolicyMiddleware,
+    DirectToolSet,
+    direct_tool_summary,
+)
 from ptc_agent.agent.middleware.skills.registry import (
     build_effective_skill_registry,
 )
 from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
 from ptc_agent.agent.state import DeltaAgentState
-from ptc_agent.agent.prompts import format_current_time, get_loader
+from ptc_agent.agent.prompts import (
+    format_current_time,
+    get_loader,
+    guidance_template_vars,
+)
 from ptc_agent.config import AgentConfig
 
-from ptc_agent.agent.middleware.model_resilience import (
-    ModelResilienceMiddleware,
-    build_fallback_pairs,
-)
+from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
 
 # External tools only (no sandbox, no MCP)
 from src.tools.web.search import get_web_search_tool
@@ -156,21 +165,20 @@ class FlashAgent:
         return tools
 
     def _build_system_prompt(
-        self,
-        tools: list[Any],
+        self, tools: list[Any], guidance: str, direct_tool_summary: str = ""
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
-        Args:
-            tools: List of available tools
-
-        Returns:
-            Rendered system prompt string
+        ``guidance`` is resolved for the flash model, not the main one: a
+        deployment running Haiku on Flash and Opus on PTC sizes each prompt for
+        the model that renders it.
         """
         loader = get_loader()
         return loader.render(
             "flash_system.md.j2",
             tools=tools,
+            direct_tool_summary=direct_tool_summary,
+            **guidance_template_vars(guidance),
         )
 
     def create_agent(
@@ -180,10 +188,16 @@ class FlashAgent:
         user_profile: dict | None = None,
         store: Any | None = None,
         response_format: Any | None = None,
+        direct_mcp: DirectToolSet | None = None,
     ) -> Any:
         """Create a Flash agent with minimal middleware stack.
 
-        Note: No MCP registry, no sandbox - MCP tools require sandbox.
+        No MCP registry and no sandbox. ``direct_mcp`` is the one MCP surface
+        Flash has: tools bound to the model as JSON tools through the relay,
+        checked per call against the connection's current status and consent.
+        That check refuses; it does not ask. The per-call confirmation a live
+        order wants is what ``order_approval`` is reserved for, and it is not
+        built yet, so nothing here stops an order to put it to the user.
 
         Args:
             checkpointer: Optional LangGraph checkpointer for state persistence
@@ -195,7 +209,7 @@ class FlashAgent:
         Returns:
             Configured LangGraph agent
         """
-        model = llm if llm is not None else self.llm
+        turn = turn_model(self.config, llm, self.llm, flash=True)
 
         # Freeze current time for this request (refreshes on each new query)
         request_time = datetime.now(tz=UTC)
@@ -204,9 +218,12 @@ class FlashAgent:
 
         # Build tools
         tools = self._build_tools()
+        direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
 
         # Build system prompt (time + profile injected by RuntimeContextMiddleware)
-        system_prompt = self._build_system_prompt(tools)
+        system_prompt = self._build_system_prompt(
+            tools, turn.guidance, direct_tool_summary=direct_tool_summary(direct_tools)
+        )
 
         # Leak detector wired into provenance so web/market/SEC snippets are
         # scrubbed before they're emitted/persisted, mirroring the main agent.
@@ -220,6 +237,8 @@ class FlashAgent:
 
         # Minimal shared middleware stack
         shared_middleware: list[Any] = [
+            # Inert unless the server installed a gate state for this run.
+            CreditGateMiddleware(),
             ToolArgumentParsingMiddleware(),
             ToolErrorHandlingMiddleware(),
             leak_detection,
@@ -268,6 +287,12 @@ class FlashAgent:
 
         main_middleware.append(SteeringMiddleware())
 
+        # Consent is re-read per call here, so a tool the connection no longer
+        # covers is refused rather than reaching the vendor.
+        if direct_tools:
+            main_middleware.append(DirectMcpPolicyMiddleware(direct_mcp))
+            tools.extend(direct_tools)
+
         # AskUserQuestion middleware (needed for onboarding and preference updates)
         ask_user_middleware = AskUserMiddleware()
         main_middleware.append(ask_user_middleware)
@@ -282,7 +307,9 @@ class FlashAgent:
             client = resolve_compaction_client(self.config)
             if client is not None:
                 compaction_config["_llm_client"] = client
-        compaction = CompactionMiddleware.from_config(config=compaction_config, backend=None)
+        compaction = CompactionMiddleware.from_config(
+            config=compaction_config, backend=None
+        )
         if compaction is not None:
             main_middleware.append(compaction)
             logger.info(
@@ -291,35 +318,26 @@ class FlashAgent:
             )
 
         # Model resilience middleware (retry + fallback + progress events)
-        fallbacks = build_fallback_pairs(self.config)
-        main_middleware.append(
-            ModelResilienceMiddleware(
-                primary_name=self.config.llm.flash or self.config.llm.name,
-                primary_client=self.llm,
-                fallbacks=fallbacks,
-                max_retries=3,
-                backoff_factor=2.0,
-                initial_delay=1.0,
-                max_delay=60.0,
-                jitter=True,
-            )
-        )
+        model_resilience = build_model_resilience_middleware(self.config, turn)
+        main_middleware.append(model_resilience)
         logger.info(
             "Flash model resilience enabled",
             max_retries=3,
-            fallback_models=[name for name, _ in fallbacks],
+            fallback_models=[name for name, _ in model_resilience.fallbacks],
         )
 
-        # Only the read-side strip is live here: Flash exposes no filesystem
-        # tool at all, so the injection half has nothing to intercept. Without
-        # it, a mid-thread switch to a text-only model replays an earlier turn's
+        # Only the strip half is wired here: Flash exposes no filesystem tool at
+        # all, so the injection half has nothing to intercept. Without the strip,
+        # a mid-thread switch to a text-only model replays an earlier turn's
         # image/PDF blocks and strict providers reject the request outright.
         # Inside model resilience so it strips against the post-fallback model.
+        # ``can_extract=False`` for the same reason: there is no workspace to
+        # tell it to pull the file apart in.
         main_middleware.append(
-            MultimodalMiddleware(
-                sandbox=None,
-                model_name=self.config.llm.flash or self.config.llm.name,
+            MultimodalStripMiddleware(
+                model_name=self.config.llm.flash_name,
                 custom_modalities=self.config.input_modalities,
+                can_extract=False,
             )
         )
 
@@ -372,7 +390,7 @@ class FlashAgent:
             create_kwargs["response_format"] = response_format
 
         agent = create_agent(
-            model,
+            turn.client,
             **create_kwargs,
         ).with_config({"recursion_limit": 500})
 

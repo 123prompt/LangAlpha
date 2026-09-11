@@ -22,7 +22,10 @@ import type { BulkSelection } from './useBulkSelection';
 // House curve, matching the sources deck's 260ms fold (SourcesPanel.css).
 const EASE_OUT = [0.16, 1, 0.3, 1] as const;
 
-const STORE_KEY = 'plugins.deckExpanded';
+// Colon, not a dot: `plugins.` is a locale namespace, and the i18n parity
+// sweep reads every bare `plugins.<x>` literal in the tree as a key that must
+// resolve in both catalogs. Matches `page:plugins` next door either way.
+export const STORE_KEY = 'plugins:deckExpanded';
 
 function readStore(): Record<string, boolean> {
   try {

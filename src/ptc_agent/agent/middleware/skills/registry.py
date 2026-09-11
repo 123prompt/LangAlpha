@@ -33,7 +33,11 @@ class SkillDefinition:
             for per-thread factory tools that can't be instantiated at import
             time (e.g. RunWorkflow). The tool object is registered by the agent
             factory; the skill only controls its visibility.
-        skill_md_path: Optional path to SKILL.md with detailed instructions
+        skill_md_path: Where the agent reaches SKILL.md, not where the repo
+            keeps it. A sandbox-relative suffix, matched against the reads
+            the agent makes under ``.agents/skills/``, which the sync
+            flattens every source into. A shipped skill's files live in the
+            bundle that declares it; that path never appears here.
         exposure: Which agent mode(s) can use this skill ("ptc", "flash", or "both")
         system_gate: Deployment kill switch for skills owned by a config section
             rather than the feature catalog — False drops the skill everywhere.
@@ -143,9 +147,10 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
     "chart-annotation": SkillDefinition(
         name="chart-annotation",
         # Keep this text in sync with the `description:` in
-        # skills/chart-annotation/SKILL.md frontmatter — both are live (this one
-        # drives PTC discovery; the frontmatter drives the sandbox/Flash skill
-        # manifest), so they must not drift.
+        # plugins/langalpha_deliverables/skills/chart-annotation/SKILL.md
+        # frontmatter — both are live (this one drives PTC discovery; the
+        # frontmatter drives the sandbox/Flash skill manifest), so they must
+        # not drift.
         description=(
             "Draw price lines, trendlines, zones, and event markers directly on a "
             "stock's price chart — reach for it whenever you'd otherwise describe a "
@@ -163,7 +168,8 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
     ),
     "market-watch": SkillDefinition(
         name="market-watch",
-        # Keep in sync with the `description:` in skills/market-watch/SKILL.md
+        # Keep in sync with the `description:` in
+        # plugins/langalpha_research/skills/market-watch/SKILL.md
         # frontmatter (this drives PTC discovery; the frontmatter drives the
         # sandbox skill manifest).
         description=(
@@ -200,7 +206,8 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
     ),
     "run-workflow": SkillDefinition(
         name="run-workflow",
-        # Keep in sync with the `description:` in skills/run-workflow/SKILL.md
+        # Keep in sync with the `description:` in
+        # plugins/langalpha_service/skills/run-workflow/SKILL.md
         # frontmatter (locked by a unit test). RunWorkflow itself is a per-thread
         # factory tool registered in agent.py, so it's gated by name here.
         description=(
@@ -396,7 +403,7 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
     ),
     "html-report": SkillDefinition(
         name="html-report",
-        description="Self-contained styled HTML reports written to results/: PDF-exportable research documents with inline data, charts, and theme-aware CSS",
+        description="Self-contained styled HTML reports written to the task directory: PDF-exportable research documents with inline data, charts, and theme-aware CSS",
         tools=[],
         skill_md_path="skills/html-report/SKILL.md",
         exposure="ptc",

@@ -89,6 +89,12 @@ export interface PluginInfo {
   source_type: string;
   source_ref: string | null;
   enabled: boolean;
+  /** Where a bundle's vendor art is proxied from. Null means the mark is a
+   *  file the frontend already ships, not that there is none. */
+  icon_url?: string | null;
+  repository?: string | null;
+  license?: string | null;
+  keywords?: string[];
   installed_at: string | null;
   updated_at: string | null;
   components: PluginComponentRef[];

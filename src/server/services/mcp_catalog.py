@@ -14,11 +14,50 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from fastapi import HTTPException
+
 from src.server.database.mcp_servers import (
     get_catalog_server,
     set_catalog_server_enabled,
     update_catalog_server,
 )
+from src.server.services.brokerages import brokerage_names
+from src.server.services.mcp_config import builtin_names
+
+
+def reject_reserved_brokerage_name(name: str) -> None:
+    """A shipped brokerage's name, which nothing else may take at either tier.
+
+    Separate from the catalog check below because the two tiers are harmed
+    differently by the same collision and both are real. A catalog row under this
+    name is joined to the shipped definition and shown wearing it, so it is
+    presented as a broker it is not. A workspace row under it shadows the
+    inherited catalog row unconditionally, so the agent's trade-shaped tools come
+    from wherever the local row points while the Plugins page still reports the
+    real one connected.
+    """
+    if name in brokerage_names():
+        raise HTTPException(
+            status_code=409,
+            detail=f"{name!r} is reserved for a brokerage connector this build ships",
+        )
+
+
+def reject_reserved_catalog_name(name: str) -> None:
+    """Names a hand-written catalog row may not claim, and why each is spoken for.
+
+    Both are joined by name somewhere the user reads as an identity, so a row
+    that takes one is presented as something it is not. It lives here because
+    the reservation is a property of the catalog, not of the door: create,
+    import and promote all mint a row, and a name only counts as reserved if
+    every one of them says so.
+    """
+    if name in builtin_names():
+        raise HTTPException(
+            status_code=409,
+            detail=f"{name!r} collides with a built-in server name",
+        )
+    reject_reserved_brokerage_name(name)
 
 
 def detach_warning(plugin_name: str) -> str:

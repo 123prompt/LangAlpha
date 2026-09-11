@@ -78,7 +78,7 @@ export function PluginBindingsStep({
               value={values[name] ?? ''}
               onChange={(e) => setValues({ ...values, [name]: e.target.value })}
               placeholder={t('plugins.install.bindingPlaceholder')}
-              className="text-xs px-2 py-1.5 rounded-md outline-none"
+              className="text-xs px-2 py-1.5 rounded-md"
               style={{
                 color: 'var(--color-text-primary)',
                 backgroundColor: 'var(--color-bg-input)',

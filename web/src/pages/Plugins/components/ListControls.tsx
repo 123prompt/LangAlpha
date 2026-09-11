@@ -106,7 +106,7 @@ export function ListControls({
           placeholder={t('plugins.filter.placeholder')}
           aria-label={t('plugins.filter.placeholder')}
           spellCheck={false}
-          className="text-sm pl-9 pr-8 py-2 rounded-md w-full outline-none"
+          className="text-sm pl-9 pr-8 py-2 rounded-md w-full"
           style={{
             color: 'var(--color-text-primary)',
             backgroundColor: 'var(--color-bg-input)',

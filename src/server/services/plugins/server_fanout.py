@@ -27,7 +27,7 @@ from src.server.models.mcp_server import (
     isolation_warnings,
 )
 from src.server.models.plugin import ComponentResult, InstallReport
-from src.server.services.mcp_config import builtin_names
+from src.server.services.mcp_config import reserved_catalog_names
 from src.server.services.mcp_import import ImportScope, run_mcp_import
 from src.server.services.plugins.mcp import McpEntryPlan
 
@@ -134,7 +134,7 @@ async def fan_out_servers(
     mcp_report = await run_mcp_import(
         parsed,
         scope=ImportScope(
-            reserved_names=builtin_names(),
+            reserved_names=reserved_catalog_names(),
             existing_names=existing_names,
             current_count=len(existing_names),
             cap=MAX_CATALOG_SERVERS_PER_USER,

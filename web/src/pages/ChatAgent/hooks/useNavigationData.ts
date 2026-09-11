@@ -12,7 +12,7 @@ import {
   type ThreadRecord,
   type ThreadsData,
 } from '@/lib/navThreadsStore';
-import type { ResourceTier } from '@/types/api';
+import type { ResourceTier, WorkspacesResponse } from '@/types/api';
 import { getWorkspaces, getWorkspaceThreads, reorderWorkspaces, updateThread } from '../utils/api';
 import { pinWorkspaceRow, renameWorkspaceRow } from './workspaceRowActions';
 import { useNavPrefs } from '../utils/navPrefs';
@@ -36,11 +36,6 @@ export interface NavWorkspace {
 // Re-exported so nav-tree consumers keep importing the hook's row types from
 // the hook rather than reaching into the store module.
 export type { ThreadRecord, ThreadsData } from '@/lib/navThreadsStore';
-
-interface WorkspacesResponse {
-  workspaces: NavWorkspace[];
-  total: number;
-}
 
 interface ThreadsResponse {
   threads: ThreadRecord[];
@@ -246,10 +241,10 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   // Memoized so the `|| []` fallback doesn't hand every dependent memo/callback
   // a fresh array identity on each render.
   const allFetched = useMemo<NavWorkspace[]>(
-    () => (wsData as WorkspacesResponse | undefined)?.workspaces || [],
+    () => wsData?.workspaces || [],
     [wsData],
   );
-  const totalCount = (wsData as WorkspacesResponse | undefined)?.total || 0;
+  const totalCount = wsData?.total || 0;
 
   // Loaded thread lists, read from the session-global shared store so every
   // cached panel sees the same data (see lib/navThreadsStore). Writes go
@@ -275,10 +270,8 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     if (wsFetchRef.current.inflight || wsFetchRef.current.failed) return;
     wsFetchRef.current.inflight = true;
     getWorkspaces(100, allFetched.length, orderBy, true)
-      .then((data: unknown) => {
-        const page = data as WorkspacesResponse;
-        queryClient.setQueryData(queryKeys.workspaces.list({ ...NAV_WS_PARAMS, sortBy: orderBy, offset: 0 }), (old: unknown) => {
-          const oldData = old as WorkspacesResponse | undefined;
+      .then((page) => {
+        queryClient.setQueryData<WorkspacesResponse>(queryKeys.workspaces.list({ ...NAV_WS_PARAMS, sortBy: orderBy, offset: 0 }), (oldData) => {
           if (!oldData) return page;
           const existingIds = new Set(oldData.workspaces.map(w => w.workspace_id));
           const unique = (page.workspaces || []).filter(w => !existingIds.has(w.workspace_id));

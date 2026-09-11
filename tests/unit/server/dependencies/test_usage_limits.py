@@ -244,7 +244,7 @@ async def test_call_validate_for_user_uses_x_service_token_header():
     with (
         patch(f"{MODULE}.HOST_MODE", "platform"),
         patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
-        patch(f"{MODULE}._get_http_client", return_value=mock_client),
+        patch(f"{MODULE}.get_http_client", return_value=mock_client),
         patch("os.getenv", return_value="my-secret-token"),
     ):
         from src.server.dependencies.usage_limits import _call_validate_for_user
@@ -274,7 +274,7 @@ async def test_call_validate_for_user_no_token_omits_service_header():
     with (
         patch(f"{MODULE}.HOST_MODE", "platform"),
         patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
-        patch(f"{MODULE}._get_http_client", return_value=mock_client),
+        patch(f"{MODULE}.get_http_client", return_value=mock_client),
         patch("os.getenv", return_value=""),
     ):
         from src.server.dependencies.usage_limits import _call_validate_for_user
@@ -310,7 +310,7 @@ async def test_call_validate_for_user_sends_check_quota_in_body():
     with (
         patch(f"{MODULE}.HOST_MODE", "platform"),
         patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"),
-        patch(f"{MODULE}._get_http_client", return_value=mock_client),
+        patch(f"{MODULE}.get_http_client", return_value=mock_client),
         patch("os.getenv", return_value="token"),
     ):
         from src.server.dependencies.usage_limits import _call_validate_for_user
@@ -350,7 +350,7 @@ def _unreachable_service(mock_client):
     stack = ExitStack()
     stack.enter_context(patch(f"{MODULE}.HOST_MODE", "platform"))
     stack.enter_context(patch(f"{MODULE}.AUTH_SERVICE_URL", "http://localhost:8003"))
-    stack.enter_context(patch(f"{MODULE}._get_http_client", return_value=mock_client))
+    stack.enter_context(patch(f"{MODULE}.get_http_client", return_value=mock_client))
     stack.enter_context(patch(f"{MODULE}._VALIDATE_RETRY_BACKOFF", 0))
     stack.enter_context(patch("os.getenv", return_value="token"))
     return stack
@@ -551,7 +551,7 @@ class TestCreditGateFailsClosed:
         mock_client = AsyncMock()
         mock_client.post = AsyncMock(side_effect=httpx.ConnectError("refused"))
 
-        with patch(f"{MODULE}.HOST_MODE", "oss"), patch(f"{MODULE}._get_http_client", return_value=mock_client):
+        with patch(f"{MODULE}.HOST_MODE", "oss"), patch(f"{MODULE}.get_http_client", return_value=mock_client):
             from src.server.dependencies.usage_limits import enforce_credit_limit
 
             await enforce_credit_limit("user-1", byok=False)
@@ -779,9 +779,9 @@ class TestGetCapacityStatus:
     async def test_unlimited_with_omitted_used(self):
         """Platform omits capacity_used on unlimited tiers — still report limit -1.
 
-        Regression: ginlix-platform's capacity counter returns
-        ``QuotaInfo(allowed=True, capacity_limit=-1)`` with no ``capacity_used`` for
-        unlimited plans, so requiring ``used`` would hide the "Unlimited" hint.
+        Regression: an unlimited tier answers with ``capacity_limit=-1`` and no
+        ``capacity_used`` at all, so requiring ``used`` would hide the
+        "Unlimited" hint.
         """
         quota_response = {"quota": {"allowed": True, "capacity_limit": -1}}
         with (

@@ -177,16 +177,20 @@ function LoginPage() {
       'Sign up failed',
       (result) => {
         const { data } = result;
-        if (data?.user && !data.session) {
-          if (data.user.identities?.length === 0) {
-            setError({ message: t('auth.signupEmailExists'), code: 'user_already_exists' });
-          } else {
-            // Confirmation email sent — make the pending state unmistakable.
-            setSentKind('signup');
-            setSentEmail(signupEmail);
-            goToView('check-inbox');
-          }
+        // Total on purpose: an error-free response means GoTrue accepted the
+        // signup and the confirmation mail is already sent, so check-inbox is
+        // the truthful screen unless we positively know otherwise. Requiring
+        // `data.user` to be present instead left the form sitting there saying
+        // nothing when auth-js 2.106.1 answered a confirmation-required signup
+        // with `user: null`, and a silent success reads as a broken button.
+        if (data?.session) return; // already signed in; the auth listener routes
+        if (data?.user?.identities?.length === 0) {
+          setError({ message: t('auth.signupEmailExists'), code: 'user_already_exists' });
+          return;
         }
+        setSentKind('signup');
+        setSentEmail(signupEmail);
+        goToView('check-inbox');
       },
     );
   };

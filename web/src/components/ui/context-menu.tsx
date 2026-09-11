@@ -41,7 +41,7 @@ const ContextMenuItem = React.forwardRef<
   <ContextMenuPrimitive.Item
     ref={ref}
     className={cn(
-      "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-3 py-2 text-sm outline-none transition-colors",
+      "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-3 py-2 text-sm transition-colors",
       "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
       itemVariants[variant],
       className

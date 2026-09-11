@@ -336,17 +336,26 @@ def find_model_pricing(model_name: str, provider: Optional[str] = None) -> Optio
 PRICE_TIER_BANDS = [(8.0, 5), (4.0, 4), (1.5, 3), (0.5, 2), (0.0, 1)]
 
 
-def _representative_rate(pricing: Dict[str, Any], flat_key: str, tier_key: str) -> Optional[float]:
+def _representative_rate(
+    pricing: Dict[str, Any],
+    flat_key: str,
+    tier_key: str,
+    tier_field: str = 'rate',
+) -> Optional[float]:
     """A single $/1M rate for tiering: the flat rate, else the base (first) tier.
 
     Base tier is deliberate: it's the standard-context rate nearly all requests
     pay; long-context surcharge tiers are excluded from the headline cost dot.
+
+    ``tier_field`` names the rate to read inside a tier, because a tiered card
+    carries its cache rates as siblings of ``rate`` rather than as tiers of
+    their own.
     """
     if pricing.get(flat_key) is not None:
         return pricing[flat_key]
     tiers = pricing.get(tier_key)
     if tiers:
-        return tiers[0].get('rate')
+        return tiers[0].get(tier_field)
     return None
 
 
@@ -369,6 +378,100 @@ def get_price_tier(model_name: str, provider: Optional[str] = None) -> Optional[
         if blended >= lo:
             return tier
     return 1
+
+
+# The token mix a typical platform-billed call bills at, measured over 30 days
+# of production traffic. Two of them, because the split is a property of the
+# provider's cache architecture rather than of the model: an implicit-cache
+# provider is never charged for a cache write, so those tokens are absent from
+# its bill entirely, while explicit breakpoints put roughly a quarter of every
+# prompt on a rate twelve times the read rate. Weights are
+# (fresh input, cache read, cache write, output).
+_MIX_IMPLICIT_CACHE = (0.17, 0.81, 0.00, 0.02)
+_MIX_EXPLICIT_CACHE = (0.00, 0.73, 0.23, 0.04)
+
+# Providers whose caching is keyed at explicit breakpoints, so a cache write is
+# a real line on the bill. Mirrors ``provider_cache.breakpoint_marker``, which
+# keys Anthropic reads that way unconditionally; OpenAI's opt-in models run in
+# implicit mode and are billed no differently from the rest.
+_EXPLICIT_CACHE_PROVIDERS = frozenset({"anthropic", "claude-oauth"})
+
+# What one call bills at, per 1M tokens, on the model carrying most of our
+# traffic. A constant rather than a live lookup on that model: a vendor price
+# cut should carry every chunk down with it, and a ratio taken against a moving
+# baseline would cancel out exactly the change a chunk needs to follow.
+_BASELINE_BLENDED_RATE = 0.34
+
+
+def blended_rate(
+    model_name: str,
+    billing_type: str = "platform",
+    at: Optional[datetime] = None,
+) -> Optional[float]:
+    """What a typical call on this model bills at, in $/1M tokens.
+
+    Weights the card's four rates by the measured production token mix, which
+    answers a different question from the headline input rate: traffic here runs
+    about 80% cache reads at a tenth of the input rate, so input alone overstates
+    a cheap model and understates one whose output rate is 6x its input.
+
+    Resolves a scheduled card (peak/off-peak) against ``at``, defaulting to now,
+    because a model on hourly pricing genuinely costs twice as much some hours.
+    """
+    provider, pricing_id = resolve_pricing_identity(model_name, billing_type)
+    pricing = find_model_pricing(pricing_id, provider)
+    if not pricing:
+        return None
+    if has_schedule(pricing):
+        pricing = resolve_schedule(pricing, at or datetime.now(timezone.utc))[0]
+    r_in = _representative_rate(pricing, 'input', 'input_tiers')
+    r_out = _representative_rate(pricing, 'output', 'output_tiers')
+    if r_in is None or r_out is None:
+        return None
+    # A card publishing no read discount charges reads as input, and one
+    # publishing no write rate bills a write as ordinary input. Both fall back
+    # to the higher figure, which sizes a budget generously rather than short.
+    r_read = _representative_rate(pricing, 'cached_input', 'input_tiers', 'cached_input')
+    r_write = _representative_rate(pricing, 'cache_5m', 'input_tiers', 'cache_5m')
+    if r_write is None:
+        # Falls through on absence, not on zero: a card that publishes a free
+        # cache write means it, and ``or`` would bill it at the input rate.
+        r_write = _representative_rate(pricing, 'cache_1h', 'input_tiers', 'cache_1h')
+    rates = (
+        r_in,
+        r_in if r_read is None else r_read,
+        r_in if r_write is None else r_write,
+        r_out,
+    )
+    mix = (
+        _MIX_EXPLICIT_CACHE
+        if provider in _EXPLICIT_CACHE_PROVIDERS
+        else _MIX_IMPLICIT_CACHE
+    )
+    return sum(rate * weight for rate, weight in zip(rates, mix))
+
+
+def chunk_multiplier(
+    model_name: str,
+    billing_type: str = "platform",
+    at: Optional[datetime] = None,
+) -> Optional[float]:
+    """How much one call on this model costs against the baseline model.
+
+    Sizes the credit lease: a run reserves this many times the baseline chunk
+    before it has to re-check, so a pricier model gets headroom matching what a
+    single model boundary actually spends. Snapped to a coarse ladder so a cent
+    of manifest drift cannot restate every reservation, and to the nearest step
+    rather than up, because the figure doubles as a plain statement of relative
+    cost and only reads honestly as one if it rounds both ways. None when the
+    model has no rates, which leaves the caller on its own default.
+    """
+    rate = blended_rate(model_name, billing_type, at)
+    if rate is None or rate <= 0:
+        return None
+    raw = rate / _BASELINE_BLENDED_RATE
+    return round(raw, 1) if raw < 1 else round(raw * 2) / 2
+
 
 
 def calculate_tiered_cost(tokens: int, tiers: List[Dict[str, Any]]) -> float:

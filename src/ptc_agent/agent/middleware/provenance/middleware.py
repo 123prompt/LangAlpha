@@ -30,6 +30,7 @@ from ptc_agent.agent.middleware.provenance.body_store import (
     schedule_body_write,
     store_bodies,
 )
+from ptc_agent.agent.middleware.direct_mcp import direct_tool_meta
 from ptc_agent.agent.provenance import (
     SNIPPET_MAX_CHARS,
     ProvenanceSource,
@@ -320,7 +321,14 @@ class ProvenanceMiddleware(AgentMiddleware):
             tool_name = tool_call.get("name")
             extractor = self._extractors.get(tool_name)
             if extractor is None:
-                return result
+                # A directly bound MCP tool is named per (server, tool) pair, so
+                # it can never be a key here. It carries its identity on the tool
+                # instead, which is also the only recoverable copy once the name
+                # has had to fall back to a digest.
+                if direct_tool_meta(getattr(request, "tool", None)):
+                    extractor = self._extract_direct_mcp
+                else:
+                    return result
 
             # Don't attest a source the tool never actually returned. The
             # MCP-trace tools (ExecuteCode/Bash) are exempt: the code/command may
@@ -689,6 +697,39 @@ class ProvenanceMiddleware(AgentMiddleware):
             result_sha256=sha256,
             result_size=size,
             result_snippet=snippet,
+        )
+
+    def _extract_direct_mcp(
+        self, request: Any, result: Any
+    ) -> Iterator[ProvenanceSource]:
+        """One mcp_tool source for a tool the model called directly.
+
+        The same record the sandbox path yields per ``mcp_trace`` entry, so a
+        server reads identically in the Sources panel whichever path carried it.
+        The identity comes off the tool's stamp rather than the tool name, which
+        is lossy by design once it has had to fall back to a digest.
+        """
+        stamp = direct_tool_meta(getattr(request, "tool", None)) or {}
+        server = str(stamp.get("server") or "")[:256]
+        tool = str(stamp.get("tool") or "")[:256]
+        if not server or not tool:
+            return
+        content = getattr(result, "content", result)
+        sha256, size, snippet, body = fingerprint_result_with_body(content)
+        args = request.tool_call.get("args")
+        yield ProvenanceSource(
+            record_id=_new_id(),
+            source_type="mcp_tool",
+            identifier=f"{server}:{tool}",
+            timestamp=_now_iso(),
+            provider=f"mcp:{server}",
+            tool_call_id=request.tool_call.get("id"),
+            args_fingerprint=hash_args(args),
+            args=redact_args(args),
+            result_sha256=sha256,
+            result_size=size,
+            result_snippet=snippet,
+            result_body=body,
         )
 
     def _extract_execute_code(

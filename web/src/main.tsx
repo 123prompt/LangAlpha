@@ -7,6 +7,12 @@ import { AuthProvider } from './contexts/AuthContext'
 import App from './App'
 import './i18n'
 import './index.css'
+// Side-effect import: the modality listeners have to be running before the
+// first click, not from whichever overlay happens to load first.
+import './lib/inputModality'
+// Side-effect import: animations created in a hidden tab must be instant from
+// the first render, so the flag has to be set before anything mounts.
+import './lib/hiddenTabMotion'
 import { Toaster } from './components/ui/toaster'
 import { StaleBuildBoundary } from './components/StaleBuildBoundary'
 

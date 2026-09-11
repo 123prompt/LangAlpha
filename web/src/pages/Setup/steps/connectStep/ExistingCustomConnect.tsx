@@ -12,6 +12,8 @@ import { api } from '@/api/client';
 import { useTranslation } from 'react-i18next';
 import { useCallback } from 'react';
 import { useModalityState, type LocationState } from './shared';
+import { modelPrefs } from '@/lib/modelPreferences';
+import type { CustomModelEntry } from '@/components/model/types';
 
 export function ExistingCustomConnect({ state }: { state: LocationState }) {
   const navigate = useNavigate();
@@ -86,21 +88,20 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
     setError(null);
 
     try {
-      const prefs = (preferences ?? {}) as Record<string, unknown>;
-      const otherPref = (prefs.other_preference ?? {}) as Record<string, unknown>;
-      const existingModels = (Array.isArray(otherPref.custom_models) ? otherPref.custom_models : []) as Array<Record<string, unknown>>;
+      const modelPref = modelPrefs(preferences);
+      const existingModels = modelPref.custom_models ?? [];
 
-      const newModels: Array<Record<string, unknown>> = [];
+      const newModels: CustomModelEntry[] = [];
 
       if (hasSelected) {
         for (const id of selectedModelIds) {
-          const entry: Record<string, unknown> = { name: id, model_id: id, provider };
+          const entry: CustomModelEntry = { name: id, model_id: id, provider };
           const mods = buildModalitiesArray(modelModalities.get(id) ?? new Set());
           if (mods) entry.input_modalities = mods;
           newModels.push(entry);
         }
       } else {
-        const entry: Record<string, unknown> = {
+        const entry: CustomModelEntry = {
           name: customModelName.trim(),
           model_id: customModelId.trim() || customModelName.trim(),
           provider,
@@ -111,11 +112,11 @@ export function ExistingCustomConnect({ state }: { state: LocationState }) {
       }
 
       // Deduplicate: replace existing entries with same name, append truly new ones
-      const newNames = new Set(newModels.map((m) => m.name as string));
-      const deduped = existingModels.filter((m) => !newNames.has(m.name as string));
+      const newNames = new Set(newModels.map((m) => m.name));
+      const deduped = existingModels.filter((m) => !newNames.has(m.name));
 
       await updatePreferences.mutateAsync({
-        other_preference: {
+        model_preference: {
           custom_models: [...deduped, ...newModels],
         },
       });

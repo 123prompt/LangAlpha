@@ -21,7 +21,7 @@ export function SettingsDoneButton({ onClick, label }: Props) {
         style={{
           backgroundColor: 'var(--color-btn-primary-bg)',
           color: 'var(--color-btn-primary-text)',
-          outlineColor: 'var(--color-accent-primary)',
+          outlineColor: 'var(--color-focus-ring)',
         }}
       >
         {label ?? t('dashboard.widgets.settings.doneButton')}

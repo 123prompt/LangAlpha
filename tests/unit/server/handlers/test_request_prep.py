@@ -3,7 +3,7 @@ Tests for src/server/handlers/chat/request_prep.py — chat request preparation.
 
 Covers:
 - classify_error: recoverable vs non-recoverable error classification
-- process_hitl_response: 4-tuple return, various HITL scenarios
+- process_hitl_response: 5-tuple return, various HITL scenarios
 - normalize_request_messages: dict conversion, multimodal, empty
 - init_tracking: returns (TokenTrackingManager, ToolUsageTracker)
 - apply_fetch_override: sets context vars
@@ -222,7 +222,7 @@ class TestProcessHitlResponse:
                 "interrupt_ids": ["int-1"],
             },
         ):
-            action, content, answers, ids = process_hitl_response(req)
+            action, content, answers, ids, decisions = process_hitl_response(req)
 
         assert action == "QUESTION_ANSWERED"
         assert ids == ["int-1"]
@@ -243,7 +243,7 @@ class TestProcessHitlResponse:
                 "interrupt_ids": ["int-1"],
             },
         ):
-            action, content, answers, ids = process_hitl_response(req)
+            action, content, answers, ids, decisions = process_hitl_response(req)
 
         assert action == "QUESTION_SKIPPED"
         assert answers["int-1"] is None
@@ -263,7 +263,7 @@ class TestProcessHitlResponse:
                 "interrupt_ids": ["int-1"],
             },
         ):
-            action, content, answers, ids = process_hitl_response(req)
+            action, content, answers, ids, decisions = process_hitl_response(req)
 
         assert answers["int-1"] == "ok"
 
@@ -284,7 +284,7 @@ class TestProcessHitlResponse:
                 "interrupt_ids": ["int-1", "int-2"],
             },
         ):
-            action, content, answers, ids = process_hitl_response(req)
+            action, content, answers, ids, decisions = process_hitl_response(req)
 
         assert action == "QUESTION_ANSWERED"
         assert answers["int-1"] == "answer 1"
@@ -305,10 +305,40 @@ class TestProcessHitlResponse:
                 "interrupt_ids": ["int-1"],
             },
         ):
-            action, content, answers, ids = process_hitl_response(req)
+            action, content, answers, ids, decisions = process_hitl_response(req)
 
         assert answers == {}
+        assert decisions == {}
         assert action == "QUESTION_SKIPPED"
+
+    def test_batch_records_a_decision_per_action_request(self):
+        """A mixed batch keeps every verdict, which hitl_answers cannot."""
+        from src.server.handlers.chat.request_prep import process_hitl_response
+
+        response = {
+            "decisions": [
+                {"type": "approve", "message": None},
+                {"type": "reject", "message": "not this one"},
+            ]
+        }
+        req = self._make_request({"int-1": response})
+
+        with patch(
+            f"{PREP}.summarize_hitl_response_map",
+            return_value={
+                "feedback_action": "QUESTION_SKIPPED",
+                "content": "not this one",
+                "interrupt_ids": ["int-1"],
+            },
+        ):
+            _action, _content, answers, _ids, decisions = process_hitl_response(req)
+
+        assert decisions["int-1"] == [
+            {"type": "approve", "message": None},
+            {"type": "reject", "message": "not this one"},
+        ]
+        # The collapsed record cannot tell this from rejecting both.
+        assert answers == {}
 
 
 # ---------------------------------------------------------------------------
@@ -753,7 +783,6 @@ class TestBuildGraphConfig:
                 platform=None,
             ),
             effective_model="gpt-4o",
-            is_byok=False,
             recursion_limit=100,
         )
         defaults.update(kwargs)
@@ -801,6 +830,46 @@ class TestBuildGraphConfig:
     def test_extra_configurable_merged(self):
         config = self._build(extra_configurable={"plan_mode": True})
         assert config["configurable"]["plan_mode"] is True
+
+    def test_graph_metadata_stays_turn_identity(self):
+        """A subagent inherits this dict wholesale while running its own model at
+        its own effort, so anything the LLM owns is asserted for calls it was
+        never true of. Those keys live on the client (see ``LLM.get_llm``)."""
+        from src.config.settings import get_langsmith_metadata
+        from src.server.handlers.chat.request_prep import build_graph_config
+
+        with (
+            patch(f"{PREP}.get_langsmith_tags", return_value=[]),
+            patch(f"{PREP}.get_langsmith_metadata", side_effect=get_langsmith_metadata),
+        ):
+            config = build_graph_config(
+                thread_id="t-1",
+                user_id="u-1",
+                workspace_id="ws-1",
+                mode="ptc",
+                timezone_str="UTC",
+                token_callback=None,
+                request=MagicMock(
+                    locale=None, checkpoint_id=None, reasoning_effort="high",
+                    fast_mode=True, platform=None,
+                ),
+                effective_model="claude-sonnet-5",
+                recursion_limit=100,
+            )
+
+        metadata = config["metadata"]
+        assert metadata["user_id"] == "u-1"
+        # The turn's own selection, which is a different question from what any
+        # one call hit; cost and latency charts group on it.
+        assert metadata["llm_model"] == "claude-sonnet-5"
+        for llm_owned in (
+            "reasoning_effort",
+            "prompt_guidance",
+            "compaction_profile",
+            "fast_mode",
+            "is_byok",
+        ):
+            assert llm_owned not in metadata
 
     def test_timezone_in_configurable(self):
         config = self._build(timezone_str="UTC")

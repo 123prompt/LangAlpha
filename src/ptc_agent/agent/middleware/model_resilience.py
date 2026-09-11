@@ -29,7 +29,11 @@ from langchain.agents.middleware.types import (
     ModelResponse,
 )
 
-from src.llms.error_classification import extract_status_code, is_retryable_error
+from src.llms.error_classification import (
+    extract_status_code,
+    is_mid_stream_error,
+    is_retryable_error,
+)
 from src.llms.reasoning_payload import strip_all_reasoning
 
 if TYPE_CHECKING:
@@ -273,21 +277,29 @@ class ModelResilienceMiddleware(AgentMiddleware):
     def _decide(
         self, exc: Exception, attempts: int, req: ModelRequest, *, escalated: bool
     ) -> tuple[int | None, _Recovery | None]:
-        """What to do about a failed attempt — shared by the sync and async loops.
+        """What to do about a failed attempt, shared by the sync and async loops.
 
         ``None`` means give up on this candidate. A reasoning-payload 400 is the
         one non-retryable status worth another call: the provider rejected the
         history's reasoning blocks, and the same request without them can
-        succeed. Detected structurally — a 400 plus "we did send reasoning" —
+        succeed. Detected structurally, a 400 plus "we did send reasoning",
         rather than by matching provider error prose, which drifts between API
         versions and fails silently when it does. The cost is one wasted call
         when an unrelated 400 coincides with reasoning in history, on a turn that
         is already failing anyway.
+
+        A mid-stream failure is excluded because that repair cannot apply to it.
+        Stripping reasoning answers a request rejected during validation, before
+        it ran; a provider that accepted the request, opened the stream and only
+        then reported failure has already judged the payload fine, and re-sending
+        bills the tokens it emitted a second time. Content rejected by an input
+        filter is the case that made this concrete: every attempt is refused
+        identically, so the call is pure latency before the fallback that works.
         """
         status, retryable = self._classify(exc)
         if retryable and attempts <= self.max_retries:
             return status, _Recovery(delay=self._calculate_delay(attempts - 1))
-        if not escalated and status == 400:
+        if not escalated and status == 400 and not is_mid_stream_error(exc):
             stripped = self._escalate_reasoning(req)
             if stripped is not None:
                 return status, _Recovery(request=stripped)

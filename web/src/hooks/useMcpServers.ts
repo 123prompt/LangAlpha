@@ -16,16 +16,22 @@ import {
   getMcpCatalog,
   getMcpCatalogServerTools,
   getBuiltinMcpServers,
+  getBuiltinMcpServerTools,
   setBuiltinMcpServerEnabled,
   createMcpCatalogServer,
   updateMcpCatalogServer,
   deleteMcpCatalogServer,
   setMcpCatalogServerEnabled,
+  setMcpCatalogServerBinding,
+  mergeToolBinding,
   importMcpCatalogServers,
   disconnectMcpOauth,
   refreshMcpOauthSchemas,
+  getBrokerages,
+  setBrokerageEnabled,
   type CatalogServerList,
   type EffectiveServerList,
+  type McpServerBindingPatch,
   type McpServerInput,
 } from '../pages/ChatAgent/utils/api';
 
@@ -197,6 +203,24 @@ export function useMcpCatalogServerTools(name: string | null) {
     queryFn: () => getMcpCatalogServerTools(name!),
     enabled: !!name,
     staleTime: 60_000,
+  });
+}
+
+/** A builtin's tools, cached for as long as the answer can be trusted.
+ *
+ *  A connected builtin really is frozen: its tool list is fixed when the
+ *  worker connects it and only a restart moves it. `connected: false` is a
+ *  different kind of answer -- the worker that replied is one of several, and
+ *  a builtin it failed to connect at startup stays dropped for that process
+ *  alone. Freezing that reply is what turns one worker's gap into a permanent
+ *  "tools unavailable" for the session, so it is left stale and the next
+ *  remount or refocus gets another draw. */
+export function useBuiltinMcpServerTools(name: string | null) {
+  return useQuery({
+    queryKey: queryKeys.mcp.builtinServerTools(name ?? ''),
+    queryFn: () => getBuiltinMcpServerTools(name!),
+    enabled: !!name,
+    staleTime: (query) => (query.state.data?.connected ? Infinity : 0),
   });
 }
 
@@ -473,6 +497,51 @@ export function useToggleMcpCatalogServer() {
 }
 
 /**
+ * Change how a catalog server's tools reach the model (Plugins detail panel).
+ * Optimistic on the three stored fields only: the effective per-tool answer
+ * lives on the tools query, which the fan-out refetches once the server has
+ * resolved the new precedence.
+ */
+export function useSetMcpServerBinding() {
+  const queryClient = useQueryClient();
+  const key = queryKeys.mcp.catalog();
+  return useMutation({
+    mutationFn: ({ name, body }: { name: string; body: McpServerBindingPatch }) =>
+      setMcpCatalogServerBinding(name, body),
+    onMutate: async ({ name, body }) => {
+      await queryClient.cancelQueries({ queryKey: key });
+      const previous = queryClient.getQueryData<CatalogServerList>(key);
+      if (previous) {
+        queryClient.setQueryData<CatalogServerList>(key, {
+          ...previous,
+          servers: previous.servers.map((s) =>
+            s.name === name
+              ? {
+                  ...s,
+                  ...((body.tool_binding_set !== undefined ||
+                    body.tool_binding_unset !== undefined) && {
+                    tool_binding: mergeToolBinding(s.tool_binding ?? {}, body),
+                  }),
+                  ...(body.binding_preset !== undefined && {
+                    binding_preset: body.binding_preset,
+                  }),
+                }
+              : s,
+          ),
+        });
+      }
+      return { previous };
+    },
+    onError: (_err, _vars, context) => {
+      if (context?.previous) queryClient.setQueryData(key, context.previous);
+    },
+    onSettled: () => {
+      invalidateMcpFanout(queryClient);
+    },
+  });
+}
+
+/**
  * Bulk-import a standard `mcpServers` blob into the user catalog (Plugins page).
  * The backend also auto-extracts inline literal credentials into the USER
  * vault, so the vault list is invalidated too — otherwise the freshly created
@@ -509,5 +578,27 @@ export function useRefreshMcpOauthSchemas() {
     onSuccess: () => {
       invalidateMcpFanout(queryClient);
     },
+  });
+}
+
+// --- Brokerage connectors ---
+
+export function useBrokerages() {
+  return useQuery({
+    queryKey: queryKeys.brokerages.list(),
+    queryFn: getBrokerages,
+    // What this build ships cannot change under a running page.
+    staleTime: Infinity,
+  });
+}
+
+export function useToggleBrokerage() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, enabled }: { name: string; enabled: boolean }) =>
+      setBrokerageEnabled(name, enabled),
+    // The shared catalog radius, not just the MCP keys: this writes a catalog
+    // row, and a plugin card lists the rows it still owns.
+    onSuccess: () => invalidateMcpFanout(queryClient),
   });
 }

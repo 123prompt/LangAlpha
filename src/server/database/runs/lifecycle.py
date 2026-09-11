@@ -140,6 +140,7 @@ async def start_run(
     fork: Optional[ForkSpec] = None,
     metadata: Optional[Dict[str, Any]] = None,
     created_at: Optional[datetime] = None,
+    user_id: Optional[str] = None,
     conn=None,
 ) -> Dict[str, Any]:
     """The START transaction: fork cleanup + query row + in_progress run row +
@@ -248,9 +249,9 @@ async def start_run(
                         INSERT INTO conversation_responses (
                             conversation_response_id, conversation_thread_id,
                             turn_index, status, metadata, created_at,
-                            attempt_no, retry_of_run_id, request_key
+                            attempt_no, retry_of_run_id, request_key, user_id
                         )
-                        VALUES (%s, %s, %s, 'in_progress', %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, 'in_progress', %s, %s, %s, %s, %s, %s)
                         RETURNING *
                         """,
                         (
@@ -262,6 +263,7 @@ async def start_run(
                             attempt_no,
                             retry_of_run_id,
                             request_key,
+                            user_id,
                         ),
                     )
                     run_row = dict(await cur.fetchone())
@@ -380,6 +382,15 @@ async def finalize_run(
                             warnings = %s,
                             errors = %s,
                             execution_time = %s,
+                            -- The turn's own usage (when any) is inserted by
+                            -- usage_writer inside this same transaction, so the
+                            -- terminal CAS is also the billing settle for the
+                            -- row: its heartbeated in-flight spend stops
+                            -- counting the instant the real usage row exists.
+                            -- Subagent spend settles on subagent_runs rows,
+                            -- never here — a tail-draining child keeps counting
+                            -- on its own row after this parent settles.
+                            usage_settled_at = NOW(),
                             -- Merge, never replace: mid-run appenders
                             -- (append_sse_event, e.g. manual compact/offload
                             -- context_window persists) may have durably written

@@ -1426,10 +1426,6 @@ class PTCSandbox:
     ) -> tuple[str, str]:
         return _execution._build_trace_env_command(self, bash_id, full_command)
 
-    async def _list_result_files(self) -> list[str]:
-        return await _execution._list_result_files(self)
-
-
     # -- sessions --
 
     async def get_preview_url(self, port: int, expires_in: int = 3600) -> PreviewInfo:

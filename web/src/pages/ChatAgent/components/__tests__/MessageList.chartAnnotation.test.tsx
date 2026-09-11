@@ -27,6 +27,7 @@ vi.mock('framer-motion', async () => {
       return createEl(Comp, domProps, children);
     };
   return {
+    useReducedMotion: () => false,
     motion: new Proxy({} as Record<string, unknown>, {
       get: (_t, key: string) => (key === 'create' ? make : make(key)),
     }),
@@ -94,7 +95,6 @@ const baseProps = {
   subagentTasks: {},
   hasError: false,
   isAssistant: true,
-  textOnly: true,
 } satisfies Partial<SegmentsProps>;
 
 // `cumulative` is the full annotation set returned by that draw — each draw is a

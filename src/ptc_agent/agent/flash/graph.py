@@ -15,6 +15,7 @@ def build_flash_graph(
     user_profile: dict | None = None,
     store: Any | None = None,
     response_format: Any | None = None,
+    direct_mcp: Any | None = None,
 ) -> Any:
     """Build flash agent graph without sandbox.
 
@@ -39,4 +40,5 @@ def build_flash_graph(
         user_profile=user_profile,
         store=store,
         response_format=response_format,
+        direct_mcp=direct_mcp,
     )

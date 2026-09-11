@@ -25,6 +25,12 @@ the task pending, and ``never_started`` has none either — a run that never
 spawned either has no row or already settled its own as ``error``.
 """
 
+# The same values as a set, for the one caller that has to ask whether a
+# string a writer handed it is one of them.
+_TERMINAL_STATUSES = frozenset(
+    ("completed", "error", "cancelled", "timeout", "never_started")
+)
+
 WORKFLOW_SUBAGENT_TYPE = "workflow"
 """The ``subagent_type`` a workflow run's task carries.
 
@@ -216,7 +222,16 @@ class BackgroundTask:
             return self.result
         self.result = result
         failed = isinstance(result, dict) and result.get("success") is False
-        self.terminal_status = "error" if failed else "completed"
+        # A writer that settled on a specific terminal says so in its payload.
+        # ``success: False`` alone reads as a failure, which is wrong for a
+        # stop that was neutral by design: the ledger row for a credit stop
+        # says "cancelled", and an in-memory "error" here would contradict
+        # every other surface and steer the model off the resumable path.
+        declared = result.get("status") if isinstance(result, dict) else None
+        if failed and declared in _TERMINAL_STATUSES:
+            self.terminal_status = declared
+        else:
+            self.terminal_status = "error" if failed else "completed"
         self.last_updated_at = time.time()
         return result
 

@@ -2,6 +2,15 @@
  * MCP server config: per-workspace servers + user catalog.
  */
 import { api } from '@/api/client';
+import {
+  beginMcpOAuth,
+  bindMcpOAuth,
+  canBeginMcpOAuth,
+  cancelMcpOAuth,
+  isDesktopShell,
+  type McpOAuthFlow,
+} from '@/lib/desktop';
+import { foldToolName } from '@/pages/ChatAgent/utils/directTools';
 
 //
 // Per-workspace effective list mixes built-in servers with workspace-added
@@ -32,6 +41,69 @@ export interface McpToolSummary {
   name: string;
   description: string;
   input_schema: Record<string, unknown>;
+  /**
+   * Which brokerage capability group reaches this tool, null when none does.
+   * Discovery is unfiltered on purpose -- it is what the vendor offers, not
+   * what a connection may call -- so this is what lets a surface say which of
+   * them the user actually granted. Absent outside the catalog tools route,
+   * and on every server that is not a brokerage.
+   */
+  capability?: string | null;
+  /**
+   * Whether this tool is refused at every grant. A null `capability` alone does
+   * not say: one we deliberately withheld is always refused, one we have simply
+   * not classified is always permitted. Reading null as "unavailable" is how the
+   * detail view came to promise the agent could not reach tools it could.
+   */
+  always_denied?: boolean;
+  /**
+   * How the agent reaches this tool right now: `ptc` from Python in the
+   * sandbox, `direct` as one tool call the app can show, `both`. Effective,
+   * not stored: `binding_source` says which layer decided it, and `policy`
+   * means the server pins it and refuses any other value.
+   */
+  binding?: McpToolBinding;
+  binding_source?: McpBindingSource;
+  /**
+   * The bindings the server accepts for this tool. A live order tool lists
+   * only `direct`, so every order is one visible call rather than a line of
+   * Python. Absent means unrestricted.
+   */
+  allowed?: McpToolBinding[];
+}
+
+export type McpToolBinding = 'ptc' | 'direct' | 'both';
+
+/** The one row-wide override: send everything the row may move through the
+ * sandbox. Null, the only other state, leaves each group's own default in force. */
+export type McpBindingPreset = 'ptc_only';
+
+/** Precedence, highest first: override > preset > config > group > default. */
+export type McpBindingSource = 'override' | 'preset' | 'group' | 'default' | 'policy';
+
+/** Partial: only the fields present change. Bindings are sent per tool, not
+ * as the whole map, so two tabs editing different tools cannot overwrite
+ * each other.
+ * A `binding_preset` of `null` clears it back to the group default. */
+export interface McpServerBindingPatch {
+  tool_binding_set?: Record<string, McpToolBinding>;
+  tool_binding_unset?: string[];
+  binding_preset?: McpBindingPreset | null;
+}
+
+/** The server's merge, mirrored for the optimistic view: a delta replaces
+ * every stored key that folds to the name it addresses. */
+export function mergeToolBinding(
+  stored: Record<string, McpToolBinding>,
+  patch: McpServerBindingPatch,
+): Record<string, McpToolBinding> {
+  const touched = new Set(
+    [...Object.keys(patch.tool_binding_set ?? {}), ...(patch.tool_binding_unset ?? [])].map(
+      foldToolName,
+    ),
+  );
+  const kept = Object.entries(stored).filter(([name]) => !touched.has(foldToolName(name)));
+  return { ...Object.fromEntries(kept), ...(patch.tool_binding_set ?? {}) };
 }
 
 export type McpStatus =
@@ -169,8 +241,39 @@ export interface CatalogServer {
   enabled?: boolean;
   /** OAuth connection status, when one exists for this server. */
   oauth_status?: McpOauthStatus | null;
+  /**
+   * The capability groups this connection was granted, in the order they were
+   * stored. `null`/absent means no connection, or one for a server we curate
+   * no groups for; `[]` means a brokerage the user granted nothing. The two
+   * are different answers and the gap between them is a broker that can do
+   * nothing, so they stay distinguishable here too.
+   */
+  granted_capabilities?: string[] | null;
+  /**
+   * The same keys, but what the user last chose rather than what is in force.
+   * Survives a `needs_reauth` or `revoked` status, where `granted_capabilities`
+   * is deliberately withheld so nothing badges a dead connection as able to
+   * trade. Only the consent dialog reads this, and only to open on the user's
+   * own last answer instead of the product defaults.
+   */
+  remembered_capabilities?: string[] | null;
+  /** Per-tool binding overrides; a name here beats the preset and the group. */
+  tool_binding?: Record<string, McpToolBinding>;
+  /** Whether any tool on this row binds directly, and so whether the row can
+   * reach Flash at all. */
+  has_direct_tools?: boolean;
+  binding_preset?: McpBindingPreset | null;
+  /**
+   * Retained but inert. The backend keeps the column for a later stage and
+   * nothing reads it now: live order tools run as direct calls the app can
+   * show, and no call stops for confirmation.
+   */
+  order_approval?: boolean;
   /** Host-side discovered tool count for the current config (OAuth servers). */
   tool_count?: number | null;
+  /** Path on this origin to the mark the server declared in its handshake.
+   * Absent when it declared none, which is most of them. */
+  icon_url?: string | null;
   /** Non-blocking policy nudges — present on create/update responses only. */
   warnings?: string[] | null;
   created_at: string | null;
@@ -184,6 +287,82 @@ export interface CatalogServer {
   /** The owning plugin's enabled state; false = the row is suppressed from
    * every workspace regardless of its own `enabled`. */
   plugin_enabled?: boolean | null;
+}
+
+// --- Brokerage connectors ---
+
+/**
+ * One shipped brokerage connector, as the backend describes it.
+ *
+ * The registry arrives over the wire rather than living in the client: a build
+ * that hard-coded a broker's host would be a second place for it to be wrong,
+ * and the host is where an OAuth token ends up. The quirks arrive as booleans
+ * and the sentence each becomes is translated, so it lives with the copy.
+ */
+export interface Brokerage {
+  name: string;
+  label: string;
+  url: string;
+  /** The broker's own website, which is not the endpoint's host: an MCP
+   *  endpoint sits on an API subdomain with no page behind it. */
+  site: string;
+  description: string;
+  /**
+   * The vendor's authorization server refuses a hosted callback, so only the
+   * desktop shell's loopback listener can finish the flow. A browser tab gets
+   * no error back either: the refusal happens on the vendor's own page.
+   */
+  native_callback_only: boolean;
+  /**
+   * The vendor allows one connected AI platform per account and drops the
+   * previous one, so connecting is destructive to a connection elsewhere.
+   */
+  exclusive_connection: boolean;
+  /**
+   * What this vendor's tools can be granted in, in display order. Empty for a
+   * vendor nothing is curated for, which reads as "nothing to choose" rather
+   * than "everything": the backend answers the same way, and a connect that
+   * names no group is granted none of them.
+   */
+  capabilities: CapabilityGroup[];
+}
+
+/**
+ * One consent toggle offered when connecting a brokerage.
+ *
+ * The key is the fact and also the translation key; the words are this client's,
+ * the same contract the quirk booleans above keep. `tone` is how loudly to draw
+ * the row -- `neutral` is public or personal data, `caution` is the user's own
+ * positions and money, `danger` places real orders -- and is left a plain string
+ * because a tone this build has no styling for must still render.
+ */
+export interface CapabilityGroup {
+  key: string;
+  tone: string;
+  /**
+   * One of the steps between reading and placing an order (paper, preview,
+   * staged, live). A fact about the group rather than a reading of its key, so
+   * a group added later reaches the badges with no release here. Absent on a
+   * backend that predates it, which reads as "not a rung" and costs a badge.
+   */
+  rung?: boolean;
+}
+
+export async function getBrokerages(): Promise<Brokerage[]> {
+  const { data } = await api.get<{ brokerages: Brokerage[] }>('/api/v1/mcp/brokerages');
+  return data.brokerages ?? [];
+}
+
+/** Turn one on or off; the backend creates its catalog row the first time. */
+export async function setBrokerageEnabled(
+  name: string,
+  enabled: boolean,
+): Promise<CatalogServer> {
+  const { data } = await api.patch<CatalogServer>(
+    `/api/v1/mcp/brokerages/${name}/enabled`,
+    { enabled },
+  );
+  return data;
 }
 
 /** A workspace-local server surfaced in the all-scopes catalog view — a
@@ -374,6 +553,30 @@ export async function getMcpCatalogServerTools(name: string): Promise<{
   };
 }
 
+/** What a builtin reported to this process at startup. Same shape as the
+ * catalog's snapshot so the detail view has one way to render tools, minus a
+ * `discovered_at`: a builtin is discovered once per process, not at a moment
+ * the user acted. */
+export async function getBuiltinMcpServerTools(name: string): Promise<{
+  server_name: string;
+  /** False when this worker never connected the server, which is not the same
+   *  as the server having no tools. Absent on an older backend, so it defaults
+   *  to true and the view reads as it did before. */
+  connected: boolean;
+  tools: McpToolSummary[];
+  discovered_at: string | null;
+}> {
+  const { data } = await api.get(
+    `/api/v1/mcp/builtin-servers/${encodeURIComponent(name)}/tools`,
+  );
+  return {
+    server_name: data.server_name ?? name,
+    connected: data.connected ?? true,
+    tools: data.tools ?? [],
+    discovered_at: data.discovered_at ?? null,
+  };
+}
+
 export async function createMcpCatalogServer(body: McpServerInput): Promise<CatalogServer> {
   const { data } = await api.post<CatalogServer>('/api/v1/mcp/servers', body);
   return data;
@@ -398,6 +601,19 @@ export async function setMcpCatalogServerEnabled(name: string, enabled: boolean)
   return data as { name: string; enabled: boolean; warnings?: string[] };
 }
 
+/** Change how a catalog server's tools reach the model. 422 when a tool that
+ *  asks first is set to `both`; the detail names it. */
+export async function setMcpCatalogServerBinding(
+  name: string,
+  body: McpServerBindingPatch,
+): Promise<CatalogServer> {
+  const { data } = await api.patch<CatalogServer>(
+    `/api/v1/mcp/servers/${name}/binding`,
+    body,
+  );
+  return data;
+}
+
 /**
  * Bulk-import a standard `mcpServers` JSON blob into the user catalog. Inline
  * literal secrets are auto-extracted into the USER vault; imported rows land
@@ -415,6 +631,13 @@ export interface BuiltinMcpServer {
   description: string;
   transport: string;
   enabled: boolean;
+  /** Path on this origin to the mark the server declared in its handshake. */
+  icon_url?: string | null;
+  /** The bundle that ships this server, and whether that bundle is on — the
+   *  same provenance pair a catalog row carries, so both group and explain
+   *  themselves the same way. */
+  plugin_name?: string | null;
+  plugin_enabled?: boolean | null;
   /** Workspaces with a disable-marker for this builtin — all-scopes view only. */
   disabled_workspace_ids?: string[];
 }
@@ -434,13 +657,211 @@ export async function setBuiltinMcpServerEnabled(name: string, enabled: boolean)
 
 // --- User-level OAuth (Plugins page) ---
 
-/** Phase 1 of the connect flow; the caller navigates to `authorize_url`. */
-export async function startMcpOauth(name: string, returnTo = '/plugins') {
-  const { data } = await api.post<{ authorize_url: string }>(
-    `/api/v1/mcp/servers/${name}/oauth/start`,
-    { return_to: returnTo },
-  );
-  return data;
+const OAUTH_CALLBACK_PATH = '/api/v1/mcp/oauth/callback';
+
+/**
+ * Offer the desktop shell's loopback listener as this flow's redirect target.
+ *
+ * Some authorization servers allowlist only the native-app profile and reject a
+ * hosted callback outright, which is a wall a browser cannot get past. The shell
+ * can, so it is asked first and its answer travels with the request: the backend
+ * binds the redirect target into the flow at this moment and checks it again at
+ * the token exchange, which is why this has to be settled here rather than
+ * rewritten in the navigation later.
+ *
+ * Undefined means there is no listener on offer, and the flow proceeds the way
+ * it does in a browser.
+ */
+async function loopbackFlow(): Promise<McpOAuthFlow | undefined> {
+  // Built outside the ask, because the two failures are not the same fault and
+  // must not answer alike: a base URL this cannot parse is a misconfigured
+  // deployment, and reporting it as "no listener" sends whoever is debugging it
+  // to the shell, which was fine. `beginMcpOAuth` swallows its own.
+  const callback = new URL(
+    OAUTH_CALLBACK_PATH,
+    api.defaults.baseURL || window.location.origin,
+  ).toString();
+  return beginMcpOAuth(callback);
+}
+
+/** Phase 1's answer. `state` and `redirect_uri` are for the desktop path. */
+export interface McpOauthStart {
+  authorize_url: string;
+  /** This flow's OAuth `state`; absent from a build older than the field. */
+  state?: string;
+  /** The callback the flow was really minted against; see `startMcpOauth`. */
+  redirect_uri?: string;
+}
+
+/**
+ * A connect that had to come home through the shell could not be set up that way.
+ *
+ * Carries the reason rather than a sentence because the four are not the same
+ * fault and do not have the same remedy, and the words belong to whoever is
+ * rendering them: this module has no translator. `shell-outdated` and
+ * `no-listener` are the pair most worth keeping apart -- one is answered by
+ * updating the app and the other by quitting a second copy of it, and a reader
+ * given the wrong one of those goes looking for a window that is not open.
+ */
+export class LoopbackRequiredError extends Error {
+  constructor(
+    readonly reason: 'shell-outdated' | 'no-listener' | 'not-minted' | 'not-bound',
+  ) {
+    super(`loopback callback unavailable: ${reason}`);
+    this.name = 'LoopbackRequiredError';
+  }
+}
+
+/** What a connect needs to know beyond which row it is for. */
+export interface StartMcpOauthOptions {
+  /**
+   * This vendor's authorization server will not accept the hosted callback at
+   * all, so the flow can only come home through the desktop shell's listener.
+   */
+  vendorRefusesHostedCallback?: boolean;
+  /**
+   * The address the caller drew the row from, checked against the row before
+   * anything starts.
+   *
+   * The row is the user's to edit from any tab, so what the page asked them
+   * about and what the connect would do can be two different servers -- and a
+   * vendor that allows one connected AI platform per account makes that
+   * difference expensive. Naming the address is what turns the question the
+   * page asked into a gate. A caller that names none has nothing to be wrong
+   * about and is let through as before.
+   */
+  expectedUrl?: string | null;
+  /**
+   * Whether the caller still wants this connect, asked once there is a URL to
+   * navigate to. Answering false gives back whatever this armed and returns
+   * null.
+   *
+   * The question belongs here rather than to the caller because the thing that
+   * has to be released is not the caller's to see: arming happens inside this
+   * function, before either round trip below, and the flow id never leaves it.
+   * A caller that took the connect back in the meantime would otherwise be
+   * holding a listener it has no handle on, and the shell would run the flow's
+   * full timeout and then raise the window over a connect the user stopped ten
+   * minutes earlier.
+   */
+  stillWanted?: () => boolean;
+  /**
+   * The capability groups the user agreed this connection may carry, or
+   * undefined for a connect that was never asked.
+   *
+   * The empty array and undefined are different answers and both travel as they
+   * are: `[]` is a brokerage granted nothing, undefined is a server we curate no
+   * groups for and hold no policy over. Collapsing them would make "declined
+   * everything" and "not a brokerage" the same request, and only one of those
+   * may reach a vendor's whole tool list.
+   */
+  grantedCapabilities?: string[];
+}
+
+/**
+ * Phase 1 of the connect flow; the caller navigates to `authorize_url`.
+ *
+ * Everything past `returnTo` is named rather than positional. Three of the four
+ * are optional and two of them are a boolean beside a callback, which is the
+ * shape an argument gets silently passed in the wrong slot.
+ */
+export async function startMcpOauth(
+  name: string,
+  returnTo = '/plugins',
+  {
+    vendorRefusesHostedCallback = false,
+    expectedUrl,
+    stillWanted,
+    grantedCapabilities,
+  }: StartMcpOauthOptions = {},
+): Promise<McpOauthStart | null> {
+  // Asked unconditionally, because asking is free: `loopbackFlow` answers
+  // undefined wherever there is no shell, so this arms a listener exactly where
+  // one exists and changes nothing in a browser.
+  const flow = await loopbackFlow();
+  // Whether its absence is fatal is the real question, and it is fatal in two
+  // separate situations.
+  //
+  // A vendor that refuses the hosted callback has no other way home anywhere.
+  //
+  // And inside the shell, NOTHING has another way home -- whatever the vendor
+  // accepts, and whatever this shell is old enough to offer. The authorize URL
+  // is an external navigation, so it leaves for the system browser, and the
+  // callback then lands in a browser that never received this flow's nonce
+  // cookie -- the cookie was set on the request this window made. The backend
+  // refuses it as a state mismatch, in a browser the user may not even be
+  // signed into, while this window sits on "connecting" because its navigation
+  // was cancelled and it never unloaded. Degrading to the hosted callback there
+  // is a guaranteed failure nobody is told about, which is worse than not
+  // starting.
+  if (!flow) {
+    // Being IN the shell is the question, not what this shell can do. A build
+    // that predates the loopback channel has no method to find, and reading
+    // that as "not the desktop app" is how it ends up on the browser path --
+    // the one path that cannot work here.
+    if (isDesktopShell() && !canBeginMcpOAuth()) {
+      throw new LoopbackRequiredError('shell-outdated');
+    }
+    if (vendorRefusesHostedCallback || isDesktopShell()) {
+      throw new LoopbackRequiredError('no-listener');
+    }
+  }
+  try {
+    const { data } = await api.post<McpOauthStart>(
+      `/api/v1/mcp/servers/${name}/oauth/start`,
+      // One guard, and it is `loopbackFlow` above: every way of not having a
+      // URI already arrives here as undefined. A second truthiness check would
+      // read as belt and braces and is really a place for the two to disagree.
+      {
+        return_to: returnTo,
+        ...(flow ? { redirect_uri: flow.redirectUri } : {}),
+        ...(expectedUrl ? { expected_url: expectedUrl } : {}),
+        // Presence, not truthiness, unlike the two above: an empty selection is
+        // a decision the user made and has to be sent, and it is the one value
+        // here that a shorthand check would drop.
+        ...(grantedCapabilities !== undefined
+          ? { granted_capabilities: grantedCapabilities }
+          : {}),
+      },
+    );
+    if (flow) {
+      // Did the flow actually get minted against the listener we armed? A build
+      // that predates the field ignores it and mints the hosted callback, and
+      // so does this one when the value fails its loopback check -- both answer
+      // 200, so without asking, the only symptom is a listener holding for five
+      // minutes on a code that was never coming, and then raising the window.
+      // For the vendors this path exists for there is no error even then: their
+      // consent screen simply never redirects anywhere we can hear.
+      if (data.redirect_uri !== flow.redirectUri || !data.state) {
+        throw new LoopbackRequiredError('not-minted');
+      }
+      // Only now can the shell recognise this flow's callback. Before it, an
+      // armed listener accepts nothing at all -- and a second connect started
+      // in this window while the first was still minting takes the slot, so a
+      // refusal here is this flow losing that race, not a broken shell.
+      if (!(await bindMcpOAuth(flow.flowId, data.state))) {
+        throw new LoopbackRequiredError('not-bound');
+      }
+    }
+    // Asked last, with the listener armed and bound and the URL in hand, since
+    // that is the widest the window gets: everything above is a round trip the
+    // user could have pressed Cancel through. Not raised as a failure -- there
+    // is nothing wrong here and nothing to tell them about a connect they are
+    // the one who stopped.
+    if (stillWanted && !stillWanted()) {
+      if (flow) await cancelMcpOAuth(flow.flowId);
+      return null;
+    }
+    return data;
+  } catch (err) {
+    // Asking armed a listener, and this is the answer that it was for nothing.
+    // The order is forced -- the redirect_uri has to be in hand before the
+    // request that binds it -- so the only way to keep arming honest is to say
+    // when the flow it was armed for did not happen. By id: this window may
+    // have started another connect since, and that one is still live.
+    if (flow) await cancelMcpOAuth(flow.flowId);
+    throw err;
+  }
 }
 
 export async function disconnectMcpOauth(name: string) {

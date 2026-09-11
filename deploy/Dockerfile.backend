@@ -49,7 +49,7 @@ RUN chmod +x scripts/docker_entrypoint.sh
 COPY config.yaml .
 COPY agent_config.yaml .
 COPY mcp_servers/ mcp_servers/
-COPY skills/ skills/
+COPY plugins/ plugins/
 COPY workflows/ workflows/
 
 EXPOSE 8000

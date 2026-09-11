@@ -105,7 +105,7 @@ describe('ActivityBlock — failed tool calls', () => {
       }),
     ];
 
-    render(<ActivityBlock items={items} isStreaming={false} />);
+    render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
 
     // Folded summary intentionally omits the failed count — failure
     // visibility lives on the per-row badge instead.
@@ -122,7 +122,7 @@ describe('ActivityBlock — failed tool calls', () => {
       }),
     ];
 
-    const { container } = render(<ActivityBlock items={items} isStreaming={false} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
 
     // Expand the accordion.
     fireEvent.click(screen.getByRole('button', { name: SUMMARY_BUTTON_RE }));
@@ -151,7 +151,7 @@ describe('ActivityBlock — failed tool calls', () => {
       }),
     ];
 
-    const { container } = render(<ActivityBlock items={items} isStreaming={false} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     fireEvent.click(screen.getByRole('button', { name: SUMMARY_BUTTON_RE }));
 
     const failedRow = container.querySelector('.titem.failed');
@@ -170,7 +170,7 @@ describe('ActivityBlock — failed tool calls', () => {
       }),
     ];
 
-    render(<ActivityBlock items={items} isStreaming={false} />);
+    render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     const summary = screen.getByRole('button', { name: SUMMARY_BUTTON_RE });
     // Three reads in the fileRead bucket (failures don't split the count).
     expect(summary).toHaveTextContent(/toolArtifact\.categoryCount.fileRead/i);
@@ -186,7 +186,7 @@ describe('ActivityBlock — failed tool calls', () => {
       }),
     ];
 
-    const { container } = render(<ActivityBlock items={items} isStreaming={false} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     fireEvent.click(screen.getByRole('button', { name: SUMMARY_BUTTON_RE }));
     expect(container.querySelector('.titem.failed')).toBeNull();
     expect(container.querySelector('.nrow-badge')).toBeNull();
@@ -206,7 +206,7 @@ describe('ActivityBlock — memo write/edit fragment', () => {
       }),
     ];
 
-    render(<ActivityBlock items={items} isStreaming={false} />);
+    render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     const summary = screen.getByRole('button', { name: SUMMARY_BUTTON_RE });
     expect(summary).toHaveTextContent(/toolArtifact\.categoryCount.memoWrite/i);
     // It must NOT show as a memo read.
@@ -221,7 +221,7 @@ describe('ActivityBlock — memo write/edit fragment', () => {
       }),
     ];
 
-    render(<ActivityBlock items={items} isStreaming={false} />);
+    render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     const summary = screen.getByRole('button', { name: SUMMARY_BUTTON_RE });
     expect(summary).toHaveTextContent(/toolArtifact\.categoryCount.memo/i);
     expect(summary).not.toHaveTextContent(/toolArtifact\.categoryCount.memoWrite/i);
@@ -247,7 +247,7 @@ describe('ActivityBlock — priority fragments survive the cap', () => {
       completedTool('Read', { id: 'r-1', toolCall: { args: { file_path: 'work/scratch.md' } } }),
     ];
 
-    render(<ActivityBlock items={items} isStreaming={false} />);
+    render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     const summary = screen.getByRole('button', { name: SUMMARY_BUTTON_RE });
     // memoryUpdated must be in the visible 3 even with overflow.
     expect(summary).toHaveTextContent(/toolArtifact\.categoryCount.memoryUpdated/i);
@@ -266,7 +266,7 @@ describe('ActivityBlock — accordion a11y', () => {
       completedTool('Read', { id: 'r-1', toolCall: { args: { file_path: 'work/scratch.md' } } }),
     ];
 
-    render(<ActivityBlock items={items} isStreaming={false} />);
+    render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     const summary = screen.getByRole('button', { name: SUMMARY_BUTTON_RE });
     expect(summary).toHaveAttribute('aria-expanded', 'false');
 
@@ -279,7 +279,7 @@ describe('ActivityBlock — accordion a11y', () => {
       completedTool('Read', { id: 'r-1', toolCall: { args: { file_path: 'work/scratch.md' } } }),
     ];
 
-    const { container } = render(<ActivityBlock items={items} isStreaming={false} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
     const summary = screen.getByRole('button', { name: SUMMARY_BUTTON_RE });
     fireEvent.click(summary);
 

@@ -18,7 +18,7 @@ export interface RateLimitErrorInfo {
 
 /** Hints the backend emits for upstream provider failures — each maps to an
  *  i18n-bound bullet the user sees ("check your API key", etc.). Keep in sync
- *  with the ``hints`` list in ``streaming_handler.format_error_event``. */
+ *  with the ``hints`` list in ``sse_producer.format_error_event``. */
 export type UpstreamErrorHint =
   | 'api_key'
   | 'model_access'
@@ -50,7 +50,14 @@ export function isUpstreamHint(value: unknown): value is UpstreamErrorHint {
 
 export interface ErrorLinkSpec {
   url: string;
+  /** Literal text, for a label the producer authored (or the service did, on a
+   *  link that arrives off the wire already worded). ``labelKey`` wins when
+   *  both are set. */
   label: string;
+  /** i18n key, for a label this client writes and therefore has to translate.
+   *  Resolved by ``ErrorLink`` — this module stays translation-free, the same
+   *  split as ``UPSTREAM_HINT_I18N_KEY``. */
+  labelKey?: string;
   /** Marks a destination outside this SPA. The URL cannot say so on its own:
    *  with a path-shaped ``VITE_PLATFORM_URL`` the account portal is same-origin
    *  and indistinguishable from one of our routes. See ``ErrorLink`` for what
@@ -118,8 +125,18 @@ export function buildRateLimitError(
   const links: ErrorLinkSpec[] | undefined =
     platformUrl && !NOT_ABOUT_THE_ACCOUNT.has(info.type as string)
       ? [
-          { url: `${platformUrl}/plans`, label: 'Manage plan', external: true },
-          { url: `${platformUrl}/usage`, label: 'View usage', external: true },
+          {
+            url: `${platformUrl}/plans`,
+            label: 'Manage plan',
+            labelKey: 'chat.errorLinkManagePlan',
+            external: true,
+          },
+          {
+            url: `${platformUrl}/usage`,
+            label: 'View usage',
+            labelKey: 'chat.errorLinkViewUsage',
+            external: true,
+          },
         ]
       : undefined;
 

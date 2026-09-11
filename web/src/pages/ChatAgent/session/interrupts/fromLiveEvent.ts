@@ -7,6 +7,9 @@
 
 import type { AssistantMessage } from '@/types/chat';
 import { updateMessage } from '../../hooks/utils/messageHelpers';
+import { setCardStatus } from './buckets';
+import { buildCreditPauseState } from './creditPauseCard';
+import { isToolApprovalRequest, toolApprovalCards } from './toolApprovalCard';
 import type { SSEEvent, StreamProcessorRefs } from '../types';
 import type { StreamRuntime } from '../runtime';
 
@@ -196,6 +199,73 @@ export function projectLiveInterrupt(
       assistantMessageId,
       proposalId,
     });
+  } else if (actionType === 'credit_pause') {
+    // --- Credit pause interrupt ---
+    const proposalId = event.interrupt_id!;
+    const pauseState = buildCreditPauseState(actionRequests[0], event.interrupt_id!);
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    // A re-raise is the pause saying it was never consumed, whatever the resume
+    // looked like from the client: admission opens a run either way, so the card
+    // was already flipped to `resumed`. Put that card back rather than writing a
+    // pending entry onto this bubble, which the suppression above leaves with no
+    // segment to render it — the pause would otherwise sit unanswerable, and the
+    // status is what history replays.
+    rt.setMessages((prev) =>
+      interruptAlreadyRendered
+        ? setCardStatus(prev, 'creditPauses', proposalId, 'pending')
+        : updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+            ...msg,
+            contentSegments: appendCardSegment(msg.contentSegments, { type: 'credit_pause', proposalId, order }),
+            creditPauses: { ...(msg.creditPauses || {}), [proposalId]: pauseState },
+            isStreaming: false,
+          }; })
+    );
+
+    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
+    rt.setPendingInterrupt({
+      type: 'credit_pause',
+      interruptId: event.interrupt_id,
+      assistantMessageId,
+      proposalId,
+    });
+  } else if (isToolApprovalRequest(actionRequests[0])) {
+    // --- Direct MCP tool approval interrupt ---
+    const cards = toolApprovalCards(
+      actionRequests,
+      event.interrupt_id,
+      `tool-approval-${Date.now()}`,
+    );
+    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+
+    // A re-raise is the backend saying the calls are still stopped, whatever
+    // the resume looked like from the client, and the click already settled
+    // the cards to approved/rejected. Put them back rather than writing fresh
+    // entries onto this bubble, which the suppression above leaves with no
+    // segment to render them: the status is what history replays.
+    rt.setMessages((prev) =>
+      interruptAlreadyRendered
+        ? cards.reduce((msgs, card) => setCardStatus(msgs, 'toolApprovals', card.proposalId, 'pending'), prev)
+        : updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+            ...msg,
+            contentSegments: cards.reduce(
+              (segments, card, i) =>
+                appendCardSegment(segments, { type: 'tool_approval', proposalId: card.proposalId, order: order + i }),
+              msg.contentSegments,
+            ),
+            toolApprovals: {
+              ...(msg.toolApprovals || {}),
+              ...Object.fromEntries(cards.map((c) => [c.proposalId, c.state])),
+            },
+            isStreaming: false,
+          }; })
+    );
+
+    // The card is a record, never a slot to fill: nothing raises a tool
+    // approval any more and the approve/reject handlers are gone, so an old
+    // one a stream still carries (a redelivery on reconnect, say) must not
+    // arm the composer against controls that do not exist. History has the
+    // same rule where the paused branch picks what to make interactive.
   } else {
     // --- Plan approval interrupt (existing) ---
     const planApprovalId = event.interrupt_id || `plan-${Date.now()}`;

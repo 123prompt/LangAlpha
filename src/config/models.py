@@ -410,10 +410,26 @@ class WorkflowOrchestrationConfig(BaseModel):
         return self
 
 
+class PromptConfig(BaseModel):
+    """Deployment-wide prompt settings."""
+
+    guidance: Literal["auto", "lean", "detailed"] = Field(
+        default="auto",
+        description=(
+            "Prompt scaffolding level for this deployment. 'auto' defers to the "
+            "model's prompt_guidance in models.json; 'lean'/'detailed' pin it. A "
+            "per-user model_preference.prompt_guidance still wins over this — a "
+            "profile for the running model first, then the account-wide value."
+        ),
+    )
+
+
 class InfrastructureConfig(BaseModel):
     """Root model for infrastructure configuration (config.yaml)."""
 
     model_config = ConfigDict(extra="allow")
+
+    prompt: PromptConfig = Field(default_factory=PromptConfig)
 
     # Application Settings
     debug: bool = Field(default=False, description="Debug mode flag")

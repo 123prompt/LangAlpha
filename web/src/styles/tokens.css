@@ -117,6 +117,10 @@ html {
   --color-accent-overlay: rgba(233, 149, 74, 0.75);
   --color-accent-gradient: linear-gradient(90deg, #E9954A 0%, #E9954A 100%);
 
+  /* Focus ring, for plain CSS files. Derived from --ring so Tailwind's
+     ring-ring and a hand-written box-shadow can never drift apart. */
+  --color-focus-ring: hsl(var(--ring));
+
   --color-slash-icon: rgb(233, 149, 74);
   --color-slash-pill-bg: rgba(233, 149, 74, 0.1);
   --color-slash-pill-border: rgba(233, 149, 74, 0.28);
@@ -199,8 +203,17 @@ html {
   --destructive-foreground: 0 0% 98%;
   --border: 0 0% 100% / 0.08;
   --input: 220 4% 14.5%;
-  /* Focus ring is NEUTRAL — the amber never rings a control (DESIGN.md). */
-  --ring: 0 0% 100% / 0.45;
+  /* Focus ring is the primary text color, carrying no hue at all. Amber is the
+     active/selected language here, so a ring painted in it reads as "selected"
+     rather than "focused", and any other hue would be a color the product uses
+     nowhere else (DESIGN.md). Ink is what the eye already reads as "this one":
+     a control gains the same edge its label has. It also clears WCAG 1.4.11 by
+     a wide margin on every surface, 11:1 on --color-bg-elevated, the menus and
+     tooltips, where the previous navy was tuned to reach 3.35:1. Kept as an
+     HSL triplet, and derived rather than repeated, because Tailwind composes
+     `ring-ring` as `hsl(var(--ring) / <alpha>)` and DESIGN.md publishes the
+     equality with the text ink as a contract. */
+  --ring: var(--foreground);
   --radius: 0.5rem;
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 4px 16px rgba(0, 0, 0, 0.25);
 
@@ -363,8 +376,8 @@ html {
   --destructive-foreground: 0 0% 100%;
   --border: 60 2% 12% / 0.09;
   --input: 60 4% 96.5%;
-  /* Focus ring is NEUTRAL — the amber never rings a control (DESIGN.md). */
-  --ring: 60 2% 12% / 0.4;
+  /* The light theme's text ink, for the same reason. */
+  --ring: var(--foreground);
   /* Kept tight rather than dropped: floating overlays (AgentEventOverlay,
      SelectionCommentOverlay, JumpToLatestPill) rely on this to separate from
      a now-pure-white page — the workspace cards carry their own border. */
@@ -409,6 +422,157 @@ html {
     height: 100vh;
     margin: 0;
     padding: 0;
+  }
+
+  /* Tailwind's preflight carries `:-moz-focusring { outline: auto }`, and it
+     lands here unlayered, so in Firefox it would beat the whole focus layer
+     below: its own ring on a keyboard focus, and one on a clicked field the
+     layer means to keep quiet. Same specificity and later in source, so this
+     wins, and revert-layer hands the decision back to the layer. */
+  :-moz-focusring {
+    outline: revert-layer;
+  }
+}
+
+/* Focus rings.
+
+   Everything in here is a default: the ring a control gets unless something
+   draws its own. It sits in a cascade layer of its own so that "its own"
+   means any rule outside this layer, whatever its specificity -- a Tailwind
+   `focus-visible:` utility, a hand-written `.class:focus-visible`, a
+   box-shadow ring on a sidebar row. Unlayered styles beat layered ones
+   outright, so a component never has to out-specify this block. (Tailwind's
+   `@layer base` above is not a cascade layer: the plugin unwraps it into plain
+   unlayered CSS, where a rule here and a component's would be settled by
+   specificity and source order instead.) */
+@layer focus-defaults {
+  /* Without a baseline the fallback is Chromium's -- `outline: auto` in a blue
+     this product uses nowhere -- and that was the ring on four out of five
+     controls, the chat transcript included. */
+  :focus-visible {
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  /* A field that fills a bordered container has nowhere to put a ring of its
+     own. An outline on the field alone cuts across the container's border and
+     leaves whatever else lives in there outside the indicator: the icon on a
+     search pill, the chips already entered on a token field. Mark the container
+     and it rings on the field's behalf.
+
+     Scoped to a direct-child input so a button sharing the container -- a clear
+     affordance, a chip's remove -- still rings itself instead of lighting the
+     whole box. Held off under the pointer like everything else here, and for
+     the same reason: the field inside matches :focus-visible for either
+     device, so ungated this would light the container on a click.
+
+     All three sit behind @supports because only the first of them survives a
+     parser without :has(): taking the ring off the field is a plain selector,
+     while the two rules that put it on the container are dropped as invalid.
+     Split, the fallback is not a ring in the wrong place, it is no ring at
+     all. Together they degrade to the baseline, which rings the field. */
+  @supports selector(:has(*)) {
+    .rings-within > input:focus-visible {
+      outline: none;
+    }
+
+    .rings-within:has(> input:focus-visible) {
+      outline: 2px solid var(--color-focus-ring);
+      outline-offset: 2px;
+    }
+
+    /* Transparent for the reason the rule at the end of this layer is. */
+    :root[data-pointer-focus] .rings-within:has(> input:focus-visible) {
+      outline-color: transparent;
+    }
+  }
+
+  /* Inside an SVG, Chromium paints its own ring on plain :focus -- it does not
+     gate that on :focus-visible the way it does for HTML, so a mouse click on
+     a chart draws a ring where the same click on a button would not. Take the
+     non-keyboard half away and the pseudo-class above rings the surface on a
+     Tab, exactly like everything else.
+
+     The descendant half is what the visible bug was: recharts stacks its
+     z-index layers as `<g tabindex="-1">`, so a click landing on a bar focuses
+     that layer rather than the surface, which is why the stray ring hugged the
+     bars and left the axis labels outside them. */
+  svg:focus:not(:focus-visible),
+  svg :focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  /* A box that clips -- a tab bar that scrolls sideways, a segmented control
+     rounding its children -- eats the outset ring off whichever child sits
+     flush against the clipped edge, and what is left renders as a bar down one
+     side. Mark the clipper and its children ring inward instead. */
+  .clips-focus-ring > :focus-visible {
+    outline-offset: -2px;
+  }
+
+  /* tabindex="-1" is not a tab stop -- it is a landing spot script moves focus
+     to so the next Tab starts there (dialog roots, scroll ports). Chromium
+     carries :focus-visible across that programmatic move (lib/inputModality.ts),
+     so without this the ring draws around an entire dialog. */
+  [tabindex="-1"]:focus-visible {
+    outline: none;
+  }
+
+  /* Menu and listbox items are tabindex="-1" as well (roving focus), but they
+     are the one landing spot the user drives through: someone arrowing down a
+     menu needs the ring to travel with them. Inward, because the menu clips at
+     its own padding. currentColor rather than the ink token: a highlighted
+     item swaps its text to the accent foreground, and a ring in the page ink
+     drawn inside that fill reads at under 2:1 against it.
+
+     The ring below it is transparent rather than absent, and it is on every
+     item rather than the focused one: forced colors drops the highlight tint
+     that marks the current row everywhere else, and what it repaints instead
+     is an outline that was already drawn. A row with no outline at all is a
+     row the OS has nothing to paint, which under a mouse is every row in the
+     menu. This is the `outline-none` the items used to carry as a utility
+     class, kept where the rest of the rule lives. */
+  [role="menuitem"],
+  [role="menuitemcheckbox"],
+  [role="menuitemradio"],
+  [role="option"] {
+    outline: 2px solid transparent;
+    outline-offset: -2px;
+  }
+
+  [role="menuitem"]:focus-visible,
+  [role="menuitemcheckbox"]:focus-visible,
+  [role="menuitemradio"]:focus-visible,
+  [role="option"]:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: -2px;
+  }
+
+  /* The browser matches :focus-visible on a mouse click for any control that
+     might take a keystroke next -- text fields, <select>, the number and date
+     widgets -- and Chromium carries it across a programmatic focus move on top
+     of that: the first control a dialog focuses after a click, the trigger a
+     menu hands focus back to, the item under the mouse as it crosses a menu.
+     No selector tells any of those from a Tab, so lib/inputModality.ts records
+     whether a key placed the focus the page holds, and while it says no the
+     ring this sheet draws is held off. A keystroke lifts the record, so the
+     same control rings the moment the keyboard takes over. It out-specifies
+     both the baseline and the item rule above, so it reaches every ring in
+     this layer. Only the color, so a rule that already set `outline: none`
+     stays at none -- and a component painting a ring of its own outside this
+     layer keeps it, which is why one that can light under a pointer reads the
+     same record itself (`:root:not([data-pointer-focus])`, LoginPage.css).
+
+     Transparent rather than `none`, which is not a stylistic choice: forced
+     colors repaints every outline in the system palette but cannot paint one
+     that was never drawn, and it drops the box-shadow and normalizes the
+     border a field would otherwise be distinguished by. `none` here leaves a
+     high-contrast user with a clicked field marked by nothing but the caret.
+     A transparent outline is invisible everywhere else and becomes the
+     system's own focus color there -- the same reason Tailwind's
+     `outline-none` compiles to this and not to `outline: none`. */
+  :root[data-pointer-focus] :focus-visible {
+    outline-color: transparent;
   }
 }
 

@@ -20,6 +20,7 @@ from langchain_core.messages.human import HumanMessage
 from langchain_core.messages.utils import convert_to_messages
 
 from ptc_agent.agent.middleware._message_utils import message_id
+from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES
 from ptc_agent.agent.middleware.compaction.types import (
     CONTEXT_SUMMARY_PREFIX,
     NON_CRITICAL_READ_PREFIXES,
@@ -102,14 +103,11 @@ def _extract_text_from_content(content: str | list) -> str:
             elif block_type == "tool_use":
                 texts.append(str(block.get("input", "")))
 
-            # Image blocks (various formats) — short placeholder for counting
-            elif block_type == "image_url":
-                texts.append("[image]")
-            elif block_type == "image":
+            # Attachments — a short placeholder is what they cost to count.
+            elif block_type in IMAGE_BLOCK_TYPES:
                 texts.append("[image]")
 
-            # File block (PDF uploads etc.)
-            elif block_type == "file":
+            elif block_type in FILE_BLOCK_TYPES:
                 fname = block.get("filename", "file")
                 texts.append(f"[file: {fname}]")
 
@@ -149,6 +147,19 @@ def count_tokens_tiktoken(messages: Iterable[MessageLikeRepresentation]) -> int:
 _DATA_URI_RE = re.compile(
     r"data:[a-zA-Z0-9_.+-]+/[a-zA-Z0-9_.+-]+;base64,[A-Za-z0-9+/=]{100,}"
 )
+
+
+def _carries_base64(block: dict) -> bool:
+    """True if an attachment block holds its bytes inline.
+
+    Two shapes, one question: the langchain v1 ``base64`` key, and the
+    Anthropic-native ``source`` object. Asked in one place because the answer
+    used to be spelled differently for images and for files.
+    """
+    if "base64" in block:
+        return True
+    source = block.get("source") or {}
+    return isinstance(source, dict) and source.get("type") == "base64"
 
 
 def strip_base64_from_content(content: str | list) -> str | list:
@@ -197,8 +208,8 @@ def strip_base64_from_content(content: str | list) -> str | list:
                 changed = True
                 continue
 
-        # PDF / file upload with inline base64
-        elif block_type == "file" and "base64" in block:
+        # PDF upload with inline base64, under either name for the block.
+        elif block_type in FILE_BLOCK_TYPES and _carries_base64(block):
             fname = block.get("filename", "file")
             new_blocks.append({"type": "text", "text": f"[PDF: {fname}]"})
             changed = True
@@ -206,8 +217,7 @@ def strip_base64_from_content(content: str | list) -> str | list:
 
         # Anthropic native image block
         elif block_type == "image":
-            source = block.get("source") or {}
-            if source.get("type") == "base64":
+            if _carries_base64(block):
                 new_blocks.append({"type": "text", "text": "[Image]"})
                 changed = True
                 continue
@@ -516,21 +526,203 @@ def _is_tool_message(message: Any) -> bool:
     return False
 
 
-def _strip_leading_orphan_tool_messages(
-    tail: list[AnyMessage],
-) -> list[AnyMessage]:
-    """Drop leading tool-result messages from a reconstructed tail.
+def _tool_result_call_id(message: Any) -> str | None:
+    """The call a tool result answers, in either typed or dict shape.
 
-    A summary message followed by a tool result reconstructs into an Anthropic
-    ``user`` turn whose first content block is an orphaned ``tool_result`` (no
-    preceding ``tool_use``) -> 400. Stripping any leading tool results makes that
-    structurally impossible. This is the crash backstop, so it matches both typed
-    ``ToolMessage`` objects and dict-shaped tool results via ``_is_tool_message``.
+    Only ``tool_call_id``. A dict's ``id`` is the *message* id (see
+    ``_message_utils.message_id``), so reading it here matched a result against
+    the wrong namespace and dropped an id-less result the caller promises to
+    keep.
     """
-    i = 0
-    while i < len(tail) and _is_tool_message(tail[i]):
-        i += 1
-    return tail[i:] if i else tail
+    if isinstance(message, dict):
+        call_id = message.get("tool_call_id")
+        return call_id if isinstance(call_id, str) else None
+    call_id = getattr(message, "tool_call_id", None)
+    return call_id if isinstance(call_id, str) else None
+
+
+def _field(message: Any, name: str) -> Any:
+    """Read a field off a message in either typed or dict shape.
+
+    The same reason ``_is_tool_message`` gives: the reducer is supposed to have
+    coerced everything, and this side of the ownership rule is what deletes, so
+    it does not trust that. Reading only attributes made a dict-shaped assistant
+    turn declare nothing, which marked its own answered results as orphans and
+    stripped them. The two halves have to make the same shape assumption or the
+    mismatch loses content.
+    """
+    if isinstance(message, dict):
+        return message.get(name)
+    return getattr(message, name, None)
+
+
+def declared_tool_call_ids(message: Any) -> set[str]:
+    """Every tool call an assistant turn is on the hook for an answer to.
+
+    Three shapes have to be read, not one. ``tool_calls`` is the parsed list;
+    ``invalid_tool_calls`` holds calls with unparseable arguments, which
+    ``PatchToolCallsMiddleware`` still answers with a ToolMessage, so a
+    predicate that skips them deletes legitimate failure records; and the
+    provider-native blocks (Responses ``function_call``, Anthropic
+    ``tool_use``) are what survives on a message whose parsed lists were never
+    populated.
+    """
+    ids: set[str] = set()
+
+    for attr in ("tool_calls", "invalid_tool_calls"):
+        for call in _field(message, attr) or []:
+            call_id = (
+                call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+            )
+            if isinstance(call_id, str) and call_id:
+                ids.add(call_id)
+
+    content = _field(message, "content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type == "function_call":
+                call_id = block.get("call_id") or block.get("id")
+            elif block_type == "tool_use":
+                call_id = block.get("id")
+            else:
+                continue
+            if isinstance(call_id, str) and call_id:
+                ids.add(call_id)
+
+    return ids
+
+
+def _result_owners(messages: list[AnyMessage]) -> dict[int, int | None]:
+    """Which turn owns each tool result, keyed by the result's position.
+
+    The one ownership rule, read by both the cut and the repair. They used to
+    carry a rule each — nearest-assistant-turn for the cut, accumulate-as-you-go
+    for the repair — and disagreed on an assistant message sitting between two
+    parallel results: the cut called it clean and the repair then dropped a
+    result, which landed in neither half and was lost.
+
+    Ownership must *precede* the result rather than merely appear somewhere in
+    the list, or a later turn that reuses an id would vouch for an orphan the
+    cut had already stranded. A result with no id at all is absent from the map:
+    it cannot be matched, and dropping it would lose content on a shape we do not
+    recognise. ``None`` marks a result whose owner is nowhere in the list, which
+    is what an orphan is.
+    """
+    last_declared: dict[str, int] = {}
+    owners: dict[int, int | None] = {}
+
+    for i, msg in enumerate(messages):
+        if _is_tool_message(msg):
+            call_id = _tool_result_call_id(msg)
+            if call_id is not None:
+                owners[i] = last_declared.get(call_id)
+        else:
+            for call_id in declared_tool_call_ids(msg):
+                last_declared[call_id] = i
+
+    return owners
+
+
+def _orphan_indexes(tail: list[AnyMessage]) -> list[int]:
+    """Positions in ``tail`` holding a tool result nothing before it asked for."""
+    return [i for i, owner in _result_owners(tail).items() if owner is None]
+
+
+def find_group_safe_cutoff(messages: list[AnyMessage], cutoff_index: int) -> int:
+    """Move a cutoff off the inside of a tool-call group.
+
+    A cut is clean exactly when the tail it leaves holds no orphan, so the search
+    runs over ``_orphan_indexes`` rather than over a second idea of which
+    assistant turn owns what.
+
+    Advancing while the next message is a ToolMessage is not enough: a visual
+    Read used to answer with a HumanMessage sitting among the tool results, so
+    the walk stopped on the carrier and left the rest of the group orphaned
+    behind a deleted parent. Those histories are still in checkpoints, so the
+    boundary is found by ownership rather than by type.
+
+    Snapping forward drops the whole partial group, which is also what relieves
+    the context. The forward search stops short of the end of the list: an empty
+    tail is trivially clean, and preserving nothing would cost the turn its most
+    recent work, so the boundary moves back instead.
+
+    A history can arrive already holding a result whose parent is nowhere in the
+    list. No cut repairs that one, so a cut is judged clean when every orphan it
+    leaves behind was already an orphan, not when the tail is orphan-free
+    outright. Otherwise one inherited orphan makes every cutoff look unsafe and
+    compaction gives up on a thread it could still relieve.
+
+    That test is on identity, never on a count. A count lets a cut that strands
+    a healthy result pass whenever the history carried an inherited orphan of
+    its own: one orphan in, one orphan out, and the healthy result deleted by
+    the strip that follows.
+    """
+    if cutoff_index <= 0 or cutoff_index >= len(messages):
+        return cutoff_index
+
+    # A cut strands a result exactly when the result survives it and its owner
+    # does not, so the whole search reduces to one number per position: the
+    # earliest owner among the results from there on. A cut is clean when that
+    # owner is not behind it. An inherited orphan has no owner to leave behind
+    # and so never counts against a candidate, which is the forgiveness the
+    # docstring describes, and identity rather than a count falls out of it.
+    # Re-deriving the orphans per candidate answered the same question, but
+    # made the search quadratic in the length of the history.
+    unowned = len(messages)
+    owners = _result_owners(messages)
+    earliest_owner = [unowned] * (len(messages) + 1)
+    for i in range(len(messages) - 1, -1, -1):
+        owner = owners.get(i)
+        earliest_owner[i] = min(
+            earliest_owner[i + 1], unowned if owner is None else owner
+        )
+
+    def adds_no_orphan(start: int) -> bool:
+        return earliest_owner[start] >= start
+
+    for i in range(cutoff_index, len(messages)):
+        if adds_no_orphan(i):
+            return i
+    for i in range(cutoff_index - 1, -1, -1):
+        if adds_no_orphan(i):
+            return i
+    return 0
+
+
+def strip_orphan_tool_messages(tail: list[AnyMessage]) -> list[AnyMessage]:
+    """Drop tool results in ``tail`` that no preceding message asked for.
+
+    The crash backstop, and the one thing that heals a history already cut
+    inside a group: a tool result whose parent was summarized away is rejected
+    by every provider (Anthropic reads it as a ``tool_result`` opening a user
+    turn, OpenAI as a ``function_call_output`` with no ``function_call``).
+
+    A cutoff from ``find_group_safe_cutoff`` already leaves nothing to drop; the
+    work here is for the checkpoints written before it existed.
+    """
+    orphans = set(_orphan_indexes(tail))
+    if not orphans:
+        return tail
+    return [msg for i, msg in enumerate(tail) if i not in orphans]
+
+
+def partition_at_cutoff(
+    messages: list[AnyMessage], cutoff_index: int
+) -> tuple[list[AnyMessage], list[AnyMessage]]:
+    """Split a history at the cutoff, leaving the preserved side provider-legal.
+
+    One place rather than three: every caller that mints a boundary needs the
+    same slice and the same repair, and when they each wrote their own the strip
+    drifted out of step with the cut that fed it.
+
+    ``find_group_safe_cutoff`` already returns a cut with no orphan behind it, so
+    the strip is the backstop for the paths that never asked it — a cutoff of 0,
+    and checkpoints written before the group-aware cut existed.
+    """
+    return messages[:cutoff_index], strip_orphan_tool_messages(messages[cutoff_index:])
 
 
 def _resolve_anchor_index(
@@ -554,24 +746,36 @@ def build_compaction_event(
     preserved_messages: list[AnyMessage],
     summary_message: HumanMessage,
     file_path: str | None,
-    effective_cutoff: int,
-    previous_event: CompactionEvent | None,
 ) -> CompactionEvent:
     """Construct a ``CompactionEvent`` carrying both a positional cutoff and an id anchor.
 
     The positional ``cutoff_index`` is grounded in ``raw_messages`` by locating
-    the first preserved message's id, falling back to the arithmetic
-    ``compute_absolute_cutoff`` when the anchor is absent (empty preserved tail).
-    ``anchor_message_id`` lets reconstruction re-find the boundary by id if the
-    raw list later drifts.
+    the first preserved message's id. ``anchor_message_id`` lets reconstruction
+    re-find the boundary by id if the raw list later drifts.
+
+    An empty preserved tail has an exact answer — the end of the raw list — and
+    it is used instead of arithmetic over the effective list. Chained arithmetic
+    assumed the effective tail was a 1:1 suffix of the raw one, which orphan
+    stripping is free to violate; when it did, reconstruction resurrected a
+    message that had already been summarized.
     """
     anchor_message_id = (
         message_id(preserved_messages[0]) if preserved_messages else None
     )
 
-    cutoff_index: int | None = _resolve_anchor_index(raw_messages, anchor_message_id)
-    if cutoff_index is None:
-        cutoff_index = compute_absolute_cutoff(effective_cutoff, previous_event)
+    if not preserved_messages:
+        cutoff_index = len(raw_messages)
+    else:
+        resolved = _resolve_anchor_index(raw_messages, anchor_message_id)
+        # An unresolvable anchor means the tail is not the suffix of raw it is
+        # supposed to be. Counting back from the end still lands on a boundary
+        # that preserves the right number of messages, where the old chained
+        # arithmetic drifted by however many the projection had removed.
+        cutoff_index = (
+            resolved
+            if resolved is not None
+            else max(0, len(raw_messages) - len(preserved_messages))
+        )
 
     return CompactionEvent(
         cutoff_index=cutoff_index,
@@ -595,8 +799,9 @@ def get_effective_messages(
     message's id) and re-resolved against the current list only when the stored
     positional ``cutoff_index`` no longer points at that anchor — so list
     perturbation (DeltaChannel reconstruction, injected messages) can't silently
-    drift the boundary. Any leading orphaned ``ToolMessage`` in the tail is
-    stripped unconditionally as a crash backstop.
+    drift the boundary. Any orphaned tool result in the tail is stripped as a
+    crash backstop, which is what heals a history cut inside a tool group by an
+    earlier build.
 
     Args:
         messages: Full message list from state.
@@ -619,29 +824,8 @@ def get_effective_messages(
         if resolved is not None:
             cutoff = resolved
 
-    tail = _strip_leading_orphan_tool_messages(messages[cutoff:])
+    tail = strip_orphan_tool_messages(messages[cutoff:])
     return [event["summary_message"], *tail]
-
-
-def compute_absolute_cutoff(
-    effective_cutoff: int,
-    previous_event: CompactionEvent | None,
-) -> int:
-    """Convert effective message cutoff to absolute state index for chaining.
-
-    When chained compaction occurs, the effective message list starts with
-    the previous summary message at index 0. The -1 accounts for this.
-
-    Args:
-        effective_cutoff: Cutoff index in the effective message list.
-        previous_event: Previous compaction event, or None.
-
-    Returns:
-        Absolute cutoff index in the state message list.
-    """
-    if previous_event is not None:
-        return previous_event["cutoff_index"] + effective_cutoff - 1
-    return effective_cutoff
 
 
 # File-note suffix appended to the summary message content; the parser splits

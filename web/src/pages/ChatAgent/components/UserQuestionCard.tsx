@@ -361,7 +361,7 @@ function UserQuestionCard({ questionData, onAnswer, onSkip }: UserQuestionCardPr
           value={otherText}
           onChange={(e: React.ChangeEvent<HTMLInputElement>) => setOtherText(e.target.value)}
           onKeyDown={handleOtherKeyDown}
-          className="flex-1 text-sm px-3 py-2 rounded-md outline-none transition-colors duration-200 focus:border-[var(--color-accent-overlay)]"
+          className="flex-1 text-sm px-3 py-2 rounded-md transition-colors duration-200 focus:border-[var(--color-accent-overlay)]"
           style={{
             backgroundColor: 'var(--color-border-muted)',
             border: '1px solid var(--color-border-muted)',

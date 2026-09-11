@@ -1,10 +1,11 @@
 'use strict'
 
-const { test, describe, before, after } = require('node:test')
+const { test, describe, before, after, beforeEach } = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { EventEmitter } = require('node:events')
+const http = require('node:http')
 const { loadShell, loadEntryWith, cleanup, opened, setOnline, setSaveDialog, tempDir, electronStub } = require('./helpers')
 
 after(cleanup)
@@ -502,7 +503,7 @@ describe('interception, and what it refuses', () => {
   })
 
   // The loopback port is reachable from any page on the open web, not just from
-  // this machine: `<img src="http://127.0.0.1:8788/callback?error=x">` needs no
+  // this machine: `<img src="http://127.0.0.1:<port>/callback?error=x">` needs no
   // CORS, because the attacker never has to read the reply. The damage is the
   // side effect — the pending flow is consumed and the window signing in is
   // driven to a failure it never had. What separates that from the provider is
@@ -522,6 +523,31 @@ describe('interception, and what it refuses', () => {
     }
 
     // The flow is still live, so the provider's own navigation still lands.
+    const real = await fetch(`http://127.0.0.1:${port}/callback?code=abc123`, {
+      headers: { 'sec-fetch-dest': 'document' },
+    })
+    assert.equal(real.status, 200)
+    assert.equal(landed.length, 1)
+  })
+
+  // Everything this shell decides is read with `get()`, which answers the FIRST
+  // value, while the forward loop rebuilds the query with `set()`, which keeps
+  // the LAST. A repeated parameter therefore splits the two: the flow is
+  // approved against one state and the backend is handed another, so neither
+  // end can tell it was handed a different callback than the one it checked.
+  test('a callback whose query repeats a parameter is not answered', async () => {
+    const landed = []
+    const waiting = windowStub(landed)
+    assert.equal(oauth.begin(authorize('https://app.example.com/callback'), waiting), true)
+
+    const split = await fetch(
+      `http://127.0.0.1:${port}/callback?code=abc123&code=zzz`,
+      { headers: { 'sec-fetch-dest': 'document' } },
+    )
+    assert.equal(split.status, 404)
+    assert.deepEqual(landed, [], 'the split callback moved the window')
+
+    // Not spent by the refusal: the real navigation still completes.
     const real = await fetch(`http://127.0.0.1:${port}/callback?code=abc123`, {
       headers: { 'sec-fetch-dest': 'document' },
     })
@@ -571,13 +597,25 @@ describe('interception, and what it refuses', () => {
     assert.equal(new URL(landed[1]).searchParams.get('code'), 'xyz')
   })
 
-  // The comment on CALLBACK_PORTS states a constraint that lives in someone
-  // else's dashboard: Supabase matches redirect_to as an exact string, so a port
-  // that is not on the Redirect URLs allowlist fails the exchange in production
-  // and only for the users whose earlier ports were already taken. The hardest
-  // possible thing to reproduce, so the list is pinned here instead.
-  test('the callback ports are the ones the provider allows', () => {
-    assert.deepEqual(oauth.CALLBACK_PORTS, [8788, 8789, 8790])
+  // The port is asked for, never chosen (RFC 8252 7.3), and the allowlist entry
+  // on the provider's side is a wildcard because of it. A hardcoded number would
+  // still pass every test above -- the listener works fine on any port -- and
+  // would fail in production only for the users whose machine already had that
+  // one taken, which is the hardest possible thing to reproduce. So the absence
+  // is asserted at the source, where reintroducing it is visible.
+  test('no callback port is hardcoded', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'oauth.js'), 'utf8')
+    assert.match(source, /\.listen\(EPHEMERAL_PORT, '127\.0\.0\.1'/)
+    assert.equal(/^const EPHEMERAL_PORT = 0$/m.test(source), true)
+    for (const line of source.split('\n')) {
+      assert.doesNotMatch(line, /\.listen\(\s*\d/, `a literal port reached listen(): ${line.trim()}`)
+    }
+  })
+
+  // And what it hands out is the port it actually got, which is the only way a
+  // caller can learn an OS-assigned one.
+  test('the port it reports is the one it bound', () => {
+    assert.ok(port >= 1024 && port <= 65535, `port ${port} is outside the usable range`)
   })
 
   // A code that arrives with nothing waiting is discarded, and the page written
@@ -592,6 +630,433 @@ describe('interception, and what it refuses', () => {
     const page = await orphan.text()
     assert.match(page, /Sign-in failed/)
     assert.doesNotMatch(page, /<h1[^>]*>Signed in/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The connector flow. Same listener, nothing else in common with sign-in: this
+// code is redeemable only by the backend that minted the flow, so the shell's
+// whole job is catching it and driving the window to that backend's callback.
+// ---------------------------------------------------------------------------
+describe('an MCP connector whose provider allows only a loopback callback', () => {
+  let oauth
+  before(() => { ({ oauth } = loadShell({ edition: 'saas' })) })
+
+  const RETURN = 'https://app.example.com/api/v1/mcp/oauth/callback'
+  const PLUGINS = 'https://app.example.com/plugins?tab=mcp'
+
+  let port = null
+  before(async () => {
+    port = await oauth.startCallbackServer()
+    assert.ok(port, 'no free callback port for the test')
+  })
+  after(() => oauth.stopCallbackServer())
+
+  // `agent: false` rather than fetch(). Both suites here take whichever loopback
+  // port is free, so they routinely land on the same one, and fetch's pool keeps
+  // a socket to it from the suite before — dispatched onto a server that has
+  // since closed, which reads as ECONNRESET in whichever test happens to be
+  // first. A connection per request has no pool to go stale.
+  const hit = (path, query, dest = 'document') => new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: '127.0.0.1', port, path: `${path}?${query}`, agent: false,
+        headers: { 'sec-fetch-dest': dest } },
+      (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => { body += c })
+        res.on('end', () => resolve({ status: res.statusCode, text: async () => body }))
+      },
+    )
+    req.on('error', reject)
+    req.end()
+  })
+
+  // Arm and bind, the way the page does it: the shell learns the flow's `state`
+  // only after the backend has minted it, and an unbound flow accepts nothing.
+  const armed = async (win, state = 'rh-state') => {
+    const flow = await oauth.beginMcp(RETURN, win)
+    assert.ok(flow, 'no flow was armed')
+    assert.equal(oauth.bindMcp(win, flow.flowId, state), true)
+    return flow
+  }
+
+  // Every test starts from a listener with nothing armed. Several of these arm a
+  // flow and leave it, and the store is module-level, so without this the suite
+  // passes in declaration order and nothing else: a shuffle, a `.only`, or a
+  // test inserted between two of them changes what the next one starts from.
+  //
+  // Tearing the listener down is what empties it, and the port is re-read after
+  // because a reopen can land on a different one. A leaked flow is not merely
+  // untidy here: flows are found by `state`, most of these use the same one, and
+  // the older flow is the one a later callback would match.
+  beforeEach(async () => {
+    oauth.stopCallbackServer()
+    port = await oauth.startCallbackServer()
+    assert.ok(port, 'no free callback port for the test')
+  })
+
+  test('the page is told which URI to mint the flow against', async () => {
+    const flow = await oauth.beginMcp(RETURN, windowStub([], PLUGINS))
+    assert.equal(flow.redirectUri, `http://127.0.0.1:${port}/mcp/callback`)
+    assert.ok(flow.flowId, 'the flow has no id to name it by later')
+  })
+
+  // The backend allowlists this value before it will mint a flow against it:
+  // http, a loopback IP literal, a port at or above 1024, no userinfo, no query
+  // and no fragment. A change on either side that broke the agreement would
+  // degrade every desktop connect to the hosted callback silently, which for
+  // the vendors this exists for is a dead end with no error to report.
+  test('the URI it mints is one the backend will accept', async () => {
+    const u = new URL((await oauth.beginMcp(RETURN, windowStub([], PLUGINS))).redirectUri)
+    assert.ok(Number(u.port) >= 1024, `port ${u.port} is below the backend's floor`)
+    assert.equal(u.protocol, 'http:')
+    assert.equal(u.hostname, '127.0.0.1')
+    assert.equal(u.pathname, oauth.MCP_CALLBACK_PATH)
+    assert.equal(u.search, '')
+    assert.equal(u.hash, '')
+    assert.equal(u.username, '')
+  })
+
+  // Everything the provider sent, not a chosen few. `iss` is the one that was
+  // being dropped: the backend checks it against the metadata of the server the
+  // request went to, and an authorization server that advertises it makes the
+  // whole flow fail closed when it does not arrive.
+  test('every parameter the provider returned reaches the app callback', async () => {
+    const landed = []
+    await armed(windowStub(landed, PLUGINS))
+
+    const back = await hit('/mcp/callback', 'code=rh-code&state=rh-state&iss=https%3A%2F%2Fas.test')
+    assert.equal(back.status, 200)
+    // Receipt, not success: the code has not reached the backend yet, so the
+    // exchange, the issuer check and the write are all still ahead of it.
+    const page = await back.text()
+    assert.match(page, /Authorization received/)
+    assert.doesNotMatch(page, /<h1[^>]*>Connected/)
+
+    assert.equal(landed.length, 1)
+    const got = new URL(landed[0])
+    assert.equal(got.origin + got.pathname, RETURN)
+    assert.equal(got.searchParams.get('code'), 'rh-code')
+    assert.equal(got.searchParams.get('state'), 'rh-state')
+    assert.equal(got.searchParams.get('iss'), 'https://as.test')
+  })
+
+  // The backend classifies on the OAuth error code, and `access_denied` is the
+  // user pressing Cancel rather than anything having gone wrong. Folding the
+  // description over it reported every cancel as a provider fault.
+  test('a denial keeps its code and its description apart', async () => {
+    const landed = []
+    await armed(windowStub(landed, PLUGINS))
+
+    const back = await hit(
+      '/mcp/callback',
+      'error=access_denied&error_description=User+declined&state=rh-state',
+    )
+    assert.equal(back.status, 200)
+    assert.match(await back.text(), /User declined/)
+
+    const got = new URL(landed[0])
+    assert.equal(got.searchParams.get('error'), 'access_denied')
+    assert.equal(got.searchParams.get('error_description'), 'User declined')
+  })
+
+  // The tab leaves the other brokers clickable on purpose, so two connector
+  // flows a second apart is ordinary. The path says only 'a connector', so a
+  // late callback for the first would have been handed to the second and taken
+  // the slot with it: the backend completes a connection nobody is waiting on
+  // while the one the user is watching is told nothing arrived.
+  test("a callback for another flow does not spend this one", async () => {
+    const landed = []
+    await armed(windowStub(landed, PLUGINS), 'second-flow-state')
+
+    const stale = await hit('/mcp/callback', 'code=for-the-first&state=first-flow-state')
+    assert.equal(stale.status, 200)
+    assert.deepEqual(landed, [], 'a stale callback moved the window')
+
+    const real = await hit('/mcp/callback', 'code=rh-code&state=second-flow-state')
+    assert.equal(real.status, 200)
+    assert.equal(landed.length, 1, 'the live flow should still have been there')
+    assert.equal(new URL(landed[0]).searchParams.get('code'), 'rh-code')
+  })
+
+  // Between arming and binding there is no authorize URL in the world for this
+  // flow, so no callback for it can exist. That is also what stops a page in the
+  // system browser from spending the slot by navigating this port with an
+  // invented error, which `sec-fetch-dest: document` cannot tell from the real
+  // thing.
+  test('a flow that was never bound accepts nothing', async () => {
+    const landed = []
+    const win = windowStub(landed, PLUGINS)
+    assert.ok(await oauth.beginMcp(RETURN, win))
+
+    const forged = await hit('/mcp/callback', 'error=forged&state=guessed')
+    assert.equal(forged.status, 200)
+    assert.deepEqual(landed, [], 'an unbound flow was spent')
+  })
+
+  test('only the flow that was armed can be bound', async () => {
+    const win = windowStub([], PLUGINS)
+    const flow = await oauth.beginMcp(RETURN, win)
+    assert.equal(oauth.bindMcp(win, 'not-the-flow-id', 'x'), false)
+    assert.equal(oauth.bindMcp(windowStub([], PLUGINS), flow.flowId, 'x'), false)
+    assert.equal(oauth.bindMcp(win, flow.flowId, ''), false)
+    assert.equal(oauth.bindMcp(win, flow.flowId, 'real-state'), true)
+  })
+
+  // The window is driven wherever `returnUrl` says, carrying a code the user
+  // just authorized. Any page the shell renders can call this, so neither the
+  // destination nor the asker may be taken on trust.
+  test('a return outside our origins is refused', async () => {
+    assert.equal(await oauth.beginMcp('https://evil.example.com/steal', windowStub([], PLUGINS)), null)
+    assert.equal(await oauth.beginMcp('', windowStub([], PLUGINS)), null)
+  })
+
+  test('an asker outside our origins is refused', async () => {
+    assert.equal(await oauth.beginMcp(RETURN, windowStub([], 'https://evil.example.com/page')), null)
+  })
+
+  // One slot, two flows. A code for one is redeemable only by the party that
+  // holds the other end of that flow, so handing it to whatever happens to be
+  // waiting could not work and would consume the slot on the way.
+  test('a sign-in callback cannot consume a connector flow', async () => {
+    const landed = []
+    await armed(windowStub(landed, PLUGINS))
+
+    const wrong = await hit('/callback', 'code=not-for-this-flow')
+    assert.equal(wrong.status, 200)
+    assert.match(await wrong.text(), /Sign-in failed/)
+    assert.deepEqual(landed, [], 'the connector flow was spent on a sign-in callback')
+
+    const real = await hit('/mcp/callback', 'code=rh-code&state=rh-state')
+    assert.equal(real.status, 200)
+    assert.equal(landed.length, 1, 'the connector flow should still have been live')
+  })
+
+  test('and a connector callback cannot consume a sign-in', async () => {
+    const landed = []
+    const authorize = `${SUPABASE}?provider=google&redirect_to=https://app.example.com/callback`
+    assert.equal(oauth.begin(authorize, windowStub(landed, PLUGINS)), true)
+
+    const wrong = await hit('/mcp/callback', 'code=not-for-this-flow&state=x')
+    assert.equal(wrong.status, 200)
+    assert.match(await wrong.text(), /Connection failed/)
+    assert.deepEqual(landed, [], 'the sign-in was spent on a connector callback')
+
+    const real = await hit('/callback', 'code=supabase-code')
+    assert.equal(real.status, 200)
+    assert.equal(landed.length, 1)
+    assert.equal(new URL(landed[0]).searchParams.get('code'), 'supabase-code')
+  })
+
+  // A timeout or a supersede is this shell talking, not the provider. Passing it
+  // on as an authorization error would have the backend explain a failure that
+  // never happened there, and the page would report the provider refused a
+  // connection the provider was never asked about. The window goes back where it
+  // started instead, which is all it takes to leave the connecting state.
+  test('a failure the shell invented is not reported as the provider refusing', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const landed = []
+    await armed(windowStub(landed, PLUGINS))
+
+    // The shell's own clock running out, which is the only way a connector flow
+    // ends without the authorization server having said anything.
+    t.mock.timers.tick(10 * 60_000)
+
+    assert.deepEqual(landed, [PLUGINS])
+  })
+
+  // The shell must not give up before the backend does: its record outlives this
+  // by design, so a shorter clock here can only discard a flow the server would
+  // still have completed. Brokerage consent behind 2FA routinely runs long.
+  test('the shell waits at least as long as the backend keeps the flow', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const landed = []
+    await armed(windowStub(landed, PLUGINS))
+
+    t.mock.timers.tick(5 * 60_000 + 1000)
+    assert.deepEqual(landed, [], 'the flow was dropped while the backend still held it')
+
+    t.mock.timers.tick(5 * 60_000)
+    assert.deepEqual(landed, [PLUGINS])
+  })
+
+  // The backend's own clock starts when it mints the state, and the page has to
+  // arm before it can ask for one -- the redirect_uri travels with that request.
+  // Discovery, and a client registration if the vendor has not seen us before,
+  // happen in between. A clock left running from `beginMcp` spends them out of
+  // the user's time at the consent screen and drops a flow the backend would
+  // still have redeemed.
+  test('the clock starts when the backend state lands, not when the listener arms', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const landed = []
+    const win = windowStub(landed, PLUGINS)
+    const flow = await oauth.beginMcp(RETURN, win)
+    assert.ok(flow, 'no flow was armed')
+
+    // Phase 1, on a vendor whose metadata has to be fetched twice.
+    t.mock.timers.tick(60_000)
+    assert.equal(oauth.bindMcp(win, flow.flowId, 'rh-state'), true)
+
+    t.mock.timers.tick(10 * 60_000 - 1000)
+    assert.deepEqual(landed, [], 'phase 1 was charged to the user at the consent screen')
+
+    t.mock.timers.tick(1000)
+    assert.deepEqual(landed, [PLUGINS])
+  })
+
+  // Only the first bind moves it. Any page the shell renders can call this, and
+  // one that kept re-binding would otherwise hold a loopback port open for as
+  // long as it cared to.
+  test('binding a second time does not push the clock back', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const landed = []
+    const win = windowStub(landed, PLUGINS)
+    const flow = await oauth.beginMcp(RETURN, win)
+    assert.equal(oauth.bindMcp(win, flow.flowId, 'rh-state'), true)
+
+    t.mock.timers.tick(9 * 60_000)
+    assert.equal(oauth.bindMcp(win, flow.flowId, 'rh-state-again'), true)
+
+    t.mock.timers.tick(60_000)
+    assert.deepEqual(landed, [PLUGINS], 'a second bind bought the flow more time')
+  })
+
+  // Same reasoning as the sign-in listener, and the same attack: any page on the
+  // open web can reach a loopback port with `<img src>`, needing no CORS because
+  // it never has to read the reply.
+  test('a connector callback fetched as a subresource cannot consume the flow', async () => {
+    const landed = []
+    await armed(windowStub(landed, PLUGINS), 's')
+
+    for (const dest of ['image', 'empty', 'iframe', 'script']) {
+      const forged = await hit('/mcp/callback', 'error=forged&state=s', dest)
+      assert.equal(forged.status, 404, `${dest} was answered`)
+      assert.deepEqual(landed, [], `${dest} moved the window`)
+    }
+
+    assert.equal((await hit('/mcp/callback', 'code=rh-code&state=s')).status, 200)
+    assert.equal(landed.length, 1)
+  })
+
+  // One window, two flows, and the window is the delivery. Each callback loads
+  // it with the backend's callback URL, and a load that supersedes another is
+  // routine for a page and fatal here: the superseded one is an authorization
+  // code that never reaches the backend, on a flow whose browser tab was told
+  // "Authorization received" a moment earlier.
+  test('a second connector callback waits for the first to arrive', async () => {
+    const landed = []
+    const win = windowStub(landed, PLUGINS)
+    const holding = []
+    win.loadURL = (u) => {
+      landed.push(u)
+      return new Promise((resolve) => holding.push(resolve))
+    }
+    await armed(win, 'first')
+    await armed(win, 'second')
+
+    assert.equal((await hit('/mcp/callback', 'code=code-1&state=first')).status, 200)
+    assert.equal((await hit('/mcp/callback', 'code=code-2&state=second')).status, 200)
+
+    // The second flow's tab has been answered, but its code has not been handed
+    // anywhere yet -- the window is still carrying the first one.
+    assert.equal(landed.length, 1, 'the second handoff went out over the first')
+    assert.match(landed[0], /code=code-1/)
+
+    holding[0]()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.equal(landed.length, 2)
+    assert.match(landed[1], /code=code-2/)
+
+    // Both loads settled before this test ends: the queue is module state, and
+    // one left mid-delivery is one every test after this waits behind.
+    holding[1]()
+    await new Promise((resolve) => setImmediate(resolve))
+  })
+
+  test('the listener answers nothing else', async () => {
+    await armed(windowStub([], PLUGINS))
+    assert.equal((await hit('/mcp/callback', 'nothing=here')).status, 404)
+    assert.equal((await hit('/mcp', 'code=x')).status, 404)
+    assert.equal((await hit('/mcp/callback/extra', 'code=x')).status, 404)
+  })
+
+  // The page has to arm before it knows whether its backend will mint a flow at
+  // all, because the redirect_uri travels with that request. A start that fails
+  // therefore leaves a flow armed for a code nobody is going to send, and left
+  // alone it runs the full timeout and then reloads the window.
+  describe('standing a flow down that never launched', () => {
+    test('the slot is free again, and the window was never touched', async () => {
+      const landed = []
+      const win = windowStub(landed, PLUGINS)
+      const flow = await armed(win)
+
+      assert.equal(oauth.cancelMcp(win, flow.flowId), true)
+      assert.deepEqual(landed, [], 'cancelling is not an outcome to report')
+
+      // Nothing is waiting, so a callback now is refused rather than consumed.
+      assert.equal((await hit('/mcp/callback', 'code=late&state=rh-state')).status, 200)
+      assert.deepEqual(landed, [], 'a stood-down flow still moved the window')
+    })
+
+    test('a second cancel finds nothing, and says so', async () => {
+      const win = windowStub([], PLUGINS)
+      const flow = await armed(win)
+      assert.equal(oauth.cancelMcp(win, flow.flowId), true)
+      assert.equal(oauth.cancelMcp(win, flow.flowId), false)
+    })
+
+    test("another window's flow is not this caller's to cancel", async () => {
+      const landed = []
+      const flow = await armed(windowStub(landed, PLUGINS))
+      // The real flow id, from a window that does not own it. An invented id
+      // misses the lookup and is refused before the windows are ever compared,
+      // so the scoping this test is named for would go unexercised.
+      assert.equal(oauth.cancelMcp(windowStub([], PLUGINS), flow.flowId), false)
+
+      // Still armed, so the code still gets home.
+      return hit('/mcp/callback', 'code=rh-code&state=rh-state').then(() => {
+        assert.equal(landed.length, 1)
+      })
+    })
+
+    // A start that is still in flight can fail after a second one has armed. It
+    // stands down its own flow and only its own: cancelling by 'the connector
+    // flow in this window' tore down a live flow the user was watching, whose
+    // real callback then arrived with nothing waiting.
+    test("a failed start stands down its own flow and leaves the next one running", async () => {
+      const landed = []
+      const win = windowStub(landed, PLUGINS)
+      const first = await oauth.beginMcp(RETURN, win)
+      const second = await armed(win, 'second-state')
+      assert.notEqual(first.flowId, second.flowId)
+
+      assert.equal(oauth.cancelMcp(win, first.flowId), true)
+      assert.equal(oauth.cancelMcp(win, first.flowId), false, 'it was stood down twice')
+
+      assert.equal((await hit('/mcp/callback', 'code=rh-code&state=second-state')).status, 200)
+      assert.equal(landed.length, 1, 'the live flow was torn down by the failed one')
+    })
+
+    // Two consent screens open at once is ordinary use on this tab, and the one
+    // the user finishes second must still get home. A single slot silently
+    // dropped whichever was armed first: its row span forever while its grant
+    // was collected by a vendor nothing would ever redeem it against.
+    test('two connects in one window each complete on their own callback', async () => {
+      const landed = []
+      const win = windowStub(landed, PLUGINS)
+      const first = await armed(win, 'first-state')
+      const second = await armed(win, 'second-state')
+      assert.notEqual(first.flowId, second.flowId)
+
+      assert.equal((await hit('/mcp/callback', 'code=b&state=second-state')).status, 200)
+      assert.equal((await hit('/mcp/callback', 'code=a&state=first-state')).status, 200)
+
+      assert.equal(landed.length, 2, 'one of the two flows was dropped')
+      assert.match(landed[0], /code=b/)
+      assert.match(landed[1], /code=a/)
+    })
   })
 })
 
@@ -653,6 +1118,22 @@ describe('an authorize URL with nowhere to come back to', () => {
     assert.equal(landed.length, 1, 'the window has to be told')
     assert.equal(new URL(landed[0]).origin + new URL(landed[0]).pathname, 'https://app.example.com/auth/callback')
     assert.match(new URL(landed[0]).searchParams.get('error'), /port/)
+  })
+
+  // The refusal above is for this attempt, not for the session. Reading the port
+  // without ever starting one is what latched a failed boot bind for the life of
+  // the process: every sign-in refused for a condition that may have cleared in
+  // seconds, while the connector path next door recovered on its first retry.
+  test('and starts the listener the click after it will need', async () => {
+    opened.length = 0
+    // Nothing exposes the listener directly, so wait for the effect instead: a
+    // click that reaches the browser is a click that got a port.
+    for (let i = 0; i < 200 && opened.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      oauth.begin(authorize('https://app.example.com/auth/callback'), windowStub([]))
+    }
+    assert.equal(opened.length > 0, true, 'still refused; the failure is latched for the session')
+    assert.match(new URL(opened[0]).searchParams.get('redirect_to'), /^http:\/\/127\.0\.0\.1:\d+\/callback$/)
   })
 
   // The refusal is for flows that are ours. A crafted redirect_to is still not
@@ -1106,6 +1587,21 @@ describe('deep links', () => {
     )
   })
 
+  // The web app relies on this: a confirmation link opened in the default
+  // browser is handed back as `langalpha://`, and only the query survives the
+  // trip. Nothing here knows an email token from an OAuth code, which is what
+  // lets /callback forward one on without the shell learning a second shape.
+  test('carry an email token across, not just an OAuth code', () => {
+    const { deeplink } = loadShell({ edition: 'saas' })
+    assert.equal(
+      deeplink.toAppUrl(
+        'langalpha://callback?token_hash=abc123&type=email',
+        'https://app.example.com/',
+      ),
+      'https://app.example.com/callback?token_hash=abc123&type=email',
+    )
+  })
+
   test('fall back to the app origin when the current page is not ours', () => {
     const { deeplink } = loadShell({ edition: 'saas' })
     assert.equal(
@@ -1282,18 +1778,53 @@ describe('the two editions can sit on one machine', () => {
     }
   })
 
+  // The fourth string, and the only invisible one. electron-updater names its
+  // download cache `<package name>-updater`, so two editions sharing a package
+  // name share the directory holding the update each is about to install. It
+  // reaches the build through `extraMetadata`, because appInfo reads the name
+  // off metadata and PublishManager overwrites `updaterCacheDirName` after
+  // spreading the publish config -- so neither package.json nor the feed block
+  // is a place this can be said.
+  test('the editions do not share an updater cache', () => {
+    const yml = read('electron-builder.yml')
+    const build = read('scripts/build.mjs')
+
+    assert.match(yml, /^extraMetadata:\n {2}name: langalpha-desktop-oss$/m,
+      'electron-builder.yml does not stamp the oss package name')
+    assert.ok(build.includes("packageName: 'langalpha-desktop-oss'"), 'oss packageName')
+    assert.ok(build.includes("packageName: 'langalpha-desktop'"), 'saas packageName')
+
+    // The saas swap has to match the committed line exactly, the same way the
+    // other three markers do, or the hosted build keeps the oss cache name.
+    assert.match(build, /name: langalpha-desktop-oss\\r\?\$\/m/,
+      'build.mjs has no marker for the committed package name')
+
+    // The hosted edition keeps the name it already shipped with: renaming it
+    // would strand the cache of every installed hosted app.
+    assert.equal(JSON.parse(read('package.json')).name, 'langalpha-desktop')
+  })
+
   // The artifact name must not follow the display name: productName carries a
-  // space in the oss edition, and the edition already distinguishes the files.
+  // space in the oss edition, and the edition tag already distinguishes the files.
   test('the download filename does not inherit the display name', () => {
     const yml = read('electron-builder.yml')
-    assert.match(yml, /^artifactName: LangAlpha-\$\{EDITION\}/m)
+    assert.match(yml, /^artifactName: LangAlpha\$\{EDITION_TAG\}-/m)
     assert.ok(!/^artifactName:.*\$\{productName\}/m.test(yml), 'artifactName still interpolates productName')
+  })
+
+  // The hosted build is the one the download page serves, so it is named plainly
+  // and only the self-hosted edition is marked. A tag that resolved to something
+  // for both would put the edition back into every public download URL.
+  test('only the self-hosted edition is tagged in the filename', () => {
+    assert.match(read('scripts/build.mjs'), /EDITION_TAG: edition === 'oss' \? '-oss' : ''/,
+      'the edition tag no longer resolves to nothing for the hosted build')
   })
 
   // The filename is not enough on its own. The unpacked bundle is named from
   // productName and lands in a shared `mac-arm64`, and the update manifests are
-  // fixed names (`latest-mac.yml` carries no edition at all), so one output tree
-  // means the second edition to build overwrites the first's metadata.
+  // named for the channel and never the edition (`latest-mac.yml` is the same
+  // filename for both), so one output tree means the second edition to build
+  // overwrites the first's metadata.
   test('neither edition builds into the other\'s output tree', () => {
     assert.match(read('electron-builder.yml'), /^ {2}output: dist\/\$\{EDITION\}$/m)
   })
@@ -1314,6 +1845,33 @@ describe('the two editions can sit on one machine', () => {
       'build.mjs no longer derives its output directory from that line')
     assert.ok(!/path\.(join|resolve)\(root, 'dist'\)/.test(build),
       'build.mjs also hardcodes the output directory somewhere')
+  })
+
+  // electron-builder names the manifest for the channel it reads off the
+  // version's prerelease tag, so a `latest*` check passes on 0.2.0 and fails on
+  // 0.2.0-rc.1 while the build is equally fine either way. That is not a corner:
+  // a prerelease through the real pipeline is how the release workflow is meant
+  // to be tested, and this check failed all three platforms on the first run
+  // that did it, after passing locally on a stable version.
+  test('the manifest check follows the version to its channel', () => {
+    const build = read('scripts/build.mjs')
+    assert.ok(!/\/\^latest\.\*\\\.yml\$\//.test(build),
+      'build.mjs is back to demanding the latest channel whatever the version says')
+    assert.match(build, /no \$\{channel\}\*\.yml was produced/,
+      'the failure no longer names the manifest it wanted, which is the whole diagnosis')
+
+    // Run the derivation the file actually ships, not a copy of it.
+    const source = /const channel = \/(.+?)\/\.exec\(version\)\?\.\[1\] \|\| 'latest'/.exec(build)
+    assert.ok(source, 'build.mjs no longer derives the channel from the version')
+    const channelOf = (v) => new RegExp(source[1]).exec(v)?.[1] || 'latest'
+
+    // The expected column is semver `prerelease()[0]`, which is verbatim what
+    // electron-builder's `appInfo.channel` returns and names the file after.
+    for (const [version, channel] of [
+      ['0.1.3', 'latest'], ['0.2.0', 'latest'], ['10.20.30', 'latest'],
+      ['0.2.0-rc.1', 'rc'], ['0.2.0-beta.1', 'beta'], ['0.2.0-beta', 'beta'],
+      ['1.0.0-alpha.beta', 'alpha'], ['1.0.0-rc-1', 'rc-1'], ['1.0.0-0', '0'],
+    ]) assert.equal(channelOf(version), channel, `${version} resolves to the wrong channel`)
   })
 })
 
@@ -1656,5 +2214,88 @@ describe('rendering a page to a PDF', () => {
       // And nothing half-written left beside it under a name nobody will explain.
       assert.deepEqual(fs.readdirSync(path.dirname(target)), ['out.pdf'])
     })
+  })
+})
+
+// Signing and notarization are two separate switches, and the committed config
+// has both off: a contributor with neither credential has to be able to run
+// `dist`. scripts/build.mjs turns each on by replacing the exact line it finds,
+// and it does exit loudly when that line is gone — but only on a build that had
+// credentials, which is never a local one. So the pairing is asserted here,
+// where a drifted marker fails on every run rather than in the release that
+// first needed it.
+describe('the committed package is unsigned and un-notarized', () => {
+  const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8')
+
+  test('both switches are committed in the off position', () => {
+    const yml = read('electron-builder.yml')
+    assert.match(yml, /^ {2}identity: null$/m, 'signing is not disabled by default')
+    // The one that is easy to lose: electron-builder signs whenever a
+    // certificate is present but submits to Apple only when told, so a config
+    // without this line ships a signed build Gatekeeper still refuses.
+    assert.match(yml, /^ {2}notarize: false$/m, 'notarization is not stated at all')
+  })
+
+  test('build.mjs targets exactly those two lines', () => {
+    const build = read('scripts/build.mjs')
+    assert.ok(build.includes('/^ {2}identity: null\\r?$/m'), 'the identity marker moved')
+    assert.ok(build.includes('/^ {2}notarize: false\\r?$/m'), 'the notarize marker moved')
+  })
+
+  // Not a switch build.mjs flips: unlike the two above, this one is committed on.
+  // It costs nothing without a certificate, because electron-builder only signs
+  // when it has one, and losing it produces a DMG that Gatekeeper refuses on open
+  // no matter how well notarized the app inside it is.
+  test('the disk image is signed', () => {
+    assert.match(read('electron-builder.yml'), /^ {2}sign: true$/m, 'dmg signing is off')
+  })
+
+  // The DMG is a separate submission from the .app, and the failure it prevents
+  // is silent: the app staples fine, the build goes green, and the file people
+  // actually download is the one that is refused.
+  test('the disk image is submitted and stapled', () => {
+    const build = read('scripts/build.mjs')
+    assert.ok(build.includes("'notarytool', 'submit'"), 'disk images are never submitted')
+    assert.ok(build.includes("'stapler', 'staple'"), 'disk images are never stapled')
+    assert.ok(build.includes("context:primary-signature"), 'the DMG is assessed with the wrong Gatekeeper context')
+  })
+})
+
+// The scheme contract spans three processes and two repos' worth of literals:
+// main writes an argv switch, preload parses it, and the web app maps the value
+// onto the path segment it marks email links with. Every consumer reads only its
+// own half, so renaming a scheme in config.js breaks nothing here, nothing in
+// tsc, and nothing in the web suite — the marked link simply addresses a scheme
+// no build answers on, and the OS opens the wrong app or none. That is the
+// failure this pins: a link marked `langalpha://` reached bare Electron on a
+// machine where the running app was the OSS edition.
+describe('the deep-link scheme contract holds across the two processes', () => {
+  const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8')
+
+  test('the switch main writes is the one preload parses', () => {
+    assert.match(read('src/main.js'), /`--langalpha-shell-scheme=\$\{config\.scheme\}`/)
+    assert.match(read('src/preload.js'), /scheme: flag\('shell-scheme'\)/)
+  })
+
+  test('the web app knows every scheme an edition can register', () => {
+    const handoff = read('../web/src/lib/desktopAuthHandoff.ts')
+    for (const edition of ['saas', 'oss']) {
+      const { scheme } = loadShell({ edition }).config
+      assert.match(
+        handoff,
+        new RegExp(`^\\s*'?${scheme}'?:\\s*'[a-z-]+',$`, 'm'),
+        `web handoff table has no entry for the ${edition} scheme '${scheme}'`,
+      )
+    }
+  })
+
+  test('the web app routes the segments it marks links with', () => {
+    const handoff = read('../web/src/lib/desktopAuthHandoff.ts')
+    const app = read('../web/src/App.tsx')
+    const segments = [...handoff.matchAll(/^\s*'?[a-z-]+'?:\s*'([a-z-]+)',$/gm)].map((m) => m[1])
+    assert.ok(segments.length >= 2, 'no segments found in the handoff table')
+    for (const page of ['/auth/confirm', '/reset-password']) {
+      assert.match(app, new RegExp(`path="${page}/:shell"`), `${page} does not serve a marked link`)
+    }
   })
 })

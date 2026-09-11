@@ -472,6 +472,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 content=required_msg,
                 tool_call_id=tool_call_id,
                 name="Task",
+                status="error",
             )
 
         task = await self.registry.get_by_task_id(tid)
@@ -482,6 +483,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 content=f"Error: Task-{tid} not found.",
                 tool_call_id=tool_call_id,
                 name="Task",
+                status="error",
             )
         return task
 

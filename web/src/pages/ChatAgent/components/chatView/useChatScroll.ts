@@ -1,28 +1,70 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { isNearBottom } from '../../utils/scrollHelpers';
+import { findMessageElement, resolveScrollContent, resolveScrollViewport } from '../../utils/scrollDom';
 import { scrollMemory } from '@/lib/scrollMemory';
 
 // Scroll/pin tuning. Distance from the bottom (px) still counted as "at bottom";
 // settle window the pin re-applies through as async media expands; fallback for
 // engines without a `scrollend` event.
 const NEAR_BOTTOM_PX = 120;
+/** "At the bottom" for an upward scroll. Not 0: scrollHeight and clientHeight
+ *  are rounded and scrollTop is not, and under browser zoom a container at
+ *  its maximum reads a residual of a pixel or two. */
+const AT_BOTTOM_PX = 4;
 const SETTLE_QUIET_MS = 1500;
 const SETTLE_HARD_CAP_MS = 8000;
 const SCROLLEND_FALLBACK_MS = 600;
+// Gap left above a bubble the transcript is pinned to.
+const ANCHOR_OFFSET_PX = 16;
+
+/** scrollTop that puts bubble `id` just under the viewport top, or null once it is no longer in the transcript. */
+function anchorTop(c: HTMLElement, id: string, part?: AnchorPart): number | null {
+  const msg = findMessageElement(c, id);
+  if (!msg) return null;
+  // The reply part is the bubble's last prose block, so a turn that opened with
+  // commentary and tool rows lands on the answer; a bubble without prose is
+  // its own start.
+  const el = (part === 'reply' && msg.querySelector<HTMLElement>('[data-reply-start]')) || msg;
+  return Math.max(0, c.scrollTop + el.getBoundingClientRect().top - c.getBoundingClientRect().top - ANCHOR_OFFSET_PX);
+}
 
 /** Chat transcript scroll controller + tab scroll memory (carved out of
- * ChatView, 5.9c): bottom pin with async-settle re-apply, streaming follow,
+ * ChatView, 5.9c): bottom pin with async-settle re-apply, per-frame streaming follow,
  * thread-entry restore, jump-to-latest pill, and per-tab scroll memory. */
-export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, isLoadingHistory, currentThreadId, threadId }: {
+/**
+ * Pin controller state. 'bottom' follows the growing transcript end; 'offset'
+ * converges on a remembered mid-thread scrollTop that async content (charts,
+ * markdown, images) hasn't made reachable yet — same settle machinery,
+ * different target. 'anchor' holds a chosen bubble under the viewport top
+ * (minimap navigation), re-measured on every re-apply so media above it
+ * finishing layout can't shift the landing.
+ */
+export type AnchorPart = 'reply';
+export type PinTarget = { mode: 'bottom' } | { mode: 'offset'; top: number } | { mode: 'anchor'; id: string; part?: AnchorPart };
+
+export function useChatScroll({
+  activeAgentId,
+  messages,
+  isActive,
+  isActiveRef,
+  isLoadingHistory,
+  isStreaming,
+  currentThreadId,
+  threadId,
+}: {
   activeAgentId: string;
   messages: unknown[];
   isActive: boolean;
   isActiveRef: { current: boolean };
   isLoadingHistory: boolean;
+  /** A turn is open: the transcript grows on its own, so a reader at the end is carried along. */
+  isStreaming: boolean;
   currentThreadId: string;
   threadId: string;
 }) {
   const scrollAreaRef = useRef<HTMLDivElement>(null);
+  const isStreamingRef = useRef(isStreaming);
+  isStreamingRef.current = isStreaming;
   const subagentScrollAreaRef = useRef<HTMLDivElement>(null);
 
   // Resolved thread id for the cross-unmount scroll store (scrollMemory) — a
@@ -41,12 +83,10 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
   const skipSubagentAutoScrollRef = useRef(false);
 
   // Helper: get the scrollable container from a ScrollArea ref
-  const getScrollContainer = useCallback((ref: React.RefObject<HTMLDivElement | null>): HTMLElement | null => {
-    if (!ref?.current) return null;
-    return ref.current.querySelector('[data-radix-scroll-area-viewport]') ||
-           ref.current.querySelector('.overflow-auto') ||
-           ref.current;
-  }, []);
+  const getScrollContainer = useCallback(
+    (ref: React.RefObject<HTMLDivElement | null>): HTMLElement | null => resolveScrollViewport(ref?.current ?? null),
+    [],
+  );
 
   // Save scroll position of the currently active tab
   const saveScrollPosition = useCallback(() => {
@@ -92,22 +132,37 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
   const isNearBottomRef = useRef(true);
   const isSubagentNearBottomRef = useRef(true);
 
-  // Pin controller state. 'bottom' follows the growing transcript end;
-  // 'offset' converges on a remembered mid-thread scrollTop that async content
-  // (charts, markdown, images) hasn't made reachable yet — same settle
-  // machinery, different target.
-  type PinTarget = { mode: 'bottom' } | { mode: 'offset'; top: number };
   const pinTargetRef = useRef<PinTarget | null>(null);
   const programmaticScrollRef = useRef(false);
+  // Detaches the pending release of the current programmatic scroll (see
+  // withProgrammaticScroll); null when no release is pending.
+  const programmaticReleaseRef = useRef<(() => void) | null>(null);
   const settleQuietTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settleHardCapRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reapplyRafRef = useRef<number | null>(null);
   const restoredForThreadRef = useRef<string | null>(null);
-  // Streaming auto-follow's deferred scroll, and the entry-restore frame —
-  // tracked so a thread switch / unmount cancels a pending scroll instead of
-  // yanking a now-stale view.
-  const streamFollowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The entry-restore frame, tracked so a thread switch / unmount cancels a
+  // pending scroll instead of yanking a now-stale view.
   const entryRestoreRafRef = useRef<number | null>(null);
+  const visibilityRafRef = useRef<number | null>(null);
+  // The last scrollTop the streaming follow set. Its scroll event is recognised
+  // by position rather than by the programmatic flag: a follow runs on every
+  // growth frame, and a flag re-armed that often never clears, which would
+  // swallow a keyboard or scrollbar scroll for the whole turn. The flag stays
+  // for smooth scrolls, which fire many events at positions nobody can predict.
+  const followTopRef = useRef<number | null>(null);
+
+  /** The entry restore for this thread has landed, so an automatic scroll may move the view. */
+  const entryRestoreSettled = useCallback(
+    () => !memoryTidRef.current || restoredForThreadRef.current === memoryTidRef.current,
+    [],
+  );
+  /** A turn is streaming, nothing else owns the scroll and the reader is
+   *  riding the end. Growth in a settled transcript is the reader's own doing
+   *  (a block opened, a panel rewrapping the text) and is left where it is. */
+  const isFollowing = useCallback(
+    () => isStreamingRef.current && !pinTargetRef.current && isNearBottomRef.current && entryRestoreSettled(),
+    [entryRestoreSettled],
+  );
 
   // Jump-to-latest pill.
   const messagesLenRef = useRef(0);
@@ -126,30 +181,54 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     );
   }, []);
   // Wrap a programmatic scroll so the scroll listener doesn't mistake it for a
-  // user scroll (which cancels the pin). Smooth scrolls clear on `scrollend`
-  // (600ms fallback for engines without it); instant clears after the scroll
-  // event flushes (double rAF).
+  // user scroll (which cancels the pin). Smooth scrolls clear on `scrollend`,
+  // with a fallback that fires 600ms after the last scroll event: it measures
+  // quiet, not elapsed time, because a whole-thread smooth scroll runs longer
+  // than any fixed budget, and it still covers a scroll that never moves and
+  // so never ends. Instant scrolls clear after the scroll event flushes (double
+  // rAF). The flag is shared, so a newer scroll detaches the previous release
+  // first: a release firing mid-way through this scroll would hand its
+  // remaining scroll events to the user-scroll branch, which drops the pin
+  // the new scroll just set.
   const withProgrammaticScroll = useCallback(
     (fn: () => void, behavior: 'auto' | 'smooth' = 'auto') => {
+      programmaticReleaseRef.current?.();
       programmaticScrollRef.current = true;
       fn();
       if (behavior === 'smooth') {
         const c = getScrollContainer(scrollAreaRef);
-        let cleared = false;
-        const clear = () => {
-          if (cleared) return;
-          cleared = true;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        function detach() {
           c?.removeEventListener('scrollend', clear);
+          c?.removeEventListener('scroll', arm);
+          if (timer) clearTimeout(timer);
+          if (programmaticReleaseRef.current === detach) programmaticReleaseRef.current = null;
+        }
+        function clear() {
+          detach();
           programmaticScrollRef.current = false;
-        };
+        }
+        function arm() {
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(clear, SCROLLEND_FALLBACK_MS);
+        }
         c?.addEventListener('scrollend', clear, { once: true });
-        setTimeout(clear, SCROLLEND_FALLBACK_MS);
+        c?.addEventListener('scroll', arm, { passive: true });
+        arm();
+        programmaticReleaseRef.current = detach;
       } else {
-        requestAnimationFrame(() =>
-          requestAnimationFrame(() => {
+        let inner = 0;
+        const outer = requestAnimationFrame(() => {
+          inner = requestAnimationFrame(() => {
+            programmaticReleaseRef.current = null;
             programmaticScrollRef.current = false;
-          }),
-        );
+          });
+        });
+        programmaticReleaseRef.current = () => {
+          cancelAnimationFrame(outer);
+          cancelAnimationFrame(inner);
+          programmaticReleaseRef.current = null;
+        };
       }
     },
     [getScrollContainer],
@@ -158,11 +237,7 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
   // The growing content node inside the fixed-height Radix viewport. The viewport
   // height is fixed (h-full); only its content grows as async media expands, so
   // that is what the ResizeObserver must watch.
-  const getScrollContent = useCallback(
-    (c: HTMLElement): HTMLElement =>
-      c.querySelector<HTMLElement>('.max-w-3xl') ?? (c.firstElementChild as HTMLElement) ?? c,
-    [],
-  );
+  const getScrollContent = useCallback((c: HTMLElement): HTMLElement => resolveScrollContent(c), []);
 
   const clearSettleTimers = useCallback(() => {
     if (settleQuietTimerRef.current) {
@@ -216,23 +291,53 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     [getScrollContainer, withProgrammaticScroll, armSettleTimers, setPillState],
   );
 
-  // Re-apply the pin target (rAF-coalesced); called by the ResizeObserver each
-  // time content settles, so async media finishing layout can't strand the user
-  // mid-thread ('bottom') or clamp a remembered offset short ('offset').
+  // Re-apply the pin target; called by the ResizeObserver each time content
+  // settles, so async media finishing layout can't strand the user mid-thread
+  // ('bottom') or clamp a remembered offset short ('offset'). Applied right
+  // there, not in a deferred frame: the observer already runs after layout and
+  // before paint, so the frame that shows the taller transcript is the frame
+  // that shows it scrolled. Deferring by a frame painted the growth first and
+  // the scroll a frame later, a visible snap on every reload and return.
   const reapplyPin = useCallback(() => {
-    if (reapplyRafRef.current != null) return;
-    reapplyRafRef.current = requestAnimationFrame(() => {
-      reapplyRafRef.current = null;
+    const c = getScrollContainer(scrollAreaRef);
+    const target = pinTargetRef.current;
+    if (!target || !c) return;
+    const top =
+      target.mode === 'bottom' ? c.scrollHeight : target.mode === 'offset' ? target.top : anchorTop(c, target.id, target.part);
+    if (top == null) {
+      // The anchored bubble left the transcript (edit / regenerate truncation).
+      pinTargetRef.current = null;
+      clearSettleTimers();
+      return;
+    }
+    withProgrammaticScroll(() => c.scrollTo({ top }), 'auto');
+    armSettleTimers();
+  }, [getScrollContainer, withProgrammaticScroll, armSettleTimers, clearSettleTimers]);
+
+  // Scroll a bubble under the viewport top and hold it there through the settle
+  // window. Anything short of the newest turn hands the user the jump pill and
+  // a false near-bottom, so a streaming follow can't yank them back down.
+  const pinToMessage = useCallback(
+    (id: string, behavior: 'auto' | 'smooth' = 'auto', isLatest = false, part?: AnchorPart) => {
       const c = getScrollContainer(scrollAreaRef);
-      const target = pinTargetRef.current;
-      if (!target || !c) return;
-      withProgrammaticScroll(
-        () => c.scrollTo({ top: target.mode === 'bottom' ? c.scrollHeight : target.top }),
-        'auto',
-      );
+      if (!c) return;
+      const top = anchorTop(c, id, part);
+      if (top == null) return;
+      pinTargetRef.current = { mode: 'anchor', id, part };
+      // A request past the maximum clamps, so any turn near enough to the end
+      // reads as "at the bottom" by position alone. Only the newest one really
+      // is: under an earlier turn the transcript still has room to grow, and
+      // calling that the bottom re-arms the follow that carries the reader off
+      // the turn they picked.
+      const landsAtBottom = isLatest && top >= Math.max(0, c.scrollHeight - c.clientHeight) - 1;
+      isNearBottomRef.current = landsAtBottom;
+      pillBaselineLenRef.current = messagesLenRef.current;
+      setPillState({ visible: !landsAtBottom, hasNew: false, newCount: 0 });
+      withProgrammaticScroll(() => c.scrollTo({ top, behavior }), behavior);
       armSettleTimers();
-    });
-  }, [getScrollContainer, withProgrammaticScroll, armSettleTimers]);
+    },
+    [getScrollContainer, withProgrammaticScroll, armSettleTimers, setPillState],
+  );
 
   // Scroll listener + settle-aware ResizeObserver.
   // Re-attaches when activeAgentId changes (ScrollArea remounts on tab switch).
@@ -246,11 +351,29 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     // Reset to near-bottom when switching tabs
     nearBottomRef.current = true;
 
+    let lastTop = c.scrollTop;
     const handleScroll = () => {
-      nearBottomRef.current = isNearBottom(
-        { scrollTop: c.scrollTop, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight },
-        NEAR_BOTTOM_PX,
-      );
+      // The band is how a *user* scroll re-joins the stream. An anchor pin's own
+      // scrolls must not get to answer it: pinToMessage already decided whether
+      // that landing is the bottom, knowing the one thing a position cannot tell
+      // it, which turn is the newest. A request past the maximum clamps, so a
+      // landing on an earlier turn near the end sits exactly at the maximum and
+      // reads as the bottom by any positional test. Letting it re-arm the follow
+      // is what walks the reader off the turn they picked once the settle window
+      // lets go.
+      const pinOwnsPosition = programmaticScrollRef.current && pinTargetRef.current?.mode === 'anchor';
+      if (!pinOwnsPosition) {
+        const metrics = { scrollTop: c.scrollTop, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight };
+        // The band answers a downward scroll. An upward one is a reader
+        // leaving, by wheel, key, drag or touch, and only the bottom itself
+        // re-arms: inside the band the follow would put them back on the next
+        // growth frame, and each frame grows, so a notch at a time they could
+        // never get out. A fold that clamps scrollTop moves up too, but lands
+        // on the bottom, so it keeps following.
+        const movedUp = c.scrollTop < lastTop;
+        nearBottomRef.current = isNearBottom(metrics, movedUp ? AT_BOTTOM_PX : NEAR_BOTTOM_PX);
+      }
+      lastTop = c.scrollTop;
       if (!isMain) return;
       // Record every settle (user scrolls AND pins/follows) so the cross-unmount
       // store always reflects where the transcript actually is — a bottom pin
@@ -258,13 +381,20 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
       // re-entry pins to the (possibly taller) new bottom. Offset sessions are
       // the exception: their intermediate scrolls clamp against still-short
       // content and would overwrite the very offset being restored.
+      // The band, not the upward rule: a nudge that pauses the follow is not a
+      // place worth coming back to, and a numeric save re-opens with the pill.
       if (memoryTidRef.current && pinTargetRef.current?.mode !== 'offset') {
         scrollMemory.set(
           `thread:${memoryTidRef.current}`,
-          nearBottomRef.current ? 'bottom' : c.scrollTop,
+          isNearBottom({ scrollTop: c.scrollTop, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight }, NEAR_BOTTOM_PX) ? 'bottom' : c.scrollTop,
         );
       }
       if (programmaticScrollRef.current) return; // ignore our own scrolls
+      if (followTopRef.current != null && Math.abs(c.scrollTop - followTopRef.current) < 1) {
+        followTopRef.current = null;
+        return;
+      }
+      followTopRef.current = null;
       // A genuine user scroll takes control away from the pin controller.
       pinTargetRef.current = null;
       clearSettleTimers();
@@ -298,71 +428,94 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     c.addEventListener('wheel', handleUserIntent, { passive: true });
     c.addEventListener('touchstart', handleUserIntent, { passive: true });
 
-    // While a pin target is set, re-apply it whenever the transcript grows
-    // (charts/code/images finishing layout) — the fix for landing mid-thread.
+    // Content growth, observed after layout and before paint. While a pin
+    // target is set, re-apply it (charts/code/images finishing layout, the fix
+    // for landing mid-thread). Otherwise this is the streaming follow: a reader
+    // near the bottom is kept there in the same frame the transcript grows.
+    // Instant, not smooth: growth per frame is a few px, so an instant set is
+    // continuous, whereas a smooth series re-targeted from every growth trails
+    // the bottom by hundreds of px under fast streaming and slides when a row
+    // folds. Only growth is followed: the observer also fires once on attach
+    // and on every shrink, and a follow there would jump a reader whose
+    // position a tab return is about to restore, or whom a fold just left
+    // exactly where they were.
     let ro: ResizeObserver | null = null;
     if (isMain) {
-      ro = new ResizeObserver(() => {
-        if (pinTargetRef.current) reapplyPin();
+      let lastHeight = -1;
+      ro = new ResizeObserver((entries) => {
+        const height = entries[0]?.contentRect.height ?? lastHeight;
+        const grew = lastHeight >= 0 && height > lastHeight;
+        lastHeight = height;
+        if (pinTargetRef.current) {
+          reapplyPin();
+          return;
+        }
+        if (!grew || !isFollowing()) return;
+        const top = c.scrollHeight - c.clientHeight;
+        if (top - c.scrollTop <= 0) return;
+        followTopRef.current = top;
+        c.scrollTo({ top });
       });
       ro.observe(getScrollContent(c));
     }
+    // A hidden tab gets no rendering updates, so the observer above does not
+    // fire and the view sits still while the transcript grows; the animations
+    // the tab queued apply their final layout only on return. Close whatever
+    // gap that leaves in one instant jump, only for a reader who was following:
+    // a user who scrolled up keeps their place. The jump is made twice: at the
+    // event, and again inside the first frame, after those animations have
+    // applied (see lib/hiddenTabMotion) but before that frame paints.
+    const handleVisibility = () => {
+      if (document.visibilityState !== 'visible' || !isMain) return;
+      const jump = () => {
+        if (!isFollowing()) return;
+        if (c.scrollHeight - c.scrollTop - c.clientHeight <= 1) return;
+        withProgrammaticScroll(() => c.scrollTo({ top: c.scrollHeight }), 'auto');
+      };
+      jump();
+      if (visibilityRafRef.current != null) cancelAnimationFrame(visibilityRafRef.current);
+      visibilityRafRef.current = requestAnimationFrame(() => {
+        visibilityRafRef.current = null;
+        jump();
+      });
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       c.removeEventListener('scroll', handleScroll);
       c.removeEventListener('wheel', handleUserIntent);
       c.removeEventListener('touchstart', handleUserIntent);
-      ro?.disconnect();
-      if (reapplyRafRef.current != null) {
-        cancelAnimationFrame(reapplyRafRef.current);
-        reapplyRafRef.current = null;
+      document.removeEventListener('visibilitychange', handleVisibility);
+      if (visibilityRafRef.current != null) {
+        cancelAnimationFrame(visibilityRafRef.current);
+        visibilityRafRef.current = null;
       }
+      ro?.disconnect();
     };
-  }, [activeAgentId, getScrollContainer, getScrollContent, reapplyPin, clearSettleTimers]);
+  }, [activeAgentId, getScrollContainer, getScrollContent, reapplyPin, clearSettleTimers, withProgrammaticScroll, isFollowing]);
 
-  // Auto-scroll main chat to bottom when messages change, but only if the user is
-  // near the bottom and the pin controller isn't currently owning the scroll.
+  // New messages for a reader who is not following: the ResizeObserver above
+  // keeps a following reader at the bottom, so all that is left here is the
+  // "N new" count on the jump pill. Held until the thread-entry decision
+  // (below) has landed, as messages render while history is still hydrating.
   useEffect(() => {
     if (pinTargetRef.current) return; // pin controller owns scroll during settle
-    // Hold all follows until the thread-entry decision (below) has landed —
-    // messages render while history is still hydrating, and a bottom-follow
-    // here would record 'bottom' over the very offset entry restore is about
-    // to read.
-    if (memoryTidRef.current && restoredForThreadRef.current !== memoryTidRef.current) return;
-    if (!isNearBottomRef.current) {
-      // User is reading earlier turns — surface "N new" instead of yanking them down.
-      const delta = messagesLenRef.current - pillBaselineLenRef.current;
-      if (delta > 0) {
-        setJumpPill((prev) => (prev.visible ? { visible: true, hasNew: true, newCount: delta } : prev));
-      }
-      return;
+    if (!entryRestoreSettled()) return;
+    if (isNearBottomRef.current) return;
+    const delta = messagesLenRef.current - pillBaselineLenRef.current;
+    if (delta > 0) {
+      setJumpPill((prev) => (prev.visible ? { visible: true, hasNew: true, newCount: delta } : prev));
     }
-    const c = getScrollContainer(scrollAreaRef);
-    if (!c) return;
-    if (streamFollowTimerRef.current) clearTimeout(streamFollowTimerRef.current);
-    streamFollowTimerRef.current = setTimeout(() => {
-      streamFollowTimerRef.current = null;
-      // Re-check at fire time: if a pin took over or the user scrolled up
-      // between scheduling and firing, do not yank them to the bottom. Wrap as
-      // programmatic so this scroll isn't misread as the user scrolling away.
-      if (pinTargetRef.current || !isNearBottomRef.current) return;
-      const el = getScrollContainer(scrollAreaRef);
-      if (!el) return;
-      withProgrammaticScroll(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }), 'smooth');
-    }, 0);
-    return () => {
-      if (streamFollowTimerRef.current) {
-        clearTimeout(streamFollowTimerRef.current);
-        streamFollowTimerRef.current = null;
-      }
-    };
-  }, [messages, getScrollContainer, withProgrammaticScroll]);
+  }, [messages, entryRestoreSettled]);
 
   // Thread-entry restore — the core fix. Fires on the real "history is present"
   // signal (isLoadingHistory flips false), not on an empty/partial list. A
   // remembered mid-thread offset (scrollMemory, survives route unmounts) wins
   // over the default bottom pin, so tabbing away and back lands where the user
   // left; 'bottom' / no memory pins to bottom through the async settle window.
-  useEffect(() => {
+  // A layout effect, applied in the same commit that renders the history: the
+  // first frame the user sees of the thread is already in position. The
+  // deferred frame remains only for a viewport that is not mounted yet.
+  useLayoutEffect(() => {
     if (!isActive) return;
     const tid = currentThreadId || threadId;
     if (!tid || tid === '__default__') return;
@@ -388,26 +541,33 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
       isNearBottomRef.current = false;
       pillBaselineLenRef.current = messagesLenRef.current;
       setPillState({ visible: true, hasNew: false, newCount: 0 });
-      entryRestoreRafRef.current = requestAnimationFrame(() => {
-        entryRestoreRafRef.current = null;
-        // The instance may have gone inactive (cached/hidden) before this frame.
-        const c = isActiveRef.current ? getScrollContainer(scrollAreaRef) : null;
-        if (!c) {
-          // The apply never ran — release the claim so a stale pin can't
-          // block follows when the instance reactivates.
-          if (pinTargetRef.current?.mode === 'offset') pinTargetRef.current = null;
-          return;
-        }
+    }
+    // One apply for both targets: run in this commit when the viewport is
+    // already mounted, on the next frame when it is not.
+    const apply = () => {
+      // The instance may have gone inactive (cached/hidden) before the frame.
+      const c = isActiveRef.current ? getScrollContainer(scrollAreaRef) : null;
+      if (!c) {
+        // Nothing was applied: release the claim so a stale pin can't block
+        // follows when the instance reactivates.
+        if (pinTargetRef.current?.mode === 'offset') pinTargetRef.current = null;
+        return;
+      }
+      if (typeof saved === 'number') {
         withProgrammaticScroll(() => {
           c.scrollTop = saved;
         });
         armSettleTimers();
-      });
+      } else {
+        pinToBottom('auto');
+      }
+    };
+    if (getScrollContainer(scrollAreaRef)) {
+      apply();
     } else {
       entryRestoreRafRef.current = requestAnimationFrame(() => {
         entryRestoreRafRef.current = null;
-        if (!isActiveRef.current) return;
-        pinToBottom('auto');
+        apply();
       });
     }
     return () => {
@@ -425,8 +585,6 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     return () => {
       if (settleQuietTimerRef.current) clearTimeout(settleQuietTimerRef.current);
       if (settleHardCapRef.current) clearTimeout(settleHardCapRef.current);
-      if (reapplyRafRef.current != null) cancelAnimationFrame(reapplyRafRef.current);
-      if (streamFollowTimerRef.current) clearTimeout(streamFollowTimerRef.current);
       if (entryRestoreRafRef.current != null) cancelAnimationFrame(entryRestoreRafRef.current);
     };
   }, []);
@@ -437,6 +595,8 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     getScrollContainer,
     withProgrammaticScroll,
     pinToBottom,
+    pinToMessage,
+    pinTargetRef,
     saveScrollPosition,
     jumpPill,
     scrollPositionsRef,
@@ -445,5 +605,6 @@ export function useChatScroll({ activeAgentId, messages, isActive, isActiveRef, 
     isNearBottomRef,
     isSubagentNearBottomRef,
     restoredForThreadRef,
+    entryRestoreSettled,
   };
 }

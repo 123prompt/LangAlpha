@@ -184,7 +184,7 @@ export function AddWidgetDialog({ open, onOpenChange, onAdd, existingWidgets }: 
               placeholder={t('dashboard.widgets.addDialog.searchPlaceholder')}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="flex-1 min-w-0 bg-transparent outline-none"
+              className="flex-1 min-w-0 bg-transparent"
               style={{ color: 'var(--color-text-primary)' }}
             />
           </label>

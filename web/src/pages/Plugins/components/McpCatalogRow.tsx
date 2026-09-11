@@ -1,18 +1,14 @@
 import { useTranslation } from 'react-i18next';
-import { Link2, Link2Off, Pencil, RefreshCw, Trash2 } from 'lucide-react';
-import { Loader } from '@/components/ui/loader';
+import { Pencil, Trash2 } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
-import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
+import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { McpOauthPill } from '@/pages/ChatAgent/components/mcp/McpStatusPill';
-import {
-  canDisconnectOauth,
-  needsOauthConnect,
-} from '@/pages/ChatAgent/components/mcp/mcpState';
+import { needsOauthConnect } from '@/pages/ChatAgent/components/mcp/mcpState';
 import {
   EnabledToggle,
   KebabTrigger,
@@ -21,9 +17,18 @@ import {
   ServerRowShell,
 } from '@/pages/ChatAgent/components/mcp/McpPrimitives';
 import type { CatalogServer } from '@/pages/ChatAgent/utils/api';
+import { brokerageArt, mcpServerArt } from '@/lib/brandArt';
+import { type Brokerage } from '../brokerages';
+import { useFlashWorkspace } from '../hooks/useFlashWorkspace';
 import { isPluginOwned } from '../utils/provenance';
+import {
+  ConnectButton,
+  OauthMenuItems,
+  ToolCountText,
+  VendorNotes,
+} from './OauthRowParts';
 import { PluginSuppressedBadge } from './PluginBadges';
-import { ScopeControl, type ScopeWorkspace } from './ScopeControl';
+import { ScopeControl, scopeLocked, type ScopeWorkspace } from './ScopeControl';
 import { rowSelection, type BulkSelection } from './useBulkSelection';
 
 /**
@@ -39,6 +44,8 @@ import { rowSelection, type BulkSelection } from './useBulkSelection';
 
 export function McpCatalogRow({
   server,
+  vendor,
+  registryUnavailable,
   workspaces,
   selection,
   connecting,
@@ -56,6 +63,15 @@ export function McpCatalogRow({
   onMove,
 }: {
   server: CatalogServer;
+  /** Which shipped brokerage this row's URL resolves to, `null` for none, and
+   *  `undefined` while the registry is still unanswered. Resolved by the list
+   *  rather than here: the registry is one static query, and asking it per row
+   *  put an observer behind every server the user owns. */
+  vendor: Brokerage | null | undefined;
+  /** The registry was asked and did not answer, as opposed to not yet having
+   *  been answered. Only decides whether the held button has a note to point
+   *  at; what holds it is `vendor` being unresolved either way. */
+  registryUnavailable?: boolean;
   workspaces: ScopeWorkspace[];
   selection: BulkSelection;
   connecting: boolean;
@@ -64,7 +80,11 @@ export function McpCatalogRow({
   /** A move or a per-workspace deny flip is in flight for this row. */
   scopeBusy: boolean;
   onOpen: () => void;
-  onConnect: () => void;
+  /** Handed the vendor this row's URL resolves to, so the caller need not
+   *  resolve it a second time and reach a different answer. Never fires while
+   *  that is `undefined`: `ConnectButton` holds the one gate, and an unresolved
+   *  registry is one of the things it refuses on. */
+  onConnect: (vendor: Brokerage | null | undefined) => void;
   onDisconnect: () => void;
   onRefreshSchemas: () => void;
   onEdit: () => void;
@@ -74,14 +94,23 @@ export function McpCatalogRow({
   onMove: (toWorkspaceId: string) => void;
 }) {
   const { t } = useTranslation();
+  const flashWorkspace = useFlashWorkspace();
   const oauthEligible = server.transport === 'http';
   const status = server.oauth_status ?? null;
+  const unconnected = oauthEligible && needsOauthConnect(status);
+  const rowKey = `catalog-${server.name}`;
 
   return (
     <ServerRowShell
       testid={`server-row-${server.name}`}
       {...rowSelection(selection, `catalog:${server.name}`)}
-      tile={<IdentityTile name={server.name} />}
+      tile={
+        <BrandMark
+          name={server.name}
+          kind="server"
+          art={brokerageArt(vendor) ?? mcpServerArt(server)}
+        />
+      }
       onOpen={onOpen}
       main={
         <>
@@ -96,11 +125,10 @@ export function McpCatalogRow({
                 ? t('plugins.servers.enabledState')
                 : t('plugins.servers.disabledState')}
             </MetaText>
-            {status === 'connected' && typeof server.tool_count === 'number' && server.tool_count > 0 && (
-              <MetaText>{t('mcp.row.toolCount', { count: server.tool_count })}</MetaText>
-            )}
+            <ToolCountText status={status} count={server.tool_count} />
             <MetaText>{server.transport}</MetaText>
             <PluginSuppressedBadge row={server} variant="prose" />
+            <VendorNotes vendor={vendor} unconnected={unconnected} rowKey={rowKey} />
           </div>
 
           {server.description && (
@@ -112,24 +140,27 @@ export function McpCatalogRow({
       }
       actions={
         <>
-          {oauthEligible && needsOauthConnect(status) && (
-            <button
-              type="button"
-              onClick={onConnect}
-              disabled={connecting}
-              className="inline-flex items-center gap-1 px-2 py-1 text-[0.6875rem] rounded-md transition-colors disabled:opacity-50"
-              style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
-            >
-              {connecting ? <Loader size={12} className="text-current" /> : <Link2 className="h-3 w-3" />}
-              {status ? t('plugins.oauth.reconnect') : t('plugins.oauth.connect')}
-            </button>
+          {unconnected && (
+            <ConnectButton
+              status={status}
+              connecting={connecting}
+              vendor={vendor}
+              registryUnavailable={registryUnavailable}
+              rowKey={rowKey}
+              testid={`catalog-connect-${server.name}`}
+              onClick={() => onConnect(vendor)}
+            />
           )}
 
           <ScopeControl
             workspaces={workspaces}
             scopeWorkspaceId={null}
             disabledWorkspaceIds={server.disabled_workspace_ids ?? []}
-            checklistLocked={!server.enabled}
+            checklistLocked={scopeLocked(server)}
+            // Flash has no sandbox, so it can install only directly bound
+            // tools. The server answers whether this row has any; offering
+            // Flash on a row that has none is a switch that does nothing.
+            flashWorkspace={server.has_direct_tools ? flashWorkspace : undefined}
             busy={scopeBusy}
             moveBlockedReason={
               // OAuth connections exist only at the user tier, so a connected
@@ -181,18 +212,11 @@ export function McpCatalogRow({
                   ? t('plugins.component.customize')
                   : t('mcp.row.edit')}
               </DropdownMenuItem>
-              {oauthEligible && status === 'connected' && (
-                <DropdownMenuItem onSelect={onRefreshSchemas}>
-                  <RefreshCw className="h-3.5 w-3.5 mr-2" />
-                  {t('plugins.oauth.refreshSchemas')}
-                </DropdownMenuItem>
-              )}
-              {oauthEligible && canDisconnectOauth(status) && (
-                <DropdownMenuItem onSelect={onDisconnect}>
-                  <Link2Off className="h-3.5 w-3.5 mr-2" />
-                  {t('plugins.oauth.disconnect')}
-                </DropdownMenuItem>
-              )}
+              <OauthMenuItems
+                status={oauthEligible ? status : null}
+                onRefreshSchemas={onRefreshSchemas}
+                onDisconnect={onDisconnect}
+              />
               {/* Not for a plugin-owned row: it belongs to the plugin, and the
                   bulk bar already refuses these. Removing one means Customize
                   (which detaches it) or uninstalling the plugin — offering

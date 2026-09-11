@@ -3,7 +3,9 @@ import { useTranslation } from 'react-i18next';
 import { motion, useReducedMotion } from 'framer-motion';
 import { X } from 'lucide-react';
 import { useBackdropDismiss, useDialogA11y } from '@/hooks/useDialogA11y';
-import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
+import type { BrandArt } from '@/lib/brandArt';
+import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
+import type { MarkKind } from '@/pages/ChatAgent/components/mcp/KindTile';
 
 /**
  * The shared shell of the three detail overlays (server / skill / plugin):
@@ -105,19 +107,25 @@ export function DetailHeader({
   name,
   labelId,
   kind,
+  kindLabel,
+  art,
   meta,
   controls,
 }: {
   name: string;
   labelId: string;
+  /** Which glyph stands in when there is no art. */
+  kind: MarkKind;
   /** The item's kind, spelled out ("Skill", "MCP server", "Plugin"). */
-  kind: string;
+  kindLabel: string;
+  /** The item's own mark; falls back to `kind`'s glyph without it. */
+  art?: BrandArt;
   meta?: React.ReactNode;
   controls?: React.ReactNode;
 }) {
   return (
     <div className="flex items-start gap-3.5 pr-8">
-      <IdentityTile name={name} size="lg" />
+      <BrandMark name={name} kind={kind} art={art} size="lg" />
       <div className="min-w-0 flex-1 flex flex-col gap-1">
         <div className="flex items-baseline gap-2 flex-wrap">
           <h2
@@ -128,7 +136,7 @@ export function DetailHeader({
             {name}
           </h2>
           <span className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {kind}
+            {kindLabel}
           </span>
         </div>
         {meta && (

@@ -31,20 +31,64 @@ const PrivacyPolicy = React.lazy(() => import('./pages/Legal/PrivacyPolicy'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 
+/** How long a callback may sit holding neither a session nor a stated reason
+ *  before it is called a failure. What it waits on is the `?code=` exchange the
+ *  Supabase client runs on load, which is the same wait AuthConfirm bounds. */
+const CALLBACK_TIMEOUT_MS = 8000;
+
 /**
- * Handles the OAuth redirect from Supabase. Two modes:
+ * The failure a callback arrived carrying, or null for none. Two writers put it
+ * in two places: Supabase reports a denied or expired authorization in the query
+ * under PKCE and in the hash under implicit, and the desktop shell writes its own
+ * prose into the query when it declines a flow it cannot finish (no free loopback
+ * port, a timeout, a second sign-in superseding this one) — this route is the
+ * only channel it has for saying so. Read during render, not from an effect: the
+ * Supabase client strips the URL as soon as it has consumed it.
+ */
+function callbackFailure(): string | null {
+  const query = new URLSearchParams(window.location.search);
+  const hash = new URLSearchParams(window.location.hash.slice(1));
+  const read = (key: string) => query.get(key) || hash.get(key);
+  return read('error_description') || read('error');
+}
+
+/**
+ * Handles the OAuth redirect from Supabase. Three modes:
  * - Popup (opened by loginWithProvider): broadcast to the opener and close.
  * - Top-level (fallback when the popup was blocked): navigate to /dashboard.
+ * - Failed: say why, and offer the way back. Waiting only on a session leaves
+ *   every flow that ends without one behind a message promising a sign-in that
+ *   is not coming, and no way out of the page but quitting.
  */
 function AuthCallback() {
   const { isLoggedIn } = useAuth();
   const navigate = useNavigate();
   const { t: tAuth } = useTranslation();
+  // Two failures with different standing. A stated one is somebody's answer --
+  // the provider denied it, or the shell could not finish it -- and it holds
+  // even if a session from an earlier sign-in is sitting in the cookie jar.
+  const [stated] = useState<string | null>(callbackFailure);
+  // A timeout is only us giving up on the wait. Nobody said no, so a session
+  // that lands on a slow connection after the deadline still wins the page;
+  // latching this into `stated` is what used to strand it behind an error.
+  const [timedOut, setTimedOut] = useState(false);
+  const failure = stated ?? (timedOut ? tAuth('auth.errors.generic') : null);
+
+  // Whether this document is the child window loginWithProvider opened. The
+  // failure UI needs it too, so it is read here rather than inside the effect:
+  // in a popup there is no back to go to, the page it would go back to is in
+  // the opener and still on screen.
+  const isPopup = typeof window !== 'undefined' && !!window.opener && window.opener !== window;
 
   useEffect(() => {
-    if (!isLoggedIn) return;
+    if (stated) return;
+    if (!isLoggedIn) {
+      // No session and nobody said why. Whatever dropped the flow is not going
+      // to report it later, so bound the wait instead of spinning on it.
+      const deadline = setTimeout(() => setTimedOut(true), CALLBACK_TIMEOUT_MS);
+      return () => clearTimeout(deadline);
+    }
 
-    const isPopup = typeof window !== 'undefined' && !!window.opener && window.opener !== window;
     if (isPopup) {
       try {
         const channel = new BroadcastChannel(AUTH_BROADCAST_CHANNEL);
@@ -66,13 +110,62 @@ function AuthCallback() {
       return;
     }
     navigate('/dashboard', { replace: true });
-  }, [isLoggedIn, navigate]);
+  }, [stated, isPopup, isLoggedIn, navigate]);
+
+  if (failure) {
+    return (
+      // A timeout swaps this in eight seconds after the page settled on
+      // "Signing you in", with nothing on screen changing that a screen reader
+      // would otherwise report. `alert` is what makes the swap audible, and it
+      // carries the button's label with it, so the way out is announced too.
+      <div
+        role="alert"
+        className="flex flex-col items-center justify-center gap-5 min-h-screen px-6 text-center"
+        style={{ backgroundColor: 'var(--color-bg-page)' }}
+      >
+        <p className="text-sm max-w-sm" style={{ color: 'var(--color-text-secondary)' }}>{failure}</p>
+        <button
+          type="button"
+          className="text-sm rounded-md px-3 py-1.5"
+          style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-default)' }}
+          onClick={() => {
+            // Navigating a popup would leave a second login page stranded in a
+            // window the user still has to find and close, while the real one
+            // waits untouched in the opener. Hand the window back instead --
+            // the opener holds no pending state, so it needs no telling.
+            if (isPopup) window.close();
+            else navigate(APP_ENTRY_PATH, { replace: true });
+          }}
+        >
+          {isPopup ? tAuth('common.close') : tAuth('auth.backToLogin')}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex items-center justify-center min-h-screen" style={{ backgroundColor: 'var(--color-bg-page)' }}>
       <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{tAuth('auth.signingIn')}</p>
     </div>
   );
+}
+
+/**
+ * The shell's one delivery route, which is why an email token can land on it.
+ *
+ * `deeplink.toAppUrl` resolves every `langalpha://` URL onto `/callback` and
+ * copies only the query across, so a confirmation handed back from the browser
+ * arrives here rather than at the page that owns email tokens. Forward it on
+ * unread: verifying it in two places would be two ways to consume one
+ * single-use token.
+ */
+function CallbackRoute() {
+  const { search } = useLocation();
+  const params = new URLSearchParams(search);
+  if (params.get('token_hash') && params.get('type')) {
+    return <Navigate to={`/auth/confirm${search}`} replace />;
+  }
+  return <AuthCallback />;
 }
 
 // Rejects protocol-relative URLs (`//evil.com/x`) and cross-origin absolutes —
@@ -257,11 +350,23 @@ function App() {
       {isPlatformMode && APP_ENTRY_PATH === '/' && (
         <Route path="/app" element={<LegacyAppPathRedirect />} />
       )}
-      <Route path="/callback" element={<AuthCallback />} />
+      <Route path="/callback" element={<CallbackRoute />} />
       {/* Supabase email-link landing (signup confirm, magic link, recovery).
-          Static import so verification starts without a chunk-fetch flash. */}
+          Static import so verification starts without a chunk-fetch flash.
+          The trailing segment names the desktop edition a link came from, since
+          `withShellReturn` marks the path: the email template appends its own
+          `?`, leaving no room for a query marker. Taken as a parameter rather
+          than one route per edition, because `desktopAuthHandoff` is what
+          decides which segments mean anything — an unknown one just confirms
+          here, like the bare path. */}
       <Route path="/auth/confirm" element={<AuthConfirm />} />
+      <Route path="/auth/confirm/:shell" element={<AuthConfirm />} />
       <Route path="/reset-password" element={
+        <Suspense fallback={<PageLoading />}>
+          <ResetPassword />
+        </Suspense>
+      } />
+      <Route path="/reset-password/:shell" element={
         <Suspense fallback={<PageLoading />}>
           <ResetPassword />
         </Suspense>

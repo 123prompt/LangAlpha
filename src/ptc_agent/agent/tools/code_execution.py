@@ -56,15 +56,12 @@ def create_execute_code_tool(backend: SandboxBackend, mcp_registry: Any, thread_
         Import MCP tools: from tools.{server} import {tool}
 
         Args:
-            code: Python code to execute. Print summary to stdout.
+            code: Python code to execute. Print a summary to stdout. Use RELATIVE
+                paths (work/<task>/, data/), never a leading slash.
             description: Brief description (5-10 words, active voice)
 
         Returns:
-            SUCCESS with stdout/files, or ERROR with stderr. The artifact carries
-            ``mcp_trace`` (provenance for MCP calls made in-sandbox) and never
-            enters the LLM context.
-
-        Paths: Use RELATIVE paths (results/, data/). Never /results/ or /workspace/.
+            SUCCESS with stdout, or ERROR with stderr.
         """
         if not backend:
             return "ERROR: Sandbox not initialized", {"mcp_trace": []}
@@ -91,15 +88,6 @@ def create_execute_code_tool(backend: SandboxBackend, mcp_registry: Any, thread_
 
                 if result.stdout:
                     parts.append(result.stdout)
-
-                if result.files_created:
-                    # Extract file names from file objects
-                    files = [
-                        f.name if hasattr(f, "name") else str(f)
-                        for f in result.files_created
-                    ]
-                    if files:
-                        parts.append(f"Files created: {', '.join(files)}")
 
                 response = "\n".join(parts)
                 logger.info(

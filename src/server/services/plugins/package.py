@@ -24,6 +24,7 @@ from src.server.services.plugins.errors import PluginAmbiguous, PluginFatal
 from src.server.services.plugins.extension import (
     NAMESPACE,
     LangalphaExtension,
+    apply_server_metadata,
     parse_extension,
     resolve_binds,
 )
@@ -270,6 +271,12 @@ def validate_package(raw: bytes, *, subdir: str | None = None) -> ValidatedPacka
 
     extension = parse_extension(
         manifest_extension(manifest, NAMESPACE), diagnostics
+    )
+    apply_server_metadata(
+        extension,
+        entry_plans,
+        document_dropped=mcp_document_invalid,
+        diagnostics=diagnostics,
     )
     # Report only. The refs themselves are written by the async install and
     # update paths, which can read the vault and so can tell a secret this

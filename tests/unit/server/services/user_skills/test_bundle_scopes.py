@@ -13,6 +13,8 @@ copy of identical bytes, so most workspaces cause no extra materialization.
 
 import pytest
 
+from src.server.database.account_disables import AccountDisables
+from src.server.services.plugins import bundled
 from src.server.services.user_skills import materialize
 
 
@@ -57,7 +59,15 @@ def db(monkeypatch):
     by name rather than by enabled state. It defaults to the enabled workspace
     rows so a test that does not care about disables says nothing about it.
     """
-    state: dict = {"rows": [], "ws_rows": None, "ws_disabled": set()}
+    state: dict = {
+        "rows": [],
+        "ws_rows": None,
+        "ws_disabled": set(),
+        # Bundle name -> the platform skills it ships, plus the ones this user
+        # switched off. Both empty is the ordinary account.
+        "bundle_owns": {},
+        "disabled_bundles": set(),
+    }
 
     async def _rows(user_id, workspace_id=None):
         return state["rows"]
@@ -76,11 +86,28 @@ def db(monkeypatch):
     async def _empty_dict(user_id):
         return {}
 
+    async def _disabled_bundles(user_id):
+        return AccountDisables(
+            servers=frozenset(), bundles=frozenset(state["disabled_bundles"])
+        )
+
+    def _owners():
+        return bundled.ComponentOwners(
+            servers={},
+            skills={
+                name: bundle
+                for bundle, names in state["bundle_owns"].items()
+                for name in names
+            },
+        )
+
     monkeypatch.setattr(materialize, "list_enabled_user_skills", _rows)
     monkeypatch.setattr(materialize, "list_user_skills", _all_ws_rows)
     monkeypatch.setattr(materialize, "list_workspace_skill_disables", _ws_disabled)
     monkeypatch.setattr(materialize, "get_disabled_builtin_skills", _empty_set)
     monkeypatch.setattr(materialize, "get_skill_command_overrides", _empty_dict)
+    monkeypatch.setattr(materialize, "list_account_disables", _disabled_bundles)
+    monkeypatch.setattr(bundled, "component_owners", _owners)
     return state
 
 
@@ -209,3 +236,132 @@ class TestScopeNamespaces:
         assert materialize._view_hash([a]) != materialize._view_hash(
             [_row("alpha", content="changed")]
         )
+
+
+class TestTheListingAgreesWithDelivery:
+    """A switched-off bundle has to subtract the same names from both halves.
+
+    ``materialize`` folds a disabled bundle's skills into the same set a
+    per-skill disable writes to, so the agent never loads them. The default
+    ``/skills`` response is the slash-command menu, and it is assembled
+    separately -- from the registry rather than from the delivery bundle -- so
+    nothing but this makes the two agree. When they disagree the menu offers a
+    command whose skill has already been removed from the registry the turn
+    runs against.
+
+    The management view is deliberately the other way: the row stays, with its
+    own switch still on and ``plugin_enabled`` false, because that pair is what
+    the Plugins page draws as "suppressed by its package".
+    """
+
+    @pytest.fixture
+    def listing(self, monkeypatch):
+        from src.server.app import skills as skills_app
+
+        state = {"platform": ["alpha", "beta"], "disabled_bundles": set()}
+
+        async def _none(user_id):
+            return set()
+
+        async def _empty(user_id):
+            return {}
+
+        async def _disables(user_id):
+            return AccountDisables(
+                servers=frozenset(), bundles=frozenset(state["disabled_bundles"])
+            )
+
+        async def _rows(user_id, workspace_id=None):
+            return []
+
+        monkeypatch.setattr(
+            skills_app,
+            "list_skills",
+            lambda mode=None: [
+                {
+                    "name": n,
+                    "description": f"{n} skill",
+                    "tool_count": 0,
+                    "tools": [],
+                    "command": f"/{n}",
+                }
+                for n in state["platform"]
+            ],
+        )
+        monkeypatch.setattr(skills_app, "get_disabled_builtin_skills", _none)
+        monkeypatch.setattr(skills_app, "get_skill_command_overrides", _empty)
+        monkeypatch.setattr(skills_app, "list_account_disables", _disables)
+        monkeypatch.setattr(skills_app, "list_user_skills", _rows)
+        monkeypatch.setattr(skills_app, "list_enabled_user_skills", _rows)
+        monkeypatch.setattr(
+            bundled,
+            "component_owners",
+            lambda: bundled.ComponentOwners(servers={}, skills={"alpha": "pack"}),
+        )
+        return state
+
+    async def _names(self, *, include_disabled: bool) -> list[str]:
+        from src.server.app.skills import _assemble_skills
+
+        payload = await _assemble_skills(
+            "u-1", None, include_disabled, None
+        )
+        return [s.name for s in payload["skills"]]
+
+    @pytest.mark.asyncio
+    async def test_a_suppressed_skill_leaves_the_slash_menu(self, listing):
+        listing["disabled_bundles"] = {"pack"}
+        assert await self._names(include_disabled=False) == ["beta"]
+
+    @pytest.mark.asyncio
+    async def test_it_stays_in_the_management_view_wearing_its_reason(
+        self, listing
+    ):
+        from src.server.app.skills import _assemble_skills
+
+        listing["disabled_bundles"] = {"pack"}
+        payload = await _assemble_skills("u-1", None, True, None)
+        (alpha,) = [s for s in payload["skills"] if s.name == "alpha"]
+        assert (alpha.enabled, alpha.plugin_name, alpha.plugin_enabled) == (
+            True, "pack", False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_enabled_bundle_subtracts_nothing(self, listing):
+        assert await self._names(include_disabled=False) == ["alpha", "beta"]
+
+
+@pytest.mark.asyncio
+async def test_a_bundle_disable_subtracts_against_the_boot_snapshot(
+    db, resolved, monkeypatch
+):
+    """Materialization withdraws, so it reads the map the running set came from.
+
+    A live re-read of ``plugins/`` can stop naming a bundle the process is
+    still delivering skills for -- renamed on disk, or momentarily unreadable.
+    Subtracting against that map hands the user back skills they switched off,
+    with the registry still carrying them; the server-side twin already reads
+    the snapshot, and this path was the one left behind.
+    """
+    from src.server.app import setup
+
+    db["disabled_bundles"] = {"market"}
+
+    monkeypatch.setattr(
+        setup,
+        "bundle_owners",
+        bundled.ComponentOwners(servers={}, skills={"morning-note": "market"}),
+    )
+    # Disk has moved on: the bundle answers under a different name now, so a
+    # live read attributes nothing to the name the disable was written under.
+    monkeypatch.setattr(
+        bundled,
+        "component_owners",
+        lambda: bundled.ComponentOwners(
+            servers={}, skills={"morning-note": "market-data"}
+        ),
+    )
+
+    bundle = await materialize.load_user_skill_bundle("u-1")
+
+    assert bundle.disabled_builtins == frozenset({"morning-note"})

@@ -8,12 +8,14 @@ import { useStableHandler } from '@/hooks/useStableHandler';
 import { useNarrowContainer } from '@/hooks/useNarrowContainer';
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { usePreferences } from '@/hooks/usePreferences';
+import { readTurnEndScroll } from '@/lib/turnEndScroll';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { modelPrefs } from '@/lib/modelPreferences';
 import { updateCurrentUser } from '../../Dashboard/utils/api';
-import { getWorkspace, summarizeThread, offloadThread, getThreadShareStatus, updateThreadSharing, cancelSubagentTask } from '../utils/api';
+import { summarizeThread, offloadThread, getThreadShareStatus, updateThreadSharing, cancelSubagentTask } from '../utils/api';
 import { buildSharedServeUrl, buildWsfilesUrl } from './viewers/html/wsfilesUrl';
 import ShareReportLinkModal from './ShareReportLinkModal';
 import { toast } from '@/components/ui/use-toast';
@@ -23,6 +25,7 @@ import { saveChatSession, getChatSession, clearChatSession } from '../hooks/util
 import type { PreviewData } from '../hooks/utils/types';
 import { useCardState } from '../hooks/useCardState';
 import { useWorkspaceFiles } from '../hooks/useWorkspaceFiles';
+import { useWorkspace } from '@/hooks/useWorkspace';
 import { classifyAgentPath } from '../utils/agentPaths';
 import { taskIdFromAgentId } from '../utils/agentId';
 import {
@@ -67,7 +70,7 @@ const PreviewViewer = React.lazy(() => import('./viewers/PreviewViewer'));
 import {
   type MessageRecord, type LocationState,
   type SubagentMessage, type SlashCommand, type ModelOptions, type ActionCommand,
-  type MsgSelectionTooltipData, type WorkspaceRecord, type ChatViewProps,
+  type MsgSelectionTooltipData, type ChatViewProps,
 } from './chatView/types';
 import SubagentStatusIndicator from './chatView/SubagentStatusIndicator';
 import { ModelStatusPill } from './chatView/ModelStatusPill';
@@ -75,6 +78,7 @@ import { FallbackSuggestionPill } from './chatView/FallbackSuggestionPill';
 import { useToolCallAnnouncer } from './chatView/useToolCallAnnouncer';
 import { useNavPanel } from './chatView/useNavPanel';
 import { useChatScroll } from './chatView/useChatScroll';
+import { useTurnEndScroll } from './chatView/useTurnEndScroll';
 import { useSubagentTabs } from './chatView/useSubagentTabs';
 import { publishSidebarAgents, clearSidebarAgents } from './sidebarAgentsBridge';
 import { useRightPanel } from './chatView/useRightPanel';
@@ -92,20 +96,41 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const marketWatchEnabled = useFeatureEnabled('market_watch');
   const queryClient = useQueryClient();
   const initialMessageSentRef = useRef(false);
-  // Determine agent mode: flash workspaces use flash mode, otherwise ptc
   const state = location.state as LocationState | null;
-  const [agentMode, setAgentMode] = useState(state?.agentMode || 'ptc');
-  const isFlashMode = agentMode === 'flash' || state?.workspaceStatus === 'flash';
+  // The workspace row drives the header title and the flash-mode fallback. It
+  // has to come from the shared detail query rather than a mount-time snapshot:
+  // a rename invalidates that key, and this view outlives the rename (it is
+  // kept mounted by the ChatView LRU, whose own copy of the name never
+  // refreshes). The prop is only the pre-fetch seed.
+  const { data: workspaceRecord } = useWorkspace(workspaceId);
+  const workspaceName = workspaceRecord?.name || initialWorkspaceName || '';
+
+  // Agent mode: what the navigation asked for, else what the workspace row
+  // says — direct URL navigation carries no route state, so the row is the
+  // only thing left that names a flash workspace.
+  //
+  // Both route-state reads are captured at mount. ChatAgent keeps up to five
+  // ChatViews rendered at once (display:none, not unmounted) and they all read
+  // the same current location, so a live read would hand every background view
+  // the mode of whatever thread the user just opened. `workspaceStatus` needs
+  // the same freeze and cannot simply be dropped: three navigations set it
+  // without an `agentMode` beside it (the sidebar's workspace-home jump, the
+  // archive fallback, and the gallery hops that inherit state).
+  const navModeRef = useRef({
+    agentMode: state?.agentMode,
+    isFlash: state?.workspaceStatus === 'flash',
+  });
+  const agentMode = navModeRef.current.agentMode || (workspaceRecord?.status === 'flash' ? 'flash' : 'ptc');
+  const isFlashMode = agentMode === 'flash' || navModeRef.current.isFlash;
 
   // The mode's currently-configured model — fallback initializer for the
   // suggestion pill's nextSendModel, mirroring ChatInput's own modePreferredModel.
-  const otherPreference = (preferences as Record<string, Record<string, unknown>> | null | undefined)?.other_preference;
+  const modelPreference = modelPrefs(preferences);
   const activePreferredModel = isFlashMode
-    ? ((otherPreference?.preferred_flash_model as string | undefined) || (otherPreference?.preferred_model as string | undefined) || null)
-    : ((otherPreference?.preferred_model as string | undefined) || null);
+    ? ((modelPreference.preferred_flash_model as string | undefined) || (modelPreference.preferred_model as string | undefined) || null)
+    : ((modelPreference.preferred_model as string | undefined) || null);
   // Live model selection reported by ChatInput (null until it reports in).
   const [inputModel, setInputModel] = useState<string | null>(null);
-  const [workspaceName, setWorkspaceName] = useState(initialWorkspaceName || '');
   // Cross-workspace file panel: in flash mode, files live in PTC workspaces.
   // This tracks which workspace the file panel should fetch from.
   const [filePanelWorkspaceId, setFilePanelWorkspaceId] = useState<string | null>(null);
@@ -147,22 +172,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const resolvedThreadIdRef = useRef(threadId);
 
 
-
-  // Direct URL navigation fallback: detect flash workspace and resolve name from API
-  const wsFetchedRef = useRef<string | null>(null); // tracks workspaceId we already fetched for
-  useEffect(() => {
-    if (!workspaceId) return;
-    if (state?.agentMode && workspaceName) return;
-    if (wsFetchedRef.current === workspaceId) return;
-    wsFetchedRef.current = workspaceId;
-    let cancelled = false;
-    getWorkspace(workspaceId).then((ws: WorkspaceRecord) => {
-      if (cancelled) return;
-      if (ws?.status === 'flash' && !state?.agentMode) setAgentMode('flash');
-      if (ws?.name && !workspaceName) setWorkspaceName(ws.name);
-    }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [workspaceId, state?.agentMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Floating cards management - extracted to custom hook for better encapsulation
   // Must be called before useChatMessages since updateTodoListCard and updateSubagentCard are passed to it
@@ -270,6 +279,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleRejectPTCAgent,
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
+    handleResumeCreditPause,
     tokenUsage,
     threadId: currentThreadId,
     threadModels,
@@ -296,7 +306,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     chatInputRef.current?.setModel(model);
     try {
       await updatePreferencesAsync({
-        other_preference: isFlashMode ? { preferred_flash_model: model } : { preferred_model: model },
+        model_preference: isFlashMode ? { preferred_flash_model: model } : { preferred_model: model },
       });
       clearFallbackSuggestion();
       toast({ description: t('chat.modelSwitched', { model }) });
@@ -344,7 +354,21 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // Keep resolvedThreadIdRef in sync with the resolved thread ID from useChatMessages
   resolvedThreadIdRef.current = currentThreadId || threadId;
 
+  // A pending interrupt or rejection clears isLoading but the turn is still
+  // open: the reply resumes once the reader answers, so the follow keeps its
+  // claim and the turn-end landing waits.
+  const isStreaming = isLoading || !!pendingInterrupt || !!pendingRejection;
   // Chat transcript scroll controller + tab scroll memory (chatView/useChatScroll).
+  const scroll = useChatScroll({
+    activeAgentId,
+    messages,
+    isActive,
+    isActiveRef,
+    isLoadingHistory,
+    isStreaming,
+    currentThreadId,
+    threadId,
+  });
   const {
     scrollAreaRef,
     subagentScrollAreaRef,
@@ -359,15 +383,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isNearBottomRef,
     isSubagentNearBottomRef,
     restoredForThreadRef,
-  } = useChatScroll({
-    activeAgentId,
-    messages,
-    isActive,
-    isActiveRef,
-    isLoadingHistory,
-    currentThreadId,
-    threadId,
-  });
+    pinToMessage,
+    pinTargetRef,
+  } = scroll;
+  useTurnEndScroll(scroll, { messages, isStreaming, isActiveRef, turnEndScroll: readTurnEndScroll(preferences) });
 
   // Subagent tab registry + card refresh (chatView/useSubagentTabs).
   const {
@@ -860,6 +879,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const stableRejectPTCAgent = useStableHandler(handleRejectPTCAgent);
   const stableApproveSecretaryAction = useStableHandler(handleApproveSecretaryAction);
   const stableRejectSecretaryAction = useStableHandler(handleRejectSecretaryAction);
+  const stableResumeCreditPause = useStableHandler(handleResumeCreditPause);
   const stableEditMessage = useStableHandler((id: string, content: string) =>
     handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
@@ -895,6 +915,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onRejectPTCAgent: stableRejectPTCAgent,
     onApproveSecretaryAction: stableApproveSecretaryAction,
     onRejectSecretaryAction: stableRejectSecretaryAction,
+    onResumeCreditPause: stableResumeCreditPause,
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
@@ -908,7 +929,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableEditMessage, stableRegenerate, stableRetry,
+    stableRejectSecretaryAction, stableResumeCreditPause,
+    stableEditMessage, stableRegenerate, stableRetry,
     stableThumbUp, stableThumbDown, stableReportWithAgent, stableSendMessage,
   ]);
 
@@ -1575,10 +1597,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 </div>
               )}
               {/* Minimap TOC — desktop only, when no right panel open */}
-              {!isMobile && !rightPanelType && activeAgentId === 'main' && (
+              {isActive && !isMobile && !rightPanelType && activeAgentId === 'main' && (
                 <ChatMinimap
                   messages={messages as unknown as MessageRecord[]}
                   scrollAreaRef={scrollAreaRef}
+                  turnInFlight={isLoading}
+                  pinToMessage={pinToMessage}
+                  pinTargetRef={pinTargetRef}
                 />
               )}
               {/* Jump-to-latest pill — coexists with the minimap (centered vs
@@ -1598,7 +1623,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
             {/* Input Area */}
             <div className={`flex-shrink-0 ${isMobile ? 'p-3' : 'p-4'} flex justify-center`}>
-              <div className="w-full max-w-3xl space-y-3">
+              <div className="w-full max-w-3xl space-y-3 relative">
                 {activeAgentId === 'main' ? (
                   <>
                     <TodoDrawer todoData={cards['todo-list-card']?.todoData ?? null} />
@@ -1632,16 +1657,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     )}
                     {messageError && !isLoading && (
                       <ErrorBanner error={messageError} />
-                    )}
-                    {isReconnecting && (
-                      <div className="flex items-center gap-2 px-3 py-1.5 text-xs"
-                        role="status" aria-live="polite"
-                        style={{ color: 'var(--color-text-tertiary)' }}>
-                        <span aria-hidden="true" className="flex-shrink-0">
-                          <Loader size={14} className="text-[color:var(--color-accent-primary)]" />
-                        </span>
-                        {t('chat.reconnecting', 'Reconnecting…')}
-                      </div>
                     )}
                     <ModelStatusPill modelStatus={modelStatus} isLoading={isLoading} />
                     <FallbackSuggestionPill
@@ -1680,7 +1695,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                             <button
                               type="button"
                               aria-label={t('chat.workspaceStateHelp')}
-                              className="inline-flex items-center justify-center rounded-full p-0.5 hover:opacity-80 focus:outline-none focus-visible:ring-1 focus-visible:ring-current"
+                              className="inline-flex items-center justify-center rounded-full p-0.5 hover:opacity-80 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                               style={{ color: 'var(--color-text-quaternary)' }}
                             >
                               <Info className="h-3 w-3" />
@@ -1738,6 +1753,24 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       mode={isFlashMode ? 'fast' : 'ptc'}
                       selectedWorkspaceId={workspaceId}
                     />
+                    {/* Floats above the composer instead of sitting in it: a
+                        reconnect that painted before its backlog landed would
+                        otherwise remove this row on catch-up and drop the whole
+                        input by one line, the one visible hop left on a
+                        mid-stream reload. Last in the stack on purpose: the
+                        parent's space-y gives every sibling after the first a
+                        top margin, so a row mounted ahead of the composer
+                        would shift it by that margin and hand the hop back. */}
+                    {isReconnecting && (
+                      <div className="absolute bottom-full left-0 mb-1 flex items-center gap-2 px-3 py-1.5 text-xs"
+                        role="status" aria-live="polite"
+                        style={{ color: 'var(--color-text-tertiary)' }}>
+                        <span aria-hidden="true" className="flex-shrink-0">
+                          <Loader size={14} className="text-[color:var(--color-accent-primary)]" />
+                        </span>
+                        {t('chat.reconnecting', 'Reconnecting…')}
+                      </div>
+                    )}
                   </>
                 ) : activeAgent && activeAgent.type !== WORKFLOW_TASK_TYPE ? (
                   // Workflow runs are script-driven and take no steering input —

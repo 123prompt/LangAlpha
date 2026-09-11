@@ -904,7 +904,7 @@ async def persist_subagent_usage(
     persisted_count = 0
     persisted_records = 0
 
-    for task, records, tool_usage in claimed:
+    for task, records, tool_usage, settle_run_id in claimed:
         try:
             usage_service = UsagePersistenceService(
                 thread_id=thread_id,
@@ -925,12 +925,30 @@ async def persist_subagent_usage(
                 usage_service._token_usage["agent_id"] = task.agent_id
                 usage_service._token_usage["subagent_type"] = task.subagent_type
 
-            await usage_service.persist_usage(
+            # settle_task_run_id makes the usage insert and the ledger's
+            # billing-settle stamp one transaction; on failure (False) the
+            # row stays countable for the recovery sweep to degraded-settle.
+            persisted = await usage_service.persist_usage(
                 response_id=response_id,
                 msg_type="task",
                 status="completed",
                 is_byok=is_byok,
+                settle_task_run_id=settle_run_id,
             )
+            if not persisted:
+                # The records left task memory before this call, so a swallowed
+                # False loses them outright: the ledger row stays countable for
+                # the sweep to degraded-settle, but no billing row will ever be
+                # written for this task. Counting it as persisted would report
+                # the loss as a success.
+                logger.error(
+                    "[SubagentUsage] usage persist reported failure for task "
+                    "%s in thread_id=%s; %d record(s) are unrecoverable",
+                    task.task_id,
+                    thread_id,
+                    len(records),
+                )
+                continue
             persisted_count += 1
             persisted_records += len(records)
 

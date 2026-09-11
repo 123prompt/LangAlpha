@@ -2374,7 +2374,7 @@ const MarketChart = React.memo(forwardRef<MarketChartHandle, MarketChartProps>((
 
           {/* ---- Bottom bar: viewing-window presets + venue clock (TradingView-style) ---- */}
           <div className="chart-bottom-bar">
-            <div className="chart-range-selector">
+            <div className="chart-range-selector clips-focus-ring">
               {RANGE_PRESETS.map((preset) => (
                 <button
                   key={preset.key}

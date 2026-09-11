@@ -108,6 +108,70 @@ def test_tool_result_event():
     assert result["data"]["content_type"] == "text"
 
 
+def test_error_status_rides_the_tool_result():
+    """A refused direct MCP call is a failure only its status reports.
+
+    Its content is prose the client must not have to classify, so the
+    projection carries the ToolMessage status the middleware stamped.
+    """
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[
+                {"name": "mcp__moomoo__trading_order_place", "args": {}, "id": "tc-r"}
+            ],
+        ),
+        ToolMessage(
+            content="Refused: trading is not enabled for this connection.",
+            tool_call_id="tc-r",
+            name="mcp__moomoo__trading_order_place",
+            id="tm-1",
+            status="error",
+        ),
+    ]
+    result = next(i for i in _sse(msgs) if i["event"] == "tool_call_result")["data"]
+    assert result["status"] == "error"
+
+
+def test_successful_tool_result_carries_its_status():
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "web_search", "args": {}, "id": "tc-1"}],
+        ),
+        ToolMessage(content="result body", tool_call_id="tc-1", name="web_search", id="tm-1"),
+    ]
+    result = next(i for i in _sse(msgs) if i["event"] == "tool_call_result")["data"]
+    assert result["status"] == "success"
+
+
+def test_successful_refusal_prose_from_a_direct_mcp_tool_keeps_its_success():
+    """The one shape the client cannot classify from prose alone.
+
+    A direct MCP tool whose successful output opens with "Refused:" reads as a
+    refusal to every prose heuristic, so the projection has to carry the
+    success the ToolMessage holds all the way through content normalization.
+    """
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": "mcp__hiring__list_screens", "args": {}, "id": "tc-s"}],
+        ),
+        ToolMessage(
+            content="Refused: 7 applications",
+            tool_call_id="tc-s",
+            name="mcp__hiring__list_screens",
+            id="tm-1",
+        ),
+    ]
+    result = next(i for i in _sse(msgs) if i["event"] == "tool_call_result")["data"]
+    assert result["content"] == "Refused: 7 applications"
+    assert result["status"] == "success"
+
+
 def test_write_tool_derives_file_operation_artifact():
     content = "line one\nline two\n"
     msgs = [

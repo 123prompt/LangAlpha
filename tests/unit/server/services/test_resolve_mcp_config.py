@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from ptc_agent.config.core import MCPConfig, MCPServerConfig
+from src.server.database.account_disables import AccountDisables
 from src.server.services.mcp_config import (
     Origin,
     ResolvedMCP,
@@ -21,6 +22,7 @@ from src.server.services.mcp_config import (
     resolve_mcp_config,
     workspace_row_to_server_config,
 )
+from src.server.services.plugins.bundled import ComponentOwners
 
 
 def _entries(resolved, origin, state):
@@ -62,9 +64,28 @@ def _user_row(name, **overrides):
 
 
 async def _resolve(
-    base, rows, version=0, user_rows=None, connections=None, user_disabled=None
+    base,
+    rows,
+    version=0,
+    user_rows=None,
+    connections=None,
+    user_disabled=None,
+    disabled_bundles=None,
+    bundle_owns=None,
 ):
-    """Run resolve_mcp_config with all four DB reads mocked."""
+    """Run resolve_mcp_config with all five DB reads mocked.
+
+    ``bundle_owns`` maps a bundle name to the built-in names it ships, which
+    is the only thing the resolver asks the bundle reader for.
+    """
+    owners = ComponentOwners(
+        servers={
+            name: bundle
+            for bundle, names in (bundle_owns or {}).items()
+            for name in names
+        },
+        skills={},
+    )
     with (
         patch(
             "src.server.database.mcp_servers.get_workspace_servers_and_version",
@@ -79,8 +100,17 @@ async def _resolve(
             new=AsyncMock(return_value=list(connections or [])),
         ),
         patch(
-            "src.server.database.mcp_servers.list_user_builtin_disables",
-            new=AsyncMock(return_value=set(user_disabled or ())),
+            "src.server.database.account_disables.list_account_disables",
+            new=AsyncMock(
+                return_value=AccountDisables(
+                    servers=frozenset(user_disabled or ()),
+                    bundles=frozenset(disabled_bundles or ()),
+                )
+            ),
+        ),
+        patch(
+            "src.server.services.plugins.bundled.component_owners",
+            return_value=owners,
         ),
     ):
         return await resolve_mcp_config(base, "user-1", "ws-1")
@@ -280,6 +310,28 @@ class TestResolveMergePrecedence:
         assert resolved.servers[0].source == "builtin"
         assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == []
 
+    async def test_workspace_row_cannot_shadow_a_shipped_brokerage(self):
+        """The backstop the write-time reservation can never reach.
+
+        Refusing the name at every door only binds writes from now on. A row
+        created before that -- or by a build that predates it -- still resolves,
+        and a workspace row shadows the inherited catalog row of the same name
+        whether it is enabled or not. So the agent's trade-shaped ``robinhood``
+        tools would come from wherever the local row points, with its description
+        reaching the prompt, while the Plugins page still reports the real
+        connector connected.
+        """
+        base = _base_config(MCPServerConfig(name="alpha"))
+        rows = [_ws_row("robinhood", config={"transport": "stdio", "command": "npx"})]
+
+        resolved = await _resolve(base, rows, user_rows=[_user_row("robinhood")])
+
+        assert _names(resolved, Origin.WORKSPACE, State.ACTIVE) == []
+        # ...and the real one is untouched: at the user tier this name IS the
+        # brokerage, so the same rule applied there would unplug the connector
+        # the reservation exists to protect.
+        assert _names(resolved, Origin.USER, State.ACTIVE) == ["robinhood"]
+
     async def test_disabled_builtins_excluded_from_builtin_names(self):
         base = _base_config(
             MCPServerConfig(name="alpha"), MCPServerConfig(name="beta")
@@ -467,6 +519,81 @@ class TestResolveInheritedLayer:
         by_name = {s.name: s for s in resolved.servers}
         assert by_name["acme"].oauth_connection_id == "conn-1"
 
+    async def test_the_policy_follows_the_address_not_the_row_name(self):
+        """The identity bug this whole surface turns on, at the hiding half.
+
+        A row is named by its owner and can be renamed or repointed at will, so
+        deriving the vendor from ``server_name`` gave a row called anything else
+        at a broker's host no policy, and a row holding a broker's name pointed
+        elsewhere somebody else's. The relay derives from the consented
+        ``server_url``; this side has to agree, or a tool is hidden from the
+        prompt and still callable, or offered and then refused.
+        """
+        base = _base_config(MCPServerConfig(name="alpha"))
+        resolved = await _resolve(
+            base,
+            rows=[],
+            user_rows=[_user_row("my_broker", url="https://mcp.moomoo.com/mcp")],
+            connections=[
+                {
+                    "connection_id": "conn-1",
+                    "server_name": "my_broker",
+                    "server_url": "https://mcp.moomoo.com/mcp",
+                    "status": "connected",
+                    "granted_capabilities": ["market_data"],
+                }
+            ],
+        )
+        denied = {e.name: e.denied_tools for e in resolved.entries}["my_broker"]
+        assert "trading_order_place" in denied
+        assert "quote_stock_quote" not in denied
+
+    async def test_a_brokerage_name_pointed_elsewhere_gets_no_policy(self):
+        """The mirror shape: the name is reserved, the address is not ours.
+
+        Refusing moomoo's tool names on somebody else's server would be
+        meaningless rather than dangerous -- the danger is the reverse, a
+        denial computed for the wrong vendor that happens to omit the tools
+        this one actually publishes.
+        """
+        base = _base_config(MCPServerConfig(name="alpha"))
+        resolved = await _resolve(
+            base,
+            rows=[],
+            user_rows=[_user_row("moomoo", url="https://not-moomoo.example.test/mcp")],
+            connections=[
+                {
+                    "connection_id": "conn-1",
+                    "server_name": "moomoo",
+                    "server_url": "https://not-moomoo.example.test/mcp",
+                    "status": "connected",
+                    "granted_capabilities": None,
+                }
+            ],
+        )
+        denied = {e.name: e.denied_tools for e in resolved.entries}["moomoo"]
+        assert denied is None
+
+    async def test_a_brokerage_with_no_recorded_consent_denies_its_curation(self):
+        base = _base_config(MCPServerConfig(name="alpha"))
+        resolved = await _resolve(
+            base,
+            rows=[],
+            user_rows=[_user_row("moomoo", url="https://mcp.moomoo.com/mcp")],
+            connections=[
+                {
+                    "connection_id": "conn-1",
+                    "server_name": "moomoo",
+                    "server_url": "https://mcp.moomoo.com/mcp",
+                    "status": "connected",
+                    "granted_capabilities": None,
+                }
+            ],
+        )
+        denied = {e.name: e.denied_tools for e in resolved.entries}["moomoo"]
+        assert "trading_order_place" in denied
+        assert "quote_stock_quote" in denied
+
     async def test_user_tier_is_read_through_list_enabled_user_servers(self):
         # The enabled filter lives in the DB layer: every row that read
         # returns for THIS user is inherited as enabled — the resolver never
@@ -487,8 +614,8 @@ class TestResolveInheritedLayer:
                 new=AsyncMock(return_value=[]),
             ),
             patch(
-                "src.server.database.mcp_servers.list_user_builtin_disables",
-                new=AsyncMock(return_value=set()),
+                "src.server.database.account_disables.list_account_disables",
+                new=AsyncMock(return_value=AccountDisables(frozenset(), frozenset())),
             ),
         ):
             resolved = await resolve_mcp_config(base, "user-1", "ws-1")

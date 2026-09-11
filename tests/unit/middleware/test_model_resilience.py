@@ -445,6 +445,53 @@ class TestReasoningPayloadEscalation:
         assert seen[1] == ["text"]
 
     @pytest.mark.asyncio
+    async def test_mid_stream_400_never_escalates(self, events):
+        """A failure reported inside an open stream skips the reasoning repair.
+
+        The repair answers a request rejected during validation. A provider that
+        accepted the request, opened the stream and only then reported failure
+        has already judged the payload fine, so the extra call is pure latency
+        before the fallback, and re-sending bills whatever the stream emitted a
+        second time. DashScope reporting an input-filter block as
+        ``response.failed`` over HTTP 200 is the case this was measured on.
+        """
+        from src.llms.extension import ResponsesStreamFailedError
+
+        # Verbatim from the live provider: the structured code says
+        # ``server_error`` even though the block is permanent, and only the
+        # message names the real cause. Do not "correct" the code to match the
+        # message.
+        exc = ResponsesStreamFailedError(
+            "Responses stream failed (server_error): <400> "
+            "InternalError.Algo.DataInspectionFailed: Input text data may "
+            "contain inappropriate content.",
+            code="server_error",
+        )
+        client = _FakeModel("primary-model", thinking={"type": "enabled"})
+        mw = _make_middleware(client, fallbacks=[("fallback-model", _FakeModel("fallback-model"))])
+        calls = []
+
+        async def handler(req):
+            calls.append(self._block_types(req))
+            if len(calls) == 1:
+                raise exc
+            return "ok"
+
+        result = await mw.awrap_model_call(
+            _FakeRequest(client, self._history()), handler
+        )
+        assert result == "ok"
+        # Two calls either way, so the count alone proves nothing: an escalation
+        # would also answer on its second call. What separates them is which
+        # call it is. The fallback re-sends the history intact; a stripped retry
+        # would arrive here with the thinking block removed.
+        assert len(calls) == 2, calls
+        assert "thinking" in calls[0]
+        assert "thinking" in calls[1], calls
+        assert [p["to_model"] for p in _fallback_props(events)] == ["fallback-model"]
+        assert [e["type"] for e in events if e["type"] == "model_retry"] == []
+
+    @pytest.mark.asyncio
     async def test_escalates_at_most_once_per_candidate(self, events):
         client = _FakeModel("primary-model")
         fallback = _FakeModel("fallback-a")

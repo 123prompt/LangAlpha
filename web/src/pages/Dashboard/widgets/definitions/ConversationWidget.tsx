@@ -73,7 +73,7 @@ function ConversationWidget({ instance }: WidgetRenderProps<ConversationConfig>)
   // Fetch 100 to match the shared React Query cache key used by useChatInput,
   // RecentThreadsWidget, and WorkspacePickerWidget (single cache entry serves all).
   const { data: wsData } = useWorkspaces({ limit: 100 });
-  const firstWsId = wsData?.workspaces?.[0]?.workspace_id as string | undefined;
+  const firstWsId = wsData?.workspaces?.[0]?.workspace_id;
 
   const { data: threadsData } = useQuery<ThreadsResponse>({
     queryKey: firstWsId

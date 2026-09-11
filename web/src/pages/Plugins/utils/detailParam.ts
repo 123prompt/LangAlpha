@@ -1,13 +1,13 @@
 /**
  * The `?detail=` deep link for the Plugins page detail overlays:
- * `detail=server:NAME | skill:NAME | plugin:NAME`, plus `dws=<workspace_id>`
+ * `detail=server:NAME | brokerage:NAME | skill:NAME | plugin:NAME`, plus `dws=<workspace_id>`
  * when the row is workspace-scoped. Names cannot contain ':' (validated
  * server-side), so the first colon splits unambiguously. Each tab renders
  * only its own kind; opening another kind's detail switches the tab in the
  * same navigation.
  */
 
-export type DetailKind = 'server' | 'skill' | 'plugin';
+export type DetailKind = 'server' | 'brokerage' | 'skill' | 'plugin';
 
 export interface DetailRef {
   kind: DetailKind;
@@ -15,7 +15,7 @@ export interface DetailRef {
   workspaceId: string | null;
 }
 
-const KINDS: ReadonlySet<string> = new Set(['server', 'skill', 'plugin']);
+const KINDS: ReadonlySet<string> = new Set(['server', 'brokerage', 'skill', 'plugin']);
 
 /**
  * The tab that renders each kind. A `?detail=` link that names no tab is
@@ -25,6 +25,10 @@ const KINDS: ReadonlySet<string> = new Set(['server', 'skill', 'plugin']);
  */
 export const DETAIL_KIND_TAB: Record<DetailKind, string> = {
   server: 'mcp',
+  // Its own kind rather than `server:NAME` on the Connectors tab, even though
+  // a connected brokerage IS a catalog row there: a brokerage has a detail
+  // before it has a row, and the link has to land where it is listed.
+  brokerage: 'brokerages',
   skill: 'skills',
   plugin: 'plugins',
 };

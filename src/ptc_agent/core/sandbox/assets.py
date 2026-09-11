@@ -411,6 +411,8 @@ async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> None:
 
     files_to_upload: list[tuple[str, str, str]] = []
     expected_files: set[str] = set()
+    #: sandbox filename -> the host file already staged under it.
+    claimed: dict[str, str] = {}
 
     # Built-ins only: only built-in servers ship host-local ``uv run python``
     # files. User servers run via npx/uvx/http and have nothing to upload here.
@@ -427,6 +429,24 @@ async def _upload_mcp_server_files_impl(sandbox: "PTCSandbox") -> None:
                 if resolved:
                     filename = Path(resolved).name
                     sandbox_path = f"{mcp_servers_dir}/{filename}"
+                    # The sandbox is one flat directory, so the file a server
+                    # came from is gone by the time it lands: two servers that
+                    # name their entry point the same thing stage to the same
+                    # destination. Bundled servers never get this far -- a
+                    # collision between them is dropped at composition, in
+                    # bundled_mcp_servers -- so what reaches here is a server
+                    # an operator added in YAML. Skipping the upload keeps the
+                    # first server correct; the second still launches against
+                    # the surviving file, which the error names so the fix is
+                    # to rename, not to guess.
+                    if (clash := claimed.get(filename)) and clash != resolved:
+                        logger.error(
+                            "MCP server entry points collide in the sandbox: "
+                            f"{clash} and {resolved} both stage as {filename}",
+                            server=server.name,
+                        )
+                        continue
+                    claimed[filename] = resolved
                     expected_files.add(filename)
                     files_to_upload.append((server.name, resolved, sandbox_path))
                 else:

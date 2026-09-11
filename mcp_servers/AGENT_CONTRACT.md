@@ -7,16 +7,14 @@ authority for the market-data MCP servers (`price_data`, `options`, `fundamental
 `macro`, `yf_*`). The `x_mcp_server` is exempt (its own conventions predate this and
 are already machine-readable).
 
-**Out of scope — direct LangChain tools.** `src/tools/market_data/tool.py` holds
-`@tool` functions the agent invokes directly and whose result is a **markdown report
-it reads**, not a JSON payload its code parses. They are not codegen'd, so none of the
-envelope shape, the `Returns: dict:` block, or the no-`Example`/`Note` rule below apply
-to them. Their docstring is the tool's prompt description and must stay a call-time
-decision aid — **what it is, what to pass (the `Args:`), and optionally when NOT to
-use it** (only a real constraint, e.g. a US-only tool → "US only, not for non-US
-symbols"). No "for X use tool_Y" cross-references (they duplicate across every tool),
-and no output-shape or formatting detail (no `Returns:` block, no markdown/table/
-currency description). Do not "conform" them to the envelope standard.
+**Direct LangChain tools follow a different `Returns:` rule.** `src/tools/` and
+`src/ptc_agent/agent/tools/` hold `@tool` functions the agent invokes directly, whose
+result is a **markdown report it reads**, not a JSON payload its code parses. Nothing
+below about the envelope, the `Returns: dict:` shape, or the no-`Example`/`Note` rule
+applies to them, and conforming them to the envelope standard is a mistake: their
+`Returns:` is a one-line selection signal, not a machine contract. The docstring rules
+shared by both surfaces are in **`src/tools/AGENTS.md`**, which is the general
+contract; this file is the market-data MCP specialisation of it.
 
 ## Success envelope
 

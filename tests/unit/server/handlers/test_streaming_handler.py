@@ -196,10 +196,17 @@ class TestStreamEventAccumulator:
 class TestRunSSEProducerFormatting:
     """Tests for RunSSEProducer SSE formatting methods."""
 
-    def _make_handler(self, thread_id="test-thread"):
+    def _make_handler(self, thread_id="test-thread", credential_source=None):
+        from types import SimpleNamespace
+
         from src.server.services.runs.sse_producer import RunSSEProducer
 
-        return RunSSEProducer(thread_id=thread_id, run_id="r-test")
+        config = (
+            SimpleNamespace(credential_source=credential_source)
+            if credential_source is not None
+            else None
+        )
+        return RunSSEProducer(thread_id=thread_id, run_id="r-test", agent_config=config)
 
     def test_format_sse_event_basic(self):
         handler = self._make_handler()
@@ -292,9 +299,14 @@ class TestRunSSEProducerFormatting:
         # 5xx is a provider outage — don't suggest checking the API key.
         assert parsed["hints"] == ["provider_status", "try_another_model"]
 
-    def test_format_error_event_upstream_401_auth_hints(self):
+    def test_format_error_event_upstream_401_auth_hints(self, monkeypatch):
         """401 upstream surfaces credential-oriented hints first."""
         from anthropic import AuthenticationError
+
+        # Pinned: these hints only survive when the reader owns the key, and
+        # letting .env decide that silently is how a test passes for the wrong
+        # reason.
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
 
         exc = AuthenticationError.__new__(AuthenticationError)
         exc.status_code = 401
@@ -307,9 +319,11 @@ class TestRunSSEProducerFormatting:
         assert parsed["status_code"] == 401
         assert parsed["hints"] == ["api_key", "model_access", "try_another_model"]
 
-    def test_format_error_event_upstream_no_status_falls_back(self):
+    def test_format_error_event_upstream_no_status_falls_back(self, monkeypatch):
         """Unknown status (network error) shows all hints."""
         from anthropic import APIConnectionError
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
 
         exc = APIConnectionError.__new__(APIConnectionError)
         Exception.__init__(exc, "Connection reset by peer")
@@ -324,6 +338,74 @@ class TestRunSSEProducerFormatting:
             "provider_status",
             "try_another_model",
         ]
+
+    @staticmethod
+    def _upstream(status):
+        """An anthropic SDK error carrying ``status``, the way the SDK raises it."""
+        from anthropic import APIStatusError
+
+        exc = APIStatusError.__new__(APIStatusError)
+        exc.status_code = status
+        Exception.__init__(exc, f"Error code: {status}")
+        return exc
+
+    def _hints(self, exc, credential_source=None):
+        handler = self._make_handler(
+            thread_id="err-thread", credential_source=credential_source
+        )
+        result = handler.format_error_event(str(exc), exc=exc)
+        return json.loads(result.split("data: ", 1)[1].rstrip("\n"))["hints"]
+
+    @pytest.mark.parametrize("status", [400, 405, 413, 422])
+    def test_request_refused_offers_only_a_model_switch(self, monkeypatch, status):
+        """A refused request is neither a bad credential nor a provider outage.
+
+        These used to fall through to the no-status branch and claim all four
+        hints, so an image the model could not accept was reported as a possible
+        API-key problem and a possible provider incident at the same time.
+        """
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+        assert self._hints(self._upstream(status)) == ["try_another_model"]
+
+    def test_platform_billed_turn_drops_credential_hints(self, monkeypatch):
+        """The user holds no key on a platform-billed turn, so do not name one."""
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        assert self._hints(self._upstream(401), credential_source="platform") == [
+            "try_another_model"
+        ]
+        # 5xx never named a credential, so it is unchanged.
+        assert self._hints(self._upstream(503), credential_source="platform") == [
+            "provider_status",
+            "try_another_model",
+        ]
+
+    @pytest.mark.parametrize("source", ["byok", "oauth"])
+    def test_user_owned_credential_keeps_its_hints(self, monkeypatch, source):
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        assert self._hints(self._upstream(401), credential_source=source) == [
+            "api_key",
+            "model_access",
+            "try_another_model",
+        ]
+
+    def test_oss_platform_source_is_still_the_operators_own_key(self, monkeypatch):
+        """``platform`` means opposite things in the two host modes.
+
+        In OSS it is the key in the operator's own .env and the operator is the
+        user, so the credential hints are the actionable ones. Reading
+        ``credential_source`` without the host mode gets this backwards.
+        """
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+        assert self._hints(self._upstream(401), credential_source="platform") == [
+            "api_key",
+            "model_access",
+            "try_another_model",
+        ]
+
+    def test_unknown_credential_fails_closed_on_the_hosted_service(self, monkeypatch):
+        """No agent_config: a wrong credential hint is worse than a missing one."""
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        assert self._hints(self._upstream(401)) == ["try_another_model"]
 
     def test_format_error_event_with_internal_exc(self):
         """Bare Exception from our code is classified as internal, no hints."""
@@ -843,6 +925,37 @@ class TestToolNodeInnerLLMSuppression:
             and '"content": "subagent tool output"' in e
             for e in events
         ), f"tool_call_result event missing content; events={events!r}"
+
+    def test_tool_message_status_rides_the_live_result(self):
+        """The live path carries the ToolMessage status whatever it holds.
+
+        A direct MCP tool whose successful output opens with "Refused:" reads
+        as a refusal to every prose heuristic, so a client that saw no status
+        would render a success as a failure.
+        """
+        from langchain_core.messages import ToolMessage
+        handler = self._handler()
+        ok = ToolMessage(content="Refused: 7 applications", tool_call_id="c3")
+        events = asyncio.run(self._drain(
+            handler._process_message_chunk(ok, "tools", {"langgraph_node": "tools"})
+        ))
+        assert any(
+            "tool_call_result" in e
+            and '"tool_call_id": "c3"' in e
+            and '"status": "success"' in e
+            for e in events
+        ), f"tool_call_result event missing success status; events={events!r}"
+
+        failed = ToolMessage(content="Refused: not permitted", tool_call_id="c4", status="error")
+        events = asyncio.run(self._drain(
+            handler._process_message_chunk(failed, "tools", {"langgraph_node": "tools"})
+        ))
+        assert any(
+            "tool_call_result" in e
+            and '"tool_call_id": "c4"' in e
+            and '"status": "error"' in e
+            for e in events
+        ), f"tool_call_result event missing error status; events={events!r}"
 
     def test_missing_metadata_defaults_to_emit(self):
         """If metadata is None or omits langgraph_node, the chunk is treated
@@ -1484,7 +1597,8 @@ class TestFormatErrorEventResilienceTrace:
         assert "attempted_models" not in parsed
         assert parsed["error_kind"] == "internal"
 
-    def test_generic_exception_with_trace_classifies_upstream(self):
+    def test_generic_exception_with_trace_classifies_upstream(self, monkeypatch):
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
         # A generic (non-SDK) exception carrying the trace is still a
         # model-call failure — it must not fall into the internal-error
         # banner path, which drops the model/attempted-models context.
@@ -1498,7 +1612,8 @@ class TestFormatErrorEventResilienceTrace:
         assert parsed["status_code"] == 404
         assert parsed["hints"] == ["model_access", "try_another_model"]
 
-    def test_generic_exception_with_trace_but_no_status(self):
+    def test_generic_exception_with_trace_but_no_status(self, monkeypatch):
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
         trace = self._trace()
         trace["attempted_models"][0]["status_code"] = None
         exc = RuntimeError("model call blew up without a status")

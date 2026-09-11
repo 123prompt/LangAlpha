@@ -122,7 +122,14 @@ async def pin_public_url(
     Callers send the request with ``PinnedTarget.pinned_kwargs()``, which
     carries the pinned URL, the restored Host authority and the SNI extension.
     """
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError as e:
+        # The url is third-party in every caller (a manifest field, a
+        # handshake icon, an upstream Location), so unparseable is an ordinary
+        # input, not a fault. ``http://[bad`` raises here rather than
+        # returning something to reject.
+        raise EgressBlockedError(f"egress url is not parseable: {e}") from e
     if require_https and parts.scheme != "https":
         raise EgressBlockedError("egress requires https")
     if parts.scheme not in ("https", "http"):
@@ -134,7 +141,12 @@ async def pin_public_url(
         raise EgressBlockedError("egress url must include a host")
 
     default_port = 443 if parts.scheme == "https" else 80
-    port = parts.port or default_port
+    try:
+        port = parts.port or default_port
+    except ValueError as e:
+        # ``parts.port`` parses lazily, so a port that is out of range or not
+        # a number survives urlsplit and raises on this read instead.
+        raise EgressBlockedError(f"egress url has an unusable port: {e}") from e
     ips = await resolve_public_ips(host, port=port, allow_non_global=allow_non_global)
     ip = ips[0]
 

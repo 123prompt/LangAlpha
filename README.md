@@ -21,8 +21,7 @@
   <a href="src/server/">Backend</a> &bull;
   <a href="web/">Web</a> &bull;
   <a href="libs/ptc-cli/">TUI</a> &bull;
-  <a href="skills/">Skills</a> &bull;
-  <a href="mcp_servers/">MCP</a>
+  <a href="plugins/">Plugins</a>
 </p>
 
 <p align="center">

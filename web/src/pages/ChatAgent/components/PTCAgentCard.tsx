@@ -361,7 +361,7 @@ function PTCAgentCard({ proposalData, onApprove, onReject, flashContext }: PTCAg
         role="switch"
         aria-checked={reportBack}
         aria-label={t('chat.ptcCard.reportBack')}
-        className="mt-3 flex w-full cursor-pointer items-center justify-between rounded-md pt-2.5 outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
+        className="mt-3 flex w-full cursor-pointer items-center justify-between rounded-md pt-2.5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
         style={{ borderTop: '1px solid var(--color-border-muted)' }}
         onClick={(e: React.MouseEvent) => { e.stopPropagation(); setReportBack((v) => !v); }}
       >

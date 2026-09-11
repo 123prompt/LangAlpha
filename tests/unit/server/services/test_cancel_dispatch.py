@@ -683,4 +683,4 @@ async def test_a_cancel_failure_does_not_put_infrastructure_text_on_the_wire():
     assert secret not in str(caught.value.detail)
     assert "db-prod-7" not in str(caught.value.detail)
     # Still says which operation failed — a fixed string, not a bare 500.
-    assert "Failed to cancel workflow" in str(caught.value.detail)
+    assert "Failed to cancel the turn" in str(caught.value.detail)

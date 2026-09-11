@@ -232,7 +232,7 @@ function RecentThreadsWidget({ instance }: WidgetRenderProps<RecentThreadsConfig
 
   const workspaceMap = useMemo(() => {
     const map = new Map<string, Workspace>();
-    (wsListData?.workspaces ?? []).forEach((ws: Workspace) => {
+    (wsListData?.workspaces ?? []).forEach((ws) => {
       if (ws.workspace_id) map.set(ws.workspace_id, ws);
     });
     return map;

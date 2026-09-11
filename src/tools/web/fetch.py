@@ -413,8 +413,8 @@ async def web_fetch(
 
 # Create async tool using StructuredTool.from_function with coroutine
 async def _web_fetch_tool_impl(
-    url: Annotated[str, "The URL to fetch content from"],
-    prompt: Annotated[str, "The prompt to run on the fetched content"],
+    url: Annotated[str, "A fully-formed URL. HTTP is upgraded to HTTPS automatically."],
+    prompt: Annotated[str, "What information to extract from the page."],
 ) -> tuple[str, dict]:
     """Delegate to web_fetch(); the agent-facing contract is ``description``.
 
@@ -441,28 +441,17 @@ web_fetch_tool = StructuredTool.from_function(
     coroutine=_decorated_impl,
     name="WebFetch",
     response_format="content_and_artifact",
-    description="""Fetches content from a specified URL and processes it using an AI model.
+    description="""Fetches a URL and answers a question about its content using a small, fast model.
 
-Takes a URL and a prompt as input. Fetches the URL content, converts to
-markdown, then processes the content with the prompt using a small,
-fast model. Returns the model's response about the content.
+Handles regular web pages (tiered fetching with anti-bot bypass), PDFs,
+YouTube transcripts and X/Twitter posts. Run several in parallel when you
+need more than one page.
 
-Supports multiple content types with dedicated extractors:
-- Regular web pages: tiered HTML fetching with anti-bot bypass
-- URL-based PDF files: text extraction (no LLM needed for parsing)
-- YouTube videos: transcript extraction with timestamps
-- X/Twitter posts: tweet text, media, and engagement stats
+Returns:
+    The model's answer to your prompt, not the raw page. Long content is
+    summarised, and when the answer is not on the page you get alternative
+    URLs from the site's sitemap instead.
 
-
-Usage notes:
-- Run multiple in parallel if needed
-- The URL must be a fully-formed valid URL
-- HTTP URLs will be automatically upgraded to HTTPS
-- The prompt should describe what information you want to extract from the page
-- Results may be summarized if the content is very large
-- If the requested information is not found, the tool will suggest alternative
-  URLs from the site's sitemap that might contain the information
-- When a URL redirects to a different host, the tool will inform you and
-  provide the redirect URL. You should then make a new request with the
-  redirect URL to fetch the content.""",
+A URL that redirects to a different host returns the redirect URL rather than
+content; call again with that URL.""",
 )

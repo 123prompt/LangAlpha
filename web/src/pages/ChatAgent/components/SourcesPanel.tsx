@@ -63,7 +63,7 @@ const CARD_CHROME =
   'flex items-center gap-2.5 rounded-lg border px-2.5 text-left outline-none cursor-pointer ' +
   'border-[var(--color-border-muted)] bg-[var(--color-bg-card)] ' +
   'hover:border-[var(--color-border-default)] hover:bg-[var(--color-bg-elevated)] ' +
-  'focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]';
+  'focus-visible:ring-2 focus-visible:ring-ring';
 
 const TERTIARY = { color: 'var(--color-text-tertiary)' as const };
 
@@ -445,7 +445,7 @@ export default function SourcesPanel({
                 onClick={() => toggleGroup(group.type)}
                 aria-expanded={!collapsed}
                 aria-label={`${groupLabel} — ${t(collapsed ? 'chat.sources.expand' : 'chat.sources.collapse')}`}
-                className="mb-1.5 flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left outline-none transition-colors hover:bg-[var(--color-bg-subtle)] focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
+                className="mb-1.5 flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left outline-none transition-colors hover:bg-[var(--color-bg-subtle)] focus-visible:ring-2 focus-visible:ring-ring"
               >
                 {collapsed ? (
                   <ChevronRight className="h-3.5 w-3.5 flex-shrink-0" style={TERTIARY} />
@@ -939,7 +939,7 @@ function SourceDetailDialog({
           <button
             type="button"
             onClick={handleOpen}
-            className="group inline-flex w-fit items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium outline-none transition-all hover:gap-2 focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
+            className="group inline-flex w-fit items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium outline-none transition-all hover:gap-2 focus-visible:ring-2 focus-visible:ring-ring"
             style={{
               backgroundColor: 'var(--color-bg-elevated)',
               borderColor: 'var(--color-border-elevated)',

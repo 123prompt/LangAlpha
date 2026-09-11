@@ -3,7 +3,6 @@ import { Eye, EyeOff, Check, X } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Loader } from "@/components/ui/loader"
-import { cn } from "@/lib/utils"
 
 export interface TestResult {
   success: boolean
@@ -104,7 +103,7 @@ export function ApiKeyInput({
             onChange={(e) => onChange(e.target.value)}
             onBlur={handleBlur}
             placeholder={maskedKey || "Paste your API key here"}
-            className={cn("pr-12 focus-visible:ring-offset-0", hasError && "focus-visible:ring-0")}
+            className="pr-12"
             style={
               hasError
                 ? { borderColor: "var(--color-loss)" }

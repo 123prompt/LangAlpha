@@ -181,14 +181,25 @@ async def _is_plan_interrupt_pending(thread_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def process_hitl_response(request: ChatRequest) -> tuple[str, str, dict, list]:
+def process_hitl_response(
+    request: ChatRequest,
+) -> tuple[str, str, dict, list, dict]:
     """Extract HITL answer metadata for persistence.
 
-    Returns (feedback_action, query_content, hitl_answers, interrupt_ids).
+    Returns (feedback_action, query_content, hitl_answers, interrupt_ids,
+    hitl_decisions).
     ``feedback_action`` is "QUESTION_ANSWERED" or "QUESTION_SKIPPED".
     ``query_content`` is the summarized content string.
     ``hitl_answers`` maps interrupt_id -> answer string | None.
     ``interrupt_ids`` is the list of interrupt IDs from the response map.
+    ``hitl_decisions`` maps interrupt_id -> the interrupt's decisions in the
+    order its action requests were raised, each a ``HITLDecision`` payload.
+
+    One interrupt can stop several calls and be answered with a different
+    verdict for each, which ``hitl_answers`` collapses into a single key.
+    ``hitl_decisions`` keeps every decision under its own slot so slot i is the
+    answer to action request i, and it carries the user's own reject message
+    rather than the wording the agent is handed on resume.
     """
     summary = summarize_hitl_response_map(request.hitl_response)
     feedback_action = summary["feedback_action"]
@@ -196,21 +207,26 @@ def process_hitl_response(request: ChatRequest) -> tuple[str, str, dict, list]:
     interrupt_ids = summary["interrupt_ids"]
 
     hitl_answers: dict = {}
+    hitl_decisions: dict = {}
     for interrupt_id, response in request.hitl_response.items():
         decisions = (
             response.decisions
             if hasattr(response, "decisions")
             else response.get("decisions", [])
         )
+        recorded: list[dict] = []
         for d in decisions:
             d_type = d.type if hasattr(d, "type") else d.get("type")
             d_msg = (
                 d.message if hasattr(d, "message") else d.get("message")
             ) or ""
+            recorded.append({"type": d_type, "message": d_msg or None})
             if d_type == "approve" and d_msg:
                 hitl_answers[interrupt_id] = d_msg
             elif d_type == "reject" and not d_msg:
                 hitl_answers[interrupt_id] = None
+        if recorded:
+            hitl_decisions[interrupt_id] = recorded
 
     if hitl_answers:
         has_answers = any(v is not None for v in hitl_answers.values())
@@ -218,7 +234,13 @@ def process_hitl_response(request: ChatRequest) -> tuple[str, str, dict, list]:
             "QUESTION_ANSWERED" if has_answers else "QUESTION_SKIPPED"
         )
 
-    return feedback_action, query_content, hitl_answers, interrupt_ids
+    return (
+        feedback_action,
+        query_content,
+        hitl_answers,
+        interrupt_ids,
+        hitl_decisions,
+    )
 
 
 def serialize_context_metadata(
@@ -507,7 +529,6 @@ def build_graph_config(
     token_callback,
     request: ChatRequest,
     effective_model: str | None,
-    is_byok: bool,
     recursion_limit: int,
     plan_mode: bool | None = None,
     extra_configurable: dict | None = None,
@@ -540,9 +561,6 @@ def build_graph_config(
         locale=request.locale,
         timezone=timezone_str,
         llm_model=effective_model,
-        reasoning_effort=getattr(request, "reasoning_effort", None),
-        fast_mode=getattr(request, "fast_mode", None),
-        is_byok=is_byok,
         platform=request.platform,
         **({"plan_mode": plan_mode} if plan_mode is not None else {}),
     )

@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
   handleRejectPTCAgent: vi.fn(),
   handleApproveSecretaryAction: vi.fn(),
   handleRejectSecretaryAction: vi.fn(),
+  handleResumeCreditPause: vi.fn(),
   handleEditMessage: vi.fn(),
   handleRegenerate: vi.fn(),
   handleRetry: vi.fn(),
@@ -75,6 +76,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     handleRejectPTCAgent: h.handleRejectPTCAgent,
     handleApproveSecretaryAction: h.handleApproveSecretaryAction,
     handleRejectSecretaryAction: h.handleRejectSecretaryAction,
+    handleResumeCreditPause: h.handleResumeCreditPause,
     pendingInterrupt: h.pendingInterrupt,
     pendingRejection: null,
     hasActiveSubagents: false,
@@ -133,7 +135,7 @@ const baseProps: PanelProps = {
   interval: '1day',
   mode: 'ptc',
   onModeChange: vi.fn(),
-  workspaces: [{ workspace_id: 'ws-1' }],
+  workspaces: [{ workspace_id: 'ws-1', name: 'Workspace 1' }],
   selectedWorkspaceId: 'ws-1',
   onWorkspaceChange: vi.fn(),
   chartImage: null,
@@ -190,6 +192,7 @@ describe('MarketChatPanel', () => {
       ['onRejectPTCAgent', h.handleRejectPTCAgent],
       ['onApproveSecretaryAction', h.handleApproveSecretaryAction],
       ['onRejectSecretaryAction', h.handleRejectSecretaryAction],
+      ['onResumeCreditPause', h.handleResumeCreditPause],
     ];
     for (const [key, spy] of wiring) {
       expect(typeof a[key]).toBe('function');

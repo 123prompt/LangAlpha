@@ -345,7 +345,7 @@ function NewsFeedCard({
               placeholder={t('dashboard.newsFeedCard.tickerPlaceholder')}
               value={tickerFilter}
               onChange={(e) => setTickerFilter(e.target.value)}
-              className="flex-1 text-[0.6875rem] bg-transparent border-none outline-none min-w-0"
+              className="flex-1 text-[0.6875rem] bg-transparent border-none min-w-0"
               style={{ color: 'var(--color-text-primary)' }}
             />
             {tickerFilter && (

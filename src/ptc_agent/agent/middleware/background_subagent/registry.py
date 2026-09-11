@@ -86,14 +86,20 @@ class TaskWriterLive(Exception):
 
 def take_task_usage(
     tasks: list[BackgroundTask], response_id: str
-) -> list[tuple[BackgroundTask, list, dict]]:
+) -> list[tuple[BackgroundTask, list, dict, str | None]]:
     """Snapshot-and-clear the usage records ``response_id`` still owns.
 
     Module-level so a torn-down thread with no registry left to lock can run
     the same body: it has no awaits, so it is atomic either way, and the lock
     only orders it against concurrent registry mutation.
+
+    ``task_run_id`` is snapshotted with the records for the same reason they
+    are cleared together: a resume remints it, and the caller reads it only
+    after several awaits. Settling the reminted id would mark the *live* run
+    billed on its predecessor's usage alone, after which its heartbeats bounce
+    off the settle guard and its spend is never seen again.
     """
-    taken: list[tuple[BackgroundTask, list, dict]] = []
+    taken: list[tuple[BackgroundTask, list, dict, str | None]] = []
     for task in tasks:
         if task.collector_response_id != response_id:
             continue
@@ -102,7 +108,7 @@ def take_task_usage(
         records, tool_usage = task.per_call_records, task.tool_usage
         task.per_call_records = []
         task.tool_usage = {}
-        taken.append((task, records, tool_usage))
+        taken.append((task, records, tool_usage, task.task_run_id or None))
     return taken
 
 
@@ -369,7 +375,7 @@ class BackgroundTaskRegistry:
 
     async def take_owned_usage(
         self, tasks: list[BackgroundTask], response_id: str
-    ) -> list[tuple[BackgroundTask, list, dict]]:
+    ) -> list[tuple[BackgroundTask, list, dict, str | None]]:
         """Take the usage records this collector already owns, under the lock.
 
         The billing sibling of the claim family: ownership is checked rather

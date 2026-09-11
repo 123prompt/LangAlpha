@@ -100,10 +100,6 @@
 .export-preview-save-btn:hover {
   opacity: 0.9;
 }
-.export-preview-save-btn:focus-visible {
-  outline: 2px solid var(--color-accent-primary);
-  outline-offset: 2px;
-}
 
 /* Preview area — gray canvas to show page sheets */
 .export-preview-content {
@@ -298,10 +294,6 @@
 }
 .export-preview-retry-btn:hover {
   background: var(--color-bg-hover);
-}
-.export-preview-retry-btn:focus-visible {
-  outline: 2px solid var(--color-accent-primary);
-  outline-offset: 2px;
 }
 .export-preview-anyway-btn {
   padding: 6px 16px;

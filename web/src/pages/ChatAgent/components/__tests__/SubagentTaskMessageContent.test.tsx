@@ -11,8 +11,10 @@ import React from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom';
-import SubagentTaskMessageContent from '../SubagentTaskMessageContent';
+import { MemoryRouter } from 'react-router-dom';
+import SubagentTaskMessageContent, { SubagentStopNotice } from '../SubagentTaskMessageContent';
 import { SubagentTelemetryContext } from '../SubagentTelemetryContext';
+import type { SubagentTelemetry } from '../../session/subagents/resolveSubagentTelemetry';
 
 const baseProps = {
   subagentId: 'tc-abc',
@@ -352,5 +354,100 @@ describe('SubagentTaskMessageContent — accessibility', () => {
     const card = screen.getByRole('button');
     fireEvent.keyDown(card, { key: 'Enter' });
     expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The reason a settled task stopped, on the card in the MAIN transcript.
+ *
+ * A background task can outlive its turn. When the credit gate stops one the
+ * turn is already finished, so no pause card is ever raised in the thread and
+ * the denial reaches only the task's own transcript — behind a click. What the
+ * thread showed was a bare "Stopped" chip, which is exactly what a task the
+ * user ended on purpose shows.
+ */
+describe('SubagentTaskMessageContent — stop reason', () => {
+  const ZERO = { input: 0, output: 0, total: 0 };
+
+  const withTelemetry = (
+    telemetry: Partial<SubagentTelemetry>,
+    props: Record<string, unknown> = {},
+  ) =>
+    render(
+      <MemoryRouter>
+        <SubagentTelemetryContext.Provider
+          value={() => ({ toolCalls: 13, tokenUsage: ZERO, ...telemetry })}
+        >
+          <SubagentTaskMessageContent {...baseProps} status="cancelled" {...props} />
+        </SubagentTelemetryContext.Provider>
+      </MemoryRouter>,
+    );
+
+  it('states the reason a stopped task stopped', () => {
+    withTelemetry({ stopReason: 'transport_lost: the stream tore mid-run' });
+    expect(screen.getByTestId('subagent-stop-reason')).toHaveTextContent('transport_lost');
+    expect(screen.queryByRole('link')).toBeNull();
+  });
+
+  it('leaves a credit stop to the notice below, so it is not said twice', () => {
+    withTelemetry({
+      stopReason: 'Monthly credit limit reached (50/50 credits)',
+      stopReasonType: 'credit_stop',
+    });
+    expect(screen.queryByTestId('subagent-stop-reason')).toBeNull();
+  });
+
+  it('says nothing while the task is still running — a reason there would be a prediction', () => {
+    withTelemetry({ stopReason: 'transport_lost' }, { status: 'running' });
+    expect(screen.queryByTestId('subagent-stop-reason')).toBeNull();
+  });
+
+  it('clamps an unbounded reason so it cannot push the card open', () => {
+    withTelemetry({ stopReason: 'x'.repeat(400) });
+    const text = screen.getByTestId('subagent-stop-reason').textContent || '';
+    expect(text.length).toBeLessThan(400);
+    expect(text.endsWith('…')).toBe(true);
+  });
+});
+
+describe('SubagentStopNotice', () => {
+  const ZERO = { input: 0, output: 0, total: 0 };
+
+  const withTelemetry = (telemetry: Partial<SubagentTelemetry> | undefined) =>
+    render(
+      <MemoryRouter>
+        <SubagentTelemetryContext.Provider
+          value={() => (telemetry ? { toolCalls: 0, tokenUsage: ZERO, ...telemetry } : undefined)}
+        >
+          <SubagentStopNotice subagentId="sub-1" />
+        </SubagentTelemetryContext.Provider>
+      </MemoryRouter>,
+    );
+
+  it('surfaces a credit stop in the main transcript, with the account pages', () => {
+    withTelemetry({
+      stopReason: 'Monthly credit limit reached (50/50 credits)',
+      stopReasonType: 'credit_stop',
+    });
+    const notice = screen.getByTestId('subagent-credit-stop-notice');
+    expect(notice).toHaveTextContent('Monthly credit limit reached (50/50 credits)');
+    expect(screen.getByRole('link', { name: 'Manage plan' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'View usage' })).toBeInTheDocument();
+  });
+
+  it('stays out of the way for a stop the user cannot act on', () => {
+    withTelemetry({ stopReason: 'transport_lost: the stream tore mid-run' });
+    expect(screen.queryByTestId('subagent-credit-stop-notice')).toBeNull();
+  });
+
+  it('renders nothing when no reason reached the client, as on a shared replay', () => {
+    withTelemetry(undefined);
+    expect(screen.queryByTestId('subagent-credit-stop-notice')).toBeNull();
+  });
+
+  it('clamps an unbounded reason', () => {
+    withTelemetry({ stopReason: 'x'.repeat(400), stopReasonType: 'credit_stop' });
+    const text = screen.getByTestId('subagent-credit-stop-notice').textContent || '';
+    expect(text.length).toBeLessThan(400);
   });
 });

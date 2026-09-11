@@ -13,9 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.server.services.llm.config import _resolve_custom_model_byok
+from src.server.services.llm.clients import _resolve_custom_model_byok
 
 H = "src.server.services.llm.config"
+USER_MODELS = "src.server.services.llm.user_models"
+CLIENTS = "src.server.services.llm.clients"
 DBK = "src.server.database.api_keys"
 
 
@@ -35,7 +37,7 @@ def _patches(provider_def, key=None):
         return provider_def if name == provider_def["name"] else None
 
     return (
-        patch(f"{H}.get_custom_provider_config", new_callable=AsyncMock, side_effect=get_cp),
+        patch(f"{USER_MODELS}.get_custom_provider_config", new_callable=AsyncMock, side_effect=get_cp),
         patch(f"{DBK}.get_byok_config_for_provider", new_callable=AsyncMock, return_value=key),
         patch(f"{DBK}.get_byok_configs_for_providers", new_callable=AsyncMock, return_value={}),
     )
@@ -95,6 +97,27 @@ async def test_openai_parent_does_not_rewrite_or_force_response_api():
 
 
 @pytest.mark.asyncio
+async def test_dashscope_parent_is_matched_in_full():
+    """A parent with its own SDK is a dialect, so naming it inherits all of it.
+
+    DashScope declares ``sdk: "dashscope"`` because it has a client of its own,
+    which is also what rescues its raw reasoning. A gateway that names it as a
+    parent is saying it is that thing, so it gets the client, the headers and
+    the manifest's ``use_response_api`` without opting in separately. Contrast
+    the ``openai`` parent above, which is a wire shape rather than a vendor.
+    """
+    provider_def = {"name": "my-qwen-gw", "parent_provider": "vendor-parent"}
+    custom_model = {"name": "eval-model", "model_id": "some-model", "provider": "my-qwen-gw"}
+    mc = _mock_mc("dashscope", parent_extra={"use_response_api": True})
+
+    p1, p2, p3 = _patches(provider_def)
+    with p1, p2, p3:
+        byok, base_url, out = await _resolve_custom_model_byok("u", "eval-model", dict(custom_model), mc)
+
+    assert out["provider"] == "vendor-parent"
+
+
+@pytest.mark.asyncio
 async def test_custom_provider_explicit_use_response_api_opt_in_preserved():
     """A custom provider that explicitly opts into the Responses API still gets
     the ``_use_response_api`` flag, regardless of parent SDK."""
@@ -109,3 +132,86 @@ async def test_custom_provider_explicit_use_response_api_opt_in_preserved():
         byok, base_url, out = await _resolve_custom_model_byok("u", "eval-model", dict(custom_model), mc)
 
     assert out.get("_use_response_api") is True
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_responses_opt_out_survives_the_inheritance():
+    """Inheriting a parent's default is not the same as ignoring what the child said.
+
+    ``users.py`` validates this field as a boolean, so ``false`` is a value a
+    gateway can actually store, and it means it speaks only
+    ``/chat/completions``. A truthiness check here forwards only ``true`` and
+    leaves ``false`` indistinguishable from absent, which hands the gateway the
+    parent's manifest default and points every call at ``/responses``.
+    """
+    provider_def = {
+        "name": "my-qwen-gw",
+        "parent_provider": "vendor-parent",
+        "use_response_api": False,
+    }
+    custom_model = {"name": "eval-model", "model_id": "some-model", "provider": "my-qwen-gw"}
+    mc = _mock_mc("dashscope", parent_extra={"use_response_api": True})
+
+    p1, p2, p3 = _patches(provider_def)
+    with p1, p2, p3:
+        byok, base_url, out = await _resolve_custom_model_byok("u", "eval-model", dict(custom_model), mc)
+
+    # Still the parent's dialect: the opt-out is about the route, not the client.
+    assert out["provider"] == "vendor-parent"
+    assert out["_use_response_api"] is False
+
+
+def test_an_explicit_opt_out_reaches_the_client_as_chat_completions():
+    """The opt-out has to survive to the built client, not just the config.
+
+    ``False`` and absent take different paths through ``ModelSpec`` only if the
+    key is present, so this is the assertion that a truthiness check breaks.
+    """
+    from src.llms.extension import ChatDashScope
+    from src.llms.llm import LLM
+
+    def build(**extra):
+        return LLM.from_custom_config(
+            {"name": "eval-model", "model_id": "qwen3.8-max", "provider": "dashscope", **extra},
+            api_key="sk-test",
+            base_url_override="https://gw.example.com/v1",
+        )
+
+    opted_out = build(_use_response_api=False)
+    assert isinstance(opted_out, ChatDashScope)  # the bridge still applies
+    assert opted_out.output_version != "responses/v1"
+
+    # Absent still inherits the parent's default, which is the rule above.
+    assert build().output_version == "responses/v1"
+
+
+def test_an_inherited_dashscope_provider_actually_builds_the_bridged_client():
+    """The rewrite above is only worth anything if it changes the client class.
+
+    Asserting on the config alone would keep passing if the factory stopped
+    honouring ``provider``, which is the failure the rewrite exists to prevent.
+    """
+    from langchain_openai import ChatOpenAI
+
+    from src.llms.extension import ChatDashScope
+    from src.llms.llm import LLM
+
+    # No ``_use_response_api``: the inherited parent is what supplies it, which
+    # is the half of "matched in full" a config assertion cannot see.
+    def build(provider):
+        return LLM.from_custom_config(
+            {"name": "eval-model", "model_id": "qwen3.8-max", "provider": provider},
+            api_key="sk-test",
+            base_url_override="https://gw.example.com/v1",
+        )
+
+    not_inherited = build("my-qwen-gw")
+    assert isinstance(not_inherited, ChatOpenAI)
+    assert not isinstance(not_inherited, ChatDashScope)
+
+    inherited = build("dashscope")
+    assert isinstance(inherited, ChatDashScope)
+    # The Responses opt-in rides as ``output_version``; see llm.py:698.
+    assert inherited.output_version == "responses/v1"
+    # The gateway's own endpoint outranks the manifest's, both ways.
+    assert inherited.openai_api_base == "https://gw.example.com/v1"

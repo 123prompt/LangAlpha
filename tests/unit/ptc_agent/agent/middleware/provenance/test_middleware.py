@@ -1060,3 +1060,73 @@ async def test_execute_code_trace_entry_secret_never_leaks(middleware):
     assert emitted[0]["args"]["api_key"] == "[redacted]"
     # The legacy fingerprint is kept alongside the readable redacted args.
     assert set(emitted[0]["args_fingerprint"]) == {"sha256"}
+
+
+# ---------------------------------------------------------------------------
+# Directly bound MCP tools
+# ---------------------------------------------------------------------------
+
+
+def _direct_request(server, tool, args=None, name=None):
+    """A call on a tool the binder stamped, with the alias the model sees."""
+    from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY
+
+    request = _make_request(name or f"mcp__{server}__{tool}", args or {})
+    request.tool = SimpleNamespace(
+        metadata={METADATA_KEY: {"server": server, "tool": tool}}
+    )
+    return request
+
+
+@pytest.mark.asyncio
+async def test_a_direct_tool_call_is_recorded_like_the_sandbox_path(middleware):
+    emitted = []
+    await _run(
+        middleware,
+        _direct_request("moomoo", "get_positions", {"account_id": "9"}),
+        _result(content='{"positions": []}'),
+        emitted,
+    )
+    assert len(emitted) == 1
+    event = emitted[0]
+    assert event["source_type"] == "mcp_tool"
+    assert event["identifier"] == "moomoo:get_positions"
+    assert event["provider"] == "mcp:moomoo"
+    assert event["tool_call_id"] == "call-1"
+    assert event["result_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_a_digest_alias_still_records_the_vendor_names(middleware):
+    """The stamp is read, not the name, which is exactly why it exists."""
+    emitted = []
+    await _run(
+        middleware,
+        _direct_request("desk__prod", "place", name="mcp__desk_prod_3a2b092c__place"),
+        _result(content="{}"),
+        emitted,
+    )
+    assert emitted[0]["identifier"] == "desk__prod:place"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_direct_call_records_nothing(middleware):
+    """The gate's refusal is an error result, and errors are not attested."""
+    emitted = []
+    result = SimpleNamespace(
+        content="Refused: the connection to moomoo does not permit x",
+        artifact=None,
+        status="error",
+    )
+    await _run(middleware, _direct_request("moomoo", "x"), result, emitted)
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_an_unstamped_tool_is_still_left_alone(middleware):
+    """The fallback keys off the stamp, not off the mcp__ prefix."""
+    emitted = []
+    request = _make_request("mcp__looks__direct", {})
+    request.tool = SimpleNamespace(metadata=None)
+    await _run(middleware, request, _result(content="{}"), emitted)
+    assert emitted == []

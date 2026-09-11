@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { AnimatePresence } from 'framer-motion';
-import { Blocks, FolderGit2, Package, Plus } from 'lucide-react';
+import { Blocks, Boxes, FolderGit2, Package, Plus } from 'lucide-react';
 import {
   HeaderButton,
   ListEmpty,
@@ -17,11 +17,13 @@ import {
   type PluginInfo,
 } from '@/pages/ChatAgent/utils/api';
 import {
+  BUNDLED_ORIGIN,
   groupBy,
   matchesFilter,
   pluginSourceOrigin,
   UPLOADED_ORIGIN,
 } from '../utils/groupOrigins';
+import { hasLifecycle } from '../utils/pluginSurface';
 import { DETAIL_KIND_TAB, withDetail } from '../utils/detailParam';
 import { useAddIntent } from '../hooks/useAddIntent';
 import { useDetailParam } from '../hooks/useDetailParam';
@@ -36,14 +38,31 @@ import { PluginInstallWizard } from './PluginInstallWizard';
 import { rowSelection } from './useBulkSelection';
 
 /**
- * The Plugins tab body: installed Agent Plugins packages, grouped by install
- * origin (the source repo, or "Uploaded" for zips) so several picks out of
- * one marketplace stack together. Each install fans components into the MCP
- * and Skills tabs, where they appear badged with the plugin's name; this
- * list owns identity and lifecycle only.
+ * The Plugins tab body: Agent Plugins packages, grouped by install origin (the
+ * source repo, or "Uploaded" for zips) so several picks out of one marketplace
+ * stack together. Each install fans components into the MCP and Skills tabs,
+ * where they appear badged with the plugin's name; this list owns identity and
+ * lifecycle only.
+ *
+ * The bundles that ship inside the app are packages of the same shape and read
+ * as ordinary rows here, but they were never installed: nothing uninstalls
+ * them and they hold no slot against the cap. Switching one off is the one
+ * verb they do answer, so they select and bulk-toggle like the rest.
  */
 
 const pluginKey = (p: PluginInfo) => `plugin:${p.name}`;
+
+/** Sort weight for a group heading: unranked repo origins lead, then the two
+ *  catch-alls, so what the user went and got sits above what came with the app. */
+const ORIGIN_RANK: Record<string, number> = {
+  [UPLOADED_ORIGIN]: 1,
+  [BUNDLED_ORIGIN]: 2,
+};
+
+const GROUP_ICON: Record<string, typeof Package> = {
+  [UPLOADED_ORIGIN]: Package,
+  [BUNDLED_ORIGIN]: Boxes,
+};
 
 export function PluginsList() {
   const { t } = useTranslation();
@@ -59,7 +78,11 @@ export function PluginsList() {
 
   const plugins = data?.plugins ?? [];
   const maxPlugins = data?.max_plugins ?? 0;
-  const atCap = maxPlugins > 0 && plugins.length >= maxPlugins;
+  // The cap counts what the user installed. Bundles arrive with the app and
+  // cannot be uninstalled, so counting them would spend an allowance nobody
+  // asked for, and read as "6 / 20" on an account holding no plugins at all.
+  const installed = plugins.filter(hasLifecycle);
+  const atCap = maxPlugins > 0 && installed.length >= maxPlugins;
 
   const visible = plugins.filter(
     (p) =>
@@ -76,15 +99,22 @@ export function PluginsList() {
   const detailPlugin = detail.target;
 
   const groups = [...groupBy(visible, pluginSourceOrigin).entries()].sort(([a], [b]) => {
-    if (a === UPLOADED_ORIGIN) return 1;
-    if (b === UPLOADED_ORIGIN) return -1;
-    return a.localeCompare(b);
+    return (ORIGIN_RANK[a] ?? 0) - (ORIGIN_RANK[b] ?? 0) || a.localeCompare(b);
   });
+
+  function groupTitle(origin: string): string {
+    if (origin === BUNDLED_ORIGIN) return t('plugins.groups.bundled');
+    if (origin === UPLOADED_ORIGIN) return t('plugins.groups.uploaded');
+    return origin;
+  }
 
   // Visible rows only: a bulk action reaches exactly what is on screen.
   const selectedPlugins = visible.filter((p) => selection.selected.has(pluginKey(p)));
   const enableTargets = selectedPlugins.filter((p) => !p.enabled);
   const disableTargets = selectedPlugins.filter((p) => p.enabled);
+  // Every action counts only the rows it can actually reach — a bundle has no
+  // install to undo, the same way an already-enabled row is not an enable.
+  const uninstallTargets = selectedPlugins.filter(hasLifecycle);
   const actions: BulkAction[] = [
     {
       id: 'enable',
@@ -112,13 +142,15 @@ export function PluginsList() {
     },
     {
       id: 'uninstall',
-      label: t('plugins.bulk.uninstall', { count: selectedPlugins.length }),
+      label: t('plugins.bulk.uninstall', { count: uninstallTargets.length }),
       destructive: true,
-      disabled: selectedPlugins.length === 0,
-      confirmMessage: t('plugins.bulk.confirmUninstall', { count: selectedPlugins.length }),
+      disabled: uninstallTargets.length === 0,
+      confirmMessage: t('plugins.bulk.confirmUninstall', {
+        count: uninstallTargets.length,
+      }),
       run: () =>
         surface.run(
-          selectedPlugins.map((p) => ({
+          uninstallTargets.map((p) => ({
             key: p.name,
             run: () => deletePlugin(p.name),
           })),
@@ -144,13 +176,16 @@ export function PluginsList() {
         onStateFilterChange={surface.setStateFilter}
         selecting={selection.selecting}
         onStartSelect={selection.start}
+        // Enable and disable reach a bundle the same as any other row; only
+        // uninstall needs one that was installed. The mode is empty when there
+        // is no row at all, not when nothing was installed.
         selectDisabled={plugins.length === 0}
       />
 
       <ListHeader
         icon={Blocks}
         title={t('plugins.list.title')}
-        count={plugins.length}
+        count={installed.length}
         max={maxPlugins}
       />
 
@@ -212,8 +247,8 @@ export function PluginsList() {
             <GroupDeck
               key={origin}
               id={`plugins:${origin}`}
-              title={origin === UPLOADED_ORIGIN ? t('plugins.groups.uploaded') : origin}
-              icon={origin === UPLOADED_ORIGIN ? Package : FolderGit2}
+              title={groupTitle(origin)}
+              icon={GROUP_ICON[origin] ?? FolderGit2}
               count={groupPlugins.length}
               enabledCount={groupPlugins.filter((p) => p.enabled).length}
               forceExpanded={surface.forceExpanded}

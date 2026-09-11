@@ -6,6 +6,8 @@ socket creation turns that failure mode into a loud error. AF_UNIX stays
 allowed: asyncio's event loop self-pipe is a unix socketpair.
 """
 
+from pathlib import Path
+
 import pytest
 import pytest_socket
 
@@ -59,3 +61,25 @@ def _empty_user_skill_bundle(monkeypatch):
 
     monkeypatch.setattr(user_skills, "load_user_skill_bundle", _empty)
     monkeypatch.setattr(materialize, "load_user_skill_bundle", _empty)
+
+
+@pytest.fixture(scope="session")
+def shipped_skill_md():
+    """Locate a shipped skill's SKILL.md on disk, by name.
+
+    A registry entry's ``skill_md_path`` is where the *agent* reaches the file
+    inside a sandbox, not where this repo keeps it: the shipped skills live in
+    the bundle that declares them, and the sync flattens every source into one
+    directory. Joining that suffix onto the repo root reads as correct and is
+    not, so the lookup asks the bundles instead.
+    """
+    from ptc_agent.config.plugins import bundled_skill_dirs
+
+    def find(name: str) -> Path:
+        for root in bundled_skill_dirs():
+            candidate = root / name / "SKILL.md"
+            if candidate.is_file():
+                return candidate
+        raise AssertionError(f"no bundle ships a {name!r} skill")
+
+    return find

@@ -17,6 +17,7 @@ import {
   sseEvents,
 } from './helpers/mockResponses.js';
 import { loadFixture } from './helpers/loadFixture.js';
+import { chatViewOverrides as sharedChatViewOverrides } from './helpers/chatScenario.js';
 
 // -- Shared helpers --
 
@@ -51,23 +52,7 @@ function threadOverrides() {
 
 /** Overrides for the chat view with a specific thread. */
 function chatViewOverrides() {
-  return {
-    ...threadOverrides(),
-    'GET /threads/b0000001-0000-4000-8000-000000000001': th1,
-    'GET /threads/b0000001-0000-4000-8000-000000000001/status': { can_reconnect: false, status: 'idle' },
-    'GET /threads/b0000001-0000-4000-8000-000000000001/turns': {
-      thread_id: 'b0000001-0000-4000-8000-000000000001',
-      turns: [
-        {
-          turn_index: 0,
-          edit_checkpoint_id: 'cp-edit-0',
-          regenerate_checkpoint_id: 'cp-regen-0',
-        },
-      ],
-      retry_checkpoint_id: 'cp-retry-0',
-    },
-    'GET /workspaces/a0000001-0000-4000-8000-000000000001/files': { files: [] },
-  };
+  return sharedChatViewOverrides({ workspaces: [ws1, ws2], threads: [th1, th2] });
 }
 
 /**

@@ -55,6 +55,10 @@ const MarketChartSurface = lazy(() =>
 const TEXT_COLOR = 'var(--color-text-tertiary)';
 const ACCENT = 'var(--color-accent-primary)';
 const ACCENT_SOFT = 'var(--color-accent-soft)';
+const FOCUS_RING = 'var(--color-focus-ring)';
+
+const RESTING_SHADOW = '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)';
+const RAISED_SHADOW = '0 2px 6px rgba(0,0,0,0.06), 0 26px 50px -20px rgba(0,0,0,0.6)';
 
 // Centered overlay for the chart's loading / empty states.
 const CENTERED: React.CSSProperties = {
@@ -108,8 +112,11 @@ export function InlineChartAnnotationCard({
 
   // Stage-2 modal open state (standalone ChatAgent page only).
   const [open, setOpen] = useState(false);
-  // Card hover drives the CTA fill (glass → accent).
+  // The card lifts for either device; only a keyboard also gets a ring, since
+  // the rounded corners mean the outline is suppressed and drawn as a shadow.
   const [hover, setHover] = useState(false);
+  const [keyboardFocus, setKeyboardFocus] = useState(false);
+  const raised = hover || keyboardFocus;
 
   // Resting-card price preview: cached bars for this symbol/timeframe. Skipped
   // inside MarketView (chartPresent) where the card collapses to a chip.
@@ -252,47 +259,30 @@ export function InlineChartAnnotationCard({
             setOpen(true);
           }
         }}
-        onMouseEnter={(e) => {
-          setHover(true);
-          e.currentTarget.style.borderColor = ACCENT;
-          e.currentTarget.style.transform = 'translateY(-2px)';
-          e.currentTarget.style.boxShadow =
-            '0 2px 6px rgba(0,0,0,0.06), 0 26px 50px -20px rgba(0,0,0,0.6)';
-        }}
-        onMouseLeave={(e) => {
-          setHover(false);
-          e.currentTarget.style.borderColor = CARD_BORDER;
-          e.currentTarget.style.transform = 'none';
-          e.currentTarget.style.boxShadow =
-            '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)';
-        }}
-        // Keyboard focus needs a visible ring (outline is suppressed for the
-        // rounded card). Gate on :focus-visible so a mouse click stays clean.
-        onFocus={(e) => {
-          if (!e.currentTarget.matches(':focus-visible')) return;
-          setHover(true);
-          e.currentTarget.style.borderColor = ACCENT;
-          e.currentTarget.style.transform = 'translateY(-2px)';
-          e.currentTarget.style.boxShadow =
-            `0 0 0 2px ${ACCENT}, 0 2px 6px rgba(0,0,0,0.06), 0 26px 50px -20px rgba(0,0,0,0.6)`;
-        }}
-        onBlur={(e) => {
-          setHover(false);
-          e.currentTarget.style.borderColor = CARD_BORDER;
-          e.currentTarget.style.transform = 'none';
-          e.currentTarget.style.boxShadow =
-            '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)';
-        }}
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
+        // :focus-visible is the only thing that answers whether a keyboard
+        // brought focus here; the ring stays off a click. The colour is the
+        // shared focus token rather than the accent, which reads as selected.
+        onFocus={(e) => setKeyboardFocus(e.currentTarget.matches(':focus-visible'))}
+        onBlur={() => setKeyboardFocus(false)}
         style={{
           position: 'relative',
           background: CARD_BG,
-          border: `1px solid ${CARD_BORDER}`,
+          border: `1px solid ${keyboardFocus ? FOCUS_RING : raised ? ACCENT : CARD_BORDER}`,
           borderRadius: 20,
           overflow: 'hidden',
           cursor: 'pointer',
-          outline: 'none',
+          // The ring is a shadow, because the card's 20px corners want one that
+          // follows them. Forced colors drops shadows, so the keyboard state
+          // also carries a transparent outline: invisible here, painted in the
+          // system's focus color there, and the only indicator left in it.
+          outline: keyboardFocus ? '2px solid transparent' : 'none',
           userSelect: 'none',
-          boxShadow: '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)',
+          transform: raised ? 'translateY(-2px)' : 'none',
+          boxShadow: keyboardFocus
+            ? `0 0 0 2px ${FOCUS_RING}, ${RAISED_SHADOW}`
+            : raised ? RAISED_SHADOW : RESTING_SHADOW,
           transition: 'border-color 0.16s, box-shadow 0.16s, transform 0.16s',
         }}
       >
@@ -493,7 +483,7 @@ export function InlineChartAnnotationCard({
             </div>
           )}
 
-          {/* Bottom-right — CTA (glass → accent on hover). */}
+          {/* Bottom-right — CTA (glass → accent whenever the card is raised). */}
           <span
             style={{
               position: 'absolute',
@@ -507,16 +497,16 @@ export function InlineChartAnnotationCard({
               padding: '9px 15px',
               borderRadius: 11,
               backdropFilter: 'blur(8px)',
-              background: hover ? ACCENT : GLASS_BG,
-              border: `1px solid ${hover ? 'transparent' : GLASS_BORDER}`,
-              color: hover ? '#fff' : 'var(--color-text-primary)',
+              background: raised ? ACCENT : GLASS_BG,
+              border: `1px solid ${raised ? 'transparent' : GLASS_BORDER}`,
+              color: raised ? '#fff' : 'var(--color-text-primary)',
               transition: 'background 0.16s, color 0.16s, border-color 0.16s',
             }}
           >
             {t('chat.chartAnnotationCard.openAnnotatedChart')}
             <ArrowRight
               size={14}
-              style={{ transform: hover ? 'translateX(3px)' : 'none', transition: 'transform 0.16s' }}
+              style={{ transform: raised ? 'translateX(3px)' : 'none', transition: 'transform 0.16s' }}
             />
           </span>
         </div>

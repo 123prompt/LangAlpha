@@ -3,6 +3,9 @@ import { Brain, ChevronDown, ChevronUp } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import Markdown from './Markdown';
 
+/** Module scope, not a literal: a fresh object would defeat Markdown's memo on every tick. */
+const REASONING_BODY_STYLE = { borderLeft: '2px solid var(--color-border-elevated)' };
+
 interface ReasoningMessageContentProps {
   reasoningContent: string;
   isReasoning: boolean;
@@ -103,7 +106,7 @@ function ReasoningMessageContent({ reasoningContent, isReasoning, reasoningCompl
           variant="compact"
           content={reasoningContent}
           className="mt-2 pl-3 pr-0 py-1 text-xs"
-          style={{ borderLeft: '2px solid var(--color-border-elevated)' }}
+          style={REASONING_BODY_STYLE}
         />
       )}
     </div>

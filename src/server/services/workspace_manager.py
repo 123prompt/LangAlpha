@@ -18,8 +18,10 @@ from ptc_agent.core.mcp_sanitize import is_untrusted_server
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from ptc_agent.core.session import Session, SessionManager
 
+from src.server.services.mcp_tool_split import build_direct_entries
 from src.server.services.egress.session_binding import (
     maybe_remint_egress_jwt,
+    RelayBind,
     sync_egress_relay,
 )
 
@@ -53,7 +55,11 @@ from src.server.database.workspace import (
     update_workspace_activity,
     update_workspace_status,
 )
-from src.server.services.persistence.file import FilePersistenceService
+from src.server.services.persistence.file import (
+    FilePersistenceService,
+    RestoreGuardUnavailable,
+    RestoreIdentityLost,
+)
 from src.server.services.user_skills import sandbox_skill_sync_params
 from src.server.services.user_skills.reconcile import reconcile_workspace_skills
 from src.server.services.workspace_entitlements import WorkspaceEntitlementsMixin
@@ -63,6 +69,21 @@ from src.server.services.workspace_status_pubsub import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_SEEDED_AGENT_MD = """# Workspace Notes
+
+<!--
+This is a starter template. Replace these comments with real content
+as you work. The system prompt has full guidelines on what to maintain.
+-->
+
+## Thread Index
+
+## Key Findings
+
+## File Index
+"""
 
 
 class WorkspaceManager(WorkspaceEntitlementsMixin):
@@ -113,6 +134,15 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # where the row is already in hand, so standard-tier restarts skip the
         # check without any extra read.
         self._pending_tier_recheck: set[str] = set()
+
+        # Workspaces whose last resolve lost the grants to a newer one. The
+        # withheld version stamp is what makes the next acquire re-resolve, and
+        # it only gets read on the slow path -- so without this the sync
+        # cooldown returns the stale session for up to 30s without ever looking
+        # at a version, and the stamp closes nothing. Same reasoning as
+        # ``skills_signature``: the cooldown exists to skip *redundant* work,
+        # and this pass is known non-redundant.
+        self._resolve_superseded: set[str] = set()
 
         # Per-workspace locks (replaces global _lock to avoid cross-workspace blocking)
         self._lock_registry_mu = asyncio.Lock()  # protects _workspace_locks dict only
@@ -260,6 +290,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             self._sessions.pop(workspace_id, None)
         self._pending_lazy_sync.discard(workspace_id)
         self._pending_tier_recheck.discard(workspace_id)
+        self._resolve_superseded.discard(workspace_id)
 
     async def _take_valid_cached_session(
         self, workspace_id: str, mark: Callable[[str], None]
@@ -605,19 +636,59 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # install so the grant annotations ride into the config copies codegen
         # reads. Best-effort: a relay hiccup leaves those servers unbound (their
         # generated clients fail with a clear error) but never blocks the turn.
-        egress_ok = True
+        egress_bind = RelayBind.APPLIED
         try:
-            egress_ok = await sync_egress_relay(
+            egress_bind = await sync_egress_relay(
                 workspace_id, user_id, session, resolved
             )
         except Exception as e:
-            egress_ok = False
+            egress_bind = RelayBind.REFUSED
             logger.warning(
                 "[EGRESS] relay binding failed for %s: %s", workspace_id, e
             )
 
         await self._install_session_composite(session, resolved, user_id=user_id)
-        if not egress_ok:
+        if egress_bind is RelayBind.SUPERSEDED:
+            # A newer resolve already owns the grants, so everything derived
+            # from this one is stale by the same amount -- including the tool
+            # set the wrappers and the per-tool docs are generated from.
+            #
+            # Reporting no change suppresses the warm path's asset sync, which
+            # gates on this return. It does NOT suppress the three provisioning
+            # paths (fresh sandbox, reattach, deferred phase two), which publish
+            # unconditionally -- and correctly so: they have no previously
+            # published set to fall back on, so withholding here would leave the
+            # turn with no MCP tools at all rather than with slightly old ones.
+            # Those paths do republish the stale documentation.
+            #
+            # What that costs is bounded to this turn's reading, never its
+            # reach: the relay checks the grant, and the grant is the newer
+            # resolve's, so a tool the user declined is refused whatever the
+            # docs in the sandbox say.
+            #
+            # The direct half is dropped rather than kept, because none of
+            # that reasoning applies to it: its stamps say which calls stop to
+            # ask, and those came from a resolve the grants no longer match.
+            # Binding nothing costs this turn only the direct tools, so it is
+            # the same trade the Flash binder already makes on supersede.
+            #
+            # The withheld stamp is what ends it, and it needs the marker to
+            # be read at all: ``_apply_session_mcp`` short-circuits only on a
+            # non-None session version, but the warm path returns inside the
+            # sync cooldown without ever reaching this function, so the stamp
+            # alone would leave the stale reading standing for the rest of the
+            # cooldown rather than for one turn.
+            logger.info(
+                "[EGRESS] resolve for %s superseded by a newer config version; "
+                "keeping the composite, dropping the direct tools, "
+                "withholding the version stamp",
+                workspace_id,
+            )
+            session.direct_mcp_tools = {}
+            session.mcp_config_version = None
+            self._resolve_superseded.add(workspace_id)
+            return None
+        if egress_bind is not RelayBind.APPLIED:
             # A refused credential push must not be stamped as applied: nothing
             # else re-pushes the file (the remint re-sends only the stale
             # in-memory map), so withhold the version — the same busted-stamp
@@ -674,11 +745,26 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 workspace_rows=await get_tool_schemas(session.conversation_id),
                 user_rows=user_rows,
             )
-            for server in untrusted_servers:
-                snapshot = snapshots.ok(server)
-                if snapshot is not None:
-                    settled.add(server.name)
-                    tool_schemas[server.name] = snapshot.get("tools") or []
+            # Consent narrows the set here rather than at discovery. The
+            # snapshot is shared by every workspace and by the catalog page and
+            # has to keep answering "what does this vendor offer": filtering it
+            # would make schema_digest consent-dependent, so a toggle would read
+            # as a vendor schema change and the page could no longer show the
+            # capabilities the user is choosing between.
+            # Subtractive, so a tool the vendor added after we curated them
+            # reaches the prompt and the sandbox rather than going missing. The
+            # policy only ever removes what a declined capability group named.
+            tool_schemas, session.direct_mcp_tools = build_direct_entries(
+                untrusted_servers,
+                snapshots,
+                denied=resolved.denied_tools_by_name,
+                plans=resolved.binding_plans_by_name,
+            )
+            # A server answers for itself only once it has a usable snapshot,
+            # which is exactly the set the split could key.
+            settled = set(tool_schemas)
+        else:
+            session.direct_mcp_tools = {}
         session.mcp_settled_servers = settled
 
         # Always build from the BUILTIN registry, never a prior composite —
@@ -908,48 +994,17 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         )
 
     @staticmethod
-    async def _seed_agent_md(
-        sandbox: Any,
-        name: str,
-        description: Optional[str] = None,
-    ) -> None:
-        """Write a default agent.md with workspace metadata and update instructions.
+    async def _seed_agent_md(sandbox: Any, name: str) -> None:
+        """Write the starter agent.md.
 
-        Uses YAML front matter so the agent (and future tooling) can parse
-        workspace identity from the file. Includes inline instructions so
-        the agent knows how to maintain this file without detection logic.
+        The template carries no workspace name. The row is the only place the
+        name lives, and the prompt injects it from there on every turn, so a
+        copy written here could only ever go stale after a rename.
         """
         if not sandbox:
             return
 
-        desc = (
-            description
-            or "Brief 1-2 sentence description — update based on the first conversation."
-        )
-        lines = [
-            "---",
-            f"workspace_name: {name}",
-            f"description: {desc}",
-            "---",
-            "",
-            f"# {name}",
-            "",
-        ]
-        lines += [
-            "<!--",
-            "This is a starter template. Replace these comments with real content",
-            "as you work. The system prompt has full guidelines on what to maintain.",
-            "-->",
-            "",
-            "## Thread Index",
-            "",
-            "## Key Findings",
-            "",
-            "## File Index",
-            "",
-        ]
-
-        content = "\n".join(lines)
+        content = _SEEDED_AGENT_MD
         try:
             # Pass relative path — awrite_file_text calls normalize_path internally
             written = await sandbox.awrite_file_text("agent.md", content)
@@ -1071,6 +1126,13 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             # can no longer be read as stale by a concurrent acquisition.
             self._sessions[workspace_id] = session
 
+            # post_init restored into a sandbox the row did not yet name, so
+            # its clear of the completeness flag could not land. Now that the
+            # row names this sandbox: a marker means the restore came back
+            # clean and the flag can go; no marker means it did not, and the
+            # restore runs again here, on the sandbox that actually won.
+            await self._maybe_restore_files(workspace_id, session.sandbox)
+
             if kick_discovery and resolved_mcp is not None:
                 self._kick_mcp_discovery(
                     workspace_id,
@@ -1123,9 +1185,15 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         always_on = await self._entitled_always_on(workspace or {}, user_id)
         auto_stop_minutes = 0 if always_on else None
 
+        previous_sandbox_id = (workspace or {}).get("sandbox_id")
+
         async def _post_init(session: Session) -> None:
             if session.sandbox:
-                await self._restore_files(workspace_id, session.sandbox)
+                await self._restore_files(
+                    workspace_id,
+                    session.sandbox,
+                    expected_sandbox_id=previous_sandbox_id,
+                )
 
         # ws_version=None forces a resolve (the session is brand new); discovery
         # is kicked in the background so recovered user servers re-hydrate.
@@ -1138,7 +1206,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
             kick_discovery=True,
             post_init=_post_init,
             core_config=core_config,
-            expected_previous_sandbox_id=(workspace or {}).get("sandbox_id"),
+            expected_previous_sandbox_id=previous_sandbox_id,
         )
         await update_workspace_activity(workspace_id)
         return session
@@ -1299,11 +1367,17 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 extra={"workspace_id": workspace_id, "sandbox_id": sandbox_id},
             )
 
-    async def _restore_files(self, workspace_id: str, sandbox: Any) -> None:
-        """Restore backed-up files from DB to sandbox. Non-blocking on failure."""
+    async def _restore_files(
+        self, workspace_id: str, sandbox: Any, *, expected_sandbox_id: Any
+    ) -> None:
+        """Restore backed-up files from DB to sandbox. Non-blocking on failure.
+
+        ``expected_sandbox_id`` is the sandbox the workspace row names while
+        the restore runs, the same value the identity CAS that follows expects
+        to replace; the restore's flag lands only while that still holds."""
         try:
             result = await FilePersistenceService.restore_to_sandbox(
-                workspace_id, sandbox
+                workspace_id, sandbox, expected_sandbox_id=expected_sandbox_id
             )
             errors = result.get("errors", 0) if isinstance(result, dict) else 0
             if errors:
@@ -1320,13 +1394,31 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 logger.info(
                     f"Restored {result['restored']} files to sandbox for {workspace_id}"
                 )
+        except RestoreIdentityLost:
+            # Another provisioner already bound this workspace; the identity
+            # CAS below would lose too. Unwinding here discards our sandbox
+            # before it is filled.
+            logger.info(
+                f"Skipping restore for {workspace_id}: another sandbox was "
+                f"bound while this one was being provisioned"
+            )
+            raise
+        except RestoreGuardUnavailable:
+            # Nothing was restored and nothing records that. Binding this
+            # sandbox would hand the next backup an empty mirror of a full
+            # manifest with pruning enabled; the provisioning unwind destroys
+            # it instead and the next start tries again.
+            raise
         except Exception as e:
             logger.warning(f"File restore failed for {workspace_id}: {e}")
 
     async def _maybe_restore_files(self, workspace_id: str, sandbox: Any) -> None:
-        """Restore files if sync marker is missing. Non-blocking on failure."""
+        """Restore files if sync marker is missing. Non-blocking on failure,
+        except when the completeness guard itself could not be raised."""
         try:
             await FilePersistenceService.maybe_restore(workspace_id, sandbox)
+        except RestoreGuardUnavailable:
+            raise
         except Exception as e:
             logger.warning(f"File restore check failed for {workspace_id}: {e}")
 
@@ -1573,7 +1665,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                 # (ws_version=0, no discovery to kick). Seed a default agent.md as
                 # the provisioning post-init step.
                 async def _post_init(session: Session) -> None:
-                    await self._seed_agent_md(session.sandbox, name, description)
+                    await self._seed_agent_md(session.sandbox, name)
 
                 _session, workspace = await self._provision_sandbox_session(
                     workspace_id,
@@ -1909,10 +2001,17 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
                         skills_signature is not None
                         and session.skills_signature != skills_signature
                     )
+                    # Consumed here rather than cleared on a later success:
+                    # its whole job is to get this acquire past the cooldown to
+                    # the version read below, and once it has, a resolve that
+                    # is superseded again re-marks it.
+                    superseded_resolve = workspace_id in self._resolve_superseded
+                    self._resolve_superseded.discard(workspace_id)
                     needs_sync = (
                         not self._sync_cooldown_ok(workspace_id)
                         or needs_deferred_sync
                         or skills_stale
+                        or superseded_resolve
                     )
                     if not needs_sync:
                         # Cooldown active, skip expensive Daytona calls — warm fast
@@ -3537,6 +3636,7 @@ class WorkspaceManager(WorkspaceEntitlementsMixin):
         # Clear session cache (don't stop workspaces on shutdown)
         self._sessions.clear()
         self._pending_lazy_sync.clear()
+        self._resolve_superseded.clear()
         self._last_sync_at.clear()
         self._workspace_locks.clear()
 

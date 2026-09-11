@@ -23,6 +23,8 @@ import io
 import logging
 import re
 import zipfile
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
@@ -35,6 +37,7 @@ from ptc_agent.agent.middleware.skills import (
     list_skills,
     load_skill_content,
 )
+from src.server.database.account_disables import list_account_disables
 from src.server.database.user_skills import (
     delete_user_skill,
     get_user_skill,
@@ -57,7 +60,9 @@ from src.server.services.features import (
     set_builtin_skill_disabled,
 )
 from src.server.services.user_skills import (
+    SkillNamesUnavailable,
     SkillValidationError,
+    configured_skill_dirs,
     drop_archive_if_unused,
     fetch_skill_archive,
     reserved_skill_names,
@@ -190,12 +195,47 @@ def _user_row_to_info(
     )
 
 
+@dataclass(frozen=True)
+class _BundleState:
+    """Which bundle ships each platform skill, and whether it is switched on.
+
+    Read once per listing rather than per row: both halves are one directory
+    read and one query, and every platform skill asks the same question. A
+    skill no bundle claims answers ``(None, None)`` — the same "no provenance"
+    a hand-uploaded row carries.
+    """
+
+    owners: Mapping[str, str]
+    disabled: Collection[str]
+
+    def of(self, name: str) -> tuple[str | None, bool | None]:
+        owner = self.owners.get(name)
+        if owner is None:
+            return None, None
+        return owner, owner not in self.disabled
+
+
+async def _bundle_state(user_id: str) -> _BundleState:
+    from src.server.services.plugins.bundled import component_owners
+
+    return _BundleState(
+        owners=component_owners().skills,
+        disabled=(await list_account_disables(user_id)).bundles,
+    )
+
+
 def _platform_info(
-    entry: dict, *, enabled: bool = True, command_override: str | None = None
+    entry: dict,
+    *,
+    enabled: bool = True,
+    command_override: str | None = None,
+    bundles: _BundleState | None = None,
 ) -> SkillInfo:
     info = SkillInfo(**entry, enabled=enabled)
     if command_override:
         info.command = command_override
+    if bundles is not None:
+        info.plugin_name, info.plugin_enabled = bundles.of(info.name)
     return info
 
 
@@ -234,6 +274,7 @@ async def _assemble_skills(
     platform = list_skills(mode=mode)
     disabled_builtins = await get_disabled_builtin_skills(user_id)
     overrides = await get_skill_command_overrides(user_id)
+    bundles = await _bundle_state(user_id)
     ws_disabled: set[str] = (
         await list_workspace_skill_disables(workspace_id) if workspace_id else set()
     )
@@ -244,9 +285,19 @@ async def _assemble_skills(
         ws_dis = entry["name"] in ws_disabled
         override = overrides.get(entry["name"])
         if not (user_dis or ws_dis):
-            skills.append(_platform_info(entry, command_override=override))
+            info = _platform_info(entry, command_override=override, bundles=bundles)
+            # The enabled-only response is the slash-command menu, and
+            # materialize already subtracts a switched-off bundle's skills from
+            # what the agent loads, so advertising one here offers a command
+            # that cannot run. The management view keeps the row: the skill's
+            # own switch really is on, and ``plugin_enabled`` is what says why
+            # it is not in effect.
+            if include_disabled or info.plugin_enabled is not False:
+                skills.append(info)
         elif include_disabled:
-            info = _platform_info(entry, enabled=False, command_override=override)
+            info = _platform_info(
+                entry, enabled=False, command_override=override, bundles=bundles
+            )
             # disabled_scope is a workspace-view annotation only: it tells
             # that surface which disables it cannot undo. The user view can
             # undo its own disables, so it stays unset there.
@@ -311,6 +362,7 @@ async def _assemble_all_scopes(
     """
     disabled_builtins = await get_disabled_builtin_skills(user_id)
     overrides = await get_skill_command_overrides(user_id)
+    bundles = await _bundle_state(user_id)
     disables_by_name: dict[str, list[str]] = {}
     for d in await list_skill_disables_for_user(user_id):
         disables_by_name.setdefault(d["name"], []).append(d["workspace_id"])
@@ -324,6 +376,7 @@ async def _assemble_all_scopes(
             entry,
             enabled=not user_dis,
             command_override=overrides.get(entry["name"]),
+            bundles=bundles,
         )
         info.disabled_workspace_ids = sorted(
             disables_by_name.get(entry["name"], [])
@@ -386,6 +439,8 @@ async def get_skills(
             raise HTTPException(status_code=401, detail="Authentication required")
         await _require_owned_workspace(workspace_id, user_id)
     if user_id is None:
+        # No attribution here: the bundle a skill came from is only meaningful
+        # next to the switch that turns it off, and this view has no account.
         return {"skills": [_platform_info(s) for s in list_skills(mode=mode)]}
     return await _assemble_skills(user_id, mode, include_disabled, workspace_id)
 
@@ -417,6 +472,12 @@ async def _upload_skill_archive(
         await ensure_free_of_platform(user_id, validated.name)
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except SkillNamesUnavailable as e:
+        # Not the upload's fault and not a name conflict: a directory skills
+        # ship from would not list, so the reservation is short rather than
+        # clear. Refusing here is also what keeps the row out of the database,
+        # since everything that writes runs below this line.
+        raise HTTPException(status_code=503, detail=str(e)) from e
     command_seed = await upload_seed(user_id, validated, workspace_id)
 
     archive_key: str | None = None
@@ -711,7 +772,12 @@ async def get_skill_content(
     skill = registry.get(name)
     if skill is None or skill.exposure == "hidden":
         raise HTTPException(status_code=404, detail="Skill not found")
-    content = load_skill_content(name, registry=registry)
+    # The configured drop-in root, not the field default: an operator who
+    # overrode a shipped skill has to see their own copy here, or the page
+    # shows one set of instructions while the agent runs another.
+    content = load_skill_content(
+        name, [str(d) for d in configured_skill_dirs()], registry=registry
+    )
     if content is None:
         raise HTTPException(status_code=404, detail="Skill not found")
     return {"name": name, "content": content}
@@ -723,6 +789,9 @@ async def get_skill_content(
 
 _USER_LEVEL_DISABLED = (
     "This skill is disabled at the user level; enable it in Plugins first"
+)
+_BUNDLE_DISABLED = (
+    "This skill's plugin is switched off; enable the plugin in Plugins first"
 )
 _INHERITED_DELETE = (
     "This skill is inherited from your Plugins. Delete it there, or "
@@ -813,6 +882,15 @@ async def patch_workspace_skill(
     user_disabled = name in await get_disabled_builtin_skills(user_id)
     if user_disabled and body.enabled:
         raise HTTPException(status_code=409, detail=_USER_LEVEL_DISABLED)
+    # A switched-off bundle subtracts its skills by name at materialize time,
+    # into the same set the per-skill disable writes to, but it never lands in
+    # that set here. Without this the toggle answers 200 and the skill stays
+    # gone, which is the one outcome worse than refusing: the same asymmetry a
+    # user-level disable already has, so it answers the same way.
+    if body.enabled:
+        _, bundle_on = (await _bundle_state(user_id)).of(name)
+        if bundle_on is False:
+            raise HTTPException(status_code=409, detail=_BUNDLE_DISABLED)
     await set_workspace_skill_disable(workspace_id, name, not body.enabled)
     overrides = await get_skill_command_overrides(user_id)
     return _builtin_info(

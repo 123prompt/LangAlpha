@@ -286,7 +286,7 @@ export function McpServerModal({
                     placeholder={'{ "mcpServers": { "my-server": { "command": "npx", "args": ["-y", "pkg"] } } }'}
                     rows={4}
                     spellCheck={false}
-                    className="w-full px-2 py-1.5 text-[0.6875rem] rounded bg-transparent outline-none font-mono resize-none"
+                    className="w-full px-2 py-1.5 text-[0.6875rem] rounded bg-transparent font-mono resize-none"
                     style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
                   />
                   <div className="flex items-center gap-2">
@@ -324,7 +324,7 @@ export function McpServerModal({
               onChange={(e) => setName(e.target.value)}
               disabled={isEdit}
               placeholder="my_server"
-              className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none font-mono disabled:opacity-60"
+              className="w-full px-3 py-2 text-sm rounded-md bg-transparent font-mono disabled:opacity-60"
               style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
               maxLength={64}
             />
@@ -367,7 +367,7 @@ export function McpServerModal({
                   spellCheck={false}
                   autoCapitalize="off"
                   autoCorrect="off"
-                  className="w-full px-3 py-2 text-sm rounded-md outline-none"
+                  className="w-full px-3 py-2 text-sm rounded-md"
                   style={{
                     color: 'var(--color-text-primary)',
                     backgroundColor: 'var(--color-bg-card)',
@@ -405,7 +405,7 @@ export function McpServerModal({
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
                   placeholder="https://example.com/mcp"
-                  className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none"
+                  className="w-full px-3 py-2 text-sm rounded-md bg-transparent"
                   style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
                 />
                 <FieldError error={errorFor('url')} />
@@ -434,7 +434,7 @@ export function McpServerModal({
               onChange={(e) => setDescription(e.target.value)}
               placeholder="What this server does"
               rows={2}
-              className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none resize-none"
+              className="w-full px-3 py-2 text-sm rounded-md bg-transparent resize-none"
               style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
               maxLength={512}
             />
@@ -450,7 +450,7 @@ export function McpServerModal({
               onChange={(e) => setInstruction(e.target.value)}
               placeholder="How the agent should use this server"
               rows={2}
-              className="w-full px-3 py-2 text-sm rounded-md bg-transparent outline-none resize-none"
+              className="w-full px-3 py-2 text-sm rounded-md bg-transparent resize-none"
               style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
               maxLength={1024}
             />
@@ -609,7 +609,7 @@ function ArgsEditor({ args, onChange }: { args: string[]; onChange: (a: string[]
             value={a}
             onChange={(e) => onChange(args.map((x, j) => (j === i ? e.target.value : x)))}
             placeholder="argument"
-            className="flex-1 px-2 py-1 text-xs rounded bg-transparent outline-none font-mono"
+            className="flex-1 px-2 py-1 text-xs rounded bg-transparent font-mono"
             style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
           />
           <button
@@ -659,7 +659,7 @@ function KeyValueEditor({ kvs, onChange, secretNames, createSecret, keyPlacehold
               value={kv.key}
               onChange={(e) => onChange(kvs.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))}
               placeholder={keyPlaceholder}
-              className="flex-1 px-2 py-1 text-xs rounded bg-transparent outline-none font-mono"
+              className="flex-1 px-2 py-1 text-xs rounded bg-transparent font-mono"
               style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
             />
             <button

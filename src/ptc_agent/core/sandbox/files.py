@@ -317,7 +317,7 @@ def normalize_path(sandbox: "PTCSandbox", path: str) -> str:
 
         Converts agent's virtual paths to real sandbox paths:
             "/" or "." or "" -> {working_directory}
-            "/results/file.txt" -> {working_directory}/results/file.txt
+            "/work/task/file.txt" -> {working_directory}/work/task/file.txt
             "data/file.txt" -> {working_directory}/data/file.txt
             "{working_directory}/file.txt" -> unchanged
             "/tmp/file.txt" -> unchanged
@@ -353,7 +353,7 @@ def virtualize_path(sandbox: "PTCSandbox", path: str) -> str:
     """Convert real sandbox path to virtual path (output normalization).
 
         Strips working_directory prefix from paths returned to agent:
-            {working_directory}/results/file.txt -> /results/file.txt
+            {working_directory}/work/task/file.txt -> /work/task/file.txt
             {working_directory}/tools/docs/foo.md -> /tools/docs/foo.md
             /tmp/file.txt -> /tmp/file.txt (unchanged)
 
@@ -386,7 +386,7 @@ def validate_path(sandbox: "PTCSandbox", filepath: str) -> bool:
     if not sandbox.config.filesystem.enable_path_validation:
         return True
 
-    # Normalize the path first (handles virtual paths like /results/...)
+    # Normalize the path first (handles virtual paths like /work/task/...)
     normalized_path = sandbox.normalize_path(filepath)
 
     # Denylist takes priority over allowlist

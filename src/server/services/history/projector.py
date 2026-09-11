@@ -56,6 +56,11 @@ _STEERING_MARKERS = (
 _MARKET_WATCH_SOURCE = "market_watch"
 _MARKET_WATCH_STAMP_OPEN = "<market-watch>"
 
+# Written by src/server/utils/credit_resume_context.py — the lc_source tag on
+# the record of gate-stopped background tasks injected when a credit-paused
+# turn resumes.
+_CREDIT_GATE_SOURCE = "credit_gate"
+
 _FILE_OPERATION_TOOLS = {"Write", "Edit"}
 _ARTIFACT_FROM_TOOL_MESSAGE = {
     "ShowWidget": "html_widget",
@@ -164,6 +169,8 @@ def history_events_to_sse(
                 data["content_type"] = event.data.get("content_type") or "text"
             if event.data.get("artifact"):
                 data["artifact"] = event.data["artifact"]
+            if event.data.get("status"):
+                data["status"] = event.data["status"]
             items.append(_sse("tool_call_result", data))
         elif event.kind == "artifact":
             items.append(
@@ -223,7 +230,14 @@ def _sse(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
 
 def _human_message_kind(message: HumanMessage) -> str:
     """Classify a HumanMessage by its injection stamp: ``market-watch``,
-    ``steering``, ``summarization``, or ``plain`` (real user input)."""
+    ``steering``, ``summarization``, ``credit-gate``, or ``plain`` (real
+    user input).
+
+    Every stamp a writer emits must be registered here. ``plain`` is the
+    fallback, and it is load-bearing — it is what ``is_run_boundary_message``
+    treats as a run's opening input, so an unregistered stamp would open a
+    run it only landed inside.
+    """
     kwargs = message.additional_kwargs or {}
     source = kwargs.get("lc_source")
     content = message.content if isinstance(message.content, str) else ""
@@ -235,6 +249,8 @@ def _human_message_kind(message: HumanMessage) -> str:
         return "steering"
     if source == "summarization":
         return "summarization"
+    if source == _CREDIT_GATE_SOURCE:
+        return "credit-gate"
     return "plain"
 
 
@@ -258,9 +274,10 @@ def _project_human_message(message: HumanMessage, agent: str) -> list[HistoryEve
     content = message.content if isinstance(message.content, str) else ""
     kind = _human_message_kind(message)
 
-    if kind == "market-watch":
-        # Live-price stamps are model-facing only — skipping them here keeps
-        # them out of history.
+    if kind in ("market-watch", "credit-gate"):
+        # Model-facing only. Returning here rather than falling through also
+        # keeps them out of a task namespace's ``user-message`` projection,
+        # where the raw reminder would surface as if the user had typed it.
         return []
 
     if kind == "steering":
@@ -409,6 +426,11 @@ def _project_tool_message(
                 "content": content,
                 "content_type": content_type,
                 "artifact": artifact if artifact else None,
+                # The whole status travels, not just the failing one. An
+                # explicit success is what stops a client from reading prose
+                # that merely looks like a failure, so dropping it here would
+                # make the success case indistinguishable from no status.
+                "status": getattr(message, "status", None),
             },
         )
     )

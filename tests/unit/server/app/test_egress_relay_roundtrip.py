@@ -91,7 +91,7 @@ def _grant() -> dict:
         "connection_id": CONNECTION_ID,
         "destination_url": VENDOR_URL,
         "allowed_methods": ["POST"],
-        "tool_allowlist": None,
+        "tool_denylist": None,
         "grant_status": "active",
         "connection_status": "connected",
     }
@@ -345,6 +345,9 @@ class TestModernRoundTrip:
             "mode": "modern",
             "version": "2026-07-28",
             "session_id": None,
+            # Captured, not discarded: a real server's identity stamp survives
+            # the relay hop, which is the only place that is provable.
+            "server_info": {"name": "vendor-under-test", "version": ""},
         }
 
     @pytest.mark.asyncio

@@ -11,11 +11,11 @@
  *  2. The feed URL is a build input, like the origins are, so
  *     `electron-builder.yml` carries `publish: null` and the real feed arrives
  *     as DESKTOP_UPDATE_FEED. Supplying it is also what makes
- *     electron-builder emit `latest-*.yml` and bake `app-update.yml` into the
- *     package. Without it there is simply no update metadata, which is a quiet
- *     way to ship a build that can never update itself.
+ *     electron-builder emit an update manifest and bake `app-update.yml` into
+ *     the package. Without it there is simply no update metadata, which is a
+ *     quiet way to ship a build that can never update itself.
  */
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, lstatSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -32,6 +32,24 @@ const feed = (process.env.DESKTOP_UPDATE_FEED || '').trim()
 // blob (CSC_LINK, what CI uses) or a keychain identity by name (CSC_NAME, what a
 // developer has locally). Either one has to take `identity: null` back out.
 const signing = !!((process.env.CSC_LINK || '').trim() || (process.env.CSC_NAME || '').trim())
+// Notarization is a second switch, not a consequence of the first. A signed,
+// un-notarized build is refused by Gatekeeper on first launch the same way an
+// unsigned one is, so getting a certificate without turning this on buys
+// nothing a user can see.
+//
+// electron-builder reads the credentials itself; what has to be decided here is
+// whether a complete set exists, because asking it to notarize with none is a
+// twenty-minute package that fails at the submission. Three ways to authenticate
+// notarytool, and a partial set is not one of them.
+const env = (name) => (process.env[name] || '').trim()
+const notarizeAuth =
+  (env('APPLE_ID') && env('APPLE_APP_SPECIFIC_PASSWORD') && env('APPLE_TEAM_ID') && 'APPLE_ID') ||
+  (env('APPLE_API_KEY') && env('APPLE_API_KEY_ID') && env('APPLE_API_ISSUER') && 'APPLE_API_KEY') ||
+  (env('APPLE_KEYCHAIN_PROFILE') && 'APPLE_KEYCHAIN_PROFILE') ||
+  null
+// Only on macOS: notarytool ships with Xcode, and the mac block is not read on
+// the runners that build the other two platforms anyway.
+const notarizing = signing && !!notarizeAuth && process.platform === 'darwin'
 // Matches write-build-config.mjs, which treats an unset edition as oss.
 const edition = (process.env.DESKTOP_EDITION || 'oss').trim()
 // `pnpm run dist -- --dir` puts a literal `--` in argv, and electron-builder's
@@ -81,6 +99,15 @@ if (signing) {
   console.log(`[build] signing enabled (${process.env.CSC_LINK ? 'CSC_LINK' : 'CSC_NAME'})`)
 }
 
+if (notarizing) {
+  replace(/^ {2}notarize: false\r?$/m, '  notarize: true', 'notarize: false')
+  console.log(`[build] notarization enabled (${notarizeAuth})`)
+} else if (signing && process.platform === 'darwin') {
+  // Loud, because this is the shape of a release that looks finished in every
+  // log line and is still refused on the machine it lands on.
+  console.warn('[build] WARNING: signing without notarization credentials. Gatekeeper refuses this build on first launch.')
+}
+
 // The two editions must be installable side by side, and on macOS that is
 // entirely a matter of these three strings: `productName` is the `.app`
 // filename and what `app.getName()` returns, which is what `getPath('userData')`
@@ -93,8 +120,8 @@ if (signing) {
 // edit to electron-builder.yml that moves one of these lines fails here instead
 // of shipping a hosted build wearing half the self-hosted identity.
 const IDENTITY = {
-  saas: { appId: 'ai.langalpha.desktop', productName: 'LangAlpha', scheme: 'langalpha' },
-  oss: { appId: 'ai.langalpha.desktop.oss', productName: 'LangAlpha OSS', scheme: 'langalpha-oss' },
+  saas: { appId: 'ai.langalpha.desktop', productName: 'LangAlpha', scheme: 'langalpha', packageName: 'langalpha-desktop' },
+  oss: { appId: 'ai.langalpha.desktop.oss', productName: 'LangAlpha OSS', scheme: 'langalpha-oss', packageName: 'langalpha-desktop-oss' },
 }
 const identity = IDENTITY[edition]
 if (edition !== 'oss') {
@@ -102,10 +129,22 @@ if (edition !== 'oss') {
   replace(/^productName: LangAlpha OSS\r?$/m, `productName: ${identity.productName}`, 'productName')
   replace(/^ {2}- name: LangAlpha OSS\r?$/m, `  - name: ${identity.productName}`, 'protocol name')
   replace(/^ {6}- langalpha-oss\r?$/m, `      - ${identity.scheme}`, 'protocol scheme')
+  // The hosted edition keeps the package name it has always had, so its
+  // existing updater cache carries over rather than being orphaned by a rename.
+  replace(/^ {2}name: langalpha-desktop-oss\r?$/m, `  name: ${identity.packageName}`, 'package name')
+}
+
+// `EDITION_TAG` is empty for the hosted edition on purpose: that build is the one
+// the download page serves, so it is named plainly and only the self-hosted
+// edition is marked. It cannot be derived from `EDITION` where it is used, because
+// the same placeholder has to stay non-empty in `directories.output`.
+const PLACEHOLDERS = {
+  EDITION: edition,
+  EDITION_TAG: edition === 'oss' ? '-oss' : '',
 }
 
 // Always resolved, unlike the feed and signing edits: the artifact filename and
-// the output directory both carry the edition on every build, so there is no
+// the output directory both carry a placeholder on every build, so there is no
 // configuration left that electron-builder can consume as committed.
 //
 // Every occurrence outside a comment, rather than one anchored to a directive by
@@ -114,22 +153,34 @@ if (edition !== 'oss') {
 // line alone, and failed at packaging with "macro EDITION is not defined",
 // which is why the old form needed a second pass to check its own work. Covering
 // exactly the lines electron-builder reads leaves nothing for that pass to find,
-// and a new directive carrying the placeholder needs no marker added here.
+// and a new directive carrying a placeholder needs no marker added here.
 let substitutions = 0
+const unknownPlaceholders = new Set()
 config = config
   .split('\n')
   .map((line) =>
     line.trimStart().startsWith('#')
       ? line
-      // A function replacement, so a `$` in the edition is not read as a
-      // capture reference.
-      : line.replace(/\$\{EDITION\}/g, () => {
+      // Matched as a family so `${version}`, `${arch}` and `${ext}` — which are
+      // electron-builder's own macros — pass through untouched, while a
+      // placeholder this script does not define is caught here rather than
+      // reaching electron-builder as an undefined macro. A function replacement,
+      // so a `$` in a value is not read as a capture reference.
+      : line.replace(/\$\{(EDITION[A-Z_]*)\}/g, (whole, name) => {
+        if (!(name in PLACEHOLDERS)) {
+          unknownPlaceholders.add(whole)
+          return whole
+        }
         substitutions++
-        return edition
+        return PLACEHOLDERS[name]
       }))
   .join('\n')
+if (unknownPlaceholders.size > 0) {
+  console.error(`[build] electron-builder.yml spells ${[...unknownPlaceholders].join(', ')}, which this script does not define`)
+  process.exit(1)
+}
 if (substitutions === 0) {
-  console.error('[build] electron-builder.yml no longer spells ${EDITION} outside its comments')
+  console.error('[build] electron-builder.yml no longer spells an ${EDITION...} placeholder outside its comments')
   process.exit(1)
 }
 
@@ -233,7 +284,119 @@ if (signing && process.platform === 'darwin') {
       process.exit(1)
     }
     console.log(`[build] signed and verified: ${rel}`)
+
+    // `codesign --verify` answers a different question: it says the bundle is
+    // intact and signed, and it says exactly that about a build Apple has never
+    // seen. The staple is the half that decides whether the app opens on a
+    // machine that has not been told to trust us, so a notarized build that
+    // shipped without one is the failure this whole block exists to catch.
+    //
+    // Skipped for --dir, like the manifest guard: an unpacked build never
+    // reaches the target that submits it, and `pnpm run build` is meant to stay
+    // the fast way to check packaging.
+    if (notarizing && !passthrough.includes('--dir')) {
+      const stapled = spawnSync('xcrun', ['stapler', 'validate', app], { encoding: 'utf8' })
+      if (stapled.status !== 0) {
+        console.error(`[build] ${rel} carries no notarization ticket`)
+        console.error(((stapled.stdout || '') + (stapled.stderr || '')).trim())
+        process.exit(1)
+      }
+      // The verdict a user's machine reaches, recorded rather than gated: it
+      // needs Gatekeeper's own assessment and that can be turned off locally,
+      // so a machine with it disabled would fail a build that is perfectly fine.
+      console.log(`[build] notarized: ${rel} (${spctlSource(app, 'exec')})`)
+    }
   }
+}
+
+// electron-builder notarizes the .app and then builds the DMG around it, so the
+// disk image itself is never submitted. Gatekeeper assesses a downloaded image on
+// its own signature and ticket rather than on the app inside, so an unstapled DMG
+// is refused on open however well notarized its contents are. That is the file
+// the download page serves, which makes it the one that has to pass.
+//
+// Deliberately after the .app loop: `stapler staple` on the image needs a ticket
+// Apple only issues for what was submitted, and submitting a DMG built around an
+// unsigned app just fails later and more expensively.
+if (notarizing && !passthrough.includes('--dir')) {
+  const dmgs = existsSync(dist)
+    ? readdirSync(dist).filter((f) => f.endsWith('.dmg')).map((f) => path.join(dist, f))
+    : []
+  if (dmgs.length === 0) {
+    console.log('[build] no disk images to notarize')
+  } else {
+    // Submitted together rather than one after another. Each is an independent
+    // wait on Apple's queue, which ran about half an hour per artifact the first
+    // time this was measured, and serialising them adds that to every release
+    // for every architecture.
+    console.log(`[build] submitting ${dmgs.length} disk image(s) to Apple; this waits on their queue`)
+    const submissions = await Promise.all(dmgs.map(submitForNotarization))
+    let failed = false
+    for (const { artifact, code, output } of submissions) {
+      const rel = path.relative(root, artifact)
+      if (code !== 0) {
+        console.error(`[build] notarization failed for ${rel}`)
+        console.error(output.trim())
+        failed = true
+        continue
+      }
+      const staple = spawnSync('xcrun', ['stapler', 'staple', artifact], { encoding: 'utf8' })
+      if (staple.status !== 0) {
+        console.error(`[build] could not staple ${rel}`)
+        console.error(((staple.stdout || '') + (staple.stderr || '')).trim())
+        failed = true
+        continue
+      }
+      // `-t open` with the primary-signature context, not `-t exec`: that is the
+      // assessment Gatekeeper runs against a quarantined disk image, and the one
+      // that returned `rejected` on every DMG built before this block existed.
+      console.log(`[build] notarized: ${rel} (${spctlSource(artifact, 'open')})`)
+    }
+    if (failed) process.exit(1)
+  }
+}
+
+/** Resolves rather than rejects, so one bad artifact still reports the others. */
+function submitForNotarization(artifact) {
+  return new Promise((resolve) => {
+    const child = spawn('xcrun', ['notarytool', 'submit', artifact, ...notarytoolAuth(), '--wait'])
+    let output = ''
+    child.stdout.on('data', (d) => { output += d })
+    child.stderr.on('data', (d) => { output += d })
+    child.on('error', (err) => resolve({ artifact, code: 1, output: err.message }))
+    child.on('close', (code) => resolve({ artifact, code, output }))
+  })
+}
+
+/**
+ * notarytool takes the same three credential shapes detected above and spells
+ * each differently. Derived from `notarizeAuth` so the image is submitted with
+ * whatever authenticated the app, rather than a second, independent guess.
+ */
+function notarytoolAuth() {
+  if (notarizeAuth === 'APPLE_API_KEY') {
+    return ['--key', env('APPLE_API_KEY'), '--key-id', env('APPLE_API_KEY_ID'), '--issuer', env('APPLE_API_ISSUER')]
+  }
+  if (notarizeAuth === 'APPLE_ID') {
+    // notarytool offers no way to pass this off the command line, so it is
+    // visible to `ps` for the length of the submission. The API key path has no
+    // such exposure, which is one more reason CI uses it.
+    return ['--apple-id', env('APPLE_ID'), '--password', env('APPLE_APP_SPECIFIC_PASSWORD'), '--team-id', env('APPLE_TEAM_ID')]
+  }
+  return ['--keychain-profile', env('APPLE_KEYCHAIN_PROFILE')]
+}
+
+/**
+ * `source=`, never the last line. The last line is `origin=`, which names the
+ * signing certificate on an un-notarized artifact just the same; `source=` is
+ * where "Notarized Developer ID" and "Unnotarized Developer ID" differ.
+ */
+function spctlSource(target, type) {
+  const args = type === 'open'
+    ? ['-a', '-vvv', '-t', 'open', '--context', 'context:primary-signature', target]
+    : ['-a', '-vvv', '-t', 'exec', target]
+  const lines = (spawnSync('spctl', args, { encoding: 'utf8' }).stderr || '').trim().split('\n')
+  return lines.find((l) => l.startsWith('source=')) || lines.pop() || 'no spctl verdict'
 }
 
 function findApps(dir, depth = 0) {
@@ -247,12 +410,21 @@ function findApps(dir, depth = 0) {
   return found
 }
 
+// electron-builder names the manifest after the channel it reads off the
+// version's prerelease tag, so 0.2.0 writes latest-mac.yml while 0.2.0-rc.1
+// writes rc-mac.yml. Deriving the same name is what lets a prerelease be
+// checked at all, and it is stricter than a `latest*` glob rather than looser:
+// a manifest written for some other channel no longer counts as success.
+const version = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version || ''
+const channel = /^[^-]*-([0-9A-Za-z-]+)/.exec(version)?.[1] || 'latest'
+
 // A feed that produced no manifest is the failure this whole wrapper is about:
 // the package looks fine, installs fine, and silently never updates.
 if (feed && !passthrough.includes('--dir')) {
-  const manifests = existsSync(dist) ? readdirSync(dist).filter((f) => /^latest.*\.yml$/.test(f)) : []
+  const wanted = new RegExp(`^${channel}(-[0-9A-Za-z-]+)?\\.yml$`)
+  const manifests = existsSync(dist) ? readdirSync(dist).filter((f) => wanted.test(f)) : []
   if (manifests.length === 0) {
-    console.error('[build] a feed was configured but no latest*.yml was produced; the build cannot update itself')
+    console.error(`[build] a feed was configured but no ${channel}*.yml was produced; the build cannot update itself`)
     process.exit(1)
   }
   console.log(`[build] update manifests: ${manifests.join(', ')}`)

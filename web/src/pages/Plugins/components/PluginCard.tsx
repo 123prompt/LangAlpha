@@ -1,6 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
-import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
+import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
+import { pluginMark, sourceLabelKey } from '../utils/pluginSurface';
 import {
   EnabledToggle,
   MetaText,
@@ -51,9 +52,7 @@ export function PluginCard({
 
   const metaParts = [
     plugin.version ? `v${plugin.version}` : null,
-    plugin.source_type === 'zip'
-      ? t('plugins.card.sourceZip')
-      : t('plugins.card.sourceRemote'),
+    t(sourceLabelKey(plugin)),
     t('plugins.card.componentCount', {
       servers: t('plugins.card.serverCount', { count: servers.length }),
       skills: t('plugins.card.skillCount', { count: skills.length }),
@@ -64,7 +63,7 @@ export function PluginCard({
     <ServerRowShell
       testid={`plugin-card-${plugin.name}`}
       {...(selection ?? {})}
-      tile={<IdentityTile name={plugin.name} />}
+      tile={<BrandMark name={plugin.name} {...pluginMark(plugin)} />}
       onOpen={onOpen}
       main={
         <>

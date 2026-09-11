@@ -30,6 +30,7 @@ from ptc_agent.agent.middleware.skills.discovery import (
     validate_skill_name,
 )
 from ptc_agent.agent.middleware.skills.registry import SKILL_REGISTRY
+from ptc_agent.config.agent import host_skill_dirs
 from src.server.services.user_skills.limits import (
     MAX_SKILL_DESCRIPTION_CHARS,
     MAX_SKILL_FILES,
@@ -49,6 +50,16 @@ _READ_CHUNK = 64 * 1024
 
 class SkillValidationError(Exception):
     """The archive or its SKILL.md is invalid — maps to a 400."""
+
+
+class SkillNamesUnavailable(RuntimeError):
+    """A directory skills ship from could not be listed — maps to a 503.
+
+    Raised rather than answered, for the reason ``BundleOwnershipUnavailable``
+    is: the caller adds what comes back to a reservation set, so an incomplete
+    answer reserves too little and the name a user takes is the one the sync
+    then overwrites, silently replacing a shipped or operator skill.
+    """
 
 
 @dataclass(frozen=True)
@@ -80,23 +91,91 @@ COMPOSER_COMMANDS = frozenset(
 )
 
 
-@functools.lru_cache(maxsize=1)
+def configured_skill_dirs() -> list[Path]:
+    """Host-side skill sources as this process is actually configured.
+
+    ``host_skill_dirs``'s default is the field default, not the operator's
+    value, so every server-side reader that answers a question about the file
+    the agent will load has to come through here. Two do: reservation, which
+    is meaningless against a root delivery does not read, and the management
+    preview, which would otherwise show the shipped copy of a skill the
+    operator has overridden.
+    """
+    from src.server.app import setup
+
+    config = setup.agent_config
+    if config is None:
+        return host_skill_dirs()
+    return host_skill_dirs(config.skills.user_skills_dir)
+
+
 def reserved_skill_names() -> frozenset[str]:
-    """Names a user skill may not take, all four sources.
+    """Names a user skill may not take, as this process is configured.
+
+    Split from the cached body so the drop-in root is read live. Keying the
+    cache on the value also means a call made before startup finished cannot
+    pin the default over the configured answer.
+    """
+    from src.server.app import setup
+
+    config = setup.agent_config
+    return _reserved_skill_names(
+        config.skills.user_skills_dir if config is not None else None
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _registered_skill_names() -> frozenset[str]:
+    """The half of the reservation that cannot change while the process runs.
 
     Registry keys preserve the no-shadowing invariant; command names prevent a
     user skill named e.g. ``dashboard`` from colliding with
-    ``interactive-dashboard``'s slash command; repo ``skills/`` dir names catch
-    shippers that never registered (e.g. ``x-api``); composer commands are the
-    same collision one layer up, in the client. Static config, so caching at
-    module level is safe.
+    ``interactive-dashboard``'s slash command; composer commands are the same
+    collision one layer up, in the client. All three are module-level Python,
+    so reading them once is safe.
     """
     names: set[str] = set(SKILL_REGISTRY)
     names.update(s.command for s in SKILL_REGISTRY.values() if s.command)
-    repo_skills = Path.cwd() / "skills"
-    if repo_skills.is_dir():
-        names.update(p.name for p in repo_skills.iterdir() if p.is_dir())
-    names |= COMPOSER_COMMANDS
+    return frozenset(names | COMPOSER_COMMANDS)
+
+
+def _reserved_skill_names(user_skills_dir: str | None) -> frozenset[str]:
+    """Names a user skill may not take, all four sources.
+
+    The fourth source is a directory listing rather than a list because that
+    is what makes it catch shippers that never registered (e.g. ``x-api``), so
+    it has to name every place a skill ships from: each bundle's own
+    ``skills/``, and the operator's drop-in root. Reading one and not the
+    other silently reserves nothing for the rest, and the sync overwrites
+    last-source-wins, so the name a user took is the one the agent then loads.
+
+    That listing is why only the registry half is cached. The operator's
+    drop-in root is writable while the server runs, which is the whole point
+    of it, so a set memoized per directory path would let a warm worker keep
+    answering from a listing taken before the operator's skill landed and
+    accept the very name it exists to reserve.
+    """
+    names = set(_registered_skill_names())
+    dirs = (
+        host_skill_dirs()
+        if user_skills_dir is None
+        else host_skill_dirs(user_skills_dir)
+    )
+    for skills_dir in dirs:
+        if not skills_dir.is_dir():
+            continue
+        try:
+            names.update(p.name for p in skills_dir.iterdir() if p.is_dir())
+        except OSError as e:
+            # ``is_dir`` swallows OSError and answers False; ``iterdir`` is
+            # the one that raises, so this is the only hole in the guard above.
+            # Reserving nothing for a directory we cannot read is how a user
+            # skill comes to overwrite a shipped one, so refuse instead: the
+            # caller turns this into a handled 503 rather than a bare 500 that
+            # has already written a plugin row.
+            raise SkillNamesUnavailable(
+                f"cannot read {skills_dir}: {e}"
+            ) from e
     return frozenset(names)
 
 

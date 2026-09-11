@@ -9,6 +9,7 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import type { AccessType, ProviderCatalogEntry } from '@/components/model/types';
 import { useTranslation } from 'react-i18next';
+import { modelPrefs } from '@/lib/modelPreferences';
 
 const CUSTOM_PROVIDER_KEY = '__custom__';
 
@@ -45,11 +46,8 @@ export default function ProviderStep() {
   // User's existing custom providers (from preferences)
   const userCustomProviders = useMemo(() => {
     if (!preferences) return [];
-    const prefs = preferences as Record<string, unknown>;
-    const other = (prefs.other_preference ?? {}) as Record<string, unknown>;
-    const cp = other.custom_providers;
-    if (!Array.isArray(cp)) return [];
-    return cp as Array<{ name: string; parent_provider: string; use_response_api?: boolean }>;
+    const cp = modelPrefs(preferences).custom_providers;
+    return Array.isArray(cp) ? cp : [];
   }, [preferences]);
 
   // Set of custom provider names for lookup

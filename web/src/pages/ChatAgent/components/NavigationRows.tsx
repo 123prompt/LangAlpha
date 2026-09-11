@@ -493,7 +493,7 @@ export function WorkspaceTreeRow({
           {isRenaming ? (
             <input
               ref={rename.inputRef}
-              className="text-sm font-medium bg-transparent outline-none border-b flex-1 min-w-0"
+              className="text-sm font-medium bg-transparent border-b flex-1 min-w-0"
               style={{ color: 'var(--color-text-primary)', borderColor: 'var(--color-border-muted)' }}
               value={rename.value}
               onChange={(e) => rename.onChange(e.target.value)}

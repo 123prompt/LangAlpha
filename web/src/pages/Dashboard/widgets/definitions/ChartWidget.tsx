@@ -1196,7 +1196,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
                   setSearchHits([]);
                 }
               }}
-              className="text-sm font-semibold tabular-nums bg-transparent outline-none border-b px-0 py-0 w-24"
+              className="text-sm font-semibold tabular-nums bg-transparent border-b px-0 py-0 w-24"
               style={{
                 color: 'var(--color-text-primary)',
                 borderColor: 'var(--color-accent-primary)',

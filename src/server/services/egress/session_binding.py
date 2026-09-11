@@ -23,6 +23,7 @@ relay JWTs are valid, and the grant map converges on the next push.
 from __future__ import annotations
 
 import logging
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from src.config.env import EGRESS_RELAY_SECRET
@@ -35,12 +36,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class RelayBind(StrEnum):
+    """What a bind settled on. Three outcomes because the caller owes each a
+    different response, and collapsing two of them is what let a superseded
+    resolve republish the tools its user had just declined."""
+
+    APPLIED = "applied"
+    #: A credential push was needed and the sandbox refused it. Nothing else
+    #: retries the file, so the caller must withhold the stamp.
+    REFUSED = "refused"
+    #: A newer config version owns the grant set. This resolve's view of the
+    #: world is stale, so nothing derived from it may be published.
+    SUPERSEDED = "superseded"
+
+
 async def sync_egress_relay(
     workspace_id: str,
     user_id: str | None,
     session: "Session",
     resolved: "ResolvedMCP",
-) -> bool:
+) -> RelayBind:
     """Converge grants + relay JWT + sandbox credential file to ``resolved``.
 
     One grant per OAuth-connected server in the resolved set; grants the
@@ -50,11 +65,16 @@ async def sync_egress_relay(
     credential file, decided from the table so it converges on any worker. A
     no-op when ``resolved`` is already superseded by a newer config version.
 
-    Returns False only when a credential push was NEEDED and the sandbox
-    refused it — the one outcome the caller must not stamp as applied, since
-    nothing else retries a refused file. Settled non-push returns (relay
-    disabled, unowned resolve, superseded config) are True: re-running them
-    would produce the same decision, so a retry buys nothing.
+    ``REFUSED`` only when a credential push was NEEDED and the sandbox refused
+    it — the one outcome the caller must not stamp as applied, since nothing
+    else retries a refused file. Settled non-push outcomes (relay disabled,
+    unowned resolve) are ``APPLIED``: re-running them would produce the same
+    decision, so a retry buys nothing.
+
+    ``SUPERSEDED`` is separate from both. It reads as settled from here, since
+    a newer sync owns the grants and re-running changes nothing — but the
+    caller has a whole composite derived from the same stale resolve, and
+    publishing that into the sandbox undoes what the newer resolve just wrote.
     """
     oauth_servers = [s for s in resolved.servers if s.oauth_connection_id]
     if oauth_servers and not EGRESS_RELAY_SECRET:
@@ -63,13 +83,13 @@ async def sync_egress_relay(
             "EGRESS_RELAY_SECRET is unset — they stay unbound",
             [s.name for s in oauth_servers],
         )
-        return True
+        return RelayBind.APPLIED
     # The replacement below is whole-set, so a resolve with no owner is never
     # authoritative: OAuth connections only resolve for an authenticated user,
     # and an unowned resolve is indistinguishable from one that resolved empty
     # because the owner was unknown — which would retire every live grant.
     if not user_id:
-        return True
+        return RelayBind.APPLIED
 
     synced = await sync_oauth_grants(
         user_id=user_id or "",
@@ -84,7 +104,7 @@ async def sync_egress_relay(
     # rejects genuinely stale replacements, and this worker's stamped v1 forces
     # a re-resolve on its next acquire.
     if synced is None:
-        return True
+        return RelayBind.SUPERSEDED
 
     grants: dict[str, str] = {}
     for srv in oauth_servers:
@@ -100,8 +120,9 @@ async def sync_egress_relay(
         grants[srv.name] = grant_id
 
     if grants or synced.retired or session.egress_binding is not None:
-        return await _push_credentials(workspace_id, session, user_id or "", grants)
-    return True
+        pushed = await _push_credentials(workspace_id, session, user_id or "", grants)
+        return RelayBind.APPLIED if pushed else RelayBind.REFUSED
+    return RelayBind.APPLIED
 
 
 async def maybe_remint_egress_jwt(workspace_id: str, session: "Session") -> None:

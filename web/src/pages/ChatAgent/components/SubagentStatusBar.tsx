@@ -1,6 +1,6 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertCircle, MessageSquarePlus, Send, X } from 'lucide-react';
+import { MessageSquarePlus, Send, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { cn } from '../../../lib/utils';
 import iconRobo from '../../../assets/img/icon-robo.png';
@@ -241,20 +241,24 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
         </div>
       </div>
 
-      {/* Failure reason — the "clue inside" for a Failed card. The status chip
-          alone said Failed with no cause; the ledger's reason lands here. */}
-      {isError && (
+      {/* The "clue inside": the status chip names the outcome, this carries the
+          ledger's reason. A failure shows the box either way; a stop only when
+          it has a reason to show. */}
+      {(isError || (isCancelled && !!agent.error)) && (
         <div
           className="flex items-start gap-2 px-4 py-2.5 rounded-lg"
           style={{
-            backgroundColor: 'var(--color-loss-soft)',
-            border: '1px solid var(--color-border-loss)',
+            backgroundColor: isError ? 'var(--color-loss-soft)' : 'var(--color-bg-tool-card)',
+            border: `1px solid ${isError ? 'var(--color-border-loss)' : 'var(--color-border-muted)'}`,
           }}
         >
-          <AlertCircle className="h-4 w-4 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-icon-danger)' }} />
+          <SubagentStatusIcon status={effectiveStatus} className="h-4 w-4 flex-shrink-0 mt-0.5" />
           <div className="min-w-0">
-            <div className="text-xs font-medium" style={{ color: 'var(--color-icon-danger)' }}>
-              {t('chat.subagentBar.errorHeading')}
+            <div
+              className="text-xs font-medium"
+              style={{ color: isError ? 'var(--color-icon-danger)' : 'var(--color-text-secondary)' }}
+            >
+              {t(isError ? 'chat.subagentBar.errorHeading' : 'chat.subagentBar.stoppedHeading')}
             </div>
             {agent.error && (
               <div className="text-xs mt-0.5 break-words" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -283,7 +287,7 @@ function SubagentStatusBar({ agent, threadId, onInstructionSent }: SubagentStatu
             onKeyDown={handleKeyDown}
             placeholder={t('chat.subagentBar.inputPlaceholder')}
             disabled={sending}
-            className="flex-1 bg-transparent text-sm placeholder-foreground/30 outline-none"
+            className="flex-1 bg-transparent text-sm placeholder-foreground/30"
             style={{ color: 'var(--color-text-primary)' }}
           />
           <div className="flex items-center gap-1">

@@ -292,6 +292,30 @@ async def test_forward_error_appends_error_record():
 
 
 @pytest.mark.asyncio
+async def test_forward_error_uses_the_declared_spelling_not_the_class_name():
+    """A credit stop reaches the frontend as ``credit_stop``, never
+    ``CreditStopError``.
+
+    The regression: this frame was built with ``type(exc).__name__``, so the
+    wire carried the class name while the frontend matched the contract
+    spelling. Nothing failed - the stop just rendered as a failure, and the
+    "task stopped" copy was unreachable in every locale.
+    """
+    from ptc_agent.agent.middleware.credit_gate import CreditStopError
+    from src.server.contracts.status import CREDIT_STOP_ERROR_TYPE
+
+    registry = BackgroundTaskRegistry()
+    task = await _register(registry)
+    fw = _SubagentTokenForwarder(registry, task.tool_call_id, "task:abc")
+
+    await fw.forward_error(CreditStopError("out of credits"))
+
+    record = next(e for e in task._test_records if e["event"] == "error")
+    assert record["data"]["error_type"] == CREDIT_STOP_ERROR_TYPE
+    assert record["data"]["error_type"] != "CreditStopError"
+
+
+@pytest.mark.asyncio
 async def test_forward_error_absorbs_registry_failure():
     """If append_captured_event raises (degraded Redis), forward_error must
     not propagate — it is always called inside an existing exception flow

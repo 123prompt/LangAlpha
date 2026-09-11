@@ -332,7 +332,7 @@ export const SelectionCommentOverlay = React.memo(function SelectionCommentOverl
           onPointerDown={(e) => e.stopPropagation()}
         >
           <span className="selection-pin selection-pin--composer">{composer.n}</span>
-          <div className="selection-composer-pill">
+          <div className="selection-composer-pill clips-focus-ring">
             <input
               ref={inputRef}
               className="selection-composer-input"

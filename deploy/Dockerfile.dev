@@ -43,7 +43,7 @@ COPY agent_config.yaml .
 COPY alembic.ini .
 COPY migrations/ migrations/
 COPY mcp_servers/ mcp_servers/
-COPY skills/ skills/
+COPY plugins/ plugins/
 COPY workflows/ workflows/
 
 # DB init + server start entrypoint

@@ -28,26 +28,47 @@ from src.server.database.pool import get_db_connection
 logger = logging.getLogger(__name__)
 
 # Hard cap on user-configured (source='workspace') servers per workspace.
-MAX_MCP_SERVERS_PER_WORKSPACE = 20
+#
+# The stingier of the two on purpose, because this one is the expensive one:
+# every row here is a server the agent actually runs, which is a discovery
+# round trip on each config change and, for stdio, a subprocess inside the
+# sandbox. Raising it spends startup latency, not storage.
+MAX_MCP_SERVERS_PER_WORKSPACE = 30
 
 # Hard cap on catalog templates per user.
-MAX_CATALOG_SERVERS_PER_USER = 50
+#
+# Roomier than the workspace cap because a catalog row costs a row and a line
+# on the settings page until it is switched on. Enabling is what makes it live,
+# and it is not a per-workspace act: ``list_enabled_user_servers`` inherits
+# every enabled row into every one of the user's workspaces, where it pays for
+# discovery and, on stdio, a subprocess. So this bounds what may be COLLECTED,
+# and the ceiling on what runs is however many of them the user switches on.
+MAX_CATALOG_SERVERS_PER_USER = 100
 
 # Mutable catalog columns, split by how a value binds. Anything outside the
 # union is rejected by ``update_catalog_server`` rather than silently dropped.
-_CATALOG_JSONB_COLUMNS = frozenset({"args", "env", "headers"})
+_CATALOG_JSONB_COLUMNS = frozenset({"args", "env", "headers", "tool_binding"})
 _CATALOG_SCALAR_COLUMNS = frozenset({
     "transport", "command", "url", "description", "instruction",
     "tool_exposure_mode", "discovery_uses_secrets",
 })
-CATALOG_COLUMNS = _CATALOG_JSONB_COLUMNS | _CATALOG_SCALAR_COLUMNS
+CATALOG_COLUMNS = (_CATALOG_JSONB_COLUMNS - {"tool_binding"}) | _CATALOG_SCALAR_COLUMNS
+
+# How the row's tools reach the model. Writable through the binding endpoint
+# only and kept OUT of ``CATALOG_COLUMNS``: a PUT replaces the connection
+# config whole, and a form that never showed these must not reset them.
+_CATALOG_BINDING_COLUMNS = frozenset({
+    "tool_binding", "binding_preset", "order_approval",
+})
 
 # Plugin provenance is writable too, but stays OUT of ``CATALOG_COLUMNS``:
 # that set is what a request body binds against, so ownership can never be
 # smuggled in from the wire. The catalog-edit service is the only caller that
 # names these, and only to clear them.
 _CATALOG_PROVENANCE_COLUMNS = frozenset({"plugin_id", "plugin_server_key"})
-_WRITABLE_CATALOG_COLUMNS = CATALOG_COLUMNS | _CATALOG_PROVENANCE_COLUMNS
+_WRITABLE_CATALOG_COLUMNS = (
+    CATALOG_COLUMNS | _CATALOG_PROVENANCE_COLUMNS | _CATALOG_BINDING_COLUMNS
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +85,7 @@ _CATALOG_SELECT = """
     SELECT s.user_mcp_server_id, s.user_id, s.name, s.transport, s.command,
            s.args, s.url, s.env, s.headers, s.description, s.instruction,
            s.tool_exposure_mode, s.discovery_uses_secrets, s.enabled,
+           s.tool_binding, s.binding_preset, s.order_approval,
            s.created_at, s.updated_at, s.plugin_id, s.plugin_server_key,
            p.name AS plugin_name, p.enabled AS plugin_enabled
     FROM user_mcp_servers s
@@ -253,7 +275,7 @@ async def update_catalog_server(
                 # A live (enabled) server changed shape — every workspace of the
                 # user must re-resolve on next acquire.
                 if row["enabled"]:
-                    await _bump_user_versions(cur, user_id)
+                    await bump_user_versions(cur, user_id)
                 logger.info(f"[mcp_db] update_catalog_server user_id={user_id} name={name}")
                 return _catalog_row_to_dict(row)
 
@@ -304,7 +326,7 @@ async def delete_catalog_server(
                     (user_id, name),
                 )
                 if row["enabled"]:
-                    await _bump_user_versions(cur, user_id)
+                    await bump_user_versions(cur, user_id)
                 logger.info(f"[mcp_db] delete_catalog_server user_id={user_id} name={name}")
                 return True
 
@@ -332,7 +354,7 @@ async def set_catalog_server_enabled(
                 if not await cur.fetchone():
                     return None
                 row = await _read_catalog_row(cur, user_id, name)
-                await _bump_user_versions(cur, user_id)
+                await bump_user_versions(cur, user_id)
                 logger.info(
                     f"[mcp_db] set_catalog_server_enabled user_id={user_id} "
                     f"name={name} enabled={enabled}"
@@ -369,52 +391,8 @@ async def bump_user_workspaces_mcp_version(user_id: str) -> int:
     """
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
-            await _bump_user_versions(cur, user_id)
+            await bump_user_versions(cur, user_id)
             return cur.rowcount
-
-
-async def list_user_builtin_disables(user_id: str) -> set[str]:
-    """Builtin server names this user disabled account-wide."""
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT name FROM user_mcp_builtin_disables WHERE user_id = %s",
-                (user_id,),
-            )
-            return {r["name"] for r in await cur.fetchall()}
-
-
-async def set_user_builtin_disable(user_id: str, name: str, disabled: bool) -> None:
-    """Write/clear an account-wide builtin disable.
-
-    Both directions change every workspace's effective set, so the fan-out
-    bump runs in the same transaction (next-acquire convergence).
-    """
-    async with get_db_connection() as conn:
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                if disabled:
-                    await cur.execute(
-                        """
-                        INSERT INTO user_mcp_builtin_disables (user_id, name)
-                        VALUES (%s, %s)
-                        ON CONFLICT (user_id, name) DO NOTHING
-                        """,
-                        (user_id, name),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        DELETE FROM user_mcp_builtin_disables
-                        WHERE user_id = %s AND name = %s
-                        """,
-                        (user_id, name),
-                    )
-                await _bump_user_versions(cur, user_id)
-                logger.info(
-                    f"[mcp_db] set_user_builtin_disable user_id={user_id} "
-                    f"name={name} disabled={disabled}"
-                )
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +724,7 @@ async def _bump_version(cur, workspace_id: str) -> None:
     )
 
 
-async def _bump_user_versions(cur, user_id: str) -> None:
+async def bump_user_versions(cur, user_id: str) -> None:
     """Increment mcp_config_version on every workspace of a user (same txn).
 
     One statement, unpaginated on purpose: a user-level change must never
@@ -787,6 +765,11 @@ def _catalog_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         "tool_exposure_mode": row["tool_exposure_mode"],
         "discovery_uses_secrets": bool(row["discovery_uses_secrets"]),
         "enabled": bool(row["enabled"]),
+        # .get(): rows built by tests and by the plugin planner predate the
+        # binding columns; an absent value is the untouched-row default.
+        "tool_binding": dict(row.get("tool_binding") or {}),
+        "binding_preset": row.get("binding_preset"),
+        "order_approval": bool(row.get("order_approval", True)),
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
     }

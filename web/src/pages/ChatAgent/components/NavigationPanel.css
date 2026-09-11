@@ -22,12 +22,12 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
+  padding: 4px 10px;
   cursor: pointer;
   border-radius: 6px;
   margin: 1px 6px;
   transition: background-color 0.15s ease;
-  min-height: 32px;
+  min-height: 28px;
 }
 
 .nav-panel-row:hover {

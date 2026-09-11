@@ -25,6 +25,7 @@ import {
 } from '../../ChatAgent/session/subagents/resolveSubagentTelemetry';
 import type { ToolCallProcessRecord, SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
+import type { Workspace } from '@/types/api';
 import MarketChatHistoryButton from './MarketChatHistoryButton';
 import MarketDetailDialog, { type DialogPayload } from './MarketDetailDialog';
 import { getMarketThreadId, setMarketThreadId, clearMarketThreadId } from '../utils/threadPersistence';
@@ -74,13 +75,6 @@ interface ModelOptionsLike {
   model?: string | null;
   reasoningEffort?: string | null;
   fastMode?: boolean | null;
-}
-
-interface Workspace {
-  workspace_id: string;
-  name?: string;
-  status?: string;
-  [key: string]: unknown;
 }
 
 interface AttachmentItem {
@@ -406,6 +400,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     handleRejectPTCAgent,
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
+    handleResumeCreditPause,
     // Turn/context state — drives the stop button, input gating, and the
     // interrupted / plan-feedback / compaction status banners.
     pendingInterrupt,
@@ -649,6 +644,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableRejectPTCAgent = useStableHandler(handleRejectPTCAgent);
   const stableApproveSecretaryAction = useStableHandler(handleApproveSecretaryAction);
   const stableRejectSecretaryAction = useStableHandler(handleRejectSecretaryAction);
+  const stableResumeCreditPause = useStableHandler(handleResumeCreditPause);
   const stableEditMessage = useStableHandler((id: string, content: string) =>
     handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
@@ -678,6 +674,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onRejectPTCAgent: stableRejectPTCAgent,
     onApproveSecretaryAction: stableApproveSecretaryAction,
     onRejectSecretaryAction: stableRejectSecretaryAction,
+    onResumeCreditPause: stableResumeCreditPause,
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
@@ -690,7 +687,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableEditMessage, stableRegenerate, stableRetry,
+    stableRejectSecretaryAction, stableResumeCreditPause,
+    stableEditMessage, stableRegenerate, stableRetry,
     stableThumbUp, stableThumbDown, stableReportWithAgent, stableWidgetSendPrompt,
   ]);
 
@@ -996,7 +994,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         mode={mode}
         onModeChange={onModeChange}
         ptcDisabledReason={ptcDisabledReason}
-        workspaces={ptcWorkspaces as never}
+        workspaces={ptcWorkspaces}
         selectedWorkspaceId={selectedWorkspaceId}
         onWorkspaceChange={onWorkspaceChange}
         onCaptureChart={onCaptureChart}

@@ -137,20 +137,23 @@ _EXCLUDED_STATE_KEYS = {"messages", "todos", "structured_response"}
 
 TASK_TOOL_DESCRIPTION = """Launch a subagent for complex, multi-step tasks.
 
+Use for: Complex tasks, isolated research, context-heavy operations.
+NOT for: Simple 1-2 tool operations (do directly).
+
 Args:
-    description: Short 1-2 sentence summary of the task (displayed as title)
-    prompt: Detailed instructions for the subagent to execute
-    subagent_type: Agent type to use
-    action: "init" (new task, default), "update" (instruct running task), "resume" (resume completed task)
-    task_id: Required for "update" and "resume" actions
+    description: Short 1-2 sentence title shown on the task card. Think commit subject line.
+    prompt: The subagent's complete instructions. It sees nothing of this conversation, so include all the context, data and expected output format it needs.
+    subagent_type: Which subagent to use (e.g. "general-purpose"). Required for "init".
+    action: "init" (new task, default), "update" (instruct a running task), "resume" (continue a completed or stopped task from its checkpoint, with its prior context intact)
+    task_id: The target task's short alphanumeric ID. Required for "update" and "resume".
 
-Usage:
-- Use for: Complex tasks, isolated research, context-heavy operations
-- NOT for: Simple 1-2 tool operations (do directly)
-- Parallel: Launch multiple agents in single message for concurrent tasks
-- Results: Subagent returns final report only (intermediate steps hidden)
+Returns:
+    A task ID immediately, not the subagent's work. The subagent runs
+    autonomously and reports only its final result; intermediate steps stay
+    hidden.
 
-The subagent works autonomously. Provide clear, complete instructions in the prompt."""
+Keep working. The report arrives through TaskOutput once a completion
+notification names the task."""
 
 
 def _get_subagents(
@@ -334,6 +337,22 @@ async def arun_subagent_streaming(
     return last_state if last_state is not None else {}
 
 
+def _launch_refusal(reason: str, runtime: Any) -> "str | ToolMessage":
+    """A Task refusal the frontend can settle on.
+
+    Nothing starts, so no channel will ever close to settle the launch card:
+    the reply is the only signal it has, and it carries the failure status
+    rather than riding on the default success. Without a tool_call_id there is
+    no ToolMessage to build, so the text falls back to the caller's default.
+    """
+    tool_call_id = getattr(runtime, "tool_call_id", None)
+    if not tool_call_id:
+        return reason
+    return ToolMessage(
+        content=reason, tool_call_id=tool_call_id, name="Task", status="error"
+    )
+
+
 def return_command_with_state_update(result: dict, tool_call_id: str) -> Command:
     """Convert a subagent's final state into the parent-facing ToolMessage Command."""
     # Validate that the result contains a 'messages' key
@@ -446,7 +465,7 @@ def _create_task_tool(
             "Task ID. Required for update and resume actions.",
         ] = None,
         runtime: ToolRuntime = None,  # type: ignore[assignment]
-    ) -> str | Command:
+    ) -> str | ToolMessage | Command:
         # Resolve subagent_type based on action
         effective_type = subagent_type
         if action == "update" or action == "resume":
@@ -455,14 +474,22 @@ def _create_task_tool(
             effective_type = effective_type or resume_type or "general-purpose"
             if effective_type not in subagent_graphs:
                 allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
-                return f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}"
+                return _launch_refusal(
+                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    runtime,
+                )
         else:
             # action == "init" (default)
             if effective_type is None:
-                return "Error: subagent_type is required for new tasks."
+                return _launch_refusal(
+                    "Error: subagent_type is required for new tasks.", runtime
+                )
             if effective_type not in subagent_graphs:
                 allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
-                return f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}"
+                return _launch_refusal(
+                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    runtime,
+                )
 
         subagent, subagent_state = _validate_and_prepare_state(
             effective_type, prompt, runtime
@@ -534,7 +561,7 @@ def _create_task_tool(
             "Task ID. Required for update and resume actions.",
         ] = None,
         runtime: ToolRuntime = None,  # type: ignore[assignment]
-    ) -> str | Command:
+    ) -> str | ToolMessage | Command:
         # Resolve subagent_type based on action
         effective_type = subagent_type
 
@@ -547,14 +574,22 @@ def _create_task_tool(
             effective_type = effective_type or resume_type or "general-purpose"
             if effective_type not in subagent_graphs:
                 allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
-                return f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}"
+                return _launch_refusal(
+                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    runtime,
+                )
         else:
             # action == "init" (default)
             if effective_type is None:
-                return "Error: subagent_type is required for new tasks."
+                return _launch_refusal(
+                    "Error: subagent_type is required for new tasks.", runtime
+                )
             if effective_type not in subagent_graphs:
                 allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
-                return f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}"
+                return _launch_refusal(
+                    f"We cannot invoke subagent {effective_type} because it does not exist, the only allowed types are {allowed_types}",
+                    runtime,
+                )
 
         subagent = subagent_graphs[effective_type]
 

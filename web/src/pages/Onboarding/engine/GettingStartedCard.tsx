@@ -55,7 +55,7 @@ export function GettingStartedCard() {
             type="button"
             onClick={dismiss}
             aria-label={t('onboarding.gettingStarted.dismiss', 'Hide guide')}
-            className="rounded-md p-1 transition-colors hover:bg-[var(--color-bg-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
+            className="rounded-md p-1 transition-colors hover:bg-[var(--color-bg-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             style={{ color: 'var(--color-text-tertiary)' }}
           >
             <X className="h-3.5 w-3.5" />
@@ -106,7 +106,7 @@ export function GettingStartedCard() {
                   navigate(def.to);
                 }
               }}
-              className="flex w-full items-start gap-3 rounded-lg p-2 text-left transition-colors enabled:hover:bg-[var(--color-bg-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
+              className="flex w-full items-start gap-3 rounded-lg p-2 text-left transition-colors enabled:hover:bg-[var(--color-bg-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             >
               <span
                 className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border"
@@ -171,7 +171,7 @@ export function GettingStartedCard() {
             <button
               type="button"
               onClick={() => setInterviewPromptOpen(false)}
-              className="rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--color-bg-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)]"
+              className="rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--color-bg-subtle)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               style={{
                 borderColor: 'var(--color-border-default)',
                 color: 'var(--color-text-secondary)',
@@ -185,7 +185,7 @@ export function GettingStartedCard() {
                 setInterviewPromptOpen(false);
                 void navigateToPersonalization();
               }}
-              className="rounded-lg px-4 py-2 text-sm font-semibold transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent-primary)] focus-visible:ring-offset-2"
+              className="rounded-lg px-4 py-2 text-sm font-semibold transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
               style={{
                 background: 'var(--color-btn-primary-bg)',
                 color: 'var(--color-btn-primary-text)',

@@ -200,129 +200,53 @@
 
 /* ====== Model selector controls (inside Radix DropdownMenuContent) ====== */
 
-.model-effort-section {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 14px;
-  gap: 8px;
-}
-
-.model-effort-label {
-  font-size: 0.75rem;
+/* Pushes the chevron to the edge and keeps the value right-aligned under it. */
+.model-setting-value {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
   color: var(--color-text-tertiary);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.model-effort-toggle {
-  display: flex;
-  gap: 2px;
-  background-color: var(--color-bg-card);
-  border-radius: 6px;
-  padding: 2px;
-}
-
-.model-effort-btn {
-  padding: 3px 10px;
-  border: none;
-  border-radius: 4px;
-  font-size: 0.75rem;
-  font-weight: 500;
-  cursor: pointer;
-  background: transparent;
+.model-setting-caption {
+  padding: 6px 10px 8px;
+  font-size: 0.6875rem;
+  line-height: 1.45;
   color: var(--color-text-tertiary);
-  transition: background-color 0.15s, color 0.15s;
 }
 
-.model-effort-btn:hover {
-  color: var(--color-text-primary);
-}
-
-.model-effort-btn.active {
-  background-color: var(--color-accent-soft);
-  color: var(--color-accent-light);
-}
-
-.fast-mode-switch {
-  position: relative;
-  width: 36px;
-  height: 20px;
-  border-radius: 10px;
-  border: none;
-  background-color: var(--color-bg-card);
-  cursor: pointer;
-  padding: 0;
-  transition: background-color 0.2s ease;
-  flex-shrink: 0;
-}
-
-.fast-mode-switch:hover {
-  background-color: var(--color-border-default);
-}
-
-.fast-mode-switch.active {
-  background-color: var(--color-accent-light);
-}
-
-.fast-mode-switch-thumb {
-  position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background-color: #fff;
-  transition: transform 0.2s ease;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
-}
-
-.fast-mode-switch.active .fast-mode-switch-thumb {
-  transform: translateX(16px);
-}
-
-.fast-mode-help-wrap {
-  position: relative;
+.model-setting-option-label {
   display: inline-flex;
   align-items: center;
-  margin-left: 3px;
-  vertical-align: middle;
+  gap: 6px;
 }
 
-.fast-mode-help-icon {
-  width: 12px;
-  height: 12px;
-  color: var(--color-text-quaternary, #aaa);
-  cursor: help;
+.model-setting-badge {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background-color: var(--color-bg-card);
+  color: var(--color-text-tertiary);
+  font-size: 0.625rem;
+  font-weight: 500;
+  line-height: 1.5;
 }
 
-.fast-mode-help-wrap:hover .fast-mode-help-icon {
-  color: var(--color-text-secondary);
-}
-
-.fast-mode-help-tooltip {
-  display: none;
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  /* Same surface as components/ui/tooltip.tsx. The border is load-bearing in
-     light theme, where bg-elevated is a near-white on a white composer. */
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border-muted);
-  color: var(--color-text-primary);
-  font-size: 0.6875rem;
-  font-weight: 400;
-  line-height: 1.4;
-  padding: 6px 10px;
-  border-radius: 6px;
-  white-space: nowrap;
-  z-index: 100;
-  pointer-events: none;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-}
-
-.fast-mode-help-wrap:hover .fast-mode-help-tooltip {
+.model-setting-hint {
   display: block;
+  margin-top: 1px;
+  font-size: 0.6875rem;
+  line-height: 1.4;
+  color: var(--color-text-tertiary);
+}
+
+/* Mobile expands the options in place (Radix submenus lose a tap there), so
+   they need an indent to read as children of the row above. The caption is not
+   an item and keeps its own padding. */
+.model-setting-options [role^='menuitem'] {
+  padding-left: 24px;
 }
 
 /* ====== Mobile responsive dropdowns ====== */

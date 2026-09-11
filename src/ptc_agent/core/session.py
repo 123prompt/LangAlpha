@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import TracebackType
+from typing import Any
 
 import structlog
 
@@ -72,6 +73,12 @@ class Session:
         # the composite's tool lists: a server that legitimately advertises
         # zero tools is settled too, and must not re-probe every acquire.
         self.mcp_settled_servers: set[str] = set()
+        # Tools bound to the model directly (server name -> the server's
+        # ``DirectServerTools``), taken out of the composite at install so the
+        # sandbox never gets a wrapper for them. Opaque here: the value is the
+        # server layer's, which this library does not import. Execution
+        # context, like the composite.
+        self.direct_mcp_tools: dict[str, Any] = {}
 
         # Egress-relay binding for OAuth-connected servers: what THIS process
         # last pushed to the sandbox. Execution context only — grant truth is
@@ -103,25 +110,31 @@ class Session:
         """Read agent.md from sandbox, with session-level caching.
 
         Returns cached content unless invalidated by invalidate_agent_md().
+
+        A failed read keeps the previous value and stays dirty. Caching the
+        failure as None would conflate "the workspace has no notes" with "the
+        sandbox did not answer", handing the model the no-agent.md placeholder
+        and inviting it to recreate a file that already exists.
         """
         if self._agent_md_dirty:
-            if self.sandbox:
-                try:
-                    self._agent_md_cache = await self.sandbox.aread_file_text(
-                        self.sandbox.normalize_path("agent.md")
-                    )
-                except Exception:
-                    # A missing agent.md is a silent None from aread_file_text;
-                    # reaching here means the read itself failed.
-                    logger.warning(
-                        "Failed to read agent.md",
-                        conversation_id=self.conversation_id,
-                        exc_info=True,
-                    )
-                    self._agent_md_cache = None
+            try:
+                content = (
+                    await self.sandbox.aread_file_text(self.sandbox.normalize_path("agent.md"))
+                    if self.sandbox
+                    else None
+                )
+            except Exception:
+                # A missing agent.md is a silent None from aread_file_text;
+                # reaching here means the read itself failed, so fall through
+                # holding the last good value and stay dirty for a retry.
+                logger.warning(
+                    "Failed to read agent.md",
+                    conversation_id=self.conversation_id,
+                    exc_info=True,
+                )
             else:
-                self._agent_md_cache = None
-            self._agent_md_dirty = False
+                self._agent_md_cache = content
+                self._agent_md_dirty = False
         return self._agent_md_cache
 
     def invalidate_agent_md(self) -> None:
@@ -326,6 +339,7 @@ class Session:
         self._owns_mcp_registry = False
         self.mcp_tool_summary = None
         self.mcp_config_version = None
+        self.direct_mcp_tools = {}
         # The binding records what the (now gone) sandbox held; keeping it
         # would violate that invariant and read as a teardown trigger on the
         # next sync.
@@ -372,6 +386,7 @@ class Session:
         self._owns_mcp_registry = False
         self.mcp_tool_summary = None
         self.mcp_config_version = None
+        self.direct_mcp_tools = {}
         self.egress_binding = None
         # Restore the pristine server list so a restart re-enters PTCSandbox with
         # the unresolved built-ins, not the stale per-workspace resolution.

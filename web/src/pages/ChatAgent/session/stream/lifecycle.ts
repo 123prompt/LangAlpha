@@ -15,11 +15,19 @@ import { ZERO_USAGE } from '../../utils/tokenUsage';
 import { REPORT_BACK_IDLE_MAX_REARMS } from '../../hooks/useReportBackWatch';
 import { createAssistantMessage, appendMessage, updateMessage } from '../../hooks/utils/messageHelpers';
 import { finalizeTodoListProcessesInMessages } from '../../hooks/utils/messageFinalizers';
+import { stripHistoryInterruptCards } from '../interrupts/buckets';
 import { checkForNewBuild } from '@/lib/staleBuild';
 import { isOnline, waitForOnline } from '@/lib/network';
 import type { AssistantMessage } from '@/types/chat';
-import type { SSEEvent, HistoryInterruptInfo, StreamProcessorRefs } from '../types';
+import type { SSEEvent, StreamProcessorRefs } from '../types';
 import type { RecoveryRuntime } from '../runtime';
+
+/** Quiet gap after the last held event before a reconnect stream that never
+ *  sends `caught_up` paints what it has. */
+export const RECONNECT_BACKLOG_QUIET_MS = 1500;
+/** Ceiling measured from the first held event, so a replay that keeps the
+ *  quiet window alive still paints instead of being held indefinitely. */
+export const RECONNECT_BACKLOG_CAP_MS = 6000;
 
 export interface ReconnectOptions {
   activeTasks?: string[];
@@ -159,63 +167,7 @@ export const reconnectToStream = async (
     for (const info of stripList) {
       if (info.interruptId) rt.renderedInterruptIdsRef.current.delete(info.interruptId);
     }
-    const stripsByMsgId = new Map<string, HistoryInterruptInfo[]>();
-    for (const info of stripList) {
-      const arr = stripsByMsgId.get(info.assistantMessageId) || [];
-      arr.push(info);
-      stripsByMsgId.set(info.assistantMessageId, arr);
-    }
-    rt.setMessages((prev) =>
-      prev.map((m) => {
-        if (m.role !== 'assistant') return m;
-        const strips = stripsByMsgId.get(m.id);
-        if (!strips) return m;
-        const msg = m as AssistantMessage;
-        const stripQuestionIds = new Set(
-          strips.filter((s) => s.type === 'ask_user_question' && s.questionId).map((s) => s.questionId!),
-        );
-        const stripProposalIds = new Set(strips.filter((s) => s.proposalId).map((s) => s.proposalId!));
-        const stripPlanApprovalIds = new Set(
-          strips.filter((s) => s.type === 'plan_approval' && s.planApprovalId).map((s) => s.planApprovalId!),
-        );
-        const newSegments = (msg.contentSegments || []).filter((seg) => {
-          if (seg.type === 'user_question') return !stripQuestionIds.has(seg.questionId);
-          if (
-            seg.type === 'create_workspace' ||
-            seg.type === 'start_question' ||
-            seg.type === 'ptc_agent' ||
-            seg.type === 'delete_workspace' ||
-            seg.type === 'stop_workspace' ||
-            seg.type === 'delete_thread'
-          ) {
-            return !stripProposalIds.has(seg.proposalId);
-          }
-          if (seg.type === 'plan_approval') return !stripPlanApprovalIds.has(seg.planApprovalId);
-          return true;
-        });
-        const next: AssistantMessage = { ...msg, contentSegments: newSegments };
-        if (stripQuestionIds.size > 0 && msg.userQuestions) {
-          const map = { ...msg.userQuestions };
-          for (const qid of stripQuestionIds) delete map[qid];
-          next.userQuestions = map;
-        }
-        if (stripProposalIds.size > 0) {
-          for (const key of ['workspaceProposals', 'questionProposals', 'ptcAgentProposals', 'secretaryActionProposals'] as const) {
-            const bucket = msg[key];
-            if (!bucket) continue;
-            const map = { ...bucket };
-            for (const pid of stripProposalIds) delete (map as Record<string, unknown>)[pid];
-            (next as unknown as Record<string, unknown>)[key] = map;
-          }
-        }
-        if (stripPlanApprovalIds.size > 0 && msg.planApprovals) {
-          const map = { ...msg.planApprovals };
-          for (const pid of stripPlanApprovalIds) delete map[pid];
-          next.planApprovals = map;
-        }
-        return next;
-      }),
-    );
+    rt.setMessages((prev) => stripHistoryInterruptCards(prev, stripList));
     // Redirect refs so the tool_call_result history-resolver targets the new bubble.
     for (const info of stripList) info.assistantMessageId = assistantMessageId;
   }
@@ -333,18 +285,77 @@ export const reconnectToStream = async (
       rt.isReconnectingOwnerRef.current = null;
     }
   };
+  // The per-run log replays its backlog in a burst before the live tail.
+  // Applied event by event, that burst is presented as if it were live: the
+  // bubble mounts empty, the typewriter re-types everything already written,
+  // and the scroll follow chases it. So the backlog is held until the server's
+  // `caught_up` marker and applied in one synchronous pass, which React
+  // batches into a single render: the turn appears as it was, and only what
+  // arrives afterwards streams. The timers are the fallback for a stream that
+  // never sends the marker; they cost a delayed first paint, never lost events.
+  let backlog: SSEEvent[] | null = [];
+  let backlogTimer: ReturnType<typeof setTimeout> | null = null;
+  let backlogCapAt = 0;
+  // One processor for the whole stream: it owns closure state a steering
+  // continuation rewrites (the bubble it appends to, pending task ids), so
+  // the tail cannot be handed to a fresh one. Handlers read `isReconnect` off
+  // the bag on arrival, so flipping it after the synchronous flush is what
+  // turns the tail live. Only the stream that still owns the reader may paint
+  // what it held: a superseded or stopped one discards its backlog, and the
+  // cursor stays put, so the reconnect that replaced it replays the same
+  // events from the log.
+  const flushBacklog = () => {
+    if (!backlog) return;
+    const held = backlog;
+    backlog = null;
+    if (backlogTimer) clearTimeout(backlogTimer);
+    backlogTimer = null;
+    if (rt.wasStoppedRef.current || rt.mainStreamAbortRef.current !== abortController) return;
+    for (const heldEvent of held) baseProcessEvent(heldEvent);
+    refs.isReconnect = false;
+    // Reaching this point is itself proof the stream is attached and current.
+    markReconnected();
+  };
+  // Restart the quiet window on every held event so a slow replay is not cut
+  // in half, but never hold past the cap.
+  const armBacklogTimer = () => {
+    const now = Date.now();
+    if (!backlogCapAt) backlogCapAt = now + RECONNECT_BACKLOG_CAP_MS;
+    if (backlogTimer) clearTimeout(backlogTimer);
+    backlogTimer = setTimeout(
+      flushBacklog,
+      Math.max(0, Math.min(RECONNECT_BACKLOG_QUIET_MS, backlogCapAt - now)),
+    );
+  };
   const processEvent = (event: SSEEvent) => {
-    receivedEvent = true;
     // Progress resets the re-arm budget: a healthy run with an occasional
     // >idleAbortMs gap must never accrue toward the wedged-run cap.
     idleRearms = 0;
+    bumpIdle?.();
+    // The marker is transport, not content: a stream that sent only it has
+    // rendered nothing, and must read as such when it closes.
+    if (event.event === 'caught_up') {
+      flushBacklog();
+      return;
+    }
+    receivedEvent = true;
+    if (backlog) {
+      backlog.push(event);
+      armBacklogTimer();
+      return;
+    }
     baseProcessEvent(event);
     markReconnected();
-    bumpIdle?.();
   };
   // Arm before the first read so an un-started run (no events at all) still
   // trips the watchdog instead of hanging forever.
   bumpIdle?.();
+  // Bound the hold from the first read, not the first held event: a stream
+  // that sends neither marker nor data (the head probe failed with the
+  // cursor already at the head) would otherwise keep the spinner up until
+  // the model speaks again.
+  backlogCapAt = Date.now() + RECONNECT_BACKLOG_CAP_MS;
+  backlogTimer = setTimeout(flushBacklog, RECONNECT_BACKLOG_CAP_MS);
 
   try {
     // Replay buffered events first — this processes artifact{task,spawned} events
@@ -357,6 +368,10 @@ export const reconnectToStream = async (
       processEvent,
       abortController.signal,
     );
+    // A stream that ended (or dropped) before the marker still shows what it
+    // delivered, and advances the cursor so a retry resumes after it. Not on
+    // a user stop: stopWorkflow already finalized the bubble.
+    flushBacklog();
     // User stop aborted the reader — stopWorkflow owns teardown; bail.
     // Exception: a foreground handler aborted this stream because the tab
     // resumed (background abort, not a user stop) — re-kick the reconnect.
@@ -422,6 +437,7 @@ export const reconnectToStream = async (
       deps.attachSubagentMux(tid, processEvent, snapshotAtMs);
     }
   } catch (err: unknown) {
+    flushBacklog();
     // User stop aborted the reader — stopWorkflow owns teardown; bail before
     // surfacing this as a reconnect error.
     if ((err as Error)?.name === 'AbortError' || rt.wasStoppedRef.current) {
@@ -438,6 +454,7 @@ export const reconnectToStream = async (
   } finally {
     // Stop the idle watchdog (no-op when it already fired or was never armed).
     if (idleTimer) clearTimeout(idleTimer);
+    if (backlogTimer) clearTimeout(backlogTimer);
     // Clean up empty reconnect messages (no content segments = nothing was
     // streamed). Skip on a user stop: finalizeStreamingMessage just stamped
     // this bubble `stopped: true` (with the "⏹ Stopped" chip) but left it

@@ -25,6 +25,7 @@ be declared there (enforced by `web/src/styles/__tests__/tokenRefs.test.ts`).
 | Cards | `hsl(var(--card))` ~#202020 | white + `#E8E8E6` hairline |
 | Elevated (menus, tooltips) | `#2A2B2E` | `#F7F7F6` |
 | Primary text | `#E6E6E4` | `#1F1F1E` |
+| Focus ring | = primary text | = primary text |
 | Accent (annotation) | `#E9954A` | `#D07D33` |
 | Primary button | `#ECECEA` bg / `#1A1B1D` text | `#1F1D1A` bg / `#FAF9F7` text |
 | Profit / loss | `#3FB950` / `#F85149` | `#1A7F37` / `#CF222E` |
@@ -56,6 +57,24 @@ ascii liveness glyph. Never:
   state are carried by glyphs + text, and borders stay uniform neutral. The
   only sanctioned edge markers are **nav selection** (sidebar rail edge,
   bottom-bar underline, watchlist active row).
+
+The rule governs the product's own surfaces. Illustrations that *depict* the
+product are not one of them: the onboarding intro panels draw a miniature of the
+app rather than being part of it, and they carry the accent structurally, in
+washes, glows and fills. A picture of a branded thing reads as brand, not as
+state. The alternative is a picture whose color has to be kept in step with the
+brand by hand, which is how that panel spent a rebrand still showing the old one.
+
+**The sign-in page is the one product surface that is exempt**, and the reason
+is that the rule has nothing to bite on there. It carries no chrome, no
+navigation and no data, so there is nothing for the accent to annotate. Amber
+is its whole interaction vocabulary instead: the submit button has always taken the
+fill on hover, and keyboard focus takes the same fill rather than inventing a
+second language for the same "about to act" state. Focus is not left to hue
+alone, since hue is what a color deficiency flattens: an underline by default, a
+doubled edge on the boxed controls, an outline under forced colors. The exemption
+is the `.login-page` surface itself, not the route it mounts on: the same build
+serves the app from that route once someone is signed in.
 
 Semantic color (profit/loss/warning/danger) is separate from the accent and
 never substitutes for it.

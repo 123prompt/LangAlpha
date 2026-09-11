@@ -79,6 +79,7 @@ def _row(
         "status": ConnectionStatus(status),
         "token_type": "Bearer",
         "scope": "notes.read offline_access",
+        "granted_capabilities": None,
         "expires_at": (
             None if expires_in is None else now + timedelta(seconds=expires_in)
         ),
@@ -2071,6 +2072,7 @@ class TestRowShapeContract:
             "status": "connected",
             "token_type": "Bearer",
             "scope": "notes.read offline_access",
+            "granted_capabilities": None,
             "expires_at": now + timedelta(seconds=self.EXPIRES_IN),
             "token_generation": 3,
             "client_info": {"client_id": "client-abc123"},

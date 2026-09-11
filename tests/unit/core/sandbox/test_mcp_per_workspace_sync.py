@@ -353,7 +353,11 @@ class TestManifestRegression:
                     "price",
                     transport="stdio",
                     command="uv",
-                    args=["run", "python", "mcp_servers/price_data_mcp_server.py"],
+                    args=[
+                        "run",
+                        "python",
+                        "plugins/langalpha_market_data/price_data_mcp_server.py",
+                    ],
                 )
             ]
         )
@@ -380,16 +384,19 @@ class TestManifestRegression:
 
         from ptc_agent.core.sandbox._shared import _MCP_SHARED_RUNTIME_FILES
 
-        root = Path(__file__).resolve().parents[4] / "mcp_servers"
+        repo = Path(__file__).resolve().parents[4]
+        root = repo / "mcp_servers"
         pattern = re.compile(
             r"^\s*(?:from (_[a-z]\w*) import|from mcp_servers\.(_[a-z]\w*) import"
             r"|from mcp_servers import (_[a-z]\w*)|import (_[a-z]\w*))",
             re.MULTILINE,
         )
         shipped = set(_MCP_SHARED_RUNTIME_FILES)
-        importers = sorted(root.glob("*_mcp_server.py")) + [
-            root / name for name in _MCP_SHARED_RUNTIME_FILES
-        ]
+        # Entrypoints live in their bundles now; the siblings they import are
+        # still shipped from mcp_servers/, which is what this gate is about.
+        entrypoints = sorted(repo.glob("plugins/*/*_mcp_server.py"))
+        assert entrypoints, "no bundled entrypoints found; this gate would pass vacuously"
+        importers = entrypoints + [root / name for name in _MCP_SHARED_RUNTIME_FILES]
         for source_file in importers:
             for match in pattern.finditer(source_file.read_text()):
                 module = next(g for g in match.groups() if g)
@@ -523,13 +530,12 @@ class TestDocPathTraversal:
     """A hostile workspace tool name maps to a contained doc filename."""
 
     def _doc_path(self, work_dir, server_name, tool_name, source):
-        # Mirrors the filename logic in PTCSandbox._install_tool_modules.
-        from ptc_agent.core.mcp_sanitize import sanitize_tool_name
+        # The shipped helper, not a copy of it: this test used to re-derive the
+        # filename, which is the same duplication that let a doc survive the
+        # sweep meant to delete it.
+        from ptc_agent.core.sandbox.mcp_setup import _doc_name
 
-        if source == "workspace":
-            doc_name = sanitize_tool_name(tool_name) or "_invalid_tool"
-        else:
-            doc_name = tool_name
+        doc_name = _doc_name(tool_name, source == "workspace")
         return f"{work_dir}/tools/docs/{server_name}/{doc_name}.md"
 
     def test_traversal_name_is_contained(self):
@@ -548,6 +554,149 @@ class TestDocPathTraversal:
         work_dir = "/home/workspace"
         path = self._doc_path(work_dir, "market", "get_price", "builtin")
         assert path == "/home/workspace/tools/docs/market/get_price.md"
+
+
+# ---------------------------------------------------------------------------
+# Stale per-tool docs are swept, not just stale server dirs
+# ---------------------------------------------------------------------------
+
+
+class TestStaleDocSweep:
+    """A tool that leaves a server's set loses its doc in the same sync.
+
+    The wrapper module is one file rewritten whole, so it drops a withdrawn
+    tool for free. ``tools/docs/<server>/`` is one file per tool and drops
+    nothing on its own, and the tool guide points the agent at that directory
+    as the answer to "what can this server do". Capability consent withdraws
+    tools on a user toggle, so without this the agent goes on reading that it
+    may place live orders for someone who declined exactly that.
+    """
+
+    WORK_DIR = "/home/workspace"
+
+    def _sandbox(self, tools, docs_listing, tools_listing=()):
+        config = _make_config(
+            servers=[_connector("broker", transport="http", url="https://example.test/mcp")]
+        )
+        sandbox = _make_sandbox(config)
+        sandbox._work_dir = self.WORK_DIR
+        sandbox.mcp_registry = MagicMock()
+        sandbox.mcp_registry.get_all_tools = MagicMock(return_value=tools)
+        sandbox.runtime = MagicMock()
+        sandbox.tool_generator = MagicMock()
+        sandbox.tool_generator.generate_mcp_client_code = MagicMock(return_value="")
+        sandbox.tool_generator.generate_tool_module = MagicMock(return_value="")
+        sandbox.tool_generator.generate_tool_documentation = MagicMock(return_value="")
+
+        listings = {
+            f"{self.WORK_DIR}/tools/docs": docs_listing,
+            f"{self.WORK_DIR}/tools": list(tools_listing),
+        }
+
+        async def als_directory(path):
+            if path in listings:
+                return listings[path]
+            return [
+                {
+                    "name": name,
+                    "path": f"{path}/{name}",
+                    "is_dir": False,
+                }
+                for name in listings.get(("dir", path), [])
+            ]
+
+        sandbox.als_directory = AsyncMock(side_effect=als_directory)
+        sandbox._upload_files_batch = AsyncMock()
+        # A real ExecResult, not a bare mock: the sweep now reads exit_code, and
+        # a MagicMock attribute is truthy, which would read as a failed delete.
+        sandbox._runtime_call = AsyncMock(
+            return_value=ExecResult(stdout="", stderr="", exit_code=0)
+        )
+        return sandbox, listings
+
+    def _dir_entry(self, name):
+        return {"name": name, "path": f"{self.WORK_DIR}/tools/docs/{name}", "is_dir": True}
+
+    async def _run(self, tools, server_docs):
+        from ptc_agent.core.sandbox.mcp_setup import _install_tool_modules
+
+        sandbox, listings = self._sandbox(tools, [self._dir_entry("broker")])
+        listings[("dir", f"{self.WORK_DIR}/tools/docs/broker")] = server_docs
+        await _install_tool_modules(sandbox)
+        # The sweep is one `rm -rf`; the same seam also carries the mkdir.
+        return next(
+            (
+                call.args[1]
+                for call in sandbox._runtime_call.await_args_list
+                if str(call.args[1]).startswith("rm -rf ")
+            ),
+            "",
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_withdrawn_tools_doc_is_removed(self):
+        tools = {"broker": [SimpleNamespace(name="get_quote", input_schema={})]}
+        rm_cmd = await self._run(tools, ["get_quote.md", "place_order.md"])
+        assert f"{self.WORK_DIR}/tools/docs/broker/place_order.md" in rm_cmd
+        assert "get_quote.md" not in rm_cmd
+
+    @pytest.mark.asyncio
+    async def test_a_surviving_tools_doc_is_left_alone(self):
+        tools = {
+            "broker": [
+                SimpleNamespace(name="get_quote", input_schema={}),
+                SimpleNamespace(name="place_order", input_schema={}),
+            ]
+        }
+        rm_cmd = await self._run(tools, ["get_quote.md", "place_order.md"])
+        assert rm_cmd == ""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_delete_is_not_reported_as_a_clean_sweep(self):
+        """A silent delete failure is indistinguishable from never sweeping.
+
+        The sync would go on to stamp the manifest current, so the doc for a
+        declined tool would survive every later sync too.
+        """
+        from ptc_agent.core.sandbox.mcp_setup import _install_tool_modules
+
+        tools = {"broker": [SimpleNamespace(name="get_quote", input_schema={})]}
+        sandbox, listings = self._sandbox(tools, [self._dir_entry("broker")])
+        listings[("dir", f"{self.WORK_DIR}/tools/docs/broker")] = [
+            "get_quote.md",
+            "place_order.md",
+        ]
+        sandbox._runtime_call = AsyncMock(
+            return_value=ExecResult(stdout="", stderr="denied", exit_code=1)
+        )
+        with pytest.raises(RuntimeError, match="stale tool files"):
+            await _install_tool_modules(sandbox)
+
+    @pytest.mark.asyncio
+    async def test_a_broken_sandbox_is_not_read_as_nothing_to_sweep(self):
+        """als_directory returns [] for an absent directory and raises only on a
+        real failure, so the raise has to travel rather than read as clean."""
+        from ptc_agent.core.sandbox.mcp_setup import _install_tool_modules
+
+        tools = {"broker": [SimpleNamespace(name="get_quote", input_schema={})]}
+        sandbox, _ = self._sandbox(tools, [self._dir_entry("broker")])
+        sandbox.als_directory = AsyncMock(side_effect=RuntimeError("sandbox down"))
+        with pytest.raises(RuntimeError, match="sandbox down"):
+            await _install_tool_modules(sandbox)
+
+    @pytest.mark.asyncio
+    async def test_a_sanitized_name_matches_the_doc_the_writer_produced(self):
+        """The sweep and the writer derive the filename the same way.
+
+        A user-tier name is sanitized before it becomes a filename, so a sweep
+        comparing against the raw name would delete the doc it just wrote.
+        """
+        tools = {"broker": [SimpleNamespace(name="get quote", input_schema={})]}
+        from ptc_agent.core.sandbox.mcp_setup import _doc_name
+
+        written = f"{_doc_name('get quote', True)}.md"
+        rm_cmd = await self._run(tools, [written])
+        assert rm_cmd == ""
 
 
 # ---------------------------------------------------------------------------

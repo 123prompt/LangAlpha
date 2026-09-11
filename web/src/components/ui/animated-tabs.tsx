@@ -41,7 +41,7 @@ export function AnimatedTabs({
             className={`
               relative rounded-md px-3 py-1.5 text-sm font-medium
               outline-none transition-colors cursor-pointer
-              focus-visible:ring-2 focus-visible:ring-[var(--color-accent-overlay)]
+              focus-visible:ring-2 focus-visible:ring-ring
               ${isActive ? "" : "hover:opacity-60"}
             `}
             style={{

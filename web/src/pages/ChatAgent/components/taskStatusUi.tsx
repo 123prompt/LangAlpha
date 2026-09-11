@@ -22,6 +22,7 @@ import type { SubagentDisplayStatus } from '../session/subagents/subagentStatus'
 
 export type TaskCardStatusKind =
   | 'running'
+  | 'pausing'
   | 'completed'
   | 'cancelled'
   | 'error'
@@ -49,6 +50,15 @@ interface TaskCardStatusUi {
 export const STATUS_UI: Record<TaskCardStatusKind, TaskCardStatusUi> = {
   running: {
     labelKey: 'chat.taskCard.statusRunning',
+    color: 'var(--color-warning)',
+    Icon: null,
+    live: true,
+  },
+  // Client-only state during a credit pause: the parent is interrupted but the
+  // task's own gate only stops it at its next model boundary, so the card
+  // stays live while promising a stop rather than more work.
+  pausing: {
+    labelKey: 'chat.taskCard.statusPausing',
     color: 'var(--color-warning)',
     Icon: null,
     live: true,
@@ -90,12 +100,21 @@ export const STATUS_UI: Record<TaskCardStatusKind, TaskCardStatusUi> = {
  * verb (`updated`/`resumed`) overrides it. Anything the vocabulary doesn't
  * name falls to `unknown`, which renders the wire value verbatim rather than
  * guessing an outcome.
+ *
+ * `pausing` is the one kind no wire status can produce: it is a view of a
+ * running task while its turn holds an unresolved credit pause, so the caller
+ * that knows about the pause passes `pausing` and this maps it. Deriving it
+ * here rather than writing it onto the record is what makes it revert on its
+ * own when the pause resolves, and keeps it out of anything replay must
+ * reproduce.
  */
 export function taskCardStatusKind(
   status: string | null | undefined,
+  pausing: boolean = false,
 ): TaskCardStatusKind {
   switch (status) {
     case 'running':
+      return pausing ? 'pausing' : 'running';
     case 'completed':
     case 'cancelled':
     case 'error':

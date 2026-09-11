@@ -36,8 +36,10 @@ from ptc_agent.agent.middleware import (
     PlanModeMiddleware,
     SubagentEventCaptureMiddleware,
     MultimodalMiddleware,
+    MultimodalStripMiddleware,
     create_plan_mode_interrupt_config,
     CodeValidationMiddleware,
+    CreditGateMiddleware,
     EmptyToolCallRetryMiddleware,
     LeakDetectionMiddleware,
     ProtectedPathMiddleware,
@@ -60,6 +62,11 @@ from ptc_agent.agent.middleware import (
     # injects <memo-index count=N path=.../>
     MemoAwarenessMiddleware,
     ReasoningCompatibilityMiddleware,
+)
+from ptc_agent.agent.middleware.direct_mcp import (
+    DirectMcpPolicyMiddleware,
+    DirectToolSet,
+    direct_tool_summary,
 )
 from ptc_agent.core.paths import (
     MEMO_INDEX_FILENAME,
@@ -89,6 +96,7 @@ from ptc_agent.agent.prompts import (
     format_current_time,
     format_subagent_summary,
     get_loader,
+    guidance_template_vars,
 )
 from ptc_agent.agent.subagents import (
     SubagentCompiler,
@@ -128,10 +136,7 @@ try:
 except ImportError:
     HumanInTheLoopMiddleware = None  # type: ignore[misc,assignment]
 
-from ptc_agent.agent.middleware.model_resilience import (
-    ModelResilienceMiddleware,
-    build_fallback_pairs,
-)
+from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
 
 try:
     from langgraph.types import Checkpointer
@@ -142,8 +147,6 @@ logger = structlog.get_logger(__name__)
 
 
 DEFAULT_MAX_CONCURRENT_TASK_UNITS = 3
-DEFAULT_MAX_TASK_ITERATIONS = 3
-DEFAULT_MAX_GENERAL_ITERATIONS = 10
 
 
 @dataclass(frozen=True)
@@ -215,20 +218,26 @@ class PTCAgent:
         self,
         tool_summary: str,
         subagent_summary: str,
+        guidance: str,
         plan_mode: bool = False,
         thread_id: str | None = None,
         memory_enabled: bool = True,
         memo_enabled: bool = True,
         crawl_enabled: bool = False,
+        direct_tool_summary: str = "",
     ) -> str:
-        """Build the static system prompt (excludes time/profile for cacheability)."""
-        loader = get_loader()
+        """Build the static system prompt (excludes time/profile for cacheability).
 
+        ``guidance`` shapes the cached prefix, so the prefix varies by (model,
+        guidance) rather than (model), which only splits when a user pins the
+        level themselves.
+        """
+        loader = get_loader()
         return loader.get_system_prompt(
+            **guidance_template_vars(guidance),
             tool_summary=tool_summary,
             subagent_summary=subagent_summary,
             max_concurrent_task_units=DEFAULT_MAX_CONCURRENT_TASK_UNITS,
-            max_task_iterations=DEFAULT_MAX_TASK_ITERATIONS,
             ask_user_enabled=True,
             plan_mode=plan_mode,
             include_examples=True,
@@ -239,28 +248,8 @@ class PTCAgent:
             memo_enabled=memo_enabled,
             market_watch_enabled=self.config.feature_enabled("market_watch"),
             crawl_enabled=crawl_enabled,
+            direct_tool_summary=direct_tool_summary,
         )
-
-    def _build_model_resilience_middleware(self) -> list[Any]:
-        """Retry + fallback + client-visible progress in a single middleware."""
-        fallbacks = build_fallback_pairs(self.config)
-        if fallbacks:
-            logger.debug(
-                "Model fallback enabled",
-                fallback_models=[name for name, _ in fallbacks],
-            )
-        return [
-            ModelResilienceMiddleware(
-                primary_name=self.config.llm.name,
-                primary_client=self.llm,
-                fallbacks=fallbacks,
-                max_retries=3,
-                backoff_factor=2.0,
-                initial_delay=1.0,
-                max_delay=60.0,
-                jitter=True,
-            )
-        ]
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
         return build_tool_summary_from_registry(
@@ -451,6 +440,8 @@ class PTCAgent:
         user_profile: dict | None = None,
         plan_mode: bool = False,
         thread_id: str | None = None,
+        workspace_name: str = "",
+        workspace_description: str = "",
         on_agent_md_write: Any | None = None,
         store: Any | None = None,
         on_signed_url: Any | None = None,
@@ -459,6 +450,7 @@ class PTCAgent:
         user_data_counts: dict[str, Any] | None = None,
         tool_summary: str | None = None,
         disable_subagents: bool = False,
+        direct_mcp: DirectToolSet | None = None,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -480,7 +472,7 @@ class PTCAgent:
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
         """
-        model = llm if llm is not None else self.llm
+        turn = turn_model(self.config, llm, self.llm, flash=False)
 
         # Freeze current time for this request (refreshes on each new query)
         request_time = datetime.now(tz=UTC)
@@ -600,6 +592,10 @@ class PTCAgent:
         )
         shared_middleware.extend(
             [
+                # First so a stop fires before any per-boundary work below;
+                # shared placement gives subagent lanes the same gate. Inert
+                # unless the server installed a gate state for the lane.
+                CreditGateMiddleware(),
                 ToolArgumentParsingMiddleware(),
                 ProtectedPathMiddleware(
                     denied_directories=self.config.filesystem.denied_directories,
@@ -672,6 +668,12 @@ class PTCAgent:
 
         # Must be first: steering context must be visible before any other middleware.
         main_only_middleware.append(SteeringMiddleware())
+
+        # Consent is re-read per call here, so a tool the connection no longer
+        # covers is refused rather than reaching the vendor.
+        direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
+        if direct_tools:
+            main_only_middleware.append(DirectMcpPolicyMiddleware(direct_mcp))
 
         _bg_registry = background_registry or BackgroundTaskRegistry()
         event_capture_middleware = SubagentEventCaptureMiddleware(registry=_bg_registry)
@@ -775,11 +777,13 @@ class PTCAgent:
         system_prompt = self._build_system_prompt(
             tool_summary,
             subagent_summary,
+            turn.guidance,
             plan_mode=plan_mode,
             thread_id=short_thread_id,
             memory_enabled=gates.memory,
             memo_enabled=gates.memo,
             crawl_enabled=bool(crawl_tools),
+            direct_tool_summary=direct_tool_summary(direct_tools),
         )
 
         logger.debug(
@@ -798,23 +802,28 @@ class PTCAgent:
             compaction_config["_llm_client"] = client
         compaction = CompactionMiddleware.from_config(config=compaction_config, backend=backend)
 
-        model_resilience = self._build_model_resilience_middleware()
+        model_resilience = [build_model_resilience_middleware(self.config, turn)]
 
-        # Inside model_resilience so it strips against the post-fallback model:
-        # a vision primary falling back to a text-only candidate would otherwise
-        # replay image/PDF blocks and earn the 400 the fallback exists to avoid.
-        # In both stacks because a subagent on its own model needs the same
-        # protection; it reads that model off each request, so the two stacks
-        # can share one instance rather than needing one apiece.
-        multimodal = (
-            MultimodalMiddleware(
-                sandbox=sandbox,
-                model_name=self.config.llm.name,
-                custom_modalities=self.config.input_modalities,
-            )
-            if self.config.llm
-            else None
+        # The strip goes inside model_resilience so it judges the post-fallback
+        # model: a vision primary falling back to a text-only candidate would
+        # otherwise replay image/PDF blocks and earn the 400 the fallback exists
+        # to avoid. Both halves go in both stacks because a subagent on its own
+        # model needs the same treatment; the strip reads that model off each
+        # request, so the two stacks share one instance rather than one apiece.
+        #
+        # Unconditional, unlike the read half's old combined form, because the
+        # two halves are no longer switched on together. ``model_name`` only
+        # decides whether the user's per-model override applies; the target is
+        # read off each request, and an unresolvable one is judged text-only. So
+        # a config with no llm gets a strip that removes everything rather than
+        # no strip at all, which is the safe direction: without it the read half
+        # would keep attaching blocks that nothing removes.
+        multimodal_strip = MultimodalStripMiddleware(
+            model_name=self.config.llm.name if self.config.llm else None,
+            custom_modalities=self.config.input_modalities,
+            can_extract=True,
         )
+        multimodal_read = MultimodalMiddleware(sandbox=sandbox)
 
         # Placed before (outer to) model_resilience so sandbox images are
         # captured once, on the final response only — not per retry attempt.
@@ -834,7 +843,8 @@ class PTCAgent:
                 image_capture,
                 compaction,
                 *model_resilience,
-                multimodal,
+                multimodal_strip,
+                multimodal_read,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
@@ -847,7 +857,13 @@ class PTCAgent:
         # Workspace context middleware (agent.md injection — main agent only)
         workspace_context_middleware: list[Any] = []
         if session is not None:
-            workspace_context_middleware = [WorkspaceContextMiddleware(session=session)]
+            workspace_context_middleware = [
+                WorkspaceContextMiddleware(
+                    session=session,
+                    name=workspace_name,
+                    description=workspace_description,
+                )
+            ]
 
         # Positioned after the prompt-cache breakpoint (innermost) so dynamic
         # content doesn't invalidate the cached prefix.
@@ -871,7 +887,7 @@ class PTCAgent:
         # RunWorkflow drops with it below.
         subagent_task_middleware = (
             SubAgentMiddleware(
-                default_model=model,
+                default_model=turn.client,
                 default_tools=list(tools),
                 subagents=subagents if subagents else [],
                 default_middleware=subagent_middleware,
@@ -930,7 +946,8 @@ class PTCAgent:
                 image_capture,
                 compaction,
                 *model_resilience,
-                multimodal,
+                multimodal_strip,
+                multimodal_read,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 OpenAIPromptCachingMiddleware(),
                 # Market watch (main agent only): appends the ephemeral
@@ -953,8 +970,14 @@ class PTCAgent:
             if m is not None
         ]
 
+        # Main agent only, added after the subagent snapshot was taken above:
+        # directly bound MCP tools are the ones a policy has to see every
+        # call, and a subagent runs no main-only middleware.
+        if direct_tools:
+            tools = [*tools, *direct_tools]
+
         agent: Any = create_agent(
-            model,
+            turn.client,
             system_prompt=system_prompt,
             tools=tools,
             middleware=deepagent_middleware,

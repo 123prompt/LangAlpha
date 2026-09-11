@@ -12,6 +12,7 @@ Injected into subagents running in the background. It:
 
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import structlog
 from langchain.agents.middleware import AgentMiddleware
@@ -22,6 +23,7 @@ from langgraph.types import Command
 
 from ptc_agent.agent.middleware.background_subagent.middleware import current_background_tool_call_id
 from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+from src.server.utils.content_normalizer import normalize_text_content
 
 logger = structlog.get_logger(__name__)
 
@@ -49,14 +51,28 @@ def _truncate_content(content: str) -> str:
     )
 
 
+def _visible_text(content: Any) -> str:
+    """The text a client should see for a tool result.
+
+    An attachment rides on the tool result as a block list, so stringifying it
+    would spend the whole capture budget on base64 where the acknowledgment
+    belongs. Read through the same extractor the main SSE producer uses, and
+    keep ``str`` for a shape it cannot name.
+    """
+    if isinstance(content, str):
+        return content
+    text, _ = normalize_text_content(content)
+    return text if text is not None else str(content)
+
+
 def _tool_message_to_event_data(msg: ToolMessage, agent_id: str) -> dict:
     """Build the ``data`` payload for a captured ``tool_call_result`` event.
 
     Shared by the direct-ToolMessage branch and the Command-wrapped branch in
-    ``awrap_tool_call``. Keeps artifact handling and content stringification in
-    one place so the two code paths can't drift.
+    ``awrap_tool_call``. Keeps status/artifact handling and content stringification
+    in one place so the two code paths can't drift.
     """
-    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+    content = _visible_text(msg.content)
     data: dict = {
         "agent": agent_id,
         "id": getattr(msg, "id", ""),
@@ -65,6 +81,11 @@ def _tool_message_to_event_data(msg: ToolMessage, agent_id: str) -> dict:
         "content": _truncate_content(content),
         "content_type": "text",
     }
+    # The whole status travels, not just the failing one. An explicit success
+    # is what stops a client from reading prose that merely looks like a failure.
+    status = getattr(msg, "status", None)
+    if status:
+        data["status"] = status
     if getattr(msg, "artifact", None) is not None:
         data["artifact"] = msg.artifact
     return data

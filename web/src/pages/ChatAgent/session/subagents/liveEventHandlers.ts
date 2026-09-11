@@ -4,14 +4,14 @@
  * none touches the main transcript's `setMessages`.
  */
 
-import { isToolResultFailure } from './subagentStatus';
+import { isToolResultFailure, toolNameOf } from './subagentStatus';
 import {
   WORKFLOW_TASK_TYPE, applyWorkflowLifecycle, isWorkflowRunTerminal, workflowRunDisplayStatus,
   workflowRunStatusFromLedger,
   type WorkflowLifecycleFrame, type WorkflowRunState,
 } from './workflowRunState';
 import type { MessageRecord, ToolCallRecord, ToolCallResultRecord } from '../../hooks/utils/types';
-import { getOrCreateTaskRefs, extractLastReasoningTitle } from '../streamRefs';
+import { getOrCreateTaskRefs, extractLastReasoningTitle, nextArrivalSeq } from '../streamRefs';
 import { isTaskAgentId } from '../../utils/agentId';
 import type {
   StreamRefs, TaskRefs, ToolCallChunkRecord, UpdateSubagentCard,
@@ -209,6 +209,7 @@ export function handleSubagentMessageChunk({
       ...prev,
       contentSegments: nextContentSegments,
       reasoningProcesses,
+      arrivalSeq: nextArrivalSeq(prev),
     };
     taskRefs.messages = updatedMessages;
     updateSubagentCard(taskId, { messages: updatedMessages });
@@ -249,6 +250,7 @@ export function handleSubagentMessageChunk({
       content: ((prev.content as string) || '') + content,
       contentType: 'text',
       isStreaming: true,
+      arrivalSeq: nextArrivalSeq(prev),
     };
 
     taskRefs.messages = updatedMessages;
@@ -314,6 +316,7 @@ export function handleSubagentToolCallChunks({ taskId, assistantMessageId, chunk
   });
 
   msg.pendingToolCallChunks = pending;
+  msg.arrivalSeq = nextArrivalSeq(msg);
   updatedMessages[messageIndex] = msg;
   taskRefs.messages = updatedMessages;
 
@@ -525,7 +528,7 @@ export function handleSubagentToolCallResult({ taskId, assistantMessageId, toolC
     const msg = updatedMessages[messageIndex];
     const toolCallProcesses = { ...((msg.toolCallProcesses as Record<string, Record<string, unknown>>) || {}) };
 
-    const isFailed = isToolResultFailure(result);
+    const isFailed = isToolResultFailure({ ...result, toolName: toolNameOf(toolCallProcesses, toolCallId) });
 
     if (toolCallProcesses[toolCallId]) {
       toolCallProcesses[toolCallId] = {

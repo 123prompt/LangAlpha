@@ -27,10 +27,22 @@ import io
 import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from src.server.database.account_disables import (
+    list_account_disables,
+    set_account_disable,
+)
 from src.server.database.mcp_servers import list_catalog_servers
 from src.server.database.plugins import (
     MAX_PLUGINS_PER_USER,
@@ -70,6 +82,14 @@ from src.server.services.plugins import (
 )
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 from src.server.utils.uploads import read_capped
+from src.server.services.brand_icons import icon_response
+from src.server.services.plugins.bundled import (
+    bundled_names,
+    BundleOwnershipUnavailable,
+    enforcement_owners,
+    icon_site_for,
+    list_bundled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -190,12 +210,17 @@ def _ambiguous_to_http(e: PluginAmbiguous) -> HTTPException:
 async def list_plugins_endpoint(user_id: CurrentUserId) -> PluginListResponse:
     rows = await list_plugins(user_id)
     components = await _components_by_plugin(user_id)
+    # Bundles ship with the app rather than being installed, so they lead the
+    # list and are not counted against the user's slots.
     return PluginListResponse(
         plugins=[
-            plugin_row_to_info(
-                r, components=components.get(r["user_plugin_id"], [])
-            )
-            for r in rows
+            *list_bundled((await list_account_disables(user_id)).bundles),
+            *(
+                plugin_row_to_info(
+                    r, components=components.get(r["user_plugin_id"], [])
+                )
+                for r in rows
+            ),
         ],
         max_plugins=MAX_PLUGINS_PER_USER,
         remaining_slots=max(0, MAX_PLUGINS_PER_USER - len(rows)),
@@ -460,12 +485,57 @@ async def set_plugin_enabled_endpoint(
     name: str, body: EnabledInput, user_id: CurrentUserId
 ) -> PluginEnabledResponse:
     """Plugin-level switch: suppresses every still-owned component through
-    the delivery join predicate, without touching the component rows."""
+    the delivery join predicate, without touching the component rows.
+
+    A bundle has no row to flag, so its answer is stored the other way up: a
+    disable is written, an enable is the absence of one. Both resolvers expand
+    the bundle into its components' names, so what the user sees switch off is
+    the same set either kind of package suppresses.
+    """
     from src.server.services.mcp_oauth.lifecycle import revoke_live_grants
 
     row = await set_plugin_enabled(user_id, name, body.enabled)
     if row is None:
-        raise HTTPException(status_code=404, detail="Plugin not found")
+        if name not in bundled_names():
+            # A disable outlives the name it was written against: rename a
+            # bundle between releases and the live list no longer answers to
+            # what the user switched off. Refusing the way back out would
+            # strand that row forever, unreachable from the page that wrote
+            # it, so an enable is allowed to clear one that is already there.
+            # Only the way out -- a disable still needs a package that exists.
+            if body.enabled and name in (
+                await list_account_disables(user_id)
+            ).bundles:
+                await set_account_disable(user_id, "bundle", name, disabled=False)
+                return PluginEnabledResponse(name=name, enabled=True)
+            raise HTTPException(status_code=404, detail="Plugin not found")
+        # Installed row first, bundle second, and the order is the rule rather
+        # than an optimization. Install refuses a name a bundle already ships,
+        # so the only way both can exist is a deploy introducing a name someone
+        # installed earlier, and the package the user chose themselves is the
+        # one whose switch has to keep working.
+        # Resolve BEFORE the write. owned_by refuses when the boot snapshot
+        # cannot say what this bundle owns, and a disable committed ahead of
+        # that refusal is the worst of both: the request 500s, the row stays,
+        # and every later turn re-raises on the same unanswerable name. Read
+        # from the snapshot, like every other withdrawal: the grants being cut
+        # belong to the servers this process is running, not to whatever
+        # plugins/ says a moment later.
+        #
+        # Only on the way off. Re-enabling is how a user gets out of a disable
+        # that stopped being enforceable, so it must never need the answer that
+        # is missing.
+        servers: frozenset[str] = frozenset()
+        if not body.enabled:
+            try:
+                servers, _ = enforcement_owners().owned_by({name})
+            except BundleOwnershipUnavailable as e:
+                raise HTTPException(status_code=503, detail=str(e)) from e
+        await set_account_disable(user_id, "bundle", name, disabled=not body.enabled)
+        if not body.enabled:
+            await revoke_live_grants(user_id, sorted(servers))
+        return PluginEnabledResponse(name=name, enabled=body.enabled)
+
     if not body.enabled:
         # The join predicate only decides what the NEXT acquire delivers. A
         # sandbox that already holds a relay JWT for one of these servers keeps
@@ -497,3 +567,15 @@ async def delete_plugin_endpoint(
     plugin: CurrentPlugin, user_id: CurrentUserId
 ) -> UninstallResponse:
     return UninstallResponse(deleted=await uninstall_plugin(user_id, plugin))
+
+
+@router.get("/{name}/icon")
+async def get_bundle_icon(name: str) -> Response:
+    """The mark a wrapper bundle names, proxied from the vendor's site.
+
+    Unauthenticated for the same reason the brokerage icon is: an ``<img>``
+    cannot send a bearer token, and the only input is a bundle name this build
+    ships. Bundles that ship their own art never reach here -- the frontend
+    already holds those files -- so a 404 is the ordinary answer, not a fault.
+    """
+    return await icon_response(icon_site_for(name))

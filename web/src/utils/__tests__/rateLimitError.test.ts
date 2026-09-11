@@ -6,8 +6,18 @@ import { buildRateLimitError } from '../rateLimitError';
 // naming our own deployment would still pass if the value were hardcoded.
 const PORTAL = 'https://account.example.com';
 const PORTAL_LINKS = [
-  { url: `${PORTAL}/plans`, label: 'Manage plan', external: true },
-  { url: `${PORTAL}/usage`, label: 'View usage', external: true },
+  {
+    url: `${PORTAL}/plans`,
+    label: 'Manage plan',
+    labelKey: 'chat.errorLinkManagePlan',
+    external: true,
+  },
+  {
+    url: `${PORTAL}/usage`,
+    label: 'View usage',
+    labelKey: 'chat.errorLinkViewUsage',
+    external: true,
+  },
 ];
 
 describe('buildRateLimitError', () => {
@@ -53,8 +63,18 @@ describe('buildRateLimitError', () => {
     // and the CTA does nothing.
     const result = buildRateLimitError({ type: 'monthly_credit_limit' }, '/account');
     expect(result.links).toEqual([
-      { url: '/account/plans', label: 'Manage plan', external: true },
-      { url: '/account/usage', label: 'View usage', external: true },
+      {
+        url: '/account/plans',
+        label: 'Manage plan',
+        labelKey: 'chat.errorLinkManagePlan',
+        external: true,
+      },
+      {
+        url: '/account/usage',
+        label: 'View usage',
+        labelKey: 'chat.errorLinkViewUsage',
+        external: true,
+      },
     ]);
   });
 

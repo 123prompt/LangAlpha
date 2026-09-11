@@ -333,19 +333,27 @@ class TestSkillsConfig:
         cfg = SkillsConfig()
         assert cfg.enabled is True
         assert cfg.user_skills_dir == "~/.ptc-agent/skills"
-        assert cfg.project_skills_dir == "skills"
 
     def test_local_skill_dirs_with_sandbox(self):
+        # Bundles are patched away for this package (see conftest), so what is
+        # left is the operator's own directory and nothing else.
         cfg = SkillsConfig()
-        cwd = Path("/test/project")
-        dirs = cfg.local_skill_dirs_with_sandbox(cwd=cwd)
-        assert len(dirs) == 2
-        # User dir first (lower priority), project dir second (higher priority)
+        dirs = cfg.local_skill_dirs_with_sandbox()
+        assert len(dirs) == 1
         user_dir, user_sandbox = dirs[0]
-        project_dir, project_sandbox = dirs[1]
         assert "ptc-agent/skills" in user_dir
-        assert "/test/project/skills" in project_dir
         assert user_sandbox == "/home/workspace/.agents/skills"
+
+    def test_the_sources_do_not_depend_on_the_working_directory(
+        self, monkeypatch, tmp_path
+    ):
+        # The shipped skills live in the bundle that declares them, so nothing
+        # resolves against cwd any more; a server started from anywhere has to
+        # see the same set.
+        cfg = SkillsConfig()
+        before = cfg.local_skill_dirs_with_sandbox()
+        monkeypatch.chdir(tmp_path)
+        assert cfg.local_skill_dirs_with_sandbox() == before
 
 
 # ---------------------------------------------------------------------------

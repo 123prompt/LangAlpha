@@ -205,7 +205,7 @@ export default function AutomationInlineForm({
   });
 
   const { data: wsData } = useWorkspaces({ limit: 100 });
-  const workspaces = (wsData as { workspaces?: WorkspaceOption[] })?.workspaces ?? [];
+  const workspaces: WorkspaceOption[] = wsData?.workspaces ?? [];
 
   const set = (key: keyof FormState) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement> | string) =>
     setForm((f) => ({ ...f, [key]: typeof e === 'string' ? e : e.target.value }));

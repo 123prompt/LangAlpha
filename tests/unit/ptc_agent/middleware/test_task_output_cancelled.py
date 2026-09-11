@@ -16,6 +16,9 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
 from ptc_agent.agent.middleware.background_subagent import tools as tools_module
+from ptc_agent.agent.middleware.background_subagent.outcomes import (
+    CREDIT_STOP_ERROR_TYPE,
+)
 from ptc_agent.agent.middleware.background_subagent.tools import (
     _delivered_result_text,
     create_task_output_tool,
@@ -237,3 +240,61 @@ class TestRegistryResolveResultText:
         registry = BackgroundTaskRegistry(thread_id="t1")
         registry.result_resolver = AsyncMock(side_effect=RuntimeError("db down"))
         assert await registry.resolve_result_text("k7Xm2p") is None
+
+
+def _ledger_middleware(run: dict) -> MagicMock:
+    """A registry whose ONLY authority is the durable ledger — the shape every
+    worker but the one holding the task sees."""
+    middleware = MagicMock()
+    registry = MagicMock()
+    ledger = MagicMock()
+    ledger.get_latest_run = AsyncMock(return_value=run)
+    ledger.mark_result_delivered = AsyncMock(return_value=None)
+    registry.run_ledger = ledger
+    registry.get_by_task_id = AsyncMock(return_value=None)
+    registry.resolve_result_text = AsyncMock(return_value=None)
+    registry.resolve_archived_result_text = AsyncMock(return_value=None)
+    middleware.registry = registry
+    return middleware
+
+
+@pytest.mark.asyncio
+async def test_a_credit_stopped_task_reads_as_resumable_from_the_ledger():
+    """The advice must not depend on which worker answers.
+
+    A credit stop spells itself 'cancelled' exactly like a timeout kill does,
+    so the generic cancelled copy ("cannot be resumed") would talk the model
+    out of the one path this stop is designed to leave open. The live task
+    already branches on it; the ledger is what answers on every worker but the
+    one still holding the task in memory, which multi-worker makes a coin flip.
+    """
+    run = {
+        "status": "cancelled",
+        "task_run_id": "run-1",
+        "failure": {"error_type": CREDIT_STOP_ERROR_TYPE, "error": "out of credits"},
+    }
+    tool = create_task_output_tool(_ledger_middleware(run))
+
+    result = await tool.coroutine(task_id="k7Xm2p")
+
+    assert "ran out of credits" in result
+    assert 'Task(action="resume"' in result
+    assert "cannot be resumed" not in result
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_cancel_still_reads_as_unresumable():
+    """The complement, and the reason the branch is on the error type rather
+    than on the status: telling the model to resume a timeout kill would be
+    the opposite error, made just as silently."""
+    run = {
+        "status": "cancelled",
+        "task_run_id": "run-1",
+        "failure": {"error": "killed by timeout"},
+    }
+    tool = create_task_output_tool(_ledger_middleware(run))
+
+    result = await tool.coroutine(task_id="k7Xm2p")
+
+    assert "cannot be resumed" in result
+    assert 'Task(action="resume"' not in result

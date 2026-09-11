@@ -643,6 +643,7 @@ class SkillsMiddleware(AgentMiddleware):
                 content=error_msg,
                 tool_call_id=tool_call_id,
                 name=self.TOOL_NAME,
+                status="error",
             )
 
         # Build the result message

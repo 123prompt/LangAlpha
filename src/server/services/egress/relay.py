@@ -22,13 +22,15 @@ import httpx
 
 from src.config.env import EGRESS_RELAY_SECRET
 from src.server.database.egress_grants import fetch_grant_for_relay
-from src.server.services.egress import RelayError, RelayRejection
+from src.server.services.brokerages import brokerage_for_url
+from src.server.services.egress import RelayError, RelayRejection, folded_contains
 from src.server.services.egress.jsonrpc import (
     CanonicalRequest,
     JsonRpcRejected,
     canonicalize_request,
 )
 from src.server.services.egress.relay_jwt import (
+    CALLER_HOST,
     RelayClaims,
     RelayJwtError,
     validate_relay_jwt,
@@ -51,6 +53,16 @@ CONNECT_TIMEOUT_S = 5.0
 WRITE_TIMEOUT_S = 10.0
 READ_IDLE_TIMEOUT_S = 45.0
 WALL_CLOCK_S = 55.0
+
+# Ceiling on one relayed response, mirroring the sandbox client's own
+# ``_REPLY_MAX_BYTES``. The wall clock bounds how LONG a vendor may stream, not
+# how MUCH: 55s of a fast connection is hundreds of megabytes. That was survivable
+# while every terminal consumer sat in a disposable per-user interpreter that
+# capped itself; the host-side direct client reads the whole body into the API
+# worker, where the parsed objects are a multiple of the bytes again and the
+# container's memory limit is shared by every worker. Cut here rather than in
+# either client so both paths and both agents are covered by one bound.
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 # Connection pool. httpx defaults keepalive_expiry to 5s, which is shorter than
 # the model latency between two execute_code blocks — so every burst of MCP
@@ -79,6 +91,8 @@ REQUEST_HEADER_ALLOWLIST = frozenset(
 RESPONSE_HEADER_ALLOWLIST = frozenset(
     {"content-type", "mcp-session-id", "mcp-protocol-version", "retry-after"}
 )
+
+
 
 
 @dataclass
@@ -174,13 +188,53 @@ async def prepare_relay(
     if "POST" not in (grant.get("allowed_methods") or []):
         raise RelayRejection(403, RelayError.METHOD_BLOCKED, "POST not in grant policy")
 
-    allowlist = grant.get("tool_allowlist")
-    if (
-        allowlist is not None
-        and canonical.method == "tools/call"
-        and canonical.tool_name not in allowlist
-    ):
-        raise RelayRejection(403, RelayError.TOOL_BLOCKED, "tool not in grant policy")
+    if canonical.method == "tools/call":
+        denylist = grant.get("tool_denylist")
+        # NULL means the denial was never computed, and for a brokerage that is
+        # a bug rather than a state: every shipped broker derives a policy, an
+        # uncurated one deriving the empty list. Under an allowlist NULL served
+        # nothing and was loud; under a denylist it serves everything and looks
+        # healthy, so it has to be refused here rather than trusted. This is the
+        # one place that can see it -- the grant row is written by a sync that
+        # may have failed, been rolled back, or been blanked by a migration,
+        # while the destination is pinned from the address consent was given
+        # for and cannot drift.
+        if denylist is None and brokerage_for_url(grant["destination_url"]):
+            raise RelayRejection(
+                403,
+                RelayError.POLICY_MISSING,
+                "this connection's capability policy has not been computed",
+            )
+        # Membership, not absence from a permitted set. The policy names the
+        # curated tools whose capability group the user declined, so a tool it
+        # does not mention passes: one we never classified is not one they said
+        # no to. Compared case- and width-folded because the denial is exact
+        # strings while the vendor decides what it considers the same name, and
+        # under an allowlist a variant spelling failed shut where here it would
+        # sail through.
+        if denylist and folded_contains(denylist, canonical.tool_name):
+            raise RelayRejection(
+                403,
+                RelayError.TOOL_BLOCKED,
+                "tool refused by this connection's policy",
+            )
+        # A tool bound directly to the model has no sandbox wrapper, and this
+        # is what keeps it that way: the policy middleware gates the direct
+        # call, and a sandbox that could reach the same tool by hand-writing
+        # the frame would have a path around it. The host's own relay calls
+        # carry the claim that lifts this refusal; a token without one is the
+        # sandbox, whatever minted it.
+        direct_only = grant.get("tool_direct_only")
+        if (
+            direct_only
+            and claims.caller != CALLER_HOST
+            and folded_contains(direct_only, canonical.tool_name)
+        ):
+            raise RelayRejection(
+                403,
+                RelayError.TOOL_BLOCKED,
+                "tool is bound directly to the model and is not callable from the sandbox",
+            )
 
     try:
         token = await ensure_fresh_access_token(grant["connection_id"])
@@ -206,6 +260,15 @@ def _vendor_headers(
     }
     headers.setdefault("accept", "application/json, text/event-stream")
     headers.setdefault("content-type", "application/json")
+    # The gate reads the body, so on a gated call the body has to be what the
+    # vendor routes on too. Both headers are agent-writable, and a vendor whose
+    # gateway dispatches on ``Mcp-Name`` would otherwise run a name the policy
+    # never saw. Re-emitted from the canonical frame rather than dropped, so a
+    # header-routing vendor keeps working; only tools/call, because that is the
+    # only method whose name this parser authoritatively knows.
+    if prepared.canonical.method == "tools/call":
+        headers["mcp-method"] = prepared.canonical.method
+        headers["mcp-name"] = prepared.canonical.tool_name or ""
     headers["authorization"] = prepared.token.header()
     return headers
 

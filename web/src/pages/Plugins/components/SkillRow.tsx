@@ -7,7 +7,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
-import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
+import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import {
   EnabledToggle,
   KebabTrigger,
@@ -79,7 +79,7 @@ function CommandChip({
       onBlur={() => setEditing(false)}
       spellCheck={false}
       aria-label={t('plugins.skills.commandInputAria')}
-      className="text-[0.6875rem] px-1.5 py-0.5 rounded w-28 outline-none"
+      className="text-[0.6875rem] px-1.5 py-0.5 rounded w-28"
       style={{
         color: 'var(--color-text-secondary)',
         backgroundColor: 'var(--color-bg-input)',
@@ -122,7 +122,7 @@ export function SkillRow({
     <ServerRowShell
       testid={`skill-row-${skill.name}`}
       {...(selection ?? {})}
-      tile={<IdentityTile name={skill.name} />}
+      tile={<BrandMark name={skill.name} kind="skill" />}
       onOpen={onOpen}
       main={
         <>
@@ -144,7 +144,7 @@ export function SkillRow({
             {lockedByUserTier && (
               <TagBadge soft>{t('plugins.skills.userDisabledBadge')}</TagBadge>
             )}
-            <PluginSuppressedBadge row={skill} />
+            {!inDeck && <PluginSuppressedBadge row={skill} />}
           </ServerNameLine>
           {skill.description && (
             <p

@@ -70,8 +70,11 @@ export interface AgentInfo {
   prompt?: string;
   type: string;
   status: string;
-  /** Ledger failure reason for an errored task (shown in the detail header). */
+  /** Ledger failure reason for a task that settled with one (shown in the
+   *  detail header). */
   error?: string;
+  /** That reason's machine spelling (``credit_stop``, ``transport_lost``, …). */
+  errorType?: string;
   toolCalls: number;
   tokenUsage: SubagentTokenUsage;
   currentTool: string;
@@ -96,6 +99,7 @@ export interface SubagentUpdateData {
   isActive: boolean;
   status?: string;
   error?: string;
+  errorType?: string;
   currentTool?: string;
   messages?: SubagentMessage[];
   tokenUsage?: SubagentTokenUsage;
@@ -109,6 +113,7 @@ export interface SubagentInfo {
   type?: string;
   status?: string;
   error?: string;
+  errorType?: string;
   /** Owning workflow run's agent id (`task:<id>`) when opened via its drill-in. */
   ownerTaskId?: string;
 }
@@ -147,12 +152,6 @@ export interface MsgSelectionTooltipData {
   x: number;
   y: number;
   text: string;
-}
-
-export interface WorkspaceRecord {
-  status?: string;
-  name?: string;
-  [key: string]: unknown;
 }
 
 export interface ChatViewProps {

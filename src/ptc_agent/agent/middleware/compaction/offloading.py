@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, AnyMessage
 from langchain_core.messages.human import HumanMessage
 from langgraph.config import get_config
 
+from src.llms.attachment_payload import FILE_BLOCK_TYPES
 from ptc_agent.agent.middleware.compaction.utils import (
     _extract_text_from_content,
     strip_base64_from_messages,
@@ -203,10 +204,9 @@ _MIME_TO_EXT: dict[str, str] = {
 def _extract_base64_info(block: dict) -> tuple[str, str, str] | None:
     """Extract (base64_data, mime_type, label) from a content block.
 
-    Handles three provider-specific formats:
-    - ``image_url`` with ``data:...;base64,...`` URL (OpenAI style)
-    - ``file`` with ``base64`` key (PDF uploads)
-    - ``image`` with base64 source (Anthropic native)
+    Handles every provider format an attachment arrives in: an ``image_url``
+    data URI (OpenAI), a ``base64`` key (langchain v1), and a ``source`` object
+    (Anthropic native), under either name the block type goes by.
 
     Returns None if the block doesn't contain base64 data.
     """
@@ -222,19 +222,25 @@ def _extract_base64_info(block: dict) -> tuple[str, str, str] | None:
             return data, mime, "image"
         return None
 
+    source = block.get("source") or {}
+    if not isinstance(source, dict):
+        source = {}
+    inline = source.get("data") if source.get("type") == "base64" else None
+
     # PDF / file upload with inline base64
-    if block_type == "file" and "base64" in block:
-        data = block["base64"]
-        mime = block.get("mime_type", "application/pdf")
+    if block_type in FILE_BLOCK_TYPES:
+        data = block.get("base64") or inline
+        if data is None:
+            return None
+        mime = block.get("mime_type") or source.get("media_type") or "application/pdf"
         fname = block.get("filename", "file")
         return data, mime, f"pdf_{fname}"
 
     # Anthropic native image block
     if block_type == "image":
-        source = block.get("source") or {}
-        if source.get("type") == "base64" and "data" in source:
-            data = source["data"]
-            mime = source.get("media_type", "image/png")
+        data = block.get("base64") or inline
+        if data is not None:
+            mime = block.get("mime_type") or source.get("media_type") or "image/png"
             return data, mime, "image"
 
     return None

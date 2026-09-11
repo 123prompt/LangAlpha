@@ -12,8 +12,10 @@ Wire shape:
 - Cursors: ``?cursors=run:<run_id>#<entry_id>,…`` — resume is exclusive.
 - Frames: ``id: run:<run_id>#<entry_id>`` + the contract envelope
   ``{run_id, seq, lane, type, payload}`` as data. Control frames
-  (``chan_open``, ``chan_close``, ``resync_required``, ``transport_error``,
-  ``timeout``) carry no cursor.
+  (``chan_open``, ``chan_caught_up``, ``chan_close``, ``resync_required``,
+  ``transport_error``, ``timeout``) carry no cursor. ``chan_caught_up``
+  marks where a channel's backlog ends: everything before it existed when
+  the channel opened, everything after arrived live.
 - Close: the ``run_end`` frame, or — for a worker that died between the
   terminal CAS and the append — a rate-limited ledger-row probe emitting
   ``chan_close{reason: terminal}`` from row truth. 'unknown' never closes.
@@ -178,6 +180,13 @@ class _RunChan:
     # Ledger started_at (epoch ms), declared on chan_open: the client
     # orders per-task outcome votes by run start, never by close order.
     started_ms: Optional[float] = None
+    # Stream head when the channel opened, probed once by the pump. The
+    # entries up to it are backlog the client presents as already rendered;
+    # ``chan_caught_up`` is emitted once the cursor reaches it, or on the
+    # first read that returns nothing for the channel. A failed probe sends
+    # no marker and leaves the client to its bounded fallback.
+    head_at_open: Optional[bytes] = None
+    caught_up: bool = False
 
     @property
     def name(self) -> str:
@@ -226,6 +235,47 @@ def _parse_task_entry(fields: dict) -> Optional[tuple[str, str]]:
     if not ftype:
         return None
     return ftype, payload or ""
+
+
+async def _probe_backlog_head(cache, chan: _RunChan) -> Optional[str]:
+    """Record the channel's backlog head; the marker frame when there is none."""
+    try:
+        tail = await cache.client.xrevrange(chan.stream_key, count=1)
+    except Exception:
+        chan.caught_up = True  # no marker: the client's fallback bounds the wait
+        logger.warning(
+            "[mux2] backlog head probe failed for %s, no boundary marker",
+            chan.name,
+            exc_info=True,
+        )
+        return None
+    if not tail:
+        chan.caught_up = True
+        return _control("chan_caught_up", {"chan": chan.name})
+    chan.head_at_open = tail[0][0]
+    return None
+
+
+def _marker_before(chan: _RunChan, entry_id: bytes) -> Optional[str]:
+    """The marker ahead of the first entry past the recorded head, so a batch
+    that straddles the boundary never sends live entries as backlog."""
+    if chan.caught_up or chan.closed or chan.head_at_open is None:
+        return None
+    if not _entry_after(entry_id, chan.head_at_open.decode()):
+        return None
+    chan.caught_up = True
+    return _control("chan_caught_up", {"chan": chan.name})
+
+
+def _caught_up_frame(chan: _RunChan, got_entries: bool) -> Optional[str]:
+    """The marker once the cursor reaches the recorded head, or a read came
+    back empty for the channel (its backlog was shorter than the head said)."""
+    if chan.caught_up or chan.closed or chan.head_at_open is None:
+        return None
+    if got_entries and _entry_after(chan.head_at_open, chan.cursor.decode()):
+        return None
+    chan.caught_up = True
+    return _control("chan_caught_up", {"chan": chan.name})
 
 
 async def _run_row(run_id: str, lane: str) -> Optional[dict]:
@@ -668,6 +718,30 @@ async def stream_thread_mux_v2(
         xread_failures = 0
         while True:
             open_chans = [c for c in channels.values() if not c.closed]
+            unprobed = [
+                c for c in open_chans if not c.caught_up and c.head_at_open is None
+            ]
+            if unprobed:
+                # One bound for the whole pass: probed together, so a slow
+                # pool costs one timeout, not one per channel, and the read
+                # loop keeps its keepalive cadence.
+                try:
+                    markers = await asyncio.wait_for(
+                        asyncio.gather(*(_probe_backlog_head(cache, c) for c in unprobed)),
+                        timeout=xread_wait_timeout_s(),
+                    )
+                except asyncio.TimeoutError:
+                    markers = []
+                    for c in unprobed:
+                        if c.head_at_open is None:
+                            c.caught_up = True
+                    logger.warning(
+                        "[mux2] backlog head probes timed out for %d channels, no boundary marker",
+                        len(unprobed),
+                    )
+                for marker in markers:
+                    if marker is not None:
+                        await out_q.put(("frame", marker))
             streams: dict[bytes, bytes] = {control_key: control_cursor}
             for c in open_chans:
                 streams[c.stream_key] = c.cursor
@@ -739,6 +813,9 @@ async def stream_thread_mux_v2(
                 got.add(chan.run_id)
                 chan.empty_rounds = 0
                 for entry_id, fields in entries:
+                    marker = _marker_before(chan, entry_id)
+                    if marker is not None:
+                        await out_q.put(("frame", marker))
                     chan.cursor = entry_id
                     parsed = (
                         _parse_main_entry(fields)
@@ -759,6 +836,9 @@ async def stream_thread_mux_v2(
                     if ftype == "run_end":
                         await _close(chan, "terminal")
                         break
+                marker = _caught_up_frame(chan, got_entries=True)
+                if marker is not None:
+                    await out_q.put(("frame", marker))
 
             # Crash-window backstop: a terminal ledger row whose stream
             # never got its run_end closes the channel from row truth.
@@ -766,6 +846,9 @@ async def stream_thread_mux_v2(
             for chan in open_chans:
                 if chan.run_id in got or chan.closed:
                     continue
+                marker = _caught_up_frame(chan, got_entries=False)
+                if marker is not None:
+                    await out_q.put(("frame", marker))
                 chan.empty_rounds += 1
                 if chan.empty_rounds < _QUIESCE_EMPTY_ROUNDS:
                     continue

@@ -25,6 +25,8 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     TaskRunRejected,
     TransportLostError,
 )
+from ptc_agent.agent.middleware.credit_gate import CreditStopError
+from src.server.contracts.status import CREDIT_STOP_ERROR_TYPE
 
 
 class FakeOwner:
@@ -258,6 +260,27 @@ async def test_abort_path_normalizes_error_type_spelling():
     (_run_id, status, failure) = ledger.finalized[0]
     assert status == "error"
     assert failure["error_type"] == "transport_lost"
+
+
+@pytest.mark.asyncio
+async def test_a_credit_stop_settles_cancelled_with_the_resume_query_spelling():
+    """The gate stop is terminal-neutral, not a failure, and the resume query
+    selects rows on exactly this pair. Were the status to drift back to
+    "error", ``list_credit_stopped_for_resume`` would match nothing and every
+    gate-stopped subagent would be stranded with no visible symptom."""
+    ledger = FakeLedger()
+    mw = _middleware(FakeOwner(), ledger)
+    mw.registry.write_task_meta = AsyncMock()
+
+    async def _stopped(_request):
+        raise CreditStopError("You have run out of credits.")
+
+    await mw.awrap_tool_call(_request({"description": "d", "prompt": "p"}), _stopped)
+    await mw.registry._tasks["tc-1"].asyncio_task
+
+    (_run_id, status, failure) = ledger.finalized[0]
+    assert status == "cancelled"  # not "error" — the resume query filters on it
+    assert failure["error_type"] == CREDIT_STOP_ERROR_TYPE
 
 
 @pytest.mark.asyncio

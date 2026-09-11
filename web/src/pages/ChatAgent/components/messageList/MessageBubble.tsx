@@ -8,8 +8,9 @@ import { useTheme } from '../../../../contexts/ThemeContext';
 import LissajousLoading from '@/components/ui/lissajous-loading';
 import { useUser } from '@/hooks/useUser';
 import { CitationMetadataProvider } from '../CitationMetadataContext';
+import { CreditPausePendingProvider } from '../CreditPausePendingContext';
 import TextMessageContent from '../TextMessageContent';
-import { countDedupedSources, type ProvenanceRecord, type SubagentTaskRecord } from '@/types/chat';
+import { countDedupedSources, type CreditPauseState, type ProvenanceRecord, type SubagentTaskRecord, type ToolApprovalState } from '@/types/chat';
 import { TextShimmer } from '@/components/ui/text-shimmer';
 import type { SelectionPreviewShape } from '../SelectionContextPreview';
 import { AttachmentCard, InlineSelectionCards, InlineWidgetDeck } from './attachments';
@@ -17,11 +18,18 @@ import type { AttachmentData, WidgetChipShape } from './attachments';
 import { MessageContentSegments } from './MessageContentSegments';
 import { OverflowCollapse } from './OverflowCollapse';
 import { useMessageActions } from './MessageActionsContext';
+import { useArrivalQuiet, useLiveToolRunning } from './useArrivalQuiet';
 import { isSteeringUserMessage } from './messagePredicates';
+import { assistantText } from './messageText';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, FeedbackResult, MessageRecord, ToolCallProcessRecord } from './types';
 
 // --- MessageBubble ---
+
+/** Pause without new text before the streaming indicator fades back in. Longer
+ *  than a token-cadence gap and the typewriter's own lag, shorter than a tool
+ *  call or a thinking pause. */
+const ARRIVAL_QUIET_MS = 700;
 
 /** Collapsed bound for long user messages (~10 lines of chat text). */
 const USER_MESSAGE_COLLAPSE_PX = 240;
@@ -118,12 +126,21 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
   const canShowActions = !isSubagentView && !readOnly;
   const showActions = canShowActions && !(message.isStreaming as boolean) && !isLoading;
 
-  // Provenance count for the Sources pill, deduped by (source_type, identifier)
-  // — the same URL fetched twice in one turn counts once. The pill lives in its
-  // own always-visible row (not the hover-gated footer), so it shows mid-stream.
-  // This counts distinct sources (every result URL), so it intentionally runs
-  // ahead of the panel's visible row count: the panel groups a whole web search
-  // into one deck, but the pill still reports how many pages were actually read.
+  // The stream stamps `arrivalSeq` on every landed reply text, reasoning text
+  // or tool-argument chunk, whatever the typewriter has shown of it. The
+  // streaming indicator hides while it climbs and shows in the pauses. A tool
+  // whose card is visibly running counts as busy too.
+  const isStreaming = message.isStreaming as boolean;
+  const toolCallProcesses = message.toolCallProcesses as Record<string, ToolCallProcessRecord> | undefined;
+  const arrivalSeq = (message.arrivalSeq as number | undefined) ?? 0;
+  const toolRunning = useLiveToolRunning(toolCallProcesses, isStreaming);
+  const arrivalQuiet = useArrivalQuiet(arrivalSeq, isStreaming, ARRIVAL_QUIET_MS) && !toolRunning;
+
+  // Provenance count for the Sources pill, deduped by (source_type,
+  // identifier): the same URL fetched twice in one turn counts once. It counts
+  // distinct sources (every result URL), so it intentionally runs ahead of the
+  // panel's visible row count: the panel groups a whole web search into one
+  // deck, but the pill still reports how many pages were actually read.
   const sourceCount = useMemo(() => {
     if (!isAssistant || isSubagentView) return 0;
     return countDedupedSources(message.provenanceRecords as Record<string, ProvenanceRecord> | undefined);
@@ -169,12 +186,7 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
   };
 
   const handleCopy = () => {
-    // Collect all text content from segments
-    const contentSegments = message.contentSegments as ContentSegmentRecord[] | undefined;
-    const text = contentSegments
-      ?.filter((s) => s.type === 'text')
-      .map((s) => s.content)
-      .join('') || (message.content as string) || '';
+    const text = assistantText(message);
     // Confirm only after the write lands (it can reject when the document
     // loses focus); rapid re-copies reset the shared timer instead of
     // stacking timers that would cut the newer indicator short.
@@ -229,7 +241,7 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
                   resizeTextarea();
                 }}
                 onKeyDown={handleEditKeyDown}
-                className="w-full bg-transparent text-sm resize-none outline-none leading-relaxed overflow-hidden"
+                className="w-full bg-transparent text-sm resize-none leading-relaxed overflow-hidden"
                 style={{ color: 'var(--color-text-primary)' }}
                 rows={1}
               />
@@ -299,6 +311,7 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
           {/* Render content segments in chronological order */}
           {(message.contentSegments as ContentSegmentRecord[] | undefined) && (message.contentSegments as ContentSegmentRecord[]).length > 0 ? (
             <CitationMetadataProvider toolCallProcesses={(message.toolCallProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}>
+            <CreditPausePendingProvider creditPauses={message.creditPauses as Record<string, CreditPauseState> | undefined}>
             <MessageContentSegments
               segments={message.contentSegments as ContentSegmentRecord[]}
               reasoningProcesses={(message.reasoningProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
@@ -318,12 +331,14 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
               isSubagentView={isSubagentView}
               ptcAgentProposals={(message.ptcAgentProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
               secretaryActionProposals={(message.secretaryActionProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
+              creditPauses={(message.creditPauses as Record<string, CreditPauseState>) || EMPTY_OBJ}
+              toolApprovals={(message.toolApprovals as Record<string, ToolApprovalState>) || EMPTY_OBJ}
               htmlWidgetProcesses={(message.htmlWidgetProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
-              textOnly={true}
               readOnly={readOnly}
               allowFiles={allowFiles}
               flashContext={flashContext}
             />
+            </CreditPausePendingProvider>
             </CitationMetadataProvider>
           ) : (
             // Fallback for messages without segments (backward compatibility) - main chat shows text only
@@ -341,19 +356,45 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
           )}
           </OverflowCollapse>
 
-          {/* Streaming indicator -- hidden when dot-loader is already showing for pending chunks */}
-          {(message.isStreaming as boolean) && !Object.keys((message.pendingToolCallChunks as Record<string, unknown>) || {}).length && (() => {
+          {/* Streaming indicator. Stays mounted for the whole stream and only
+              fades: while text is landing it is invisible (the text is the
+              liveness signal), in a pause it fades back in so the turn never
+              looks finished. Fading rather than unmounting keeps its row, so
+              the transcript bottom does not hop by a line on every pause. */}
+          {isStreaming && (() => {
             const contentSegments = message.contentSegments as ContentSegmentRecord[] | undefined;
             const hasContent = contentSegments?.some(s => s.content?.trim()) || (message.content as string)?.trim();
-            return <LissajousLoading className={`${hasContent ? "mt-2" : "mt-0"} ${isMobile ? 'w-5 h-5' : 'w-6 h-6'} text-neutral-500 dark:text-neutral-400`} />;
+            // A tool call being generated shows its own row in the activity
+            // block; the spinner fades for it like for any other activity.
+            const preparingTool = Object.keys((message.pendingToolCallChunks as Record<string, unknown>) || {}).length > 0;
+            const quiet = arrivalQuiet && !preparingTool;
+            return (
+              <div
+                className={`${hasContent ? 'mt-2' : 'mt-0'} transition-opacity duration-200`}
+                style={{ opacity: quiet ? 1 : 0 }}
+                aria-hidden={!quiet}
+                data-testid="streaming-indicator"
+                data-quiet={quiet ? 'true' : 'false'}
+              >
+                <LissajousLoading className={`${isMobile ? 'w-5 h-5' : 'w-6 h-6'} text-neutral-500 dark:text-neutral-400`} />
+              </div>
+            );
           })()}
         </div>
 
-        {/* Sources pill -- always-visible row (not the hover-gated footer below,
-            which is hidden during streaming). Surfaces the turn's tracked data
-            provenance; clicking opens the Sources tab in the right panel. */}
+        {/* Sources pill -- always-visible row (not the hover-gated footer
+            below). Mounted from the first source onward and only faded in once
+            the turn has finished: a count that climbs mid-stream reads as
+            activity, but unmounting the row until then would hop the whole
+            transcript by a line the moment the turn ends. While faded the row
+            is inert, so the invisible button takes neither a click nor a tab
+            stop. Clicking opens the Sources tab in the right panel. */}
         {isAssistant && !isSubagentView && sourceCount > 0 && (
-          <div className="flex justify-start mt-1">
+          <div
+            className="flex justify-start mt-1 transition-opacity duration-200"
+            style={{ opacity: isStreaming ? 0 : 1 }}
+            inert={isStreaming}
+          >
             <button
               type="button"
               onClick={() => onOpenSources?.(message.id as string)}

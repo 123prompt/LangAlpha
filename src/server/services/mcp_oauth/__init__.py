@@ -17,6 +17,7 @@ from src.server.database.mcp_oauth import (  # noqa: F401
 )
 from src.server.services.mcp_oauth.connect import (  # noqa: F401
     McpOAuthError,
+    McpServerMoved,
     McpServerNotFound,
     StartedConnect,
     complete_callback,

@@ -78,6 +78,9 @@
     "confirming": "正在确认邮箱…",
     "confirmedSigningIn": "邮箱已确认，正在登录…",
     "confirmError": "链接无效或已过期。",
+    "shellHandoffTitle": "正在打开 LangAlpha…",
+    "shellHandoffBody": "此链接已交给 LangAlpha 应用，请在应用中完成登录。",
+    "shellHandoffFallback": "在浏览器中继续",
     "requestNewLink": "重新获取链接",
     "confirmPassword": "确认密码",
     "strengthTooShort": "长度不足",
@@ -171,6 +174,10 @@
     "locale": "语言",
     "voiceInput": "语音输入",
     "voiceInputDesc": "在聊天栏中启用麦克风图标以进行语音转文字。",
+    "turnEndScroll": "回复结束时",
+    "turnEndScrollDesc": "助手回复完成后，聊天视图停留的位置。",
+    "turnEndScrollBottom": "停留在末尾",
+    "turnEndScrollReplyStart": "显示回复开头",
     "emailCannotBeChanged": "邮箱不可更改",
     "changeAvatar": "更换头像",
     "uploading": "上传中...",
@@ -291,6 +298,10 @@
     "claudeOpenAgain": "重新打开授权页面",
     "starredModels": "快速切换模型",
     "starredModelsDesc": "标星的模型会显示在聊天输入框中方便快速切换",
+    "fallbackModels": "备用模型",
+    "fallbackModelsDesc": "当主模型或快速模型不可用时，按顺序依次尝试。请只添加你有权访问的模型。未选择时不使用备用模型。",
+    "fallbackModelsEmpty": "未找到模型",
+    "removeModel": "移除 {{model}}",
     "addModels": "添加",
     "searchProvider": "网络搜索引擎",
     "searchProviderDesc": "Agent 进行网络搜索时使用的搜索引擎。",
@@ -307,7 +318,7 @@
       "deep": "深度"
     },
     "compactionProfile": "压缩预设",
-    "compactionProfileDesc": "用于控制压缩触发与保留的预设组合。除非有特殊需求，否则建议保持系统默认。",
+    "compactionProfileDesc": "用于控制压缩触发与保留的预设组合。保持系统默认时，每个模型会自动匹配与其上下文窗口相称的预设。",
     "compactionProfileUseDefault": "使用系统默认",
     "compactionProfilePreset": "{{tokens}}k tokens · 保留 {{keep}} 条 · 第 {{trim}} 条起截断",
     "compactionProfiles": {
@@ -327,6 +338,40 @@
         "label": "宽松",
         "description": "最大化上下文。适合 1M 上下文模型。"
       }
+    },
+    "modelTuning": {
+      "sectionModels": "模型",
+      "sectionDefaults": "账户默认值",
+      "sectionRouting": "路由",
+      "sectionSearch": "网页搜索",
+      "sectionProviders": "服务商与账户",
+      "detailLevel": "显示层级",
+      "simple": "简洁",
+      "advanced": "高级",
+      "perModel": "按模型设置",
+      "perModelDesc": "仅对单个模型生效的设置。保持为默认的项目将沿用上方的账户默认值。",
+      "colModel": "模型",
+      "colEffort": "思考强度",
+      "colContext": "上下文",
+      "colGuidance": "提示词",
+      "colSpeed": "速度",
+      "default": "默认",
+      "defaultNamed": "默认（{{value}}）",
+      "modelDefault": "模型默认",
+      "useModelDefault": "使用模型默认值",
+      "notSupported": "不支持",
+      "modelUnavailable": "当前不可用",
+      "addModel": "添加模型",
+      "resetModel": "移除覆盖设置",
+      "effortDesc": "模型在回答前的思考强度，仅对提供该选项的模型生效。",
+      "guidanceDesc": "代理在每轮对话中携带的指令量。精简会去掉指导性内容，只保留事实。",
+      "guidanceLean": "精简",
+      "guidanceDetailed": "完整",
+      "fetchModel": "网页抓取模型",
+      "fetchModelDesc": "用于提取网页内容。",
+      "compactionModel": "上下文压缩模型",
+      "compactionModelDesc": "用于压缩过长的对话上下文。",
+      "defaultsToFlash": "默认使用快速模型"
     }
   },
   "dashboard": {
@@ -1240,6 +1285,10 @@
     "jumpToLatest": {
       "aria": "滚动到最新消息"
     },
+    "minimap": {
+      "untitledTurn": "无文字消息",
+      "replyPending": "处理中"
+    },
     "pills": {
       "plan": "计划",
       "planTitle": "计划模式 — 智能体先生成计划，经确认后再执行",
@@ -1275,6 +1324,8 @@
     "errorHintModelAccess": "请确认您的套餐或订阅允许访问此模型。",
     "errorHintProviderStatus": "请查看提供商状态页，了解是否存在服务中断。",
     "errorHintTryAnotherModel": "请尝试在模型选择器中切换到其他模型。",
+    "errorLinkManagePlan": "管理套餐",
+    "errorLinkViewUsage": "查看用量",
     "errorUpstreamHeadlineModel": "{{model}} 返回错误",
     "errorUpstreamHeadlineModelStatus": "{{model}} 返回错误 ({{status}})",
     "errorAttemptedModels": "还尝试了：",
@@ -1310,11 +1361,21 @@
     "taskReportBackPending": "等待子代理结果汇报",
     "taskCard": {
       "statusRunning": "运行中",
+      "statusPausing": "完成当前步骤",
       "statusCompleted": "已完成",
       "statusStopped": "已停止",
       "statusFailed": "失败",
       "statusUpdated": "已更新",
       "statusResumed": "已恢复"
+    },
+    "creditPause": {
+      "title": "运行已暂停",
+      "resume": "继续",
+      "resuming": "继续中…",
+      "resumedLabel": "已继续"
+    },
+    "creditStop": {
+      "title": "额度已用尽"
     },
     "subagentCard": {
       "titleFallback": "子智能体任务",
@@ -1334,6 +1395,7 @@
       "initializing": "初始化中",
       "instruct": "指示",
       "errorHeading": "该智能体因错误而停止",
+      "stoppedHeading": "该智能体已停止",
       "inputPlaceholder": "为该智能体添加指令…",
       "avatarAlt": "智能体"
     },
@@ -1462,6 +1524,7 @@
     },
     "compactedNotification": "上下文已压缩 · {{from}} 条消息 → 摘要",
     "taskErrorNotification": "子任务运行失败",
+    "taskStoppedNotification": "子任务运行已停止",
     "taskSteeringReturnedNotification": "引导消息已退回 · 运行在送达前已结束",
     "viewSummary": "查看摘要",
     "hideSummary": "隐藏摘要",
@@ -1475,15 +1538,20 @@
       "manageModels": "管理模型",
       "moreModels": "更多模型",
       "configureModels": "配置模型 →",
-      "reasoningEffort": "推理",
+      "reasoningEffort": "推理强度",
+      "effortNone": "关闭",
+      "effortMinimal": "极简",
       "effortLow": "低",
       "effortMedium": "中",
       "effortHigh": "高",
-      "effortXhigh": "极高",
-      "fastMode": "快速",
-      "fastModeDesc": "优先路由以获得更快响应",
-      "fastModeHelpLine1": "等同于 Codex 中的 /fast",
-      "fastModeHelpLine2": "消耗 2 倍积分，优先服务层级"
+      "effortXhigh": "超高",
+      "effortMax": "最大",
+      "effortHint": "强度越高越细致，但速度更慢。",
+      "defaultBadge": "默认",
+      "speed": "速度",
+      "speedStandard": "标准",
+      "speedFast": "快速",
+      "speedFastHint": "消耗 2 倍积分，优先服务层级"
     },
     "voice": {
       "start": "开启语音输入",
@@ -2109,6 +2177,7 @@
       "updated_preference": "已更新偏好"
     },
     "inProgress": {
+      "callingServer": "正在调用 {{server}}...",
       "activatingSkill": "激活技能中...",
       "activatingSkillName": "激活技能 {{name}}...",
       "readingMemory": "读取记忆中...",
@@ -2204,6 +2273,18 @@
       "openInTab": "在 {{tab}} 中打开",
       "collapseDiff": "折叠差异",
       "expandDiff": "展开差异"
+    },
+    "directTool": {
+      "approvalTitle": "是否批准此操作？",
+      "unansweredTitle": "曾等待批准，未获回应",
+      "approve": "批准",
+      "reject": "拒绝",
+      "reasonPlaceholder": "原因（可选）",
+      "approvedAction": "已批准 {{vendor}} {{tool}}",
+      "rejectedAction": "已拒绝 {{vendor}} {{tool}}",
+      "refused": "连接器拒绝了此调用",
+      "rejected": "你拒绝了此调用",
+      "noArguments": "无参数"
     }
   },
   "setup": {
@@ -2381,7 +2462,7 @@
     "addModel": "添加模型",
     "modelIdInputPlaceholder": "输入模型 ID（如 GPT-5.4）",
     "customModelNameLabel": "显示名称",
-    "customModelNamePlaceholder": "在菜单中如何显示（如 glm-5.1）",
+    "customModelNamePlaceholder": "在菜单中如何显示（如 glm-5.3）",
     "customModelNameSlugPreview": "将保存为：{{slug}}",
     "customModelNameSlugEmpty": "请输入字母或数字 — 空格和符号会被自动移除。",
     "customModelIdLabel": "上游模型 ID",
@@ -2705,7 +2786,8 @@
       "mcp": "连接器",
       "skills": "技能",
       "secrets": "密钥",
-      "plugins": "插件"
+      "plugins": "插件",
+      "brokerages": "券商"
     },
     "servers": {
       "inheritHint": "在此开启的服务器对你的所有工作区生效；如需在单个工作区关闭，请前往该工作区的 MCP 标签页。关闭状态的服务器仅作为模板保留。",
@@ -2721,27 +2803,129 @@
       "deleteConfirmNo": "取消",
       "warningTitle": "服务器已保存（含提示）"
     },
+    "brokerages": {
+      "capabilities": {
+        "market_data": {
+          "label": "行情与研究",
+          "desc": "报价、K 线、基本面、公告和选股器。不涉及你的账户。"
+        },
+        "watchlists": {
+          "label": "自选列表",
+          "desc": "读取自选列表，增删标的，并可新建或删除整个列表。"
+        },
+        "scanners": {
+          "label": "已保存的选股条件",
+          "desc": "读取你保存的选股器，并可新建、运行或修改。"
+        },
+        "alerts": {
+          "label": "价格提醒",
+          "desc": "读取你的价格提醒，并新建或删除。"
+        },
+        "account": {
+          "label": "账户与持仓",
+          "desc": "余额、持仓和订单历史。仅读取。"
+        },
+        "paper_trading": {
+          "label": "模拟交易",
+          "desc": "在券商的模拟账户中交易。它有自己的资金和持仓，不涉及真实资金。"
+        },
+        "order_preview": {
+          "label": "订单预览",
+          "desc": "针对真实账户试算一笔订单，查看成本与风险提示。不会提交，也不会保存。"
+        },
+        "staged_orders": {
+          "label": "待提交订单",
+          "desc": "在真实账户中保存一份订单草稿。它尚未生效，但你可以在券商端一键提交。"
+        },
+        "trading": {
+          "label": "实盘下单",
+          "desc": "使用账户中的真实资金买入、卖出、改单和撤单。"
+        }
+      },
+      "consent": {
+        "title": "连接“{{server}}”",
+        "subtitle": "选择此连接允许智能体在该券商做哪些事。",
+        "footnote": "未勾选的分组在智能体调用时会被拒绝，而不只是隐藏。之后可重新连接以更改。"
+      },
+      "detail": {
+        "broker": "券商",
+        "capabilities": "可执行的操作",
+        "capabilitiesNote": "被拒绝的分组在智能体调用时会被拒绝，而不只是隐藏。重新连接可以更改。",
+        "declined": "未授予",
+        "endpoint": "接入地址",
+        "granted": "已授予",
+        "grantedNone": "此连接未获授权任何分组，因此分组内的所有工具都会被拒绝。重新连接可重新选择。",
+        "notConnectedNote": "连接之前不会授予任何操作，连接时由你选择。",
+        "offered": "可选",
+        "website": "官网",
+        "unclassified": "不属于任何分组",
+        "unclassifiedNote": "没有分组涵盖这些工具，因此拒绝某个分组并不会拒绝它们。智能体仍然可以调用。",
+        "unclassifiedNoteUnconnected": "这些工具不属于任何分组，拒绝某个分组不会屏蔽它们。此处尚未连接，因此暂时无法调用。",
+        "neverAvailable": "始终不可用",
+        "neverAvailableNote": "已刻意保留。无论授权什么都会被拒绝。"
+      },
+      "exclusiveNote": "会取代该账户已有的 AI 连接",
+      "exclusiveWarning": "该账户只允许连接一个 AI 平台，因此在此连接会取代当前已连接的那一个。",
+      "grantedNone": "未授予任何操作",
+      "intro": "智能体可读取并交易的券商账户。连接后即可关联你的账户；在此之前不会向券商发送任何数据。",
+      "none": "此版本未内置券商连接器。",
+      "notAdded": "未添加",
+      "openInMcp": "在连接器中打开",
+      "redirectedNote": "指向自定义地址",
+      "removeConfirm": "确定移除“{{server}}”吗？这将断开你的账户连接，并从所有工作区中移除。",
+      "toggleFailed": "无法更改此连接器"
+    },
     "oauth": {
-      "connected": "已连接",
-      "needsReauth": "需要重新连接",
-      "refreshAmbiguous": "请检查连接",
-      "revoked": "已断开",
-      "connect": "连接",
-      "reconnect": "重新连接",
-      "disconnect": "断开连接",
-      "refreshSchemas": "刷新工具",
-      "connectFailed": "无法发起连接",
-      "connectedTitle": "已连接",
-      "connectedDesc": "“{{server}}”已连接。开启后即可在工作区中使用。",
+      "abandonedDesc": "“{{server}}”未从服务商的登录页面返回。",
+      "abandonedDescNeedsDesktop": "“{{server}}”未从服务商的登录页面返回。部分服务商仅接受桌面应用，请使用 LangAlpha 桌面应用连接。",
+      "abandonedTitle": "连接未完成",
+      "callbackError": {
+        "blocked_endpoint": "服务商要求从本应用不会访问的地址获取令牌。",
+        "denied": "你在服务商处拒绝了该请求。",
+        "internal": "我们这边出现了问题，请重试。",
+        "invalid_state": "此次连接请求已失效，请重新发起。",
+        "issuer_mismatch": "服务商的身份与其自身配置不符，连接已中止。",
+        "missing_code": "服务商未返回授权信息，请重新发起连接。",
+        "missing_state": "服务商返回的链接不完整，请重新发起连接。",
+        "provider_error": "服务商拒绝了此次连接。",
+        "server_changed": "连接过程中该连接器的地址发生了变化，请检查后重试。",
+        "state_mismatch": "无法将其与你发起的连接对应上，请在最初的窗口中重新发起。",
+        "token_exchange_failed": "服务商未能将授权兑换为令牌，请重新发起连接。",
+        "unknown": "连接未完成，请重试。"
+      },
       "callbackErrorTitle": "连接失败",
-      "disconnectedTitle": "已断开",
-      "disconnectedDesc": "“{{server}}”已断开。可随时重新连接；在此之前智能体调用将失败。",
+      "connect": "连接",
+      "connectFailed": "无法发起连接",
+      "connected": "已连接",
+      "connectedDesc": "“{{server}}”已连接。开启后即可在工作区中使用。",
+      "connectedDescAnon": "连接已完成。",
+      "connectedTitle": "已连接",
+      "disconnect": "断开连接",
       "disconnectFailed": "无法断开连接",
-      "refreshedTitle": "工具已刷新",
-      "refreshedDesc": "“{{server}}”现提供 {{count}} 个工具。",
-      "refreshFailedStaleTitle": "工具未刷新",
+      "disconnectedDesc": "“{{server}}”已断开。可随时重新连接；在此之前智能体调用将失败。",
+      "disconnectedTitle": "已断开",
+      "loopback": {
+        "no-listener": "无法占用本地端口来接收该券商的回调。请先退出其他正在运行的桌面端，然后重试。",
+        "not-minted": "服务端尚未配置为将回调发回桌面端。请稍后重试。",
+        "not-bound": "在本次连接完成前，又发起了另一个连接。请重新连接。",
+        "shell-outdated": "当前版本的桌面应用无法接收提供方的回调。请更新桌面应用后重试。"
+      },
+      "nativeHint": "部分服务商仅接受桌面应用，无法在浏览器中连接。",
+      "nativeOnlyNote": "需要桌面应用",
+      "registryUnavailableNote": "无法获取券商要求，连接暂时不可用。",
+      "needsReauth": "需要重新连接",
+      "reconnect": "重新连接",
+      "refreshAmbiguous": "请检查连接",
+      "refreshFailed": "无法刷新工具",
       "refreshFailedStaleDesc": "“{{server}}”的刷新未能完成。此前发现的 {{count}} 个工具仍可使用。",
-      "refreshFailed": "无法刷新工具"
+      "refreshFailedStaleTitle": "工具未刷新",
+      "refreshSchemas": "刷新工具",
+      "refreshedDesc": "“{{server}}”现提供 {{count}} 个工具。",
+      "refreshedTitle": "工具已刷新",
+      "revoked": "已断开",
+      "serverMoved": "自本页面加载以来，该服务器的地址已更改。请刷新页面后重新连接。",
+      "shellOutdatedHint": "当前版本的桌面应用无法完成连接。请更新桌面应用，或在浏览器中连接。",
+      "shellOutdatedNote": "桌面应用需要更新"
     },
     "import": {
       "disabledNudgeTitle": "导入的服务器为关闭状态",
@@ -2755,7 +2939,8 @@
     "mcp": {
       "platform": "平台服务器",
       "platformBadge": "平台",
-      "yours": "你的服务器"
+      "yours": "你的服务器",
+      "builtinLoadFailed": "无法加载随应用一起提供的服务器。"
     },
     "skills": {
       "platform": "平台技能",
@@ -2792,6 +2977,8 @@
       "allExcept": "所有工作区（除 {{count}} 个外）",
       "activeIn": "生效于",
       "futureHint": "新建工作区默认启用",
+      "flash": "Flash",
+      "flashNote": "Flash 仅能使用绑定为直接调用的工具；PTC 工具需要 PTC 智能体。",
       "moveToWorkspace": "移至工作区",
       "moveToAll": "移至所有工作区",
       "moveToAnother": "移至其他工作区",
@@ -2801,7 +2988,7 @@
       "inWorkspace": "工作区：{{name}}",
       "unknownWorkspace": "未知工作区",
       "triggerAria": "范围：{{scope}}",
-      "movePluginBlocked": "由 {{plugin}} 安装；插件组件保留在账户层级"
+      "movePluginBlocked": "由 {{plugin}} 提供；其组件保留在账户层级"
     },
     "list": {
       "title": "已安装插件",
@@ -2829,7 +3016,8 @@
       "uninstallFailed": "卸载失败",
       "uninstallConfirm": "卸载 {{plugin}}？其服务器和技能将从所有工作区移除。已自定义的组件会被保留。",
       "uninstallConfirmYes": "卸载",
-      "uninstallConfirmNo": "保留"
+      "uninstallConfirmNo": "保留",
+      "sourceBundled": "随 LangAlpha 提供"
     },
     "component": {
       "fromPlugin": "由 {{plugin}} 提供",
@@ -2886,7 +3074,8 @@
       "collapseAria": "收起 {{title}}",
       "selectAllAria": "全选 {{title}}",
       "uploaded": "本地上传",
-      "openPlugin": "查看插件"
+      "openPlugin": "查看插件",
+      "bundled": "内置"
     },
     "bulk": {
       "select": "选择",
@@ -2929,6 +3118,7 @@
     },
     "detail": {
       "kindServer": "MCP 服务器",
+      "kindBrokerage": "券商",
       "kindSkill": "技能",
       "kindPlugin": "插件",
       "tools": "工具",
@@ -2957,7 +3147,22 @@
       "sourceLabel": "来源",
       "installed": "安装于",
       "openComponentAria": "打开 {{name}}",
-      "toolsFailed": "无法加载工具。请求失败，请重试。"
+      "toolsFailed": "无法加载工具。请求失败，请重试。",
+      "toolsUnavailable": "当前服务进程未能获取，重启后通常可恢复。",
+      "repository": "代码仓库",
+      "license": "许可证",
+      "toolAccess": "工具调用方式",
+      "toolAccessNote": "PTC 工具由智能体在代码中调用；直接工具是应用可展示的单次调用。下方单个工具的设置优先于这些开关。",
+      "groupDefaults": "按工具组默认方式调用",
+      "groupDefaultsDesc": "开启后，由每个工具组决定其工具的调用方式，支持的工具作为应用可展示的单次调用运行；关闭后，该行可切换的工具全部由智能体在代码中调用。",
+      "binding_ptc": "PTC",
+      "binding_direct": "直接",
+      "binding_both": "两者",
+      "bindingAria": "智能体调用 {{name}} 的方式",
+      "bindingCustom": "自定义",
+      "bindingReset": "重置",
+      "bindingResetAria": "将 {{name}} 重置为该行默认",
+      "bindingPinned": "实盘下单工具仅作为应用可展示的直接调用运行。"
     }
   }
 }

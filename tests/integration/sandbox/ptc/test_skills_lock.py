@@ -116,7 +116,6 @@ class TestSkillsLockLifecycle:
                 "skills": SkillsConfig(
                     enabled=True,
                     user_skills_dir=tmpdir,
-                    project_skills_dir=tmpdir,
                     sandbox_skills_base=skills_base,
                 ),
             })()

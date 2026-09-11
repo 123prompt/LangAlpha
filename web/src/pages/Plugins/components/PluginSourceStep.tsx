@@ -153,7 +153,7 @@ export function PluginSourceStep({
           }}
           placeholder="https://github.com/owner/repo"
           spellCheck={false}
-          className="text-xs px-2 py-1.5 rounded-md outline-none"
+          className="text-xs px-2 py-1.5 rounded-md"
           style={{
             color: 'var(--color-text-primary)',
             backgroundColor: 'var(--color-bg-input)',

@@ -150,6 +150,46 @@ async def test_exactly_one_script_source_is_required() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_refused_launch_is_stamped_an_error() -> None:
+    """A refusal starts no run, so its reply is the card's only settle signal.
+
+    Every refusal leaves through ``_Refused``, so one launch that cannot
+    resolve a source stands for the whole class.
+    """
+    workflow_tool = _make_tool(FakeBackend())
+
+    message = await workflow_tool.ainvoke(
+        {
+            "name": "RunWorkflow",
+            "type": "tool_call",
+            "id": "tc-refused",
+            "args": {"script": _script(), "workflow": "saved"},
+        }
+    )
+
+    assert "exactly one" in message.content
+    assert message.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_workflow_refusal_is_stamped_an_error() -> None:
+    """The refusal text is built, not a literal, so no static sweep sees it."""
+    workflow_tool = _make_tool(FakeBackend(), prebuilt=FakePrebuilt({"known": _script()}))
+
+    message = await workflow_tool.ainvoke(
+        {
+            "name": "RunWorkflow",
+            "type": "tool_call",
+            "id": "tc-unknown",
+            "args": {"workflow": "nope"},
+        }
+    )
+
+    assert "Unknown workflow 'nope'" in message.content
+    assert message.status == "error"
+
+
+@pytest.mark.asyncio
 async def test_inline_workflow_snapshots_and_builds_v2_spec() -> None:
     backend = FakeBackend()
     workflow_tool = _make_tool(backend)
@@ -705,10 +745,11 @@ async def test_a_refused_admission_names_its_reason_and_drops_the_entry() -> Non
 
     message = await workflow_tool.coroutine(script=_script(), tool_call_id="wf-1")
 
-    assert message.startswith("Error: could not start Task-")
-    assert message.endswith(
+    assert message.content.startswith("Error: could not start Task-")
+    assert message.content.endswith(
         "— its checkpoint namespace could not be fenced. Try again."
     )
+    assert message.status == "error"
     assert await dispatcher.registry.get_all_tasks() == []
     assert CapturingDriver.specs == []
 

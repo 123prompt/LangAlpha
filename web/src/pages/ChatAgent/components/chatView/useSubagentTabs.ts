@@ -284,6 +284,7 @@ export function useSubagentTabs({
       ? existingStatus!
       : (history?.status || overrides.status || 'completed');
     const finalError = history?.error || overrides.error;
+    const finalErrorType = history?.errorType || overrides.errorType;
 
     // Check if card is currently live (active with an open stream). A card
     // whose own status already settled is not live however its flag reads.
@@ -313,6 +314,7 @@ export function useSubagentTabs({
       updateData.status = finalStatus;
       updateData.currentTool = '';
       if (finalError) updateData.error = finalError;
+      if (finalErrorType) updateData.errorType = finalErrorType;
     }
     if (history) {
       updateData.messages = (history.messages || []) as SubagentMessage[];

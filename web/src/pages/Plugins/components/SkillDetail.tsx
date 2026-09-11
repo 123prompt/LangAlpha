@@ -61,7 +61,8 @@ export function SkillDetail({
         <DetailHeader
           name={skill.name}
           labelId={labelId}
-          kind={t('plugins.detail.kindSkill')}
+          kind="skill"
+          kindLabel={t('plugins.detail.kindSkill')}
           meta={
             <>
               {skill.command && <TagBadge>/{skill.command}</TagBadge>}

@@ -18,6 +18,7 @@ from ptc_agent.agent.middleware.skills.registry import (
     _matches_mode,
     get_skill,
 )
+from ptc_agent.config.agent import host_skill_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +122,12 @@ def load_skill_content(
             )
             return None
 
-    # Default skill directory: project_root/skills
+    # No caller-supplied search path: fall back to the same sources, in the
+    # same order, that a caller holding a config would have passed. A caller
+    # that overrode ``user_skills_dir`` has to pass its own list -- this branch
+    # answers for the ones that have no config to read it from.
     if skill_dirs is None:
-        project_root = Path.cwd()
-        skill_dirs = [str(project_root / "skills")]
+        skill_dirs = [str(d) for d in host_skill_dirs()]
 
     # Search for SKILL.md in each directory (last wins)
     content = None

@@ -15,11 +15,11 @@ interface Span {
 }
 
 /** Opening fence: up to 3 spaces of indent, then 3+ backticks or tildes. */
-const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
+export const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
 /** Closing fence: same character as the opener, at least as long, nothing else. */
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
-function closesFence(line: string, opener: string): boolean {
+export function closesFence(line: string, opener: string): boolean {
   // The terminator has to come off first: JavaScript's `$` does not match ahead
   // of a trailing newline, so testing the raw line never matches.
   const match = FENCE_CLOSE_RE.exec(line.replace(/\r?\n$/, ''));

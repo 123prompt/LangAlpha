@@ -143,10 +143,10 @@ and deleted again on an `oss` build: a tree that previously built `saas` cannot 
 those origins into an OSS package by accident.
 
 **Nor do the two share an output directory** (`directories.output: dist/${EDITION}`).
-The artifact filename carries the edition; nothing else written there does. The unpacked
+The artifact filename carries the edition tag; nothing else written there does. The unpacked
 bundle is named from `productName`, so both `.app`s land under one `mac-arm64`, and the
-update manifests are `latest-mac.yml` and `latest.yml`, fixed names with no edition in
-them at all, so whichever edition builds second overwrites the first's. `scripts/build.mjs`
+update manifests are named for the update channel and never the edition
+(`latest-mac.yml`, `latest.yml`), so whichever edition builds second overwrites the first's. `scripts/build.mjs`
 then searches that same directory for what it just produced, which is where one tree
 turns into a signing check verifying the other edition's stale bundle and a no-feed build
 whose sweep strips the other edition's baked `app-update.yml`.
@@ -251,8 +251,22 @@ Three things are load-bearing:
 - **The exchange happens in the renderer, never in main.** The PKCE verifier lives in
   that renderer's cookie jar and never leaves it. That is also what makes the loopback
   hop safe: anything else listening on the port gets a code it cannot redeem.
-- **Only 8788/8789/8790 work.** Supabase matches `redirect_to` as an exact string, so
-  every port has to be in its Redirect URLs allowlist.
+- **The port comes from the OS, not from us.** `listen(0)` on loopback, which is what
+  RFC 8252 §7.3 tells an authorization server to expect from a native client, and the
+  only way to be sure of getting a port at all. Sign-in's `redirect_to` is still matched
+  against the Supabase Redirect URLs allowlist, so that entry has to be a port wildcard
+  (`http://127.0.0.1:*/callback`) for any of this to work. **That wildcard is wider than
+  a port.** Supabase's glob stops only at `.` and `/`, and `@` is neither, so the same
+  entry also matches `http://127.0.0.1:x@capture/callback`, a string whose real host is
+  `capture` rather than loopback. Reaching it takes a single-label hostname the user's own
+  resolver answers for, which is a narrower opening than the glob's shape suggests but not a
+  closed one: a search domain or a `hosts` entry can point `capture` at an address anywhere.
+  The allowlist is simply not doing the work it looks like it is doing. Whatever a Supabase
+  version happens to special-case about loopback literals is theirs to change, so do not
+  lean on it: the binding that actually holds is the PKCE verifier, which lives in the
+  renderer that minted it and cannot be redeemed anywhere else. A connector's authorization
+  server matches loopback as a pattern and adds no constraint, and this deployment's backend
+  accepts any loopback port at or above 1024 (`sanitize_loopback_redirect`).
 - **The interception mechanic is indirect.** `setWindowOpenHandler` returns `deny`, so
   `window.open` returns `null` and the SPA takes its existing popup-blocked fallback: a
   same-tab navigation to the authorize URL, which `will-navigate` then catches. If an
@@ -326,27 +340,92 @@ A build learns where to look in one of two ways, and needs exactly one:
 `electron-builder.yml` carries `publish: null` because where a build looks for
 updates is deployment configuration, not source: the feed arrives as
 `DESKTOP_UPDATE_FEED` and `scripts/build.mjs` rewrites the config for that one
-build. **Supplying a feed is what makes electron-builder emit `latest-*.yml` at
-all.** Without it there is no manifest, and a build with no manifest installs
+build. **Supplying a feed is what makes electron-builder emit an update manifest
+at all.** Without it there is no manifest, and a build with no manifest installs
 perfectly and then never updates, which is why the build script fails hard when a
-feed was set but no manifest came out. That guard caught its own case the first time it ran.
+feed was set but no manifest came out.
+
+**The manifest is named for the update channel, which electron-builder reads off the
+version's prerelease tag** (`appInfo.channel`): `0.2.0` writes `latest-mac.yml`,
+`0.2.0-rc.1` writes `rc-mac.yml`. The guard derives that same name instead of globbing
+`latest*`, and so does every step of the release pipeline that collects or uploads a
+manifest. Getting this wrong is not a corner case: shipping a prerelease through the real
+pipeline is how that pipeline is meant to be rehearsed, and the first run to do it failed
+all three platforms on a guard demanding a filename the build had no reason to write.
 
 Distribution has two halves: the GitHub release is where a person downloads the
 app, and the feed host is the only thing an installed app reads. Publishing one
 without the other is a silent no-op.
 
-The workflow in this repository builds the OSS edition only, and ships it feed-less
-and unsigned. The hosted edition is built by a separate pipeline that holds the
-signing certificates and the key to the feed host; it consumes this directory but
-does not live in it, because a public repository is the wrong place to keep a
-credential that can replace the binary every installed app runs. Both editions are
-the same source, so a change here reaches both, and `scripts/` is shared: nothing
-under it is dead code merely because this repository's own workflow does not call
-it.
+The workflow in this repository builds the OSS edition unsigned and with no feed.
+That is what makes it useful to a fork: it takes no credentials and needs no
+setup, and its signing and feed steps activate on their own if a fork ever
+supplies them. It is not what cuts the published releases. Those come from a
+separate pipeline that holds the signing certificates and the key to the feed
+host, builds both editions, and consumes this directory without living in it,
+because a public repository is the wrong place to keep a credential that can
+replace the binary every installed app runs. Both editions are the same source,
+so a change here reaches both, and `scripts/` is shared: nothing under it is dead
+code merely because this repository's own workflow does not call it.
 
-Applying a macOS update needs a Developer ID signature, which does not exist yet.
-Everything up to that point is verified: the packaged app fetches its baked-in
-feed, recognises a newer version, downloads it and verifies the sha512.
+**The two editions cannot share a feed.** electron-builder names a manifest for
+the channel and nothing else, so two editions publishing to one feed root both
+write `latest-mac.yml` and the second overwrites the first. Whichever wins then
+hands its own archives to both, and a self-hosted install updates itself into the
+hosted app: same version, same filename shape, different product. Each edition
+needs a feed root of its own, and the `extraMetadata.name` in
+`electron-builder.yml` for the same reason one layer down, since electron-updater
+names its download cache from the package name.
+
+Applying a macOS update needs a Developer ID signature, and Squirrel.Mac checks
+the incoming build's against the running one's: a Team ID that differs is
+refused. So an unsigned install can never be updated into a signed one, and
+changing enrollment type later strands every install already out there.
+Everything up to the signature is verified: the packaged app fetches its
+baked-in feed, recognises a newer version, downloads it and verifies the sha512.
+
+**Signing and notarization are two switches and a release needs both.** The
+certificate is what makes `codesign --verify` pass, and it says nothing about
+whether Apple has ever seen the bundle; the notarization ticket is what
+Gatekeeper asks for on first launch, so a signed build without one is refused
+exactly like an unsigned one. `electron-builder.yml` commits `identity: null`
+and `notarize: false`, because someone with neither credential still has to be
+able to run `dist`, and `scripts/build.mjs` replaces each line when the
+credentials for it arrive: a certificate in `CSC_LINK` or `CSC_NAME` for the
+first, and a complete notarytool authentication for the second (an Apple ID with
+an app-specific password, an App Store Connect API key, or a keychain profile).
+A partial set counts as none, since `notarize: true` with nothing to authenticate
+with packages for twenty minutes and then fails at the submission.
+
+`CSC_NAME` takes the certificate's name **without** the `Developer ID
+Application:` prefix that `security find-identity` prints, which is the whole
+string a person naturally copies. electron-builder picks the type itself and
+rejects the prefixed form, and it does so after unpacking Electron rather than
+at startup, so the mistake costs a few minutes each time:
+
+```bash
+CSC_NAME="Your Company (TEAMID)" pnpm run dist
+```
+
+The check after the build splits the same way. `codesign --verify` passes on a
+bundle Apple has never seen, so a notarized build is also put through
+`xcrun stapler validate`, and the missing staple is the failure that otherwise
+reaches a user as an app that will not open.
+
+**The disk image needs the same two gates as the app it carries.**
+electron-builder notarizes the `.app` and then builds the DMG around it, so the
+image itself is never submitted; Gatekeeper assesses a downloaded image on its
+own signature, and refuses an unsigned one however well notarized its contents
+are. `dmg.sign: true` covers the first gate (it is off by default), and
+`scripts/build.mjs` submits and staples each image after electron-builder
+returns for the second. Only the first-time install was ever affected: the
+updater reads the `.zip`, which carries the stapled app, so auto-update looked
+healthy while every fresh download was refused.
+
+An image is assessed with a different question than an app: `-t open --context
+context:primary-signature` rather than `-t exec`. Ask the wrong one and a
+correctly notarized DMG reports a verdict that does not mean what it looks
+like.
 
 ## Conventions
 
@@ -370,9 +449,16 @@ feed, recognises a newer version, downloads it and verifies the sha512.
 
 ## Status
 
-macOS is built and verified, including the outage page and the update path up to
-the signature check. Windows and Linux targets are declared in
-`electron-builder.yml` and run in CI, but have not been exercised by hand.
+macOS is built and verified end to end, including the outage page and the update
+path. Windows and Linux targets are declared in `electron-builder.yml` and run in
+CI, but are not signed and have not been exercised by hand.
 
-Nothing has shipped a feed yet, so no released build can update itself until
-`DESKTOP_UPDATE_FEED` is set and the artifacts are uploaded there.
+The signing and notarization switches above are wired and exercised on CI: both
+`.app` bundles and both disk images come back notarized and stapled, verified
+with `stapler validate` and `spctl` rather than read off the build log. Windows
+builds are still unsigned, so SmartScreen warns on first run.
+
+Both editions ship a feed and update themselves, each from a root of its own. An
+install that predates its edition's feed carries no `app-update.yml` and so never
+polls: it takes one manual update to reach the feed, and everything after that is
+automatic.

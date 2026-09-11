@@ -21,7 +21,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from src.server.database.mcp_oauth import SERVABLE_PARAM
-from src.server.database.mcp_servers import _bump_user_versions, _bump_version
+from src.server.database.mcp_servers import _bump_version, bump_user_versions
 from src.server.database.pool import get_db_connection
 
 
@@ -341,5 +341,5 @@ async def delete_user_and_workspace_tool_schemas_and_bump(
                     (server_names, user_id),
                 )
                 deleted += cur.rowcount
-                await _bump_user_versions(cur, user_id)
+                await bump_user_versions(cur, user_id)
                 return deleted

@@ -94,6 +94,35 @@ class TestRoundTrip:
         assert claims.jti
         assert claims.expires_at > int(time.time())
 
+    def test_a_token_without_a_caller_claim_is_the_sandbox(self):
+        """Every credential minted before the claim existed keeps the stricter
+        reading, and so does anything that strips it."""
+        token = mint_relay_jwt(
+            SECRET, user_id=USER_ID, workspace_id=WORKSPACE_ID, sandbox_id=SANDBOX_ID
+        ).token
+        assert validate_relay_jwt(SECRET, token).caller == "sandbox"
+
+        payload = jwt.decode(token, SECRET, algorithms=[ALGORITHM], audience="langalpha-egress-relay")
+        payload.pop("caller")
+        assert validate_relay_jwt(SECRET, _encode(payload)).caller == "sandbox"
+
+    def test_the_host_claim_round_trips_and_an_unknown_one_is_refused(self):
+        token = mint_relay_jwt(
+            SECRET, user_id=USER_ID, workspace_id=WORKSPACE_ID,
+            sandbox_id=SANDBOX_ID, caller="host",
+        ).token
+        assert validate_relay_jwt(SECRET, token).caller == "host"
+
+        payload = jwt.decode(token, SECRET, algorithms=[ALGORITHM], audience="langalpha-egress-relay")
+        payload["caller"] = "browser"
+        with pytest.raises(RelayJwtError):
+            validate_relay_jwt(SECRET, _encode(payload))
+        with pytest.raises(ValueError):
+            mint_relay_jwt(
+                SECRET, user_id=USER_ID, workspace_id=WORKSPACE_ID,
+                sandbox_id=SANDBOX_ID, caller="browser",
+            )
+
     def test_ttl_is_honored_and_each_mint_gets_a_fresh_jti(self):
         first = validate_relay_jwt(
             SECRET,

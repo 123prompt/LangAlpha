@@ -36,6 +36,7 @@ from src.server.models.plugin import (
     UninstalledComponents,
 )
 from src.server.services.mcp_oauth.lifecycle import oauth_fence
+from src.server.services.plugins.bundled import bundled_names
 from src.server.services.plugins.extension import materialize_binds
 from src.server.services.plugins.grants import (
     resolve_bind_grants,
@@ -86,11 +87,23 @@ async def install_plugin_package(
     """Create the plugin row and fan its components out.
 
     Raises PluginFatal (from the caller's validate_package), and ValueError
-    for whole-install refusals: duplicate plugin, plugin cap, or a component
-    name owned by another plugin. The duplicate check runs first, so a user
-    reinstalling a plugin they already have is told to update it rather than
-    told to uninstall one of its own servers.
+    for whole-install refusals: a name that ships with the app, duplicate
+    plugin, plugin cap, or a component name owned by another plugin. The
+    shipped-name check runs first because it is the only one no user action
+    resolves, and the duplicate check runs before the component scan so a
+    user reinstalling a plugin they already have is told to update it rather
+    than told to uninstall one of its own servers.
+
+    That first check is also what keeps the plugin name unambiguous. A
+    shipped bundle has no row here, so nothing else stops a user installing
+    over one, and both would then answer to the same name on every route
+    that addresses a package by it.
     """
+    if package.name in bundled_names():
+        raise ValueError(
+            f"{package.name!r} is the name of a package that already ships "
+            "with the app; rename the plugin and install it again"
+        )
     if await get_plugin(user_id, package.name) is not None:
         raise ValueError(
             f"Plugin {package.name!r} is already installed; use update"

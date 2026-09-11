@@ -321,7 +321,6 @@ def load_from_dict(
     skills_config = SkillsConfig(
         enabled=skills_data.get("enabled", True),
         user_skills_dir=skills_data.get("user_skills_dir", "~/.ptc-agent/skills"),
-        project_skills_dir=skills_data.get("project_skills_dir", "skills"),
         sandbox_skills_base=skills_data.get(
             "sandbox_skills_base", f"{filesystem_config.working_directory}/.agents/skills"
         ),
@@ -424,7 +423,7 @@ filesystem:
   # These tools provide direct file and directory operations without code generation
 
   # Working directory for the sandbox - used as the root for virtual path normalization
-  # Agent sees virtual paths like /results/file.txt which map to {working_directory}/results/file.txt
+  # Agent sees virtual paths like /work/task/file.txt which map to {working_directory}/work/task/file.txt
   working_directory: "/home/workspace"
 
   # allowed_directories and denied_directories are auto-derived from working_directory:

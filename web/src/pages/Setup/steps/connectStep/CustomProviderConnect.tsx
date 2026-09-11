@@ -10,9 +10,12 @@ import { useUpdateApiKeys } from '@/hooks/useApiKeys';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { queryKeys } from '@/lib/queryKeys';
+import { modelPrefs } from '@/lib/modelPreferences';
 import { api } from '@/api/client';
 import { useTranslation } from 'react-i18next';
-import { mergeCustomModelsForSlug, type CustomModelEntry } from '../mergeCustomModelsForSlug';
+import { mergeCustomModelsForSlug } from '../mergeCustomModelsForSlug';
+import type { CustomModelEntry } from '@/components/model/types';
+import type { CustomProviderEntry } from '@/lib/modelPreferences';
 import { API_FORMATS, useModalityState, type LocationState, type ParentModel } from './shared';
 
 export function CustomProviderConnect({ state }: { state: LocationState }) {
@@ -118,12 +121,11 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
       const useRespApi = format?.useResponseApi ?? false;
 
       // 1. Read existing custom_providers/custom_models from current preferences
-      const prefs = (preferences ?? {}) as Record<string, unknown>;
-      const otherPref = (prefs.other_preference ?? {}) as Record<string, unknown>;
-      const existingProviders = (Array.isArray(otherPref.custom_providers) ? otherPref.custom_providers : []) as Array<Record<string, unknown>>;
-      const existingModels = (Array.isArray(otherPref.custom_models) ? otherPref.custom_models : []) as Array<Record<string, unknown>>;
+      const mPref = modelPrefs(preferences);
+      const existingProviders = mPref.custom_providers ?? [];
+      const existingModels = mPref.custom_models ?? [];
 
-      const newProvider: Record<string, unknown> = {
+      const newProvider: CustomProviderEntry = {
         name: slug,
         parent_provider: parentProvider,
       };
@@ -134,10 +136,10 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
       // imported from the parent keep their original name/model_id; only the
       // ``provider`` is rewritten to the new variant so BYOK routes through
       // the user's key/base_url.
-      const newModels: Array<Record<string, unknown>> = [];
+      const newModels: CustomModelEntry[] = [];
       for (const pm of parentModels) {
         if (!selectedParentModelNames.has(pm.name)) continue;
-        const entry: Record<string, unknown> = {
+        const entry: CustomModelEntry = {
           name: pm.name,
           model_id: pm.model_id,
           provider: slug,
@@ -148,7 +150,7 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
         newModels.push(entry);
       }
       if (hasManual) {
-        const entry: Record<string, unknown> = {
+        const entry: CustomModelEntry = {
           name: customModelName.trim(),
           model_id: customModelId.trim() || customModelName.trim(),
           provider: slug,
@@ -168,14 +170,14 @@ export function CustomProviderConnect({ state }: { state: LocationState }) {
       // name collision; anything the user added elsewhere under this slug
       // keeps its current config.
       const mergedModels = mergeCustomModelsForSlug({
-        existing: existingModels as unknown as CustomModelEntry[],
+        existing: existingModels,
         slug,
-        newForSlug: newModels as unknown as CustomModelEntry[],
+        newForSlug: newModels,
       });
 
       // Only send custom_providers and custom_models — backend merges into existing JSONB
       await updatePreferences.mutateAsync({
-        other_preference: {
+        model_preference: {
           custom_providers: [...existingProviders.filter((p) => p.name !== slug), newProvider],
           custom_models: mergedModels,
         },

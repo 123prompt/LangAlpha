@@ -145,6 +145,13 @@ class PluginInfo(BaseModel):
     source_type: str
     source_ref: Optional[str] = None
     enabled: bool
+    # Set only when the manifest names a vendor whose mark we do not ship, so a
+    # null here is the answer "this one's art is a file the frontend already
+    # holds", not "this one has none".
+    icon_url: Optional[str] = None
+    repository: Optional[str] = None
+    license: Optional[str] = None
+    keywords: list[str] = Field(default_factory=list)
     installed_at: Optional[str] = None
     updated_at: Optional[str] = None
     components: list[PluginComponentRef] = Field(default_factory=list)
@@ -195,7 +202,12 @@ class UninstallResponse(BaseModel):
 def plugin_row_to_info(
     row: dict[str, Any], *, components: list[PluginComponentRef] | None = None
 ) -> PluginInfo:
-    """Project a user_plugins row (+ manifest metadata) onto the wire model."""
+    """Project a user_plugins row (+ manifest metadata) onto the wire model.
+
+    Every field the model carries, because the detail view draws the same
+    panel for an installed package and a shipped one: a field this projection
+    skips reads to the user as metadata the package did not declare.
+    """
     manifest = row.get("manifest") or {}
     author = manifest.get("author") or {}
     return PluginInfo(
@@ -204,6 +216,9 @@ def plugin_row_to_info(
         description=str(manifest.get("description") or ""),
         author=author.get("name") if isinstance(author, dict) else None,
         homepage=manifest.get("homepage"),
+        repository=manifest.get("repository"),
+        license=manifest.get("license"),
+        keywords=list(manifest.get("keywords") or []),
         source_type=row["source_type"],
         source_ref=row.get("source_ref"),
         enabled=bool(row["enabled"]),

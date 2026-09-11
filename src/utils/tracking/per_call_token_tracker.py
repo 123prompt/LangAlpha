@@ -22,6 +22,7 @@ from langchain_core.messages.ai import UsageMetadata, add_usage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 from src.llms.token_counter import extract_token_usage
+from src.utils.tracking.core import calculate_cost_from_per_call_records
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,15 @@ class PerCallTokenTracker(BaseCallbackHandler):
         self._lock = threading.Lock()
         self.per_call_records: List[Dict[str, Any]] = []
         self.usage_metadata: Dict[str, UsageMetadata] = {}
+        # Running USD total of platform-billed calls. A reader prices only the
+        # records appended since the last read, through the batch pass that
+        # bills the turn, so the gate's arithmetic is the biller's arithmetic
+        # rather than a copy of it. Advisory by design: the billed figure
+        # remains that finalize-time pass, so a pricing failure here costs
+        # gating precision, never money.
+        self._platform_usd: float = 0.0
+        self._priced_upto: int = 0
+        self._pricing_error_logged = False
         # Maps run_id → what is only knowable at dispatch: the billing attribution
         # stamped on the client that issued the call (see LLM.get_llm) — billing_type,
         # the manifest key, the pricing id/provider that key resolves to — plus the
@@ -271,20 +281,22 @@ class PerCallTokenTracker(BaseCallbackHandler):
             )
             return
 
+        record = {
+            "model_name": model_name,
+            "served_model": served_model,
+            "pricing_model_id": attribution.get("pricing_model_id"),
+            "pricing_provider": attribution.get("pricing_provider"),
+            "usage": usage_metadata,
+            "billing_type": billing_type,
+            "started_at": attribution.get("started_at"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": str(run_id),
+            "parent_run_id": str(parent_run_id) if parent_run_id else None,
+        }
+
         with self._lock:
             # Store per-call record
-            self.per_call_records.append({
-                "model_name": model_name,
-                "served_model": served_model,
-                "pricing_model_id": attribution.get("pricing_model_id"),
-                "pricing_provider": attribution.get("pricing_provider"),
-                "usage": usage_metadata,
-                "billing_type": billing_type,
-                "started_at": attribution.get("started_at"),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "run_id": str(run_id),
-                "parent_run_id": str(parent_run_id) if parent_run_id else None,
-            })
+            self.per_call_records.append(record)
 
             # Also maintain aggregated usage for backward compatibility
             if model_name not in self.usage_metadata:
@@ -304,6 +316,41 @@ class PerCallTokenTracker(BaseCallbackHandler):
     ) -> None:
         with self._lock:
             self._run_attribution.pop(run_id, None)
+
+    def platform_usd_total(self) -> float:
+        """Running USD total of platform-billed calls, for mid-run gating.
+
+        Prices only the records appended since the last read, through the same
+        batch pass that bills the turn — one pricing implementation rather than
+        a second one that has to be kept agreeing with it. A tail that raises
+        is skipped rather than retried: the alternative freezes this figure for
+        the rest of the turn, and a record that cannot be priced here cannot be
+        billed at finalize either, so it is already a money bug elsewhere.
+        """
+        # The lock guards the records and the cursor, not the pricing pass:
+        # this is called on every model boundary and on a two-second
+        # heartbeat, and holding it across the pass stalls the callbacks
+        # appending the records being priced.
+        with self._lock:
+            tail = self.per_call_records[self._priced_upto:]
+            self._priced_upto = len(self.per_call_records)
+            if not tail:
+                return self._platform_usd
+        try:
+            priced = calculate_cost_from_per_call_records(tail)["platform_cost"]
+        except Exception:
+            priced = 0.0
+            if not self._pricing_error_logged:
+                self._pricing_error_logged = True
+                logger.warning(
+                    "Failed to price %d record(s) into the running total; "
+                    "the mid-run spend figure undercounts them",
+                    len(tail),
+                    exc_info=True,
+                )
+        with self._lock:
+            self._platform_usd += priced
+            return self._platform_usd
 
     def get_aggregated_usage(self) -> Dict[str, UsageMetadata]:
         """
@@ -345,6 +392,9 @@ class PerCallTokenTracker(BaseCallbackHandler):
             self.per_call_records.clear()
             self.usage_metadata.clear()
             self._run_attribution.clear()
+            self._platform_usd = 0.0
+            self._priced_upto = 0
+            self._pricing_error_logged = False
 
     def __repr__(self) -> str:
         """String representation showing number of calls and models tracked."""

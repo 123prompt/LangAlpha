@@ -588,7 +588,7 @@ class SandboxBackend(SandboxBackendProtocol):
         """Execute Python code in the sandbox (Jupyter-style).
 
         Distinct from `aexecute` (shell) — returns rich `ExecutionResult`
-        with stdout/files_created/charts.
+        with stdout/charts/mcp_trace.
         """
         return await self.sandbox.execute(code, thread_id=thread_id)
 

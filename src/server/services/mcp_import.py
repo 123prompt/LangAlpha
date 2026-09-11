@@ -133,7 +133,7 @@ async def run_mcp_import(parsed: list[Any], *, scope: ImportScope) -> ImportRepo
             continue
         if entry.name in scope.reserved_names:
             report.results.append(
-                {**base, "status": "skipped", "reason": "collides with a built-in server"}
+                {**base, "status": "skipped", "reason": "collides with a name this build reserves"}
             )
             continue
         if entry.name in seen_names or entry.name in scope.existing_names:

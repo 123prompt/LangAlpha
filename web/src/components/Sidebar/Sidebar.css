@@ -190,7 +190,7 @@ html.desktop-mac .sidebar-window-drag {
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 7px 9px;
+  padding: 5px 9px;
   border: none;
   border-radius: 6px;
   background: transparent;
@@ -308,7 +308,7 @@ html.desktop-mac .sidebar-window-drag {
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 6px 8px;
+  padding: 5px 8px;
   border: none;
   border-radius: 8px;
   background: transparent;
@@ -320,9 +320,18 @@ html.desktop-mac .sidebar-window-drag {
   background: hsl(var(--sidebar-hover));
 }
 
+/* Inset, unlike the collapsed avatar's: the row is already full-bleed against
+   the panel, so an outset ring lands in the gutter and reads as a second border
+   on the sidebar itself. Drawn inside its own radius it stays a ring on one
+   control. */
+.sidebar-account-row:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--color-focus-ring);
+}
+
 .sidebar-account-row-avatar {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 28px;
   border-radius: 999px;
   background: var(--color-accent-soft);
   color: var(--color-accent-light);
@@ -354,6 +363,13 @@ html.desktop-mac .sidebar-window-drag {
   background: var(--color-accent-soft);
   color: var(--color-accent-light);
   flex-shrink: 0;
+  /* Bounded because the text is a backend value, not one of ours: the plan's
+     display name is free-form, and unbounded next to a shrinkable name this
+     pill wins the row and squeezes the account down to nothing. */
+  max-width: 7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sidebar-logo {
@@ -479,7 +495,7 @@ html.desktop-mac .sidebar-window-drag {
 
 .sidebar-account-trigger:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px var(--color-accent-overlay);
+  box-shadow: 0 0 0 2px var(--color-focus-ring);
 }
 
 .sidebar-account-trigger[data-active='true'] {

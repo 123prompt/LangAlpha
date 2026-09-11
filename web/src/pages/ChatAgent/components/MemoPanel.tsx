@@ -389,7 +389,7 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
   });
   const workspaceNameById = useMemo(() => {
     const map = new Map<string, string>();
-    const items = (wsData as { workspaces?: { workspace_id: string; name?: string }[] } | undefined)?.workspaces;
+    const items = wsData?.workspaces;
     for (const ws of items ?? []) {
       if (ws.workspace_id && ws.name) map.set(ws.workspace_id, ws.name);
     }

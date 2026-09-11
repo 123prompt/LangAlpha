@@ -11,8 +11,9 @@ interface ErrorBannerProps {
   style?: React.CSSProperties;
 }
 
-function ErrorLink({ url, label, external }: ErrorLinkSpec) {
+export function ErrorLink({ url, label, labelKey, external }: ErrorLinkSpec): React.ReactElement {
   const navigate = useNavigate();
+  const { t } = useTranslation();
   // A leading slash is not enough to claim a URL as ours: with a path-shaped
   // VITE_PLATFORM_URL the account portal answers on /account/*, same origin but
   // a different app, and routing to it lands on our catch-all with no network
@@ -40,7 +41,7 @@ function ErrorLink({ url, label, external }: ErrorLinkSpec) {
         }}
         style={{ textDecoration: 'underline', fontWeight: 500 }}
       >
-        {label}
+        {labelKey ? t(labelKey) : label}
       </a>
   );
 }

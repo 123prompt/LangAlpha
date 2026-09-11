@@ -1,8 +1,9 @@
 import { useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
+import { hasLifecycle, pluginMark, sourceLabelKey } from '../utils/pluginSurface';
 import { ChevronRight, Download, RefreshCw, Trash2 } from 'lucide-react';
 import { toast } from '@/components/ui/use-toast';
-import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
 import {
   ConfirmStrip,
   EnabledToggle,
@@ -28,7 +29,10 @@ import {
   DetailSection,
 } from './DetailOverlay';
 import { validatePluginZip } from '../utils/pluginSchemas';
+import { webLink } from '../utils/webLink';
 import { PluginOutcome } from './PluginOutcome';
+
+const formatDate = createDateFormatter({ dateStyle: 'medium' });
 
 /**
  * A plugin's detail overlay. The lifecycle verbs (Update, Export, Uninstall)
@@ -36,8 +40,6 @@ import { PluginOutcome } from './PluginOutcome';
  * manages it. Component rows link through to their own detail views on the
  * MCP and Skills tabs — the plugin never re-renders what those tabs own.
  */
-
-const formatDate = createDateFormatter({ dateStyle: 'medium' });
 
 export function PluginDetail({
   plugin,
@@ -167,8 +169,8 @@ export function PluginDetail({
     }
   }
 
-  const homepage =
-    plugin.homepage && /^https?:\/\//i.test(plugin.homepage) ? plugin.homepage : null;
+  const homepage = webLink(plugin.homepage);
+  const repository = webLink(plugin.repository);
 
   return (
     <>
@@ -176,7 +178,10 @@ export function PluginDetail({
         labelId={labelId}
         onClose={onClose}
         footer={
-          confirmingDelete ? (
+          // No verbs for a package with no lifecycle: Update, Export and
+          // Uninstall all answer 404 against a name with no install behind it.
+          // The switch above stays — it is the one thing a bundle answers.
+          !hasLifecycle(plugin) ? null : confirmingDelete ? (
             <ConfirmStrip
               message={t('plugins.card.uninstallConfirm', { plugin: plugin.name })}
               confirmLabel={
@@ -223,15 +228,12 @@ export function PluginDetail({
           <DetailHeader
             name={plugin.name}
             labelId={labelId}
-            kind={t('plugins.detail.kindPlugin')}
+            {...pluginMark(plugin)}
+            kindLabel={t('plugins.detail.kindPlugin')}
             meta={
               <>
                 {plugin.version && <span>v{plugin.version}</span>}
-                <span>
-                  {plugin.source_type === 'zip'
-                    ? t('plugins.card.sourceZip')
-                    : t('plugins.card.sourceRemote')}
-                </span>
+                <span>{t(sourceLabelKey(plugin))}</span>
                 {!plugin.enabled && <span>{t('plugins.card.disabledState')}</span>}
               </>
             }
@@ -268,7 +270,10 @@ export function PluginDetail({
                   })}
                   className="group flex items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-foreground/10"
                 >
-                  <IdentityTile name={component.name} />
+                  <BrandMark
+                    name={component.name}
+                    kind={component.kind === 'mcp' ? 'server' : 'skill'}
+                  />
                   <span
                     className="min-w-0 flex-1 truncate text-xs font-medium"
                     style={{ color: 'var(--color-text-primary)' }}
@@ -315,6 +320,23 @@ export function PluginDetail({
                 >
                   {homepage}
                 </a>
+              </DetailField>
+            )}
+            {repository && (
+              <DetailField label={t('plugins.detail.repository')}>
+                <a
+                  href={repository}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:underline underline-offset-2"
+                >
+                  {repository}
+                </a>
+              </DetailField>
+            )}
+            {plugin.license && (
+              <DetailField label={t('plugins.detail.license')}>
+                {plugin.license}
               </DetailField>
             )}
             {plugin.source_ref && (

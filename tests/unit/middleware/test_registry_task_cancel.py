@@ -175,3 +175,48 @@ async def test_soft_cancel_leaves_the_handler_running():
         await task.asyncio_task
     assert not handler.done()
     handler.cancel()
+
+
+@pytest.mark.asyncio
+async def test_adopt_writer_outcome_honors_a_declared_terminal():
+    """``success: False`` alone reads as a failure; a writer that settled on a
+    neutral terminal says so and is believed.
+
+    The regression: a credit stop wrote ``cancelled`` to the ledger while this
+    mapped the same run to ``error`` in memory, so the durable row and the
+    agent-facing aggregate disagreed and the model was steered off the
+    resumable path.
+    """
+    registry = BackgroundTaskRegistry(thread_id="thread-x")
+    task = await _register(registry, "tc-stop")
+
+    async def _stopped() -> dict:
+        return {
+            "success": False,
+            "error": "out of credits",
+            "error_type": "credit_stop",
+            "status": "cancelled",
+        }
+
+    writer = asyncio.create_task(_stopped())
+    await writer
+
+    task.adopt_writer_outcome(writer)
+    assert task.terminal_status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_adopt_writer_outcome_ignores_an_unknown_declared_status():
+    """A declared status outside the vocabulary falls back to the failure
+    reading rather than writing an unknown terminal."""
+    registry = BackgroundTaskRegistry(thread_id="thread-x")
+    task = await _register(registry, "tc-bogus")
+
+    async def _bogus() -> dict:
+        return {"success": False, "error": "x", "status": "not-a-terminal"}
+
+    writer = asyncio.create_task(_bogus())
+    await writer
+
+    task.adopt_writer_outcome(writer)
+    assert task.terminal_status == "error"

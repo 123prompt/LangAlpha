@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ExternalLink } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { useScrollMemory } from '@/lib/scrollMemory';
 import { getNewsArticle } from '../Dashboard/utils/api';
 
 interface ArticleSentiment {
@@ -28,7 +29,38 @@ interface NewsArticle {
   article_url?: string;
 }
 
+/* Three exit paths render three different roots, and none of them is a bar the
+   window could be dragged by, so the titlebar is donated here instead of in each
+   one. Outside the article's own padding on purpose: it keeps the strip flush
+   with the top of the column and out of the column gap below it.
+
+   The article is long and this route brought no scroll port of its own, so it
+   was `.app-main` doing the scrolling -- with the strip inside it. That is the
+   third shape App.css warns about: the titlebar rides the content out of view
+   and stops working the moment the user scrolls. Give the page the column that
+   Settings and Plugins have, strip above and a scroll port below it. */
 function NewsDetailPage() {
+  const { id } = useParams<{ id: string }>();
+  const portRef = useRef<HTMLDivElement>(null);
+  // Owned here rather than left to the shell, now that the scrolling is. What
+  // `App.tsx` remembers is `.app-main`, which on this route no longer moves.
+  //
+  // The slowest caller the hook has, and the one that decided its shape: the
+  // article arrives from a fetch inside `NewsArticleView`, so the port is empty
+  // for as long as that takes and there is nothing to scroll until it lands.
+  useScrollMemory(portRef, `page:news:${id ?? ''}`);
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="chrome-drag-strip" aria-hidden="true" />
+      <div ref={portRef} className="flex-1 min-h-0 overflow-y-auto">
+        <NewsArticleView />
+      </div>
+    </div>
+  );
+}
+
+function NewsArticleView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [article, setArticle] = useState<NewsArticle | null>(null);

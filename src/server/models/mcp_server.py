@@ -22,7 +22,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field
 from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ptc_agent.core.mcp_sanitize import VAULT_REF_RE
 from src.server.database.mcp_oauth import ConnectionStatus
+from src.server.services.brokerages import Brokerage
 from src.server.services.mcp_config import Origin
 
 
@@ -324,6 +325,49 @@ class McpServerInput(BaseModel):
         return fields
 
 
+class BindingInput(BaseModel):
+    """PATCH body for a row's tool-binding settings. Every field is optional
+    and only the ones sent are written, so the page can flip one switch
+    without re-sending the map."""
+
+    # A delta, not the map: a client that re-sends the whole map writes back
+    # whatever it last read, so a second tab editing another tool of the same
+    # row loses its edit to whichever save lands second.
+    tool_binding_set: Optional[dict[str, Literal["ptc", "direct", "both"]]] = None
+    tool_binding_unset: Optional[list[str]] = None
+    # ``null`` clears the preset, which is how the row switch turns off: a
+    # cleared row falls back to each group's own default. What separates that
+    # from "not sent" is ``model_fields_set``, which the handler reads rather
+    # than a sentinel.
+    binding_preset: Optional[Literal["ptc_only"]] = None
+    # Echoed back from the column, but nothing reads it to decide a binding:
+    # live orders reach the model as tool calls, but the per-call stop this
+    # would arm is not built yet. The handler refuses a value here with a 422
+    # until governed order execution gives it something to mean; the field
+    # stays so the shape of the body does not change when that lands.
+    order_approval: Optional[bool] = None
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _validate_map(self) -> "BindingInput":
+        # A server publishes at most ``MAX_TOOLS_PER_SERVER`` tools, so a
+        # request naming more than that is naming tools that do not exist. The
+        # merged map is bounded in the handler as well: this body is a delta,
+        # so a cap here alone would still let repeated writes accumulate one.
+        from src.server.services.mcp_discovery import MAX_TOOLS_PER_SERVER
+
+        names = [*(self.tool_binding_set or {}), *(self.tool_binding_unset or [])]
+        if len(names) > MAX_TOOLS_PER_SERVER:
+            raise ValueError(
+                f"a binding change may name at most {MAX_TOOLS_PER_SERVER} tools"
+            )
+        for tool in names:
+            if not tool or len(tool) > 128:
+                raise ValueError("tool names must be 1-128 characters")
+        return self
+
+
 class EnabledInput(BaseModel):
     """PATCH body for the enabled toggle."""
 
@@ -602,10 +646,34 @@ class CatalogServer(BaseModel):
     transport: str
     enabled: bool = False
     oauth_status: Optional[ConnectionStatus] = None
+    # The capability groups this connection was actually granted, in the order
+    # they were stored. None means no connection, or one for a server we curate
+    # no groups for -- distinct from ``[]``, which is a brokerage the user
+    # granted nothing. The consent is enforced per call at the relay, so a
+    # surface that cannot read it back can only guess what a connection does.
+    granted_capabilities: Optional[list[str]] = None
+    # The same keys, but answering "what did the user last choose" rather than
+    # "what is in force". They part company the moment a connection stops being
+    # servable: the grant is gone, so the badges must not draw one, while the
+    # choice behind it is still the user's and is what a reconnect has to open
+    # on. Seeding a repair from product defaults instead re-proposed every group
+    # the user had declined, on a flow they entered to fix an expiry rather than
+    # to change their mind.
+    remembered_capabilities: Optional[list[str]] = None
     # Host-side discovered tool count for the server's CURRENT config (OAuth
     # servers only today — that's the only user-level discovery path). None =
     # no current snapshot; the UI omits the count rather than showing 0.
     tool_count: Optional[int] = None
+    # Set only when the server's handshake named a mark we can reach. A path on
+    # this origin, never the server's own URL: resolving it here means one fetch
+    # for everyone instead of every settings-page render telling a third party
+    # who is looking, which is the same reason the brokerage marks are proxied.
+    icon_url: Optional[str] = None
+    # Whether any tool on this row resolves to a path that binds directly, and
+    # so whether the row can reach Flash at all: Flash has no sandbox, and a
+    # tool it cannot bind directly it cannot run. Computed from the snapshot
+    # the list already loaded, never a per-row query.
+    has_direct_tools: bool = False
     command: Optional[str] = None
     args: list[str] = Field(default_factory=list)
     url: Optional[str] = None
@@ -622,6 +690,15 @@ class CatalogServer(BaseModel):
     instruction: str = ""
     tool_exposure_mode: str = "summary"
     discovery_uses_secrets: bool = False
+    # The row's say in which path each tool takes to the model: the map is the
+    # per-tool override, the preset a row-level shortcut. Neither can move a
+    # tool off the paths its group allows; a live-order tool is a tool call
+    # and nothing else. The effective binding per tool, and the paths it may
+    # take, are on the tools endpoint, which sees the vendor's list.
+    # ``order_approval`` is stored only; see ``BindingInput``.
+    tool_binding: dict[str, str] = Field(default_factory=dict)
+    binding_preset: Optional[str] = None
+    order_approval: bool = True
     # Non-blocking policy nudges (isolation etc.) — populated on create/update
     # responses only, never stored.
     warnings: Optional[list[str]] = None
@@ -670,6 +747,16 @@ class BuiltinServer(BaseModel):
     description: str = ""
     transport: str = "stdio"
     enabled: bool
+    # As on ``CatalogServer``: a path on this origin, present only when the
+    # server's handshake named a mark. Ours draw their bundle's mark instead,
+    # so in practice this fills in for a self-hoster's own additions.
+    icon_url: Optional[str] = None
+    # The bundle that ships this server, and whether that bundle is switched
+    # on — the same provenance pair a catalog row carries for its plugin, so
+    # the list groups and explains both kinds the same way. Only a server
+    # declared outside ``plugins/`` (an operator's own YAML entry) has none.
+    plugin_name: Optional[str] = None
+    plugin_enabled: Optional[bool] = None
     # Workspaces with a disable-marker for this builtin — all-scopes view only.
     disabled_workspace_ids: list[str] = Field(default_factory=list)
 
@@ -678,6 +765,77 @@ class BuiltinServerList(BaseModel):
     """GET /api/v1/mcp/builtin-servers payload."""
 
     servers: list[BuiltinServer]
+
+
+class CapabilityGroupOption(BaseModel):
+    """One consent toggle offered when connecting a brokerage.
+
+    ``key`` is the fact and also the translation key; ``tone`` is how loudly to
+    draw the row. No label or description, for the reason the flags above carry
+    no prose: the words are the client's.
+    """
+
+    key: str
+    tone: str
+    # One of the steps between reading and placing an order, which is the thing
+    # a row is asked first. False for the reading groups.
+    rung: bool = False
+
+
+class BrokerageOption(BaseModel):
+    """One shipped brokerage connector, as offered on the Plugins page.
+
+    A catalog row does not exist for it until the user turns it on, so this
+    carries no per-user state at all: the page joins it to the catalog by
+    ``name``. The two behavioural flags travel as booleans rather than prose
+    because the sentence that explains each one is translated client-side.
+    """
+
+    name: str
+    label: str
+    url: str
+    # The broker's own website, not the endpoint's host. The detail view links
+    # it, which is the one thing a user reliably wants that we cannot answer:
+    # where their actual account lives.
+    site: str = ""
+    description: str = ""
+    native_callback_only: bool = False
+    exclusive_connection: bool = False
+    # List order is display order. Empty would mean a brokerage we curate no
+    # groups for, which the client reads as "nothing to choose".
+    capabilities: list[CapabilityGroupOption] = []
+
+
+class BrokerageList(BaseModel):
+    """GET /api/v1/mcp/brokerages payload."""
+
+    brokerages: list[BrokerageOption]
+
+
+def brokerage_to_response(brokerage: Brokerage) -> BrokerageOption:
+    """Shape a shipped brokerage definition for the API.
+
+    A wire model of its own rather than the registry entry itself, because the
+    two are allowed to diverge: a field the registry needs is not automatically
+    one the API should carry. Extra keys are ignored on the way through, so
+    adding one to :class:`Brokerage` keeps it off the wire until it is named
+    above — and nobody has to maintain a copy to keep that true.
+
+    The exception is ``capabilities``, which is derived rather than stored: the
+    curation map is the source for which groups a vendor has, and copying them
+    onto the registry entry would be a second place for that to be wrong.
+    """
+    from src.server.services.brokerage_capabilities import groups_for
+
+    return BrokerageOption.model_validate(
+        asdict(brokerage)
+        | {
+            "capabilities": [
+                {"key": g.key, "tone": g.tone, "rung": g.rung}
+                for g in groups_for(brokerage.name)
+            ]
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -698,7 +856,11 @@ def catalog_row_to_response(
     row: dict[str, Any],
     *,
     oauth_status: ConnectionStatus | None = None,
+    granted_capabilities: list[str] | None = None,
+    remembered_capabilities: list[str] | None = None,
     tool_count: int | None = None,
+    icon_url: str | None = None,
+    has_direct_tools: bool = False,
 ) -> CatalogServer:
     """Shape a DB catalog row for the owner-scoped API.
 
@@ -711,7 +873,11 @@ def catalog_row_to_response(
         transport=row["transport"],
         enabled=bool(row.get("enabled", False)),
         oauth_status=oauth_status,
+        granted_capabilities=granted_capabilities,
+        remembered_capabilities=remembered_capabilities,
         tool_count=tool_count,
+        icon_url=icon_url,
+        has_direct_tools=has_direct_tools,
         command=row.get("command"),
         args=row.get("args") or [],
         url=row.get("url"),
@@ -723,6 +889,9 @@ def catalog_row_to_response(
         instruction=row.get("instruction") or "",
         tool_exposure_mode=row.get("tool_exposure_mode") or "summary",
         discovery_uses_secrets=bool(row.get("discovery_uses_secrets", False)),
+        tool_binding=dict(row.get("tool_binding") or {}),
+        binding_preset=row.get("binding_preset"),
+        order_approval=bool(row.get("order_approval", True)),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
         # Indexed, not .get(): the plugin LEFT JOIN is part of every catalog

@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { IdentityTile } from '@/pages/ChatAgent/components/mcp/IdentityTile';
+import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import {
   EnabledToggle,
   MetaText,
@@ -45,7 +45,7 @@ export function McpWorkspaceRow({
     <ServerRowShell
       testid={`ws-server-row-${server.name}`}
       {...rowSelection(selection, `ws:${workspaceId}:${server.name}`)}
-      tile={<IdentityTile name={server.name} />}
+      tile={<BrandMark name={server.name} kind="server" />}
       onOpen={onOpen}
       main={
         <>

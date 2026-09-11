@@ -71,17 +71,31 @@ class _Refused(Exception):
     """Carries the reply a refused call answers with, raised by the phase
     helpers so a resolved script has exactly one shape at the call site.
 
-    The failure prefix is stamped here rather than written at each raise. A
-    refusal starts no run, so no task artifact binds the launch card and no
-    channel will ever close it — this text is the only signal the card has to
-    settle on, and the one wording that omitted the prefix left the card
-    spinning "Running" for the life of the thread.
+    A refusal starts no run, so no task artifact binds the launch card and no
+    channel will ever close it: the reply is the only signal the card has to
+    settle on. That is why the failure status, and the prefix, are stamped
+    here rather than written at each raise.
     """
 
     def __init__(self, reason: str) -> None:
         reply = reason if reason[:5].lower() == "error" else f"Error: {reason}"
         super().__init__(reply)
         self.reply = reply
+
+    def as_reply(self, tool_call_id: str) -> str | ToolMessage:
+        """The refusal as the tool's return value, carrying ``status="error"``.
+
+        Without a tool_call_id there is no ToolMessage to build, so the text
+        falls back to the caller's own default status.
+        """
+        if not tool_call_id:
+            return self.reply
+        return ToolMessage(
+            content=self.reply,
+            tool_call_id=tool_call_id,
+            name="RunWorkflow",
+            status="error",
+        )
 
 
 def _script_path_forms(backend: Any, path: str) -> set[str]:
@@ -568,6 +582,6 @@ def create_run_workflow_tool(
                 script, script_path, workflow, params, description, tool_call_id
             )
         except _Refused as refused:
-            return refused.reply
+            return refused.as_reply(tool_call_id)
 
     return run_workflow

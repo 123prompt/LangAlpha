@@ -1,5 +1,12 @@
 /** SSE event type union and per-event interfaces */
 
+/**
+ * `error_type` on a task's terminal frame when the credit gate stopped it,
+ * rather than something failing. Mirrors CREDIT_STOP_ERROR_TYPE in
+ * src/server/contracts/status.py by hand — change there first, then here.
+ */
+export const CREDIT_STOP_ERROR_TYPE = 'credit_stop';
+
 export type SSEEventType =
   | 'metadata'
   | 'reasoning_signal'
@@ -72,6 +79,9 @@ export interface ToolCallResultData {
   content_type: string;
   tool_call_id: string;
   artifact?: unknown;
+  /** The ToolMessage status the backend stamped, 'success' or 'error'. Absent
+   *  only on turns persisted before the field rode the wire. */
+  status?: string;
 }
 
 export interface ToolCallResultEvent extends BaseSSEEvent {
@@ -80,6 +90,7 @@ export interface ToolCallResultEvent extends BaseSSEEvent {
   content: string | unknown;
   content_type?: string;
   artifact?: unknown;
+  status?: string;
 }
 
 export interface ToolCallChunksEvent extends BaseSSEEvent {
@@ -268,6 +279,8 @@ export interface ActionRequest {
   thread_id?: string;
   report_back?: boolean;
   tool_call_id?: string;
+  /** credit_pause: the quota service's denial copy, relayed verbatim. */
+  message?: string;
 }
 
 export interface InterruptEvent extends BaseSSEEvent {

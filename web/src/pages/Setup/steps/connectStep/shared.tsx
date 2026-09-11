@@ -47,6 +47,7 @@ export function getApiFormatKey(sdk?: string | null, useResponseApi?: boolean): 
     case 'gemini':
       return 'setup.apiFormatGemini';
     case 'openai':
+    case 'dashscope':
       return useResponseApi ? 'setup.apiFormatOpenaiResponses' : 'setup.apiFormatOpenaiCompletions';
     case 'codex':
       return 'setup.apiFormatCodex';

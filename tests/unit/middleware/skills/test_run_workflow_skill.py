@@ -5,7 +5,6 @@ gates it by name via SkillDefinition.tool_names rather than a tool object.
 """
 
 import re
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -25,9 +24,6 @@ from ptc_agent.agent.middleware.skills.registry import (
 
 SKILL_NAME = "run-workflow"
 TOOL_NAME = "RunWorkflow"
-
-# Repo root: tests/unit/middleware/skills/ -> repo root is four parents up.
-REPO_ROOT = Path(__file__).resolve().parents[4]
 
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
@@ -64,11 +60,10 @@ def test_skill_registered_as_name_gated_ptc_skill():
     assert SKILL_NAME in get_sandbox_skill_names()
 
 
-def test_skill_md_frontmatter_matches_registry():
+def test_skill_md_frontmatter_matches_registry(shipped_skill_md):
     """SKILL.md exists and its frontmatter description stays in sync with the registry."""
     skill = SKILL_REGISTRY[SKILL_NAME]
-    skill_md = REPO_ROOT / skill.skill_md_path
-    assert skill_md.is_file(), f"missing {skill_md}"
+    skill_md = shipped_skill_md(SKILL_NAME)
 
     match = _FRONTMATTER_RE.match(skill_md.read_text(encoding="utf-8"))
     assert match, f"no YAML frontmatter in {skill_md}"

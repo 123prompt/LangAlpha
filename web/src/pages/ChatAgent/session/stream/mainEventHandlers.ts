@@ -4,13 +4,13 @@
  * `setMessages`; subagent (task-namespace) events never enter this module.
  */
 
-import { isToolResultFailure } from '../subagents/subagentStatus';
+import { isToolResultFailure, toolNameOf } from '../subagents/subagentStatus';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { ProvenanceEvent } from '@/types/sse';
 import type { ProvenanceRecord, SubagentTaskRecord } from '@/types/chat';
 import { provenanceEventToRecord, provenanceRecordKey } from './provenance';
-import { extractLastReasoningTitle } from '../streamRefs';
+import { extractLastReasoningTitle, nextArrivalSeq } from '../streamRefs';
 import type { StreamRefs, ToolCallChunkRecord } from '../streamRefs';
 
 /**
@@ -30,6 +30,10 @@ export function handleReasoningSignal({ assistantMessageId, signalContent, refs,
   eventId?: number | null;
 }): boolean {
   const { contentOrderCounterRef, currentReasoningIdRef } = refs;
+  // Stamped on arrival, not inside the updater: React runs the updater after
+  // a reconnect flush has already flipped the bag live, and a completion the
+  // backlog carried must still fold on arrival rather than take a live turn.
+  const completedAt = refs.isReconnect ? 1 : Date.now();
 
   if (signalContent === 'start') {
     // Reasoning process has started - create new reasoning process
@@ -83,7 +87,7 @@ export function handleReasoningSignal({ assistantMessageId, signalContent, refs,
               isReasoning: false,
               reasoningComplete: true,
               reasoningTitle: null,
-              _completedAt: refs.isReconnect ? 1 : Date.now(),
+              _completedAt: completedAt,
             };
           }
 
@@ -138,6 +142,7 @@ export function handleReasoningContent({ assistantMessageId, content, refs, setM
         return {
           ...msg,
           reasoningProcesses,
+          arrivalSeq: nextArrivalSeq(msg),
         };
       })
     );
@@ -215,6 +220,7 @@ export function handleTextContent({ assistantMessageId, content, finishReason, r
           content: accumulatedText,
           contentType: 'text',
           isStreaming: true,
+          arrivalSeq: nextArrivalSeq(msg),
         };
       })
     );
@@ -252,21 +258,17 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
   eventId?: number | null;
 }): boolean {
   const { contentOrderCounterRef } = refs;
+  // Same arrival-time rule as the reasoning stamp: read before the updater.
+  const createdAt = refs.isReconnect ? 1 : Date.now();
 
   if (!toolCalls || !Array.isArray(toolCalls)) {
     return false;
   }
 
-  // Track creation times outside React state so handleToolCallResult can read them synchronously
-  if (!refs._toolCreatedAt) refs._toolCreatedAt = {};
-
   toolCalls.forEach((toolCall: ToolCallRecord, toolIndex: number) => {
     const toolCallId = toolCall.id;
 
     if (toolCallId) {
-      if (!refs.isReconnect && !refs._toolCreatedAt![toolCallId]) {
-        refs._toolCreatedAt![toolCallId] = Date.now();
-      }
       setMessages((prev: MessageRecord[]) =>
         prev.map((msg: MessageRecord) => {
           if (msg.id !== assistantMessageId) return msg;
@@ -293,7 +295,7 @@ export function handleToolCalls({ assistantMessageId, toolCalls, finishReason: _
               toolCallResult: null,
               isInProgress: true,
               isComplete: false,
-              _createdAt: refs.isReconnect ? 1 : Date.now(),
+              _createdAt: createdAt,
               order: currentOrder,
             };
           } else {
@@ -358,7 +360,7 @@ export function handleToolCallResult({ assistantMessageId, toolCallId, result, r
 
       const toolCallProcesses = { ...((msg.toolCallProcesses as Record<string, Record<string, unknown>>) || {}) };
 
-      const isFailed = isToolResultFailure(result);
+      const isFailed = isToolResultFailure({ ...result, toolName: toolNameOf(toolCallProcesses, toolCallId) });
 
       // Track subagent task status updates
       const subagentTasks = { ...((msg.subagentTasks as Record<string, SubagentTaskRecord>) || {}) };
@@ -632,7 +634,7 @@ export function handleToolCallChunks({ assistantMessageId, chunks, setMessages }
           firstSeenAt: existing.firstSeenAt,
         };
 
-        return { ...msg, pendingToolCallChunks: pending };
+        return { ...msg, pendingToolCallChunks: pending, arrivalSeq: nextArrivalSeq(msg) };
       })
     );
   });

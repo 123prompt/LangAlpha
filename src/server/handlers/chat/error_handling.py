@@ -477,7 +477,7 @@ async def handle_workflow_error(
                 return  # durable cancel won — no failure surface
 
             error_data = {
-                "message": f"Workflow failed after {MAX_RETRIES} retry attempts",
+                "message": f"Turn failed after {MAX_RETRIES} retry attempts",
                 "error_type": error_type,
                 "error_class": type(e).__name__,
                 "retry_count": retry_count,
@@ -510,7 +510,7 @@ async def handle_workflow_error(
                 return  # durable cancel won — cancelled, not retryable: no retry SSE
 
             retry_data = {
-                "message": "Temporary error occurred, you can retry or resume the workflow",
+                "message": "Temporary error occurred, you can retry or resume the turn",
                 "thread_id": thread_id,
                 "auto_retry": True,
                 "error_type": error_type,

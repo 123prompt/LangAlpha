@@ -8,6 +8,7 @@ real chokepoint fed a mocked DB.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -19,7 +20,10 @@ from httpx import ASGITransport, AsyncClient
 
 from ptc_agent.config.core import MCPServerConfig
 from src.server.app.mcp_servers import _derive_status
+from src.server.database.account_disables import AccountDisables
+from src.server.database.mcp_servers import MAX_MCP_SERVERS_PER_WORKSPACE
 from src.server.services.mcp_config import Origin
+from src.server.services.plugins.bundled import ComponentOwners
 from src.server.services.mcp_discovery import mcp_discovery_fingerprint
 from tests.conftest import create_test_app
 from tests.unit.server.mcp_builders import resolved_mcp
@@ -220,7 +224,7 @@ async def test_list_effective_servers_masks_and_decorates(client):
     body = resp.json()
     assert body["sandbox_running"] is True
     assert body["sandbox_warming"] is False  # already running ⇒ not warming
-    assert body["max_servers"] == 20
+    assert body["max_servers"] == MAX_MCP_SERVERS_PER_WORKSPACE
     assert body["config_version"] == 3
     by_name = {s["name"]: s for s in body["servers"]}
 
@@ -603,6 +607,33 @@ async def test_add_server_409_on_builtin_collision(client):
             json={"name": "builtin_search", "transport": "stdio", "command": "npx"},
         )
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_add_server_409_on_a_shipped_brokerage_name(client):
+    """The workspace tier owes the reservation too, for a different reason.
+
+    A workspace row shadows the inherited catalog row of the same name whether it
+    is enabled or not, so a local ``robinhood`` silently replaces the broker the
+    user actually connected: inside that workspace the agent's trade-shaped tools
+    come from wherever the local row points, with its description reaching the
+    prompt, while the Plugins page still reports the real one connected.
+    """
+    ws = _ws()
+    insert = AsyncMock()
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", _agent_config([])),
+        patch("src.server.app.mcp_servers.list_workspace_servers", new=AsyncMock(return_value=[])),
+        patch("src.server.app.mcp_servers.insert_workspace_server", new=insert),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers",
+            json={"name": "robinhood", "transport": "http", "url": "https://not-rh.example.com/mcp"},
+        )
+    assert resp.status_code == 409
+    assert "reserved" in resp.json()["detail"]
+    insert.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1124,6 +1155,37 @@ async def test_promote_creates_template(client):
 
 
 @pytest.mark.asyncio
+async def test_promote_cannot_mint_a_reserved_catalog_name(client):
+    """The third door onto the catalog, and it owed the same reservation.
+
+    Before the workspace tier reserved these names too, a workspace server called
+    ``robinhood`` was legal down there, and promoting it minted a user-tier row
+    under a name the Plugins page joins a shipped brokerage on, pointing wherever
+    the workspace row pointed. Both doors are shut now; this one still owes its
+    own check, because a row can predate the other.
+    """
+    ws = _ws()
+    create = AsyncMock()
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", _agent_config([])),
+        patch(
+            "src.server.app.mcp_servers.list_workspace_servers",
+            new=AsyncMock(return_value=[_promotable_row(name="robinhood")]),
+        ),
+        patch("src.server.app.mcp_servers.get_catalog_server", new=AsyncMock(return_value=None)),
+        patch("src.server.app.mcp_servers.create_catalog_server", new=create),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/robinhood/promote",
+            json={"overwrite": False},
+        )
+    assert resp.status_code == 409
+    assert "reserved" in resp.json()["detail"]
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_promote_409_when_template_exists_without_overwrite(client):
     ws = _ws()
     base = _agent_config([])
@@ -1505,6 +1567,39 @@ async def test_adopt_refuses_a_plugin_owned_server(client):
     drop.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_adopt_refuses_a_brokerage_connector(client):
+    """A brokerage lives at the user tier, where its connection is and where
+    every surface joins it to the shipped vendor. Moved down it would land under
+    a name the workspace resolver skips and the edit path refuses to rename, so
+    it would sit there inert with deleting it as the only way out. The other
+    workspace writers already refuse the name; this one has to as well."""
+    ws = _ws()
+    insert = AsyncMock()
+    drop = AsyncMock()
+    with (
+        patch(
+            "src.server.app.mcp_servers.db_get_workspace",
+            new=AsyncMock(return_value=ws),
+        ),
+        patch(
+            "src.server.app.mcp_servers.get_catalog_server",
+            new=AsyncMock(return_value=_catalog_row(name="robinhood")),
+        ),
+        patch("src.server.app.mcp_servers.insert_workspace_server", new=insert),
+        patch("src.server.app.mcp_servers.delete_catalog_server", new=drop),
+    ):
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/robinhood/adopt"
+        )
+    assert resp.status_code == 409
+    assert "reserved" in resp.json()["detail"]
+    # An unconnected row reaches this, so the refusal has to land before the
+    # move rather than behind the connection test.
+    insert.assert_not_awaited()
+    drop.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # PUT edit
 # ---------------------------------------------------------------------------
@@ -1559,6 +1654,9 @@ async def test_patch_disable_builtin_upserts_marker(client):
         patch("src.server.app.setup.agent_config", base),
         patch("src.server.app.mcp_servers.upsert_workspace_server", new=AsyncMock(return_value={})) as up,
         patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)) as dele,
+        patch(
+            "src.server.app.mcp_servers._sync_sandbox_grants_now", new=AsyncMock()
+        ) as grants,
     ):
         resp = await client.patch(
             f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/builtin_search/enabled",
@@ -1568,6 +1666,9 @@ async def test_patch_disable_builtin_upserts_marker(client):
     _, kwargs = up.await_args
     assert kwargs["source"] == "builtin" and kwargs["enabled"] is False
     assert dele.await_count == 0
+    # The narrowing is only real once the grant is gone, so the 200 has to
+    # stand behind it rather than behind a task that has not run yet.
+    assert grants.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1578,11 +1679,14 @@ async def test_patch_enable_builtin_deletes_marker(client):
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
         patch(
-            "src.server.app.mcp_servers.list_user_builtin_disables",
-            new=AsyncMock(return_value=set()),
+            "src.server.app.mcp_servers.account_disabled_builtins",
+            new=AsyncMock(return_value=frozenset()),
         ),
         patch("src.server.app.mcp_servers.upsert_workspace_server", new=AsyncMock(return_value={})) as up,
         patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)) as dele,
+        patch(
+            "src.server.app.mcp_servers._sync_sandbox_grants_now", new=AsyncMock()
+        ) as grants,
     ):
         resp = await client.patch(
             f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/builtin_search/enabled",
@@ -1590,6 +1694,7 @@ async def test_patch_enable_builtin_deletes_marker(client):
         )
     assert resp.status_code == 200
     assert dele.await_count == 1 and up.await_count == 0
+    assert grants.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -1602,8 +1707,46 @@ async def test_patch_enable_builtin_conflicts_when_disabled_for_user(client):
         patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
         patch("src.server.app.setup.agent_config", base),
         patch(
-            "src.server.app.mcp_servers.list_user_builtin_disables",
-            new=AsyncMock(return_value={"builtin_search"}),
+            "src.server.app.mcp_servers.account_disabled_builtins",
+            new=AsyncMock(return_value=frozenset({"builtin_search"})),
+        ),
+        patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)) as dele,
+    ):
+        resp = await client.patch(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/builtin_search/enabled",
+            json={"enabled": True},
+        )
+    assert resp.status_code == 409
+    assert dele.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_patch_enable_builtin_conflicts_when_its_bundle_is_off(client):
+    """Same refusal when the subtraction came from the bundle, not the server.
+
+    A bundle disable leaves no per-server row, so the workspace's marker
+    delete would succeed and change nothing — success reported for a switch
+    that did not move. Patched one layer lower than the test above on
+    purpose: what is under test is that the router asks a question covering
+    both routes, not that a stub answers.
+    """
+    ws = _ws()
+    base = _agent_config([_builtin("builtin_search")])
+    owners = ComponentOwners(servers={"builtin_search": "some-bundle"}, skills={})
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch(
+            "src.server.database.account_disables.list_account_disables",
+            new=AsyncMock(
+                return_value=AccountDisables(
+                    servers=frozenset(), bundles=frozenset({"some-bundle"})
+                )
+            ),
+        ),
+        patch(
+            "src.server.services.plugins.bundled.component_owners",
+            return_value=owners,
         ),
         patch("src.server.app.mcp_servers.delete_workspace_server", new=AsyncMock(return_value=True)) as dele,
     ):
@@ -1788,3 +1931,77 @@ async def test_workspace_not_found_404(client):
     with patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=None)):
         resp = await client.get(f"/api/v1/workspaces/{uuid.uuid4()}/mcp/servers")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Flash grant revocation on a scope change
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_flash_disable_revokes_the_grant_before_it_answers(client):
+    """A 200 on the toggle has to mean the revocation already happened.
+
+    The per-call ``DirectMCPBinding.check`` rereads connection status and
+    consent but not workspace scope, so the grant is the only thing that stops
+    a Flash turn already in flight from reaching a server just taken out of
+    scope. Scheduling the sync would let the response beat it.
+    """
+    ws = _ws(status="flash")
+    base = _agent_config([_builtin("builtin_search")])
+    released = asyncio.Event()
+    seen: dict = {}
+
+    async def blocking_sync(base_config, *, user_id, workspace_id):
+        seen["user_id"] = user_id
+        seen["workspace_id"] = workspace_id
+        await released.wait()
+
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.upsert_workspace_server", new=AsyncMock(return_value={})),
+        patch(
+            "src.server.services.egress.flash_binding.sync_flash_grants",
+            new=blocking_sync,
+        ),
+    ):
+        pending = asyncio.ensure_future(
+            client.patch(
+                f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/builtin_search/enabled",
+                json={"enabled": False},
+            )
+        )
+        # Hold the sync open and let the loop run everything it can. A
+        # scheduled sync would let the response land here; an awaited one
+        # cannot answer until the revocation does.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not pending.done()
+
+        released.set()
+        resp = await pending
+
+    assert resp.status_code == 200
+    assert seen == {"user_id": USER, "workspace_id": ws["workspace_id"]}
+
+
+@pytest.mark.asyncio
+async def test_flash_disable_fails_loudly_when_the_grant_will_not_retire(client):
+    """A revocation that did not happen must not be reported as a success."""
+    ws = _ws(status="flash")
+    base = _agent_config([_builtin("builtin_search")])
+    with (
+        patch("src.server.app.mcp_servers.db_get_workspace", new=AsyncMock(return_value=ws)),
+        patch("src.server.app.setup.agent_config", base),
+        patch("src.server.app.mcp_servers.upsert_workspace_server", new=AsyncMock(return_value={})),
+        patch(
+            "src.server.services.egress.flash_binding.sync_flash_grants",
+            new=AsyncMock(side_effect=RuntimeError("grant store is down")),
+        ),
+    ):
+        resp = await client.patch(
+            f"/api/v1/workspaces/{ws['workspace_id']}/mcp/servers/builtin_search/enabled",
+            json={"enabled": False},
+        )
+    assert resp.status_code == 500

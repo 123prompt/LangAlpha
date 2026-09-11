@@ -45,10 +45,11 @@ import { useMarketWatch } from './useMarketWatch';
 import type {
   MessageRecord, TokenUsage, PendingInterrupt, PendingRejection,
   SSEEvent, ModelOptions, OffloadBatch, SubagentHistoryEntry, TaskRefs,
-  HistoryInterruptInfo,
+  HistoryInterruptInfo, StreamProcessorRefs,
   ModelStatus, FallbackSuggestion,
 } from '../session/types';
-import { SECRETARY_ACTION_TYPES } from '../session/interrupts/buckets';
+import { PROPOSAL_INTERRUPT_TYPES, SECRETARY_ACTION_TYPES, setCardStatus } from '../session/interrupts/buckets';
+import { beginResume, restoreCreditPausePending, type CreditPauseResumeRefs } from '../session/interrupts/creditPauseResume';
 export type { ModelStatus, FallbackSuggestion } from '../session/types';
 import type { ChatSessionRuntime } from '../session/runtime';
 import { projectSubagentHistory } from '../session/subagents/projectHistory';
@@ -453,22 +454,27 @@ export function useChatMessages(
     isNewConversation?: boolean;
     isReconnect?: boolean;
     withUnresolvedInterrupt?: boolean;
-  } = {}) => ({
-    contentOrderCounterRef,
-    currentReasoningIdRef,
-    currentToolCallIdRef,
-    steeringAtOrderRef,
-    updateTodoListCard: updateTodoListCard || undefined,
-    isNewConversation: o.isNewConversation ?? false,
-    subagentStateRefs: subagentStateRefsRef.current,
-    updateSubagentCard: !updateSubagentCard
-      ? (() => {})
-      : o.isReconnect
-        ? (agentId: string, data: Record<string, unknown>) => updateSubagentCard(agentId, { ...data, isReconnect: true })
-        : updateSubagentCard,
-    ...(o.isReconnect ? { isReconnect: true } : {}),
-    ...(o.withUnresolvedInterrupt ? { unresolvedHistoryInterruptRef } : {}),
-  });
+  } = {}): StreamProcessorRefs => {
+    const refs: StreamProcessorRefs = {
+      contentOrderCounterRef,
+      currentReasoningIdRef,
+      currentToolCallIdRef,
+      steeringAtOrderRef,
+      updateTodoListCard: updateTodoListCard || undefined,
+      isNewConversation: o.isNewConversation ?? false,
+      subagentStateRefs: subagentStateRefsRef.current,
+      updateSubagentCard: updateSubagentCard || (() => {}),
+      ...(o.isReconnect ? { isReconnect: true } : {}),
+      ...(o.withUnresolvedInterrupt ? { unresolvedHistoryInterruptRef } : {}),
+    };
+    // Read at call time: a reconnect flips the bag live once its backlog is
+    // applied, and the cards it updates after that are live too.
+    if (updateSubagentCard && o.isReconnect) {
+      refs.updateSubagentCard = (agentId: string, data: Record<string, unknown>) =>
+        updateSubagentCard(agentId, refs.isReconnect ? { ...data, isReconnect: true } : data);
+    }
+    return refs;
+  };
 
   // Per-task running total of token usage. Backend emits per-call deltas via
   // `context_window/token_usage` events; we sum here. The ref is the source
@@ -678,6 +684,23 @@ export function useChatMessages(
         // Interrupt cards belong to the thread we're leaving; the next thread's
         // replay repopulates this from its persisted interrupt events.
         renderedInterruptIdsRef.current.clear();
+        // So does the answer board. Left behind, thread A's unanswered id keeps
+        // failing B's `every(id => collected[id])` batch gate, so B's own
+        // interrupt is collected but never resumed: the card holds a disabled
+        // spinner until a full reload. Its only other clears sit on paths a
+        // thread switch does not take.
+        pendingInterruptIdsRef.current.clear();
+        collectedHitlResponsesRef.current = {};
+        // And the two state slots the board arms. Their only other clears sit
+        // on answering or rejecting, which a thread switch also does not take,
+        // so thread A's leftovers act on B: a live `pendingInterrupt` disables
+        // B's composer outright, and a live `pendingRejection` turns B's next
+        // ordinary message into rejection feedback carrying A's interrupt id.
+        // A credit pause is the case that makes this ordinary rather than
+        // exotic — resolving one means leaving to buy credits, so wandering off
+        // to another thread with it unanswered is the expected way to meet it.
+        setPendingInterrupt(null);
+        setPendingRejection(null);
       }
     }
   }, [workspaceId, initialThreadId]);
@@ -872,8 +895,20 @@ export function useChatMessages(
         await reconnectToStream({ activeTasks: status.active_tasks || [], runId: status.run_id ?? null, resetCursor: true, snapshotAtMs });
         unresolvedHistoryInterruptRef.current = [];
       } else if (historyHasUnresolvedInterruptRef.current && !status.can_reconnect) {
-        // Workflow genuinely paused → make interrupt(s) interactive
-        const intInfos = unresolvedHistoryInterruptRef.current;
+        // Workflow genuinely paused → make interrupt(s) interactive.
+        //
+        // A tool approval is the one family with no answer path: nothing
+        // raises one any more and the approve/reject handlers are gone, so an
+        // unanswered one from history is a record to render, never a slot to
+        // fill. Arming it would disable the composer against a card with no
+        // controls, and a reload would only repeat that. Filtered here rather
+        // than where replay queues the entry: that list is also what the
+        // resolvers settle by id and what the reconnect branch strips, and
+        // both still need to find the card. The live projection keeps the
+        // same rule for a stream that still carries one (fromLiveEvent).
+        const intInfos = unresolvedHistoryInterruptRef.current.filter(
+          (info) => info.type !== 'tool_approval',
+        );
         if (intInfos.length > 0) {
           const intInfo = intInfos[0]; // Use first for setPendingInterrupt (single-slot state)
           console.log('[Reconnect] Workflow paused, making', intInfos.length, 'interrupt(s) interactive:', intInfos.map((p) => p.type));
@@ -894,28 +929,13 @@ export function useChatMessages(
               assistantMessageId: intInfo.assistantMessageId,
               questionId: intInfo.questionId,
             });
-          } else if (intInfo.type === 'create_workspace') {
-            setPendingInterrupt({
-              type: 'create_workspace',
-              interruptId: intInfo.interruptId,
-              assistantMessageId: intInfo.assistantMessageId,
-              proposalId: intInfo.proposalId,
-            });
-          } else if (intInfo.type === 'start_question') {
-            setPendingInterrupt({
-              type: 'start_question',
-              interruptId: intInfo.interruptId,
-              assistantMessageId: intInfo.assistantMessageId,
-              proposalId: intInfo.proposalId,
-            });
-          } else if (intInfo.type === 'ptc_agent') {
-            setPendingInterrupt({
-              type: 'ptc_agent',
-              interruptId: intInfo.interruptId,
-              assistantMessageId: intInfo.assistantMessageId,
-              proposalId: intInfo.proposalId,
-            });
-          } else if (intInfo.type === 'delete_workspace' || intInfo.type === 'stop_workspace' || intInfo.type === 'delete_thread') {
+          } else if (
+            PROPOSAL_INTERRUPT_TYPES.has(intInfo.type)
+            || intInfo.type === 'credit_pause'
+          ) {
+            // Every proposal-shaped card restores the same single-slot state,
+            // and the type it wants is the one the entry already carries, so a
+            // per-type branch here only differed in re-spelling that literal.
             setPendingInterrupt({
               type: intInfo.type,
               interruptId: intInfo.interruptId,
@@ -1595,7 +1615,7 @@ export function useChatMessages(
     currentPlanModeRef.current = planMode;
 
     // Store model options so HITL resume can forward them
-    lastModelOptionsRef.current = { model: model || null, reasoningEffort: reasoningEffort || null, fastMode: fastMode || null };
+    lastModelOptionsRef.current = { model: model || null, reasoningEffort: reasoningEffort || null, fastMode: fastMode ?? null };
 
     // Intercept: if a plan was rejected, route this message as rejection feedback
     if (pendingRejection) {
@@ -1741,7 +1761,7 @@ export function useChatMessages(
         userLocale, userTimezone, undefined, undefined,
         model || null,
         reasoningEffort || null,
-        fastMode || null,
+        fastMode ?? null,
         platform,
         // Latch run_id AND the server-assigned thread_id from Content-Location
         // BEFORE the first SSE body byte. run_id closes the reconnect race
@@ -1917,11 +1937,28 @@ export function useChatMessages(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCompacting]);
 
+  /** The credit pause this resume is answering, so the stream can settle its
+   *  status. Held in a ref because the settle happens in stream callbacks. */
+  const resumingCreditPauseRef = useRef<string | null>(null);
+  const creditPauseRefs = useRef<CreditPauseResumeRefs>({
+    pauseId: resumingCreditPauseRef,
+    pendingInterruptIds: pendingInterruptIdsRef,
+    collectedHitlResponses: collectedHitlResponsesRef,
+    sessionEpoch: sessionEpochRef,
+    setMessages,
+  }).current;
+
   /**
-   * Resumes an interrupted workflow with an HITL response (approve or reject).
+   * Resumes an interrupted turn with an HITL response (approve or reject).
    * Follows the same pattern as handleSendMessage but sends messages: [] with hitl_response.
    */
   const resumeWithHitlResponse = useCallback(async (hitlResponse: Record<string, { decisions: Array<{ type: string; message?: string }> }>, planMode: boolean = false) => {
+    // Ahead of beginResume, so the settler's fence captures this run's own
+    // epoch rather than the previous one (which it would already fail).
+    sessionEpochRef.current += 1;
+    const settleResume = beginResume(creditPauseRefs);
+    let admitted = false;
+
     setPendingInterrupt(null);
     pendingInterruptIdsRef.current.clear();
     collectedHitlResponsesRef.current = {};
@@ -1947,7 +1984,6 @@ export function useChatMessages(
     // from the primary again) succeed; a re-fired model_fallback re-sets it.
     setFallbackSuggestion(null);
     wasStoppedRef.current = false;
-    sessionEpochRef.current += 1;
     backgroundReconnectRef.current = false;
     acquireStreamOwnership(threadId);
     // Fresh AbortController so stopWorkflow can abort this resumed stream.
@@ -1983,6 +2019,11 @@ export function useChatMessages(
         (runId) => {
           requestKeyRef.current.clear();
           currentRunIdRef.current = runId;
+          // The backend opened a run, so the resume was admitted. Settled here
+          // rather than left to the `finally` because this is the first moment
+          // "Resumed" is true, and the wait is visible on the card.
+          admitted = true;
+          settleResume(true);
         },
         abortController.signal,
         requestKey,
@@ -2004,6 +2045,8 @@ export function useChatMessages(
       if (result?.disconnected) {
         console.log('[HITL] Stream disconnected, attempting reconnect');
         wasDisconnected = true;
+        // A dropped link, not a refusal: the run is live and reconnect owns it.
+        admitted = true;
         attemptReconnectAfterDisconnect(assistantMessageId);
         return;
       }
@@ -2019,6 +2062,7 @@ export function useChatMessages(
         );
         markTranscriptPersisted();
       }
+      admitted = true;
     } catch (err: unknown) {
       if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
         return;
@@ -2027,19 +2071,49 @@ export function useChatMessages(
       // accepted (its response was lost) — adopt that run instead of erroring.
       if (adoptDuplicateRun(err, assistantMessageId)) {
         wasDisconnected = true;
+        // Accepted, just not by this attempt — the pause is genuinely answered.
+        admitted = true;
         return;
       }
-      console.error('[HITL] Error resuming workflow:', err);
-      setMessageError((err as Error).message || 'Failed to resume workflow');
-      setMessages((prev) =>
-        updateMessage(prev,assistantMessageId, (msg) => ({
-          ...msg,
-          content: msg.content || 'Failed to resume workflow. Please try again.',
-          isStreaming: false,
-          error: true,
-        }))
-      );
+      // 429 and 503 are both the quota service answering rather than a failure
+      // to reach it, and it authors the copy the banner renders. Stacking a
+      // generic red bubble under that reads as a second, unrelated fault, so
+      // the turn settles empty and MessageList hides it.
+      const errObj = err as Record<string, unknown>;
+      if (errObj.status === 429 || errObj.status === 503) {
+        // Only a 429 carries `rateLimitInfo`; the transport routes every other
+        // structured detail into `errorInfo`. Reading just the first left a 503
+        // with an empty object, which loses the outage copy and — because the
+        // suppression keys off `type` — offers "Manage plan" to someone who
+        // cannot reach the service to spend anything.
+        const info = (errObj.rateLimitInfo ||
+          errObj.errorInfo ||
+          {}) as Record<string, unknown>;
+        const platformUrl = (import.meta.env.VITE_PLATFORM_URL as string | undefined) || '/account';
+        setMessageError(buildRateLimitError(info, platformUrl));
+        setMessages((prev) =>
+          updateMessage(prev,assistantMessageId, (msg) => ({
+            ...msg,
+            isStreaming: false,
+          }))
+        );
+      } else {
+        console.error('[HITL] Error resuming turn:', err);
+        setMessageError((err as Error).message || 'Failed to resume this turn');
+        setMessages((prev) =>
+          updateMessage(prev,assistantMessageId, (msg) => ({
+            ...msg,
+            content: msg.content || 'Failed to resume this turn. Please try again.',
+            isStreaming: false,
+            error: true,
+          }))
+        );
+      }
     } finally {
+      // A refusal, abort or stop leaves `admitted` false: restore the interrupt
+      // board and put the card back so a top-up can retry. Already-settled
+      // paths are a no-op, so a run that did open is never reverted.
+      settleResume(admitted);
       if (mainStreamAbortRef.current === abortController) {
         mainStreamAbortRef.current = null;
       }
@@ -2125,9 +2199,15 @@ export function useChatMessages(
     collectedHitlResponsesRef.current[interruptId] = response;
     const pending = pendingInterruptIdsRef.current;
     const collected = collectedHitlResponsesRef.current;
+    // Returns whether a resume actually went out. A turn can hold several
+    // interrupts and this batches them, so one answer is often not enough;
+    // a caller that optimistically flipped its card has to know that, or the
+    // card sits in an in-flight state no stream will ever settle.
     if (pending.size > 0 && [...pending].every((id) => collected[id])) {
       resumeWithHitlResponse({ ...collected }, planMode);
+      return true;
     }
+    return false;
   }, [resumeWithHitlResponse]);
 
   const handleAnswerQuestion = useCallback((answer: string, questionId: string, interruptId: string) => {
@@ -2194,15 +2274,7 @@ export function useChatMessages(
   // Shared helper: update a proposal's status within an AssistantMessage.
   // Used by all HITL approve/reject handlers below.
   const resolveProposal = useCallback((proposalKey: string, pid: string, status: string) => {
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.role !== 'assistant') return m;
-        const msg = m as AssistantMessage;
-        const proposals = (msg as unknown as Record<string, Record<string, Record<string, unknown>>>)[proposalKey];
-        if (!proposals?.[pid]) return m;
-        return { ...msg, [proposalKey]: { ...proposals, [pid]: { ...proposals[pid], status } } };
-      })
-    );
+    setMessages((prev) => setCardStatus(prev, proposalKey, pid, status));
   }, []);
 
   const handleApproveCreateWorkspace = useCallback(() => {
@@ -2293,6 +2365,31 @@ export function useChatMessages(
     resolveProposal('secretaryActionProposals', pendingInterrupt.proposalId!, 'rejected');
     resumeWithHitlResponse({ [pendingInterrupt.interruptId!]: { decisions: [{ type: 'reject' }] } }, false);
   }, [pendingInterrupt, resumeWithHitlResponse, resolveProposal]);
+
+  // --- Credit pause resume ---
+  // Approve is the only decision: the gate's interrupt() discards the resume
+  // value and re-checks the verdict itself, so there is nothing to answer —
+  // resuming IS the answer. Admission re-runs the quota check and can refuse
+  // with a 429 that opens no turn at all, so the click only moves the card to
+  // `resuming`; the stream settles it either way. The card supplies its own ids
+  // (single-slot pendingInterrupt would misroute after a reload).
+  const handleResumeCreditPause = useCallback((pauseId: string, interruptId: string) => {
+    if (!pauseId || !interruptId) return;
+    resumingCreditPauseRef.current = pauseId;
+    resolveProposal('creditPauses', pauseId, 'resuming');
+    const resumed = collectHitlResponseAndMaybeResume(
+      interruptId,
+      { decisions: [{ type: 'approve' }] },
+    );
+    if (!resumed) {
+      // Another interrupt in this turn is still unanswered, so nothing was
+      // sent and no stream will settle this card. Put it back rather than
+      // leave a disabled spinner the user can only clear by reloading — and
+      // keep the reference, because the batch this answer joined dispatches
+      // later and its settler is what moves the card to `resumed`.
+      restoreCreditPausePending(creditPauseRefs);
+    }
+  }, [collectHitlResponseAndMaybeResume, resolveProposal, creditPauseRefs]);
 
   const insertNotification = useCallback(
     (text: string, variant: 'info' | 'success' | 'warning' = 'info', detail?: string) => {
@@ -2430,7 +2527,7 @@ export function useChatMessages(
             processEvent,
             modelOptions.model || null,
             modelOptions.reasoningEffort || null,
-            modelOptions.fastMode || null,
+            modelOptions.fastMode ?? null,
             latchRunId,
             abortController.signal,
             requestKey,
@@ -2450,7 +2547,7 @@ export function useChatMessages(
             forkFromTurn,
             modelOptions.model || null,
             modelOptions.reasoningEffort || null,
-            modelOptions.fastMode || null,
+            modelOptions.fastMode ?? null,
             platform,
             latchRunId,
             abortController.signal,
@@ -2715,6 +2812,7 @@ export function useChatMessages(
     handleRejectPTCAgent,
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
+    handleResumeCreditPause,
     tokenUsage,
     isShared,
     insertNotification,

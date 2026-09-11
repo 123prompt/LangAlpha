@@ -7,6 +7,7 @@ import type {
   TodoItem,
   ProvenanceSourceType,
 } from './sse';
+import type { ErrorLinkSpec } from '@/utils/rateLimitError';
 
 // --- Content Segments (discriminated union) ---
 
@@ -128,6 +129,19 @@ export interface PlanApprovalSegment {
   order: number;
 }
 
+export interface CreditPauseSegment {
+  type: 'credit_pause';
+  proposalId: string;
+  order: number;
+}
+
+/** A direct MCP tool call (`mcp__<server>__<tool>`) stopped for approval. */
+export interface ToolApprovalSegment {
+  type: 'tool_approval';
+  proposalId: string;
+  order: number;
+}
+
 export type ContentSegment =
   | ReasoningSegment
   | TextSegment
@@ -142,7 +156,9 @@ export type ContentSegment =
   | DeleteWorkspaceSegment
   | StopWorkspaceSegment
   | DeleteThreadSegment
-  | PlanApprovalSegment;
+  | PlanApprovalSegment
+  | CreditPauseSegment
+  | ToolApprovalSegment;
 
 // --- Process Records ---
 
@@ -286,6 +302,32 @@ export interface PlanApprovalState {
   interruptId?: string;
 }
 
+/** Where one approval card sits among the action requests its interrupt raised.
+ *  The resume answers all of them in order, so the card carries its own slot. */
+export interface ToolApprovalPosition {
+  index: number;
+  count: number;
+}
+
+export interface ToolApprovalState {
+  status: 'pending' | 'approved' | 'rejected';
+  /** The full `mcp__<server>__<tool>` name the interrupt named. */
+  toolName: string;
+  server: string;
+  tool: string;
+  args: Record<string, unknown>;
+  interruptId?: string;
+  /**
+   * Where this call sits in its interrupt's action requests. One interrupt can
+   * stop several calls at once, and the resume has to answer them in the order
+   * it raised them, so each card carries its slot and the width of the batch.
+   */
+  actionIndex: number;
+  actionCount: number;
+  /** The reason typed on Reject, if any. */
+  reason?: string | null;
+}
+
 export interface UserQuestionState {
   questionId?: string;
   question?: string;
@@ -334,6 +376,24 @@ export interface SecretaryActionProposalState {
   workspace_id?: string;
   thread_id?: string;
   interruptId?: string;
+}
+
+/**
+ * ``resuming`` is the in-flight leg and exists because a resume can be refused:
+ * admission re-runs the quota check and answers 429 without opening a turn, so
+ * a click cannot be treated as success. Only an accepted run reaches
+ * ``resumed``; a refusal returns the card to ``pending`` so a top-up can retry.
+ */
+export type CreditPauseStatus = 'pending' | 'resuming' | 'resumed';
+
+export interface CreditPauseState {
+  status: CreditPauseStatus;
+  /** The quota service's denial copy, relayed verbatim — never authored here. */
+  message?: string;
+  /** Where the user resolves the denial, built by ``buildRateLimitError`` so a
+   *  pause and a 429 banner offer the same destinations. */
+  links?: ErrorLinkSpec[];
+  interruptId: string;
 }
 
 // --- Chat Messages ---
@@ -394,6 +454,8 @@ export interface AssistantMessage {
   questionProposals?: Record<string, QuestionProposalState>;
   ptcAgentProposals?: Record<string, PTCAgentProposalState>;
   secretaryActionProposals?: Record<string, SecretaryActionProposalState>;
+  creditPauses?: Record<string, CreditPauseState>;
+  toolApprovals?: Record<string, ToolApprovalState>;
   // Runtime flags
   steering?: boolean;
   steeringDelivered?: boolean;
@@ -402,6 +464,10 @@ export interface AssistantMessage {
   // Set when the user hard-stopped this turn (live finalize or history replay
   // of a stopped turn). Drives the per-message "⏹ Stopped" chip.
   stopped?: boolean;
+  /** Monotonic counter bumped by every landed reply text, reasoning text or
+   *  tool-argument chunk (`nextArrivalSeq`). The streaming indicator reads it
+   *  to tell arriving text from a pause. */
+  arrivalSeq?: number;
 }
 
 export type NotificationVariant = 'info' | 'success' | 'warning';

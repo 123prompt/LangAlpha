@@ -72,6 +72,12 @@ def get_sse_keepalive_interval() -> float:
     return get_infrastructure_config().sse_keepalive_interval
 
 
+def get_prompt_guidance_default() -> str | None:
+    """Deployment-pinned prompt scaffolding level, or None for 'auto'."""
+    guidance = get_infrastructure_config().prompt.guidance
+    return None if guidance == "auto" else guidance
+
+
 # =============================================================================
 # Feature Flags
 # =============================================================================
@@ -575,13 +581,17 @@ def get_langsmith_metadata(
     locale: Optional[str] = None,
     timezone: Optional[str] = None,
     llm_model: Optional[str] = None,
-    reasoning_effort: Optional[str] = None,
-    fast_mode: Optional[bool] = None,
     plan_mode: bool = False,
-    is_byok: bool = False,
     platform: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build LangSmith metadata dict for a workflow run (omits None values)."""
+    """Build LangSmith metadata dict for a workflow run (omits None values).
+
+    Turn identity only. How the model was tuned for a call — effort, guidance,
+    compaction preset, billing — is stamped on the client in ``LLM.get_llm``
+    and lands on the LLM run, because a subagent inherits this dict wholesale
+    while running a different model. ``llm_model`` stays as the turn's own
+    selection, which is a different question from what any one call hit.
+    """
     metadata = {}
 
     if user_id:
@@ -598,14 +608,8 @@ def get_langsmith_metadata(
         metadata["timezone"] = timezone
     if llm_model:
         metadata["llm_model"] = llm_model
-    if reasoning_effort:
-        metadata["reasoning_effort"] = reasoning_effort
-    if fast_mode is not None:
-        metadata["fast_mode"] = fast_mode
     if plan_mode:
         metadata["plan_mode"] = plan_mode
-    if is_byok:
-        metadata["is_byok"] = is_byok
     if platform:
         metadata["platform"] = platform
 

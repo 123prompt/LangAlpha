@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import { toast } from '@/components/ui/use-toast';
+import { Brokerages } from './components/Brokerages';
 import { McpServers } from './components/McpServers';
 import { SkillsList } from './components/SkillsList';
 import { PluginSecrets } from './components/PluginSecrets';
@@ -18,6 +19,10 @@ import { PluginsList } from './components/PluginsList';
 import { ADD_INTENT_TAB, ADD_PARAM, type AddIntent } from './utils/addParam';
 import { DETAIL_KIND_TAB, parseDetail } from './utils/detailParam';
 import './Plugins.css';
+import { useToggleBrokerage } from '@/hooks/useMcpServers';
+import { canBeginMcpOAuth } from '@/lib/desktop';
+import { readConnectOutcome } from './connectOutcome';
+import { useConnectReturn } from './connectReturn';
 
 /**
  * /plugins — user-level MCP servers, skills and the user vault. An enabled
@@ -30,13 +35,15 @@ import './Plugins.css';
  * — surfaced as a toast, then stripped from the URL.
  */
 
-const TABS = ['plugins', 'mcp', 'skills', 'secrets'] as const;
+const TABS = ['plugins', 'brokerages', 'mcp', 'skills', 'secrets'] as const;
 type Tab = (typeof TABS)[number];
 
 // Explicit key map (not a template literal) so the i18n parity test can see
-// every tab label.
+// every tab label -- it reads bare `plugins.` literals, and a template would
+// leave five tab labels free to drift out of one catalog unnoticed.
 const TAB_LABEL_KEYS: Record<Tab, string> = {
   plugins: 'plugins.tabs.plugins',
+  brokerages: 'plugins.tabs.brokerages',
   mcp: 'plugins.tabs.mcp',
   skills: 'plugins.tabs.skills',
   secrets: 'plugins.tabs.secrets',
@@ -77,26 +84,55 @@ function Plugins() {
     );
   };
 
+  // Reached only from the return path, where the lifecycle's own rollback can
+  // no longer run. Held here rather than in the brokerages tab because this is
+  // where the landing is read, and the tab may not even be the one on screen.
+  const standDownMutation = useToggleBrokerage();
+
+  // The other way back from a vendor's sign-in page: no callback at all. A
+  // provider that refuses our redirect_uri renders its own page and never
+  // redirects, so the only return is the Back button — and the toast below is
+  // the only thing that explains why nothing happened.
+  useConnectReturn({
+    onAbandoned: (server) => {
+      toast({
+        variant: 'destructive',
+        title: t('plugins.oauth.abandonedTitle'),
+        description: canBeginMcpOAuth()
+          ? t('plugins.oauth.abandonedDesc', { server })
+          : t('plugins.oauth.abandonedDescNeedsDesktop', { server }),
+      });
+    },
+    // Silent on purpose, the same way the in-page rollback is: the refusal is
+    // already on screen and is the one thing the user can act on, and a second
+    // toast about the tidying would bury it. A failure here leaves the row
+    // switched on and visible, with its own switch.
+    onStandDown: (server) => {
+      void standDownMutation.mutateAsync({ name: server, enabled: false }).catch(() => {});
+    },
+  });
+
   // OAuth callback landing: toast the outcome once, then strip the params so a
   // refresh doesn't re-announce it.
   const callbackHandled = useRef(false);
   useEffect(() => {
     if (callbackHandled.current) return;
-    const connected = searchParams.get('mcp_connected');
-    const errorReason = searchParams.get('mcp_error');
-    if (!connected && !errorReason) return;
+    const outcome = readConnectOutcome(searchParams);
+    if (!outcome) return;
     callbackHandled.current = true;
-    if (connected) {
+    if (outcome.kind === 'connected') {
       toast({
         title: t('plugins.oauth.connectedTitle'),
-        description: t('plugins.oauth.connectedDesc', { server: connected }),
+        description: outcome.server
+          ? t('plugins.oauth.connectedDesc', { server: outcome.server })
+          : t('plugins.oauth.connectedDescAnon'),
       });
     } else {
-      const server = searchParams.get('server');
+      const reason = t(outcome.reasonKey);
       toast({
         variant: 'destructive',
         title: t('plugins.oauth.callbackErrorTitle'),
-        description: server ? `${server}: ${errorReason}` : String(errorReason),
+        description: outcome.server ? `${outcome.server}: ${reason}` : reason,
       });
     }
     const next = new URLSearchParams(searchParams);
@@ -108,82 +144,89 @@ function Plugins() {
   }, [searchParams]);
 
   return (
-    <div ref={pageRef} className="plugins-page">
-      <div className="plugins-container">
-        <div className="flex items-start justify-between gap-3 mb-6">
-          <div className="min-w-0">
-            <h2 className="text-xl font-semibold mb-1" style={{ color: 'var(--color-text-primary)' }}>
-              {t('plugins.title')}
-            </h2>
-            <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-              {t('plugins.description')}
-            </p>
+    <div className="plugins-page">
+      {/* Doubles as the window titlebar in the desktop shell; inert
+          elsewhere. Above the scroll port rather than inside it, so it stays
+          put once the page is scrolled. */}
+      <div className="chrome-drag-strip" aria-hidden="true" />
+      <div ref={pageRef} className="plugins-scroll">
+        <div className="plugins-container">
+          <div className="flex items-start justify-between gap-3 mb-6">
+            <div className="min-w-0">
+              <h2 className="text-xl font-semibold mb-1" style={{ color: 'var(--color-text-primary)' }}>
+                {t('plugins.title')}
+              </h2>
+              <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
+                {t('plugins.description')}
+              </p>
+            </div>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-opacity hover:opacity-90 flex-shrink-0"
+                  style={{
+                    color: 'var(--color-btn-primary-text)',
+                    backgroundColor: 'var(--color-btn-primary-bg)',
+                  }}
+                >
+                  <Plus className="h-3 w-3" />
+                  {t('plugins.addMenu.add')}
+                  <ChevronDown className="h-3 w-3" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={() => requestAdd('plugin')}>
+                  {t('plugins.addMenu.installPlugin')}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => requestAdd('server')}>
+                  {t('plugins.addMenu.addServer')}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => requestAdd('import')}>
+                  {t('plugins.addMenu.importServers')}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => requestAdd('skill')}>
+                  {t('plugins.addMenu.uploadSkill')}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
+          <div className="flex gap-2 mb-6 border-b overflow-x-auto plugins-tab-bar clips-focus-ring" style={{ borderColor: 'var(--color-border-muted)' }}>
+            {TABS.map((tab) => (
               <button
+                key={tab}
                 type="button"
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-md transition-opacity hover:opacity-90 flex-shrink-0"
+                onClick={() => handleTabChange(tab)}
+                className="relative px-4 py-2 text-sm font-medium whitespace-nowrap flex-shrink-0 transition-colors"
                 style={{
-                  color: 'var(--color-btn-primary-text)',
-                  backgroundColor: 'var(--color-btn-primary-bg)',
+                  color: activeTab === tab ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
                 }}
               >
-                <Plus className="h-3 w-3" />
-                {t('plugins.addMenu.add')}
-                <ChevronDown className="h-3 w-3" />
+                {t(TAB_LABEL_KEYS[tab])}
+                {activeTab === tab && (
+                  <motion.span
+                    layoutId="plugins-tab-underline"
+                    aria-hidden
+                    className="absolute inset-x-1 bottom-0 h-0.5 rounded-full"
+                    style={{ backgroundColor: 'var(--color-accent-primary)' }}
+                    transition={
+                      reducedMotion
+                        ? { duration: 0 }
+                        : { type: 'spring', stiffness: 500, damping: 40 }
+                    }
+                  />
+                )}
               </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={() => requestAdd('plugin')}>
-                {t('plugins.addMenu.installPlugin')}
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => requestAdd('server')}>
-                {t('plugins.addMenu.addServer')}
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => requestAdd('import')}>
-                {t('plugins.addMenu.importServers')}
-              </DropdownMenuItem>
-              <DropdownMenuItem onSelect={() => requestAdd('skill')}>
-                {t('plugins.addMenu.uploadSkill')}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-        <div className="flex gap-2 mb-6 border-b overflow-x-auto plugins-tab-bar" style={{ borderColor: 'var(--color-border-muted)' }}>
-          {TABS.map((tab) => (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => handleTabChange(tab)}
-              className="relative px-4 py-2 text-sm font-medium whitespace-nowrap flex-shrink-0 transition-colors"
-              style={{
-                color: activeTab === tab ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
-              }}
-            >
-              {t(TAB_LABEL_KEYS[tab])}
-              {activeTab === tab && (
-                <motion.span
-                  layoutId="plugins-tab-underline"
-                  aria-hidden
-                  className="absolute inset-x-1 bottom-0 h-0.5 rounded-full"
-                  style={{ backgroundColor: 'var(--color-accent-primary)' }}
-                  transition={
-                    reducedMotion
-                      ? { duration: 0 }
-                      : { type: 'spring', stiffness: 500, damping: 40 }
-                  }
-                />
-              )}
-            </button>
-          ))}
-        </div>
+            ))}
+          </div>
 
-        <div className="plugins-content">
-          {activeTab === 'plugins' && <PluginsList />}
-          {activeTab === 'mcp' && <McpServers />}
-          {activeTab === 'skills' && <SkillsList />}
-          {activeTab === 'secrets' && <PluginSecrets />}
+          <div className="plugins-content">
+            {activeTab === 'plugins' && <PluginsList />}
+            {activeTab === 'brokerages' && <Brokerages />}
+            {activeTab === 'mcp' && <McpServers />}
+            {activeTab === 'skills' && <SkillsList />}
+            {activeTab === 'secrets' && <PluginSecrets />}
+          </div>
         </div>
       </div>
     </div>

@@ -14,7 +14,9 @@ from src.server.services.user_skills.materialize import (
     skills_delivery_signature,
 )
 from src.server.services.user_skills.validate import (
+    SkillNamesUnavailable,
     SkillValidationError,
+    configured_skill_dirs,
     reserved_skill_names,
     valid_command,
     validate_skill_archive,
@@ -22,7 +24,9 @@ from src.server.services.user_skills.validate import (
 
 __all__ = [
     "EMPTY_USER_SKILL_BUNDLE",
+    "SkillNamesUnavailable",
     "SkillValidationError",
+    "configured_skill_dirs",
     "drop_archive_if_unused",
     "fetch_skill_archive",
     "load_user_skill_bundle",

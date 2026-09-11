@@ -29,6 +29,22 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+def _doc_name(tool_name: str, untrusted: bool) -> str:
+    """The filename a tool's documentation is written under.
+
+    Shared by the writer and by the sweep that removes what the writer no longer
+    produces. Two derivations of one name is exactly how a doc for a tool the
+    agent may not call survives a pass meant to delete it.
+
+    Untrusted names could carry ``..`` or ``/`` and traverse out of the docs
+    directory, so there the sanitized identifier is the filename; a builtin's
+    name is already a valid identifier.
+    """
+    if untrusted:
+        return sanitize_tool_name(tool_name) or "_invalid_tool"
+    return tool_name
+
+
 async def _install_dependencies(sandbox: "PTCSandbox") -> None:
     """Install required Python packages in sandbox (no-snapshot fallback)."""
     logger.info("Installing dependencies (no snapshot)")
@@ -185,37 +201,77 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
     docs_root = f"{work_dir}/tools/docs"
     tools_root = f"{work_dir}/tools"
     stale_paths: list[str] = []
-    try:
-        existing_docs = await sandbox.als_directory(docs_root)
-        if existing_docs:
-            stale_paths.extend(
-                entry["path"]
-                for entry in existing_docs
-                if entry.get("is_dir") and entry.get("name") not in tools_by_server
-            )
-    except Exception:
-        pass  # docs dir may not exist yet on fresh sandbox
-    try:
-        existing_tools = await sandbox.als_directory(tools_root)
-        if existing_tools:
-            expected_wrappers = {f"{name}.py" for name in tools_by_server}
-            stale_paths.extend(
-                entry["path"]
-                for entry in existing_tools
-                if not entry.get("is_dir")
-                and entry.get("name", "").endswith(".py")
-                and entry.get("name") not in expected_wrappers
-                and entry.get("name") not in ("mcp_client.py", "__init__.py")
-            )
-    except Exception:
-        pass  # tools dir may not exist yet on fresh sandbox
+    # Not wrapped: ``als_directory`` returns [] for a directory that is empty or
+    # absent, and raises only when the sandbox itself failed. Swallowing that
+    # raise reads a broken sandbox as "nothing stale here", and the sync then
+    # stamps the manifest current -- so the doc for a tool the user declined
+    # survives every later sync too, which is the failure this sweep exists to
+    # prevent. A fresh sandbox costs nothing here; a broken one should fail.
+    existing_docs = await sandbox.als_directory(docs_root)
+    stale_paths.extend(
+        entry["path"]
+        for entry in existing_docs
+        if entry.get("is_dir") and entry.get("name") not in tools_by_server
+    )
+
+    # The sweep inside the servers that DID survive. Removing a whole directory
+    # when its server leaves the set was enough while a server's tool list only
+    # changed when the vendor changed it. Capability consent changes it on a user
+    # toggle, so a declined tool now routinely leaves its doc behind: the wrapper
+    # module is one file rewritten whole and correctly loses the function, while
+    # ``tools/docs/<server>/`` goes on describing it.
+    #
+    # That is not clutter. The tool guide sends the agent to this directory to
+    # find out what a server can do, and it is the surface the agent trusts, so a
+    # doc left behind is the agent reading that it can place live orders and
+    # telling the user so -- on a connection whose owner declined exactly that.
+    # The call is refused at the relay either way; what leaks here is the claim,
+    # which on this feature is the part that matters.
+    #
+    # Only directories the listing above already found are opened, so a fresh
+    # sandbox costs nothing and a warm one costs one listing per server present.
+    for entry in existing_docs:
+        server_name = entry.get("name")
+        if not entry.get("is_dir") or server_name not in tools_by_server:
+            continue
+        expected = {
+            f"{_doc_name(tool.name, untrusted_by_name.get(server_name, True))}.md"
+            for tool in tools_by_server[server_name]
+        }
+        existing_tool_docs = await sandbox.als_directory(entry["path"])
+        stale_paths.extend(
+            doc["path"]
+            for doc in existing_tool_docs
+            if not doc.get("is_dir")
+            and doc.get("name", "").endswith(".md")
+            and doc.get("name") not in expected
+        )
+    existing_tools = await sandbox.als_directory(tools_root)
+    if existing_tools:
+        expected_wrappers = {f"{name}.py" for name in tools_by_server}
+        stale_paths.extend(
+            entry["path"]
+            for entry in existing_tools
+            if not entry.get("is_dir")
+            and entry.get("name", "").endswith(".py")
+            and entry.get("name") not in expected_wrappers
+            and entry.get("name") not in ("mcp_client.py", "__init__.py")
+        )
     if stale_paths:
         rm_cmd = "rm -rf " + " ".join(shlex.quote(p) for p in stale_paths)
-        await sandbox._runtime_call(
+        result = await sandbox._runtime_call(
             sandbox.runtime.exec,
             rm_cmd,
             retry_policy=RetryPolicy.SAFE,
         )
+        # A delete that silently failed is the same outcome as never sweeping:
+        # the manifest is stamped current and the stale doc is never revisited.
+        exit_code = getattr(result, "exit_code", 0)
+        if exit_code:
+            raise RuntimeError(
+                f"failed to remove stale tool files (exit {exit_code}): "
+                f"{getattr(result, 'stderr', '')}"
+            )
 
     for server_name, tools in tools_by_server.items():
         # Fail closed: a server present in the registry but missing from the
@@ -247,13 +303,7 @@ async def _install_tool_modules(sandbox: "PTCSandbox") -> None:
             doc = sandbox.tool_generator.generate_tool_documentation(
                 tool, untrusted=untrusted
             )
-            # Untrusted tool names could contain ``..`` or ``/`` and traverse
-            # out of the docs dir; use the sanitized identifier for the
-            # filename. Builtin names are already valid identifiers.
-            if untrusted:
-                doc_name = sanitize_tool_name(tool.name) or "_invalid_tool"
-            else:
-                doc_name = tool.name
+            doc_name = _doc_name(tool.name, untrusted)
             doc_path = f"{work_dir}/tools/docs/{server_name}/{doc_name}.md"
             upload_item: tuple[bytes, str, tuple[str, dict[str, str]] | None] = (
                 doc.encode("utf-8"),
@@ -315,7 +365,8 @@ async def discover_user_mcp_schemas(
         For each server: run ``mcp_client.py discover <name> <out>`` (file IPC —
         the CLI writes its result JSON to a temp file, never stdout), read the
         file back, delete it. Per-server error isolation; one hung/broken server
-        never blocks the others. Returns ``{name: {"status","error","tools"}}``.
+        never blocks the others. Returns
+        ``{name: {"status","error","tools","server_info"}}``.
         No vault file is needed — the client substitutes inert placeholders.
         """
     await sandbox._wait_ready()
@@ -363,10 +414,12 @@ async def discover_user_mcp_schemas(
                 parsed = json.loads(
                     raw.decode("utf-8") if isinstance(raw, bytes) else raw
                 )
+                info = parsed.get("server_info")
                 return name, {
                     "status": parsed.get("status", "error"),
                     "error": parsed.get("error", "") or "",
                     "tools": parsed.get("tools") or [],
+                    "server_info": info if isinstance(info, dict) else None,
                 }
             except Exception as e:  # noqa: BLE001 — isolate one bad server
                 logger.warning(

@@ -37,6 +37,29 @@ const SHELL_BRIDGE = { version: '0.0.0-e2e', platform: 'darwin', windowChrome: '
 // measures what that costs.
 const CHROMELESS_ROUTES = ['/setup/method', '/privacy', '/legal', '/s/no-such-token'];
 
+// Any valid v4 UUID; nothing has to exist behind it for the thread gallery to
+// render its back-button row, which is the bar this suite measures.
+const E2E_WORKSPACE_ID = '11111111-1111-4111-8111-111111111111';
+
+// And every route that renders INSIDE the app shell. There the sidebar reserves
+// and drags its own column and the fallback strip has stood down, which leaves
+// the content column beside it entirely to the route: a route with no top bar of
+// its own to mark `data-chrome="drag"` owes the window a `.chrome-drag-strip`, or
+// nothing right of the sidebar moves the window at all. Four routes shipped
+// without one, and the shape of the miss is why this list is swept rather than
+// spot-checked -- see the test.
+//
+// `/chat` appears twice on purpose. One path segment later ChatAgent swaps the
+// workspace gallery for the thread gallery, a different component with a
+// different top row, so the bare route proves nothing about the one below it.
+// Any route whose component branches on a param owes this list both branches.
+//
+// The id has to be a well-formed UUID. ChatAgent runs the param through
+// isValidUuid and treats anything else as absent, so a readable placeholder
+// like `ws-e2e` silently lands back on the workspace gallery and the test
+// passes while measuring the route above the one it names.
+const APP_ROUTES = ['/dashboard', '/chat', `/chat/${E2E_WORKSPACE_ID}`, '/market', '/plugins', '/automations', '/settings', '/news/1'];
+
 async function asDesktopShell(page, bridge = SHELL_BRIDGE) {
   await page.addInitScript((value) => {
     Object.defineProperty(window, 'langalphaDesktop', { value, configurable: true });
@@ -263,6 +286,127 @@ test.describe('desktop window chrome', () => {
       expect(await cornerOccupants(page)).toEqual([]);
     });
   }
+
+  // Swept across the whole row rather than sampled in the middle, because both
+  // ways this fails leave the middle working. A strip dropped inside a page that
+  // carries the column's padding on its root starts BELOW the window's top edge
+  // and stops short of BOTH sides -- and the left shortfall lands exactly in the
+  // gap between this strip and the sidebar's own, which is where a drag aimed at
+  // "the empty bit at the top" tends to go. One sample at x=50% passes on all of
+  // it. A strip parked inside a scrolling page is the third shape: it rides the
+  // content out of view, so the titlebar works until the user scrolls.
+  for (const route of APP_ROUTES) {
+    test(`the top of the content column moves the window on ${route}`, async ({ page }) => {
+      await asDesktopShell(page);
+      await mockAPI(page);
+      await page.goto(route);
+      // The settled CONTENT COLUMN, and not merely a settled document. The
+      // sweeps above wait on `document.body`, which inside the app shell is
+      // satisfied by the sidebar alone -- and /chat opens behind a full-height
+      // curtain at opacity 0, so the row was swept while the route it belongs to
+      // had not painted, and every point read as dead. Waiting on `.main` waits
+      // for the column the assertion is about.
+      await page.waitForFunction(
+        () => !document.querySelector('.page-loading')
+          && document.querySelector('.app-main .main')?.innerText.trim().length > 0,
+      );
+
+      // Still the route this test names. A route whose data 404s can navigate
+      // itself somewhere else before the sweep runs -- /chat/<id> does exactly
+      // that, its not-found effect replacing the URL with /chat -- and the sweep
+      // then measures a page that was never in question and reports it under the
+      // name of the one that was. Mocks keep it here; this is what notices when
+      // they stop.
+      expect(new URL(page.url()).pathname).toBe(route);
+
+      const dead = await page.evaluate((stripH) => {
+        const main = document.querySelector('.app-main');
+        if (!main) return ['no .app-main'];
+        const box = main.getBoundingClientRect();
+        const y = Math.round(stripH / 2);
+        const out = [];
+        // The 24px stride can stop up to a stride short of the right edge, and a
+        // page that carries its padding on the root falls short by exactly that
+        // sort of distance. Sample the far edge outright rather than hoping the
+        // stride lands inside the gap.
+        const xs = [];
+        for (let x = Math.round(box.left) + 2; x < box.right - 2; x += 24) xs.push(x);
+        xs.push(Math.round(box.right) - 3);
+        for (const x of xs) {
+          const el = document.elementFromPoint(x, y);
+          let region = 'none';
+          for (let node = el; node; node = node.parentElement) {
+            const r = getComputedStyle(node).webkitAppRegion;
+            if (r === 'drag' || r === 'no-drag') { region = r; break; }
+          }
+          // `no-drag` is a control taking its own clicks back, which is the whole
+          // point of the rule in chrome.css and is expected wherever a route puts
+          // a real bar in the titlebar row. `none` is the row never having been a
+          // drag region at all, which is the bug.
+          if (region === 'none') {
+            out.push(`x=${x} <${el ? el.tagName.toLowerCase() : 'nothing'}` +
+              `${el && el.className ? ` class="${String(el.className).slice(0, 40)}"` : ''}>`);
+          }
+        }
+        return out;
+      }, BUTTON_RECT.h);
+
+      expect(dead, `dead points in the titlebar row on ${route}`).toEqual([]);
+    });
+  }
+
+  // The third shape, and the one the sweep above cannot see: a strip parked
+  // inside a page that scrolls sits in the right row at load and then rides the
+  // content out of view on the first wheel event, so the titlebar works until
+  // the user scrolls and the sweep passes the whole time. `/news/:id` is the
+  // long route -- an article -- and was exactly that until it grew a scroll port
+  // of its own.
+  test('the titlebar stays put once a long route is scrolled', async ({ page }) => {
+    await asDesktopShell(page);
+    await mockAPI(page, {
+      'GET /news/*': {
+        id: 'news-long',
+        title: 'Markets Rally on Strong Earnings',
+        published_at: '2025-01-01T12:00:00Z',
+        source: { name: 'Reuters', favicon_url: '' },
+        tickers: ['AAPL'],
+        // Long enough to overflow any window this suite runs in.
+        description: 'Lorem ipsum dolor sit amet. '.repeat(2000),
+        sentiments: [],
+        article_url: 'https://example.com/article',
+      },
+    });
+    await page.goto('/news/1');
+    await page.waitForFunction(
+      () => !document.querySelector('.page-loading')
+        && document.querySelector('.app-main .main')?.innerText.trim().length > 0,
+    );
+
+    // Whichever element ended up owning the overflow -- that is the question, so
+    // the test must not assume the answer.
+    const scrolled = await page.evaluate(() => {
+      let moved = 0;
+      for (const el of document.querySelectorAll('*')) {
+        if (el.scrollHeight > el.clientHeight + 4) {
+          el.scrollTop = el.scrollHeight;
+          if (el.scrollTop > 0) moved += 1;
+        }
+      }
+      return moved;
+    });
+    expect(scrolled, 'nothing scrolled; the article is not long enough to test').toBeGreaterThan(0);
+
+    const region = await page.evaluate((stripH) => {
+      const box = document.querySelector('.app-main').getBoundingClientRect();
+      const el = document.elementFromPoint(Math.round((box.left + box.right) / 2), Math.round(stripH / 2));
+      for (let node = el; node; node = node.parentElement) {
+        const r = getComputedStyle(node).webkitAppRegion;
+        if (r === 'drag' || r === 'no-drag') return r;
+      }
+      return `none <${el ? el.tagName.toLowerCase() : 'nothing'}>`;
+    }, BUTTON_RECT.h);
+    expect(region).toBe('drag');
+  });
 
   test('a pre-0.1.1 shell still gets the strip from the platform guess', async ({ page }) => {
     // The bridge without `windowChrome` is what an already-installed older shell

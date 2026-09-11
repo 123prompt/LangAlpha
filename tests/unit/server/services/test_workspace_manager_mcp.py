@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.server.services.egress.session_binding import RelayBind
 from src.server.services.workspace_manager import WorkspaceManager
 from tests.unit.server.mcp_builders import resolved_mcp
 from tests.unit.server.services.conftest import _patch_identity, _patch_sandbox_bind
@@ -138,6 +139,55 @@ class TestWarmCooldownNoQuery:
         mock_get_ws.assert_not_awaited()
         mock_resolve.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.db_get_workspace", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.update_workspace_status", new_callable=AsyncMock)
+    @patch("src.server.services.workspace_manager.update_workspace_activity", new_callable=AsyncMock)
+    async def test_a_superseded_resolve_gets_past_the_cooldown(
+        self, mock_activity, mock_status, mock_get_ws
+    ):
+        """The withheld version stamp only closes the loop if something reads it.
+
+        A superseded resolve clears ``mcp_config_version`` so the next acquire
+        re-resolves, but the version is read on the slow path and the cooldown
+        returns before it. So the stamp alone bought nothing: for a full cooldown
+        the session kept serving a composite built from grants a newer resolve
+        had already replaced -- the declined tools' wrappers and docs among them.
+        """
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        ws_id = str(uuid.uuid4())
+        session = _make_session(version=None, summary="stale")
+        wm._sessions[ws_id] = session
+        wm._record_sync(ws_id)  # cooldown active
+        wm._resolve_superseded.add(ws_id)
+
+        workspace = _make_workspace(ws_id, mcp_config_version=5)
+        mock_get_ws.return_value = workspace
+        wm._sync_sandbox_assets = AsyncMock()
+        wm._maybe_restore_files = AsyncMock()
+
+        with patch(
+            "src.server.services.mcp_config.resolve_mcp_config",
+            new_callable=AsyncMock,
+            return_value=_resolved(5),
+        ) as mock_resolve, patch(
+            "src.server.services.workspace_manager.sync_egress_relay",
+            new=AsyncMock(return_value=RelayBind.APPLIED),
+        ), patch(
+            "ptc_agent.core.mcp_registry.build_composite_registry",
+            return_value=MagicMock(),
+        ), patch(
+            "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+            return_value="NEW",
+        ), _patch_identity(workspace):
+            await wm.get_session_for_workspace(ws_id, user_id="user-1")
+
+        mock_resolve.assert_awaited_once()
+        assert session.mcp_config_version == 5
+        # Spent, not held: the mark exists to get one acquire to the version
+        # read, and the resolve it forced either succeeded or re-marked.
+        assert ws_id not in wm._resolve_superseded
+
 
 # ---------------------------------------------------------------------------
 # Session caches registry + summary; second acquire reuses without re-resolve
@@ -184,7 +234,7 @@ class TestSessionCachesMcp:
             return_value=resolved,
         ) as mock_resolve, patch(
             "src.server.services.workspace_manager.sync_egress_relay",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=RelayBind.APPLIED),
         ), patch(
             "ptc_agent.core.mcp_registry.build_composite_registry",
             return_value=composite,
@@ -204,6 +254,49 @@ class TestSessionCachesMcp:
         assert session.mcp_config_version == 2
 
     @pytest.mark.asyncio
+    async def test_a_superseded_resolve_publishes_nothing(self):
+        """A resolve a newer version has overtaken must not reach the sandbox.
+
+        Everything derived from it is stale by the same amount, including the
+        tool set the wrappers and per-tool docs come from -- so publishing here
+        reinstates, in a sandbox the newer resolve just corrected, the
+        documentation for tools its user had declined. Reporting no change is
+        what keeps the asset sync from running; the composite still installs so
+        the turn keeps a registry, and the withheld stamp forces a re-resolve.
+        """
+        wm = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_session(version=None, summary=None)
+        resolved = _resolved(2)
+
+        composite = MagicMock()
+        with patch(
+            "src.server.services.mcp_config.resolve_mcp_config",
+            new_callable=AsyncMock,
+            return_value=resolved,
+        ), patch(
+            "src.server.services.workspace_manager.sync_egress_relay",
+            new=AsyncMock(return_value=RelayBind.SUPERSEDED),
+        ), patch(
+            "ptc_agent.core.mcp_registry.build_composite_registry",
+            return_value=composite,
+        ), patch(
+            "ptc_agent.agent.prompts.formatter.build_tool_summary_from_registry",
+            return_value="SUMMARY",
+        ):
+            out = await wm._apply_session_mcp(
+                "ws", "user-1", session, ws_version=2
+            )
+
+        # None is what the callers read as "nothing changed", and it is the only
+        # thing standing between a stale composite and the asset sync.
+        assert out is None
+        assert session.mcp_config_version is None
+        assert session.mcp_registry is composite
+        # The stamp is read on the slow path only, so the mark is what carries
+        # the next acquire past the sync cooldown far enough to read it.
+        assert "ws" in wm._resolve_superseded
+
+    @pytest.mark.asyncio
     async def test_apply_session_mcp_withholds_the_stamp_on_a_refused_push(self):
         """A refused relay-credential push must not be stamped as applied:
         nothing else re-pushes the file, so the version stays None (the
@@ -220,7 +313,7 @@ class TestSessionCachesMcp:
             return_value=resolved,
         ), patch(
             "src.server.services.workspace_manager.sync_egress_relay",
-            new=AsyncMock(return_value=False),
+            new=AsyncMock(return_value=RelayBind.REFUSED),
         ), patch(
             "ptc_agent.core.mcp_registry.build_composite_registry",
             return_value=composite,
@@ -637,7 +730,7 @@ class TestVersionDeltaBackgroundDiscovery:
             return_value=resolved,
         ) as mock_resolve, patch(
             "src.server.services.workspace_manager.sync_egress_relay",
-            new=AsyncMock(return_value=True),
+            new=AsyncMock(return_value=RelayBind.APPLIED),
         ), patch(
             "ptc_agent.core.mcp_registry.build_composite_registry",
             return_value=MagicMock(),

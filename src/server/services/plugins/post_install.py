@@ -29,6 +29,7 @@ from src.server.services.plugins.errors import PluginRejected
 from src.server.services.plugins.extension import (
     NAMESPACE,
     LangalphaExtension,
+    apply_server_metadata,
     materialize_binds,
     parse_extension,
 )
@@ -78,6 +79,7 @@ async def _stored_entry_plans(
         )
     )
     extension = stored_extension(plugin)
+    apply_server_metadata(extension, plans, document_dropped=doc is None)
     grants = await resolve_bind_grants(
         user_id, extension, plugin_id=plugin["user_plugin_id"]
     )

@@ -109,7 +109,7 @@ function ThumbDownModal({ isOpen, onSubmit, onCancel, onReportWithAgent }: Thumb
           onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setComment(e.target.value)}
           placeholder="Tell us more about the issue..."
           rows={3}
-          className="w-full rounded-lg px-3 py-2.5 text-sm resize-none outline-none mb-2"
+          className="w-full rounded-lg px-3 py-2.5 text-sm resize-none mb-2"
           style={{
             backgroundColor: 'var(--color-bg-page)',
             color: 'var(--color-text-primary)',

@@ -189,6 +189,4 @@ async def read_thread_runtime_status(
 
     except Exception as e:
         logger.exception(f"Error checking workflow status for {thread_id}: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to check workflow status: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail="Failed to check turn status")

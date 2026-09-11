@@ -152,13 +152,11 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
     ) -> Tuple[str, Dict[str, Any]]:
         """Crawl a website and dump each page as markdown into the workspace.
 
-        Starts an asynchronous crawl at ``url``, follows internal links up to
-        ``limit`` pages, and writes one .md file per page plus an index.jsonl
-        manifest. Read the dumped files with Glob/Read afterwards — page
-        content is never returned inline. Scope a site with WebMap first, and
-        prefer WebFetch when you already know the handful of URLs you need.
-        Crawling bills per delivered page, so keep ``limit`` tight and focus
-        the crawl with include_paths/exclude_paths.
+        Starts an asynchronous crawl at ``url`` and follows internal links up
+        to ``limit`` pages. Scope a site with WebMap first, and prefer WebFetch
+        when you already know the handful of URLs you need. Crawling bills per
+        delivered page, so keep ``limit`` tight and focus the crawl with
+        include_paths/exclude_paths.
 
         Args:
             url: Starting URL; the crawl stays within its site.
@@ -170,6 +168,13 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
             output_dir: Workspace directory to dump into; pages land in
                 <output_dir>/<host>/. Defaults to work/crawl. Pass your task's
                 work dir (e.g. work/<task>/crawl) when running a task workflow.
+
+        Returns:
+            A page count and the paths it wrote, never page content: one .md
+            file per page plus an index.jsonl manifest.
+
+        Glob the directory and Read the pages you need. Never re-crawl what
+        you already dumped.
         """
         stamp_run(crawl_provider=provider)
         limit_ = max(1, min(int(limit), _MAX_CRAWL_PAGES))
@@ -287,14 +292,17 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
     async def web_map(url: str, query: Optional[str] = None, limit: int = 100) -> Tuple[str, Dict[str, Any]]:
         """Discover the URLs of a website without crawling it.
 
-        Maps ``url`` and lists its discovered links, ranked by relevance to
-        ``query`` when given. Fast and cheap — use it to scope a site before
-        deciding which pages to WebFetch or whether a WebCrawl is worth it.
+        Fast and cheap — use it to scope a site before deciding which pages to
+        WebFetch or whether a WebCrawl is worth it.
 
         Args:
             url: Site to map.
-            query: Optional relevance filter/ranking for the returned links.
+            query: Optional relevance filter for the returned links.
             limit: Max links to return (default 100, max 300).
+
+        Returns:
+            URLs with page titles where the site supplies them, ranked by
+            ``query`` when given. No page content is fetched.
         """
         limit_ = max(1, min(int(limit), _MAX_MAP_LINKS))
         try:

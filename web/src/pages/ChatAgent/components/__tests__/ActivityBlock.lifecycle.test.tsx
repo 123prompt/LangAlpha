@@ -93,7 +93,7 @@ const SUMMARY_BUTTON_RE = /toolArtifact/i;
 describe('ActivityBlock — live-row lifecycle states', () => {
   it('renders an active tool row with the state-active left-rule hook and no badge', () => {
     const items = [toolItem('active', { isComplete: false })];
-    const { container } = render(<ActivityBlock items={items} isStreaming={true} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={true} isFirst={false} />);
 
     const row = container.querySelector('.nrow.state-active');
     expect(row).not.toBeNull();
@@ -104,7 +104,7 @@ describe('ActivityBlock — live-row lifecycle states', () => {
 
   it('renders a completing tool row without the active rule and without a badge', () => {
     const items = [toolItem('completing', { isComplete: true, _recentlyCompleted: true })];
-    const { container } = render(<ActivityBlock items={items} isStreaming={true} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={true} isFirst={false} />);
 
     const row = container.querySelector('.nrow');
     expect(row).not.toBeNull();
@@ -114,7 +114,7 @@ describe('ActivityBlock — live-row lifecycle states', () => {
 
   it('renders the failed ✕ badge on a live failed row with the a11y label', () => {
     const items = [toolItem('failed', { isComplete: true, isFailed: true, _recentlyCompleted: true })];
-    const { container } = render(<ActivityBlock items={items} isStreaming={true} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={true} isFirst={false} />);
 
     const badge = container.querySelector('.nrow .nrow-badge');
     expect(badge).not.toBeNull();
@@ -134,7 +134,7 @@ describe('ActivityBlock — replay parity', () => {
       toolItem('completed', { id: 'tc-1', isComplete: true }),
       toolItem('completed', { id: 'tc-2', isComplete: true }),
     ];
-    const { container } = render(<ActivityBlock items={items} isStreaming={false} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={false} isFirst={false} />);
 
     fireEvent.click(screen.getByRole('button', { name: SUMMARY_BUTTON_RE }));
 
@@ -148,7 +148,7 @@ describe('ActivityBlock — replay parity', () => {
 
   it('renders newly completed rows WITH the entrance wrapper while streaming (contrast case)', () => {
     const items = [toolItem('completed', { id: 'tc-1', isComplete: true })];
-    const { container } = render(<ActivityBlock items={items} isStreaming={true} />);
+    const { container } = render(<ActivityBlock items={items} isStreaming={true} isFirst={false} />);
 
     fireEvent.click(screen.getByRole('button', { name: SUMMARY_BUTTON_RE }));
 

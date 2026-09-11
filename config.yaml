@@ -18,6 +18,17 @@ debug: false
 ptc_recursion_limit: 2000
 flash_recursion_limit: 500
 
+# Prompt scaffolding level. Frontier models perform better with less procedural
+# instruction; smaller models need the expanded version.
+#   auto      — follow each model's prompt_guidance in src/llms/manifest/models.json
+#               (unannotated models fall back to detailed)
+#   lean      — pin every model to the minimal prompt
+#   detailed  — pin every model to the expanded prompt
+# A per-user model_preference.prompt_guidance overrides this — a profile for
+# the running model first, then the account-wide value.
+prompt:
+  guidance: auto
+
 # Workflow Settings
 workflow_timeout: 21600  # seconds (6 hours) — matches background_execution.abandoned_workflow_timeout
 sse_keepalive_interval: 15  # seconds

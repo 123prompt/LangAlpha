@@ -993,14 +993,26 @@ class TestSeedAgentMd:
         sandbox = AsyncMock()
         sandbox.awrite_file_text = AsyncMock(return_value=True)
 
-        await WorkspaceManager._seed_agent_md(sandbox, "My Workspace", "A description")
+        await WorkspaceManager._seed_agent_md(sandbox, "My Workspace")
 
         sandbox.awrite_file_text.assert_awaited_once()
         call_args = sandbox.awrite_file_text.call_args
         assert call_args[0][0] == "agent.md"
-        content = call_args[0][1]
-        assert "My Workspace" in content
-        assert "A description" in content
+        assert "## Thread Index" in call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_the_template_does_not_name_the_workspace(self):
+        # The row is the only place the name lives, and the prompt injects it
+        # from there each turn. A copy written here could only go stale, which
+        # is the whole bug the front-matter block used to cause.
+        sandbox = AsyncMock()
+        sandbox.awrite_file_text = AsyncMock(return_value=True)
+
+        await WorkspaceManager._seed_agent_md(sandbox, "My Workspace")
+
+        content = sandbox.awrite_file_text.call_args[0][1]
+        assert "My Workspace" not in content
+        assert not content.startswith("---")
 
     @pytest.mark.asyncio
     async def test_seed_agent_md_none_sandbox_noop(self):
@@ -1138,7 +1150,13 @@ class TestSandboxRecovery:
 
     def _make_manager(self):
         config = _make_config()
-        return WorkspaceManager.get_instance(config=config)
+        manager = WorkspaceManager.get_instance(config=config)
+        # Recovery re-provisions through the real restore path; with no DB pool
+        # the completeness guard cannot be raised and provisioning aborts on
+        # purpose. These tests are about the recovery spine, not the restore.
+        manager._restore_files = AsyncMock()
+        manager._maybe_restore_files = AsyncMock()
+        return manager
 
     def _make_failed_session(self, error=None):
         """Create a session whose sandbox has a failed lazy init."""
@@ -3654,3 +3672,159 @@ class TestPlatformSecretWiring:
                 )
 
         assert workspace_id not in manager._sessions
+
+
+class TestRestoreGuard:
+    """A restore that could not raise the completeness flag aborts provisioning.
+
+    Every other restore failure is a warning: the flag it raised first keeps the
+    next backup from pruning. With no flag there is nothing keeping it, so the
+    sandbox must not be bound.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_missing_guard_propagates_out_of_the_restore_wrapper(self):
+        from src.server.services.persistence.file import RestoreGuardUnavailable
+
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        with patch(
+            "src.server.services.workspace_manager.FilePersistenceService.restore_to_sandbox",
+            AsyncMock(side_effect=RestoreGuardUnavailable("ws-1")),
+        ):
+            with pytest.raises(RestoreGuardUnavailable):
+                await manager._restore_files(
+                    "ws-1", MagicMock(), expected_sandbox_id="sb-old"
+                )
+
+    @pytest.mark.asyncio
+    async def test_any_other_restore_failure_is_still_a_warning(self):
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        with patch(
+            "src.server.services.workspace_manager.FilePersistenceService.restore_to_sandbox",
+            AsyncMock(side_effect=RuntimeError("transfer boom")),
+        ):
+            await manager._restore_files(
+                "ws-1", MagicMock(), expected_sandbox_id="sb-old"
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_lost_identity_propagates_too(self):
+        from src.server.services.persistence.file import RestoreIdentityLost
+
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        with patch(
+            "src.server.services.workspace_manager.FilePersistenceService.restore_to_sandbox",
+            AsyncMock(side_effect=RestoreIdentityLost("ws-1")),
+        ) as restore_call:
+            with pytest.raises(RestoreIdentityLost):
+                await manager._restore_files(
+                    "ws-1", MagicMock(), expected_sandbox_id="sb-old"
+                )
+        assert restore_call.await_args.kwargs["expected_sandbox_id"] == "sb-old"
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.workspace_manager.update_workspace_status")
+    @patch("src.server.services.workspace_manager.SessionManager")
+    @patch("src.server.services.workspace_manager.db_get_workspace")
+    async def test_recovery_restores_against_the_sandbox_the_row_still_names(
+        self, mock_get_ws, mock_session_mgr, mock_status
+    ):
+        """The restore's flag and the bind's CAS must expect the same previous
+        sandbox, or a late provisioner could flag a row another has bound."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        ws_id = str(uuid.uuid4())
+        workspace = _make_workspace(workspace_id=ws_id, status="running")
+        workspace["sandbox_id"] = "sb-previous"
+        mock_get_ws.return_value = workspace
+        session = _make_mock_session()
+        mock_session_mgr.get_session.return_value = session
+        mock_session_mgr.cleanup_session = AsyncMock()
+        manager._mint_sandbox_tokens = AsyncMock(return_value={})
+        manager._apply_session_mcp = AsyncMock(return_value=None)
+        manager._sync_sandbox_assets = AsyncMock()
+        # Stop at the restore: the rest of the spine needs a live pool.
+        manager._restore_files = AsyncMock(side_effect=RuntimeError("stop here"))
+
+        with pytest.raises(RuntimeError, match="stop here"):
+            await manager._recover_sandbox(ws_id, "user-1", MagicMock())
+
+        assert manager._restore_files.await_args.kwargs["expected_sandbox_id"] == "sb-previous"
+
+    @pytest.mark.asyncio
+    async def test_provision_reconciles_the_flag_after_winning_the_bind(self):
+        """post_init restores into a sandbox the row does not yet name, so its
+        clear cannot land. The reconcile runs once the row names this sandbox,
+        and after the session is published."""
+        manager = WorkspaceManager.get_instance(config=_make_config())
+        session = _make_mock_session()
+        session.sandbox.runtime = MagicMock()
+        workspace = _make_workspace()
+        workspace_id = workspace["workspace_id"]
+        order: list[str] = []
+
+        async def _bind(*_a, **_k):
+            order.append("bind")
+            return workspace
+
+        async def _reconcile(*_a, **_k):
+            order.append("reconcile")
+
+        with (
+            patch.object(manager, "_mint_sandbox_tokens", AsyncMock(return_value={})),
+            patch("src.server.services.workspace_manager.SessionManager") as session_mgr,
+            patch.object(manager, "_apply_session_mcp", AsyncMock(return_value=None)),
+            patch.object(manager, "_sync_sandbox_assets", AsyncMock()),
+            patch("src.server.services.workspace_manager.try_bind_workspace_sandbox", _bind),
+            patch.object(manager, "_maybe_restore_files", _reconcile),
+        ):
+            session_mgr.get_session.return_value = session
+            await manager._provision_sandbox_session(
+                workspace_id, "user-1", ws_version=None, kick_discovery=False, post_init=AsyncMock()
+            )
+
+        assert order == ["bind", "reconcile"]
+
+
+class TestSupersededResolve:
+    """A resolve a newer config version has overtaken keeps its composite but
+    not its directly bound tools."""
+
+    @pytest.mark.asyncio
+    async def test_direct_tools_are_dropped_and_the_composite_is_kept(self):
+        from src.server.services.egress.session_binding import RelayBind
+
+        manager = WorkspaceManager(_make_config())
+        session = SimpleNamespace(
+            sandbox=MagicMock(),
+            mcp_config_version=1,
+            mcp_tool_summary="old summary",
+            direct_mcp_tools={},
+        )
+
+        async def _install(sess, resolved, *, user_id=None):
+            sess.direct_mcp_tools = {"moomoo": object()}
+            sess.mcp_tool_summary = "installed summary"
+
+        with (
+            patch(
+                "src.server.services.mcp_config.resolve_mcp_config",
+                AsyncMock(return_value=SimpleNamespace(version=2, servers=[])),
+            ),
+            patch.object(
+                manager, "_install_session_composite", AsyncMock(side_effect=_install)
+            ),
+            patch(
+                "src.server.services.workspace_manager.sync_egress_relay",
+                AsyncMock(return_value=RelayBind.SUPERSEDED),
+            ),
+        ):
+            out = await manager._apply_session_mcp(
+                "ws-1", "user-1", session, ws_version=2
+            )
+
+        assert out is None
+        # The stamps on a stale direct set say which calls stop to ask, and the
+        # grants they were computed against are gone.
+        assert session.direct_mcp_tools == {}
+        assert session.mcp_tool_summary == "installed summary"
+        assert session.mcp_config_version is None

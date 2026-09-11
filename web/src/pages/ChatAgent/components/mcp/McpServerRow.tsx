@@ -7,7 +7,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
-import { IdentityTile } from './IdentityTile';
+import { BrandMark } from './BrandMark';
 import { McpLifecycle } from './McpLifecycle';
 import {
   EnabledToggle,
@@ -114,7 +114,7 @@ function McpServerRowImpl({
   return (
     <ServerRowShell
       testid={`mcp-row-${server.name}`}
-      tile={<IdentityTile name={server.name} />}
+      tile={<BrandMark name={server.name} kind="server" />}
       main={
         <>
           <ServerNameLine name={server.name}>

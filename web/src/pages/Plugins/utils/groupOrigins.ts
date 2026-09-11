@@ -8,6 +8,10 @@
 
 export const UPLOADED_ORIGIN = 'uploaded';
 
+/** Bundles ship inside the app, so they have no origin to derive: nobody
+ *  installed them from anywhere. */
+export const BUNDLED_ORIGIN = 'bundled';
+
 /** Stack a group into a deck only past this row count; below it a plain
  * header reads faster than a collapsed stack. */
 export const STACK_THRESHOLD = 4;
@@ -16,6 +20,8 @@ export function pluginSourceOrigin(plugin: {
   source_type: string;
   source_ref?: string | null;
 }): string {
+  // A bundle's origin key is its source_type: it came from nowhere else.
+  if (plugin.source_type === BUNDLED_ORIGIN) return BUNDLED_ORIGIN;
   if (plugin.source_type === 'zip' || !plugin.source_ref) return UPLOADED_ORIGIN;
   try {
     const url = new URL(plugin.source_ref);

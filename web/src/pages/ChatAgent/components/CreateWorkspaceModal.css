@@ -99,7 +99,6 @@
   background-color: var(--color-bg-card);
   border: 1px solid var(--color-border-muted);
   color: var(--color-text-primary);
-  outline: none;
   font-family: inherit;
   transition: border-color 0.15s;
 }

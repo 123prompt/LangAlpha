@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Any, cast
 
-from langchain_core.messages import AnyMessage, ToolMessage
+from langchain_core.messages import AnyMessage
 from langchain_core.messages.utils import trim_messages
 
 from langchain.chat_models import BaseChatModel
@@ -24,7 +24,9 @@ from ptc_agent.agent.middleware.compaction.utils import (
     build_compaction_event,
     build_summary_message,
     count_tokens_tiktoken,
+    find_group_safe_cutoff,
     get_effective_messages,
+    partition_at_cutoff,
     truncate_message_args,
     truncate_read_results,
 )
@@ -139,19 +141,12 @@ async def compact_messages(
             f"need more than {keep_messages} to preserve."
         )
 
-    target_cutoff = len(effective) - keep_messages
-    # Adjust cutoff to not split AI/Tool message pairs
-    cutoff_index = target_cutoff
-    while cutoff_index < len(effective) and isinstance(
-        effective[cutoff_index], ToolMessage
-    ):
-        cutoff_index += 1
+    cutoff_index = find_group_safe_cutoff(effective, len(effective) - keep_messages)
 
     if cutoff_index <= 0:
         raise ValueError("Cannot determine valid cutoff point for compaction")
 
-    messages_to_summarize = effective[:cutoff_index]
-    preserved = effective[cutoff_index:]
+    messages_to_summarize, preserved = partition_at_cutoff(effective, cutoff_index)
 
     # ---- Tier 2: Offload evicted messages to backend ----
     file_path = await aoffload_to_backend(backend, messages_to_summarize)
@@ -231,8 +226,6 @@ async def compact_messages(
         preserved_messages=preserved,
         summary_message=summary_message,
         file_path=file_path,
-        effective_cutoff=cutoff_index,
-        previous_event=previous_event,
     )
 
     return {

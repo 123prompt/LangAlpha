@@ -36,6 +36,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from src.server.database.account_disables import list_account_disables
 from src.server.database.user_skills import (
     archive_key_unused_guard,
     get_user_skill_archive_blob,
@@ -304,7 +305,8 @@ async def load_user_skill_bundle(
 
     With a workspace, the effective set is the two-tier union with workspace
     rows shadowing same-named user rows, minus the workspace's disables of
-    inherited skills. Those disables also extend ``disabled_builtins``, so a
+    inherited skills. Those disables, and the skills owned by a bundle the
+    user switched off, extend ``disabled_builtins``, so a
     platform skill they name drops from the registry and the sandbox upload;
     a user-tier name in the set is a no-op there (platform-only consumers)
     and takes effect through the row filter here.
@@ -320,6 +322,21 @@ async def load_user_skill_bundle(
     rows = await list_enabled_user_skills(user_id, workspace_id=workspace_id)
     disabled = await get_disabled_builtin_skills(user_id)
     command_overrides = await get_skill_command_overrides(user_id)
+
+    # A switched-off bundle subtracts the skills it ships, by name, into the
+    # same set a per-skill disable writes to. Nothing downstream learns about
+    # bundles: the registry, the sandbox upload and the delivery signature all
+    # already key on this set, so the toggle re-syncs a warm sandbox for free.
+    if bundle_names := (await list_account_disables(user_id)).bundles:
+        # Local: services.plugins imports this module for the export path.
+        # Enforcement, not a listing: this subtracts skills, so it has to read
+        # the map taken when the running set was composed. A live re-read lets
+        # a bundle renamed after boot answer for nothing, which hands the user
+        # back skills they switched off while the registry still carries them.
+        from src.server.services.plugins.bundled import enforcement_owners
+
+        _, owned = enforcement_owners().owned_by(bundle_names)
+        disabled = disabled | owned
 
     scope = "user"
     own: list[dict[str, Any]] = []

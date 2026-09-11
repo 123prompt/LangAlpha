@@ -17,6 +17,7 @@ from deepagents.backends.utils import (
     format_content_with_line_numbers,
     sanitize_tool_call_id,
 )
+from src.llms.attachment_payload import has_attachment
 
 # Approximate number of characters per token for truncation calculations.
 # Using 4 chars per token as a conservative approximation (actual ratio varies by content)
@@ -141,6 +142,15 @@ class LargeResultEvictionMiddleware(AgentMiddleware):
         if not self._tool_token_limit_before_evict:
             return message
 
+        # A result carrying an attachment cannot be evicted: eviction replaces
+        # content with a path, and a path is not something a model can look at.
+        # Read is excluded from eviction entirely, so this is unreachable today;
+        # it is here because the moment any other tool answers with an image or
+        # a PDF, the fallback below would stringify its base64 and the size
+        # check would then send the whole thing to a file.
+        if has_attachment(message.content):
+            return message
+
         # Convert content to string once for both size check and eviction
         if (
             isinstance(message.content, list)
@@ -179,10 +189,15 @@ class LargeResultEvictionMiddleware(AgentMiddleware):
         )
 
         # Preserve artifact from content_and_artifact tools
+        # The eviction rebuilds the message, so anything not copied here is
+        # silently reset to its default. `status` is the one field a consumer
+        # cannot recover from the replacement text: a failure whose result was
+        # too large would land as a success.
         kwargs = dict(
             content=replacement_text,
             tool_call_id=message.tool_call_id,
             name=message.name,
+            status=message.status,
         )
         if hasattr(message, 'artifact') and message.artifact is not None:
             kwargs['artifact'] = message.artifact

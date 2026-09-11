@@ -20,6 +20,8 @@ import { TaskStatusChip, taskCardStatusKind } from './taskStatusUi';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
 import { parseDisplayableResults, buildRichResultMap, resolveSnippet } from './webSearchUtils';
+import { isDirectToolName } from '../utils/directTools';
+import { DirectToolDetail } from './mcp/DirectToolDetail';
 
 // --- Public types ---
 
@@ -362,6 +364,18 @@ function ArtifactOrMarkdown({ artifact, content, toolName, toolCallProcess, onOp
       case 'automations':
         return <AutomationDetailPanel data={artifact} />;
     }
+  }
+
+  if (isDirectToolName(toolName)) {
+    return (
+      <DirectToolDetail
+        toolName={toolName}
+        args={toolCallProcess.toolCall?.args}
+        content={content}
+        artifact={toolCallProcess.toolCallResult?.artifact}
+        isFailed={toolCallProcess.isFailed}
+      />
+    );
   }
 
   const rawContent = typeof content === 'string' ? content : content ? String(content) : '';

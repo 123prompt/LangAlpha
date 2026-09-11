@@ -114,6 +114,7 @@ export function projectSubagentHistory(
             content_type: event.content_type,
             tool_call_id: event.tool_call_id,
             artifact: event.artifact,
+            status: event.status,
           },
           refs: tempRefs,
           updateSubagentCard: historyUpdateSubagentCard,
@@ -253,6 +254,7 @@ export function projectSubagentHistory(
       // to 'running' and let /status reconciliation settle it.
       status: taskMetadata?.status || 'running',
       error: taskMetadata?.error,
+      errorType: taskMetadata?.errorType,
       toolCalls: countToolCalls(finalMessages),
       tokenUsage: tempTokenUsage,
       currentTool: '',

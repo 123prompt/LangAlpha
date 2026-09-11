@@ -23,7 +23,12 @@ const EXPECTED = ['index', 'vendor-dnd', 'vendor-motion', 'vendor-react']
 // Measured against platform mode, which is what ships (oss builds land ~60 kB
 // lower). Headroom is deliberately thin — routine growth should be visible here,
 // not quietly absorbed.
-const MAX_EAGER_KB = 450
+//
+// Raised 450 -> 460 for per-model tuning: the composer resolves the selected
+// model's profile to label its trigger before first paint, which puts
+// modelPreferences.ts, useUpdatePreferences.ts and the dropdown primitive on the
+// critical path for +1.9 kB gz. Nothing moved chunks; the eager set is unchanged.
+const MAX_EAGER_KB = 460
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')

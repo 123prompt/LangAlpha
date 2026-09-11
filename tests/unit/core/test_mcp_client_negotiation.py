@@ -192,6 +192,8 @@ class TestNegotiation:
         assert result == {"data": "structured"}  # structuredContent preferred
         assert ns["_PROTO"]["fake"] == {
             "mode": "modern", "version": "2026-07-28", "session_id": None,
+            # The 2026-era identity stamp is optional and this server omits it.
+            "server_info": None,
         }
         assert _spawn_count(state) == 1
         ns["cleanup_mcp_servers"]()

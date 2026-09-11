@@ -1,3 +1,5 @@
+import { cn } from '@/lib/utils';
+
 /**
  * The per-item identity mark on Plugins / MCP rows: a rounded tile whose tint
  * derives from the item's name, with the name's initial as a monogram. The
@@ -33,23 +35,40 @@ function monogram(name: string): string {
   return first.toUpperCase();
 }
 
-const SIZES = {
-  sm: 'h-7 w-7 rounded-md text-[0.75rem]',
-  lg: 'h-10 w-10 rounded-lg text-base',
+/** Geometry only, shared with `BrandMark` so a real logo and the monogram it
+ *  falls back to occupy the same box on the same row. */
+export const TILE_SIZES = {
+  sm: 'h-7 w-7 rounded-md',
+  lg: 'h-10 w-10 rounded-lg',
 } as const;
+
+const TEXT_SIZES = {
+  sm: 'text-[0.75rem]',
+  lg: 'text-base',
+} as const;
+
+export type TileSize = keyof typeof TILE_SIZES;
 
 export function IdentityTile({
   name,
   size = 'sm',
+  className = '',
 }: {
   name: string;
-  size?: keyof typeof SIZES;
+  size?: TileSize;
+  /** Extra geometry from the caller (e.g. a round mask on the model picker). */
+  className?: string;
 }) {
   const [bg, fg] = TINTS[identityIndex(name)];
   return (
     <span
       aria-hidden
-      className={`inline-flex flex-shrink-0 items-center justify-center font-semibold select-none ${SIZES[size]}`}
+      className={cn(
+        'inline-flex flex-shrink-0 items-center justify-center font-semibold select-none',
+        TILE_SIZES[size],
+        TEXT_SIZES[size],
+        className,
+      )}
       style={{ color: fg, backgroundColor: bg }}
     >
       {monogram(name)}

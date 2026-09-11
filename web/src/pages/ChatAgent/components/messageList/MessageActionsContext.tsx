@@ -35,6 +35,7 @@ export interface MessageActions {
   onRejectPTCAgent?: (proposalData: Record<string, unknown>, proposalId: string, interruptId: string) => void;
   onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
+  onResumeCreditPause?: (pauseId: string, interruptId: string) => void;
   onEditMessage?: (messageId: string, content: string) => void;
   onRegenerate?: (messageId: string) => void;
   onRetry?: () => void;

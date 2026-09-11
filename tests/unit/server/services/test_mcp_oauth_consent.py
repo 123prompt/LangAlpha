@@ -281,7 +281,9 @@ class _FakeClient:
 
     async def __aenter__(self):
         return SimpleNamespace(
-            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[_FakeTool()]))
+            list_tools=AsyncMock(return_value=SimpleNamespace(tools=[_FakeTool()])),
+            # A real session always exposes this, so the stand-in does too.
+            server_info=None,
         )
 
     async def __aexit__(self, *exc):

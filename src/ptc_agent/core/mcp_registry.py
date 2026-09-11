@@ -9,6 +9,7 @@ documented import surface.
 import asyncio
 import os
 from types import TracebackType
+from typing import Any
 
 import structlog
 from mcp import StdioServerParameters
@@ -25,7 +26,7 @@ from src.observability.tracing import tracer as _otel_tracer
 
 from .mcp_composite import SchemaOnlyRegistry, build_composite_registry
 from .mcp_diagnostics import StderrTail, classify_startup_failure
-from .mcp_schema import MCPToolInfo
+from .mcp_schema import MCPToolInfo, client_identity
 
 logger = structlog.get_logger(__name__)
 
@@ -55,6 +56,11 @@ class MCPServerConnector:
         self.config = config
         self.session: Client | None = None
         self.tools: list[MCPToolInfo] = []
+        # The server's own business card from the handshake, as the wire spelled
+        # it, so a builtin and a sandbox-discovered server hand the UI the same
+        # shape. Survives disconnect for the same reason ``tools`` does: this
+        # process asked once at startup and the answer is what it serves.
+        self.server_info: dict[str, Any] | None = None
 
         # Background task management
         self._connection_task: asyncio.Task | None = None
@@ -168,6 +174,7 @@ class MCPServerConnector:
     async def _serve(self, client: Client, *, retry_discovery: bool = False) -> None:
         """Discover tools, signal readiness, and hold the connection open."""
         self.session = client
+        self.server_info = client_identity(client)
         if retry_discovery:
             await self._discover_tools_with_retry()
         else:

@@ -35,7 +35,6 @@ from src.server.database.mcp_servers import (
     get_catalog_server,
     get_workspace_servers_and_version,
     insert_workspace_server,
-    list_user_builtin_disables,
     list_workspace_servers,
     set_catalog_server_enabled,
     set_workspace_server_enabled,
@@ -48,13 +47,20 @@ from src.server.database.vault_secrets import (
     get_workspace_secret_names,
 )
 from src.server.database.workspace import get_workspace as db_get_workspace
-from src.server.services.mcp_catalog import apply_catalog_edit, detach_warning
+from src.server.services.mcp_catalog import (
+    apply_catalog_edit,
+    detach_warning,
+    reject_reserved_brokerage_name,
+    reject_reserved_catalog_name,
+)
 from src.server.services.mcp_config import (
     Origin,
     ResolvedServer,
     State,
+    account_disabled_builtins,
     builtin_names,
     classify_server_name,
+    reserved_catalog_names,
     resolve_mcp_config,
 )
 from src.server.services.mcp_discovery import ToolSnapshotIndex
@@ -382,6 +388,9 @@ async def add_server(
             status_code=409,
             detail=f"{server.name!r} collides with a built-in server name",
         )
+    # A workspace row shadows the inherited catalog row of the same name whether
+    # it is enabled or not, so this name is spoken for here too.
+    reject_reserved_brokerage_name(server.name)
 
     try:
         row = await _insert_local_fork(workspace_id, server)
@@ -431,6 +440,10 @@ async def promote_server(
             detail="Built-in servers are global; only workspace servers can be "
             "saved as templates",
         )
+    # Promoting mints a catalog row, so it owes the same reservation the create
+    # and import doors owe: the name is what the Plugins page joins a shipped
+    # brokerage on, and a template is free to point anywhere.
+    reject_reserved_catalog_name(name)
 
     rows = {r["name"]: r for r in await list_workspace_servers(workspace_id)}
     existing = rows.get(name)
@@ -528,6 +541,15 @@ async def adopt_server(
     row = await get_catalog_server(user_id, name)
     if row is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    # Asked before the connection test below, which would otherwise answer a
+    # connected brokerage with "disconnect it first, then move the server" --
+    # true of the connection and useless here, because disconnecting does not
+    # make this move possible. A brokerage row that moved down would land under
+    # a name the workspace resolver skips, and the edit path that could rename
+    # it refuses the same name, so it would be inert with no way back but
+    # deleting it. The tier is the point: the connection lives at the user tier,
+    # and every surface joins the row to the shipped vendor there.
+    reject_reserved_brokerage_name(name)
     if row["plugin_id"] is not None:
         # Plugin-level disable acts through ONE predicate, on
         # list_enabled_user_servers, and that predicate only reaches the user
@@ -643,7 +665,7 @@ async def import_servers(
     report = await run_mcp_import(
         parsed,
         scope=ImportScope(
-            reserved_names=builtin_names(),
+            reserved_names=reserved_catalog_names(),
             existing_names={r["name"] for r in existing_rows},
             # Only the workspace's OWN servers count against the cap; builtin
             # markers and inherited tombstones are not servers.
@@ -705,6 +727,7 @@ async def edit_server(
 
     if name in builtin_names():
         raise HTTPException(status_code=409, detail=_BUILTIN_EDIT)
+    reject_reserved_brokerage_name(name)
     if body.name != name:
         raise HTTPException(
             status_code=409, detail="name in body must match the path name"
@@ -745,15 +768,21 @@ async def edit_server(
 async def set_enabled(
     workspace_id: str, name: str, body: EnabledInput, user_id: CurrentUserId
 ) -> dict:
-    await _require_owned_workspace(workspace_id, user_id)
+    workspace = await _require_owned_workspace(workspace_id, user_id)
+    # The flash workspace has no sandbox to warm: its next turn re-resolves
+    # on its own, and the toggle only decides whether Flash binds the
+    # server's direct tools.
+    is_flash = workspace.get("status") == "flash"
 
     if name in builtin_names():
         # Built-ins are toggled by an explicit (source='builtin', enabled=false)
         # disable-marker row; enabling = delete the marker.
         if body.enabled:
-            if name in await list_user_builtin_disables(user_id):
+            if name in await account_disabled_builtins(user_id):
                 # Deleting the marker would report success and change nothing:
-                # the account-level disable outranks every workspace.
+                # the account-level subtraction outranks every workspace,
+                # whether it came from this server's own switch or from the
+                # bundle that ships it.
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -766,7 +795,11 @@ async def set_enabled(
             await upsert_workspace_server(
                 workspace_id, name, source="builtin", enabled=False, config=None
             )
-        _schedule_proactive_apply(workspace_id, user_id)
+        if not is_flash:
+            await _sync_sandbox_grants_now(workspace_id, user_id)
+            _schedule_proactive_apply(workspace_id, user_id)
+        else:
+            await _sync_flash_grants_now(workspace_id, user_id)
         return {"name": name, "enabled": body.enabled}
 
     ref = await classify_server_name(workspace_id, user_id, name)
@@ -790,7 +823,11 @@ async def set_enabled(
         case _:
             # A disable-marker whose built-in no longer exists: nothing to toggle.
             raise HTTPException(status_code=404, detail=_NOT_FOUND)
-    _schedule_proactive_apply(workspace_id, user_id)
+    if not is_flash:
+        await _sync_sandbox_grants_now(workspace_id, user_id)
+        _schedule_proactive_apply(workspace_id, user_id)
+    else:
+        await _sync_flash_grants_now(workspace_id, user_id)
     return {"name": name, "enabled": body.enabled}
 
 
@@ -943,6 +980,87 @@ def _schedule_proactive_apply(workspace_id: str, user_id: str) -> None:
             _proactive_apply_pending.pop(workspace_id, None)
 
     task.add_done_callback(_cleanup)
+
+
+async def _sync_flash_grants_now(workspace_id: str, user_id: str) -> None:
+    """Bring a flash workspace's relay grants to its new scope before replying.
+
+    The flash workspace has no sandbox, so ``_schedule_proactive_apply`` has
+    nothing to warm and is skipped for it. Its grants still need retiring: a
+    Flash turn already in flight holds the set it bound with, and the per-call
+    ``DirectMCPBinding.check`` rereads connection status and consent but not
+    workspace scope, so the grant is the *only* thing standing between a
+    narrowed scope and a turn that keeps reaching the vendor.
+
+    Awaited rather than scheduled, unlike its sibling: that sibling warms a
+    sandbox and is safe to be late, while this one enforces a revocation, and a
+    200 on the toggle has to mean the revocation happened. It costs a few local
+    reads (``resolve_mcp_config`` reads rows, it does not dial anyone), and a
+    failure surfaces on the request that caused it instead of in a task nobody
+    is waiting on.
+    """
+    from src.server.app import setup
+
+    base_config = setup.agent_config
+    if base_config is None:
+        return
+    from src.server.services.egress.flash_binding import sync_flash_grants
+    from src.server.services.egress.grant_resync import GrantSyncSuperseded
+
+    try:
+        await sync_flash_grants(
+            base_config, user_id=user_id, workspace_id=workspace_id
+        )
+    except GrantSyncSuperseded:
+        # 503 rather than 500: nothing is broken, a burst of concurrent config
+        # writes simply kept winning the version race. The row change itself
+        # committed already, and repeating the same toggle runs this sync again
+        # (it is driven unconditionally, not off a change in value), so a retry
+        # is what closes it.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not retire this workspace's connector grants while other "
+                "changes were saving. Please try again."
+            ),
+        ) from None
+
+
+async def _sync_sandbox_grants_now(workspace_id: str, user_id: str) -> None:
+    """Retire a sandbox workspace's out-of-scope relay grants before replying.
+
+    ``_schedule_proactive_apply`` converges these too, but it sleeps first and
+    swallows its own failures, so between the 200 and that task a turn already
+    in flight still holds an active grant for a server the workspace no longer
+    resolves. The relay authorizes against the grant row on every request, so
+    retiring the row here is what actually stops the next call; the scheduled
+    apply still runs, because it is what pushes the new credential file into
+    the sandbox.
+
+    The kept set is every OAuth-connected server the workspace resolves, which
+    is the set ``sync_egress_relay`` keeps. Narrowing it to the directly bound
+    ones, as the flash path does, would retire the grants the sandbox wrappers
+    dial through.
+    """
+    from src.server.app import setup
+
+    base_config = setup.agent_config
+    if base_config is None:
+        return
+    from src.server.services.egress.grant_resync import sync_grants_until_current
+
+    # Unlike the flash sibling this one does not raise when the retries are
+    # exhausted: ``_schedule_proactive_apply`` runs behind it and re-resolves,
+    # so the retirement has somewhere else to land, and failing the toggle
+    # would be the harsher answer to a race that fixes itself.
+    await sync_grants_until_current(
+        base_config,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        connection_ids=lambda resolved: [
+            s.oauth_connection_id for s in resolved.servers if s.oauth_connection_id
+        ],
+    )
 
 
 def _schedule_session_mcp_refresh(workspace_id: str, user_id: str) -> None:

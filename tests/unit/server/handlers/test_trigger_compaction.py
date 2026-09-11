@@ -22,6 +22,8 @@ from ptc_agent.config.core import (
 
 
 HANDLER = "src.server.handlers.thread_maintenance"
+USER_MODELS = "src.server.services.llm.user_models"
+CLIENTS = "src.server.services.llm.clients"
 LLM_HANDLER = "src.server.services.llm.config"
 
 
@@ -164,12 +166,12 @@ async def test_manual_compact_uses_user_compaction_model(base_config):
             return_value=False,
         ),
         patch(
-            f"{LLM_HANDLER}.get_model_preference",
+            f"{USER_MODELS}.get_model_preference",
             new_callable=AsyncMock,
             return_value={"compaction_model": "user-compaction-model"},
         ),
         patch(
-            f"{LLM_HANDLER}.resolve_oauth_llm_client",
+            f"{CLIENTS}.resolve_oauth_llm_client",
             new_callable=AsyncMock,
             return_value=None,
         ),

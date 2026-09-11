@@ -182,12 +182,18 @@ export function ServerNameLine({
 export function TagBadge({
   title,
   soft = false,
+  tone = 'muted',
   children,
 }: {
   title?: string;
   soft?: boolean;
+  /** `warning` borrows the pill's colour and not its fill, the same rule
+   *  `RowNote` follows: a tinted background here would make this the pill it
+   *  is deliberately not. For a badge naming something that moves real money. */
+  tone?: 'muted' | 'warning';
   children: React.ReactNode;
 }) {
+  const warn = tone === 'warning';
   return (
     <span
       className={
@@ -196,9 +202,15 @@ export function TagBadge({
           : 'text-[0.625rem] px-1.5 py-0.5 rounded uppercase tracking-wide'
       }
       style={{
-        color: 'var(--color-text-tertiary)',
+        color: warn ? 'var(--color-warning)' : 'var(--color-text-tertiary)',
         backgroundColor: 'var(--color-bg-tag)',
-        ...(soft ? {} : { border: '1px solid var(--color-border-muted)' }),
+        ...(soft
+          ? {}
+          : {
+              border: `1px solid ${
+                warn ? 'var(--color-warning)' : 'var(--color-border-muted)'
+              }`,
+            }),
       }}
       title={title}
     >

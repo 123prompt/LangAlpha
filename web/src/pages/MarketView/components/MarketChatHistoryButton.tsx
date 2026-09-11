@@ -194,7 +194,7 @@ export default function MarketChatHistoryButton({
                 e.preventDefault();
                 e.stopPropagation();
               }}
-              className="inline-flex items-center justify-center h-4 w-4 rounded-full transition-opacity opacity-60 hover:opacity-100 focus:outline-none focus-visible:ring-1 focus-visible:ring-foreground/30"
+              className="inline-flex items-center justify-center h-4 w-4 rounded-full transition-opacity opacity-60 hover:opacity-100 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               style={{ color: 'var(--color-text-tertiary)' }}
             >
               <Info className="h-3 w-3" />

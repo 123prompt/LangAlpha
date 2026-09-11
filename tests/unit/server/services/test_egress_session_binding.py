@@ -24,6 +24,7 @@ from ptc_agent.core.session import EgressBinding
 from src.server.database.egress_grants import GrantSync
 from src.server.services.egress.session_binding import (
     maybe_remint_egress_jwt,
+    RelayBind,
     sync_egress_relay,
 )
 
@@ -151,7 +152,7 @@ class TestTeardown:
         ):
             ok = await sync_egress_relay(WS, USER, session, _resolved())
 
-        assert ok is False
+        assert ok is RelayBind.REFUSED
         assert session.egress_binding is binding
 
 
@@ -279,7 +280,7 @@ class TestBind:
         ):
             ok = await sync_egress_relay(WS, USER, session, _resolved(srv))
 
-        assert ok is True
+        assert ok is RelayBind.APPLIED
         session.sandbox.upload_egress_relay_credentials.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -298,7 +299,7 @@ class TestBind:
         ):
             ok = await sync_egress_relay(WS, USER, session, _resolved(srv))
 
-        assert ok is False  # the caller must keep a retry signal
+        assert ok is RelayBind.REFUSED  # the caller must keep a retry signal
         assert session.egress_binding is None
 
     @pytest.mark.asyncio
@@ -319,7 +320,7 @@ class TestBind:
             ok = await sync_egress_relay(WS, USER, session, _resolved(srv))
 
         # Settled non-push: re-running would decide the same, so no retry signal.
-        assert ok is True
+        assert ok is RelayBind.APPLIED
         sync.assert_not_awaited()
         session.sandbox.upload_egress_relay_credentials.assert_not_awaited()
 

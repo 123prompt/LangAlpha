@@ -555,14 +555,20 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="flex flex-col items-center gap-4">
-          <span aria-hidden="true" className="flex-shrink-0">
-            <Loader size={32} className="text-[color:var(--color-accent-primary)]" />
-          </span>
-          <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t('thread.loadingThreads')}
-          </p>
+      // A branch that replaces the whole route replaces its top bar too, so it
+      // owes the window a titlebar of its own -- otherwise the column beside the
+      // sidebar stops moving the window for as long as the fetch is in flight.
+      <div className="h-full flex flex-col">
+        <div className="chrome-drag-strip" aria-hidden="true" />
+        <div className="flex-1 min-h-0 flex items-center justify-center">
+          <div className="flex flex-col items-center gap-4">
+            <span aria-hidden="true" className="flex-shrink-0">
+              <Loader size={32} className="text-[color:var(--color-accent-primary)]" />
+            </span>
+            <p className="text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
+              {t('thread.loadingThreads')}
+            </p>
+          </div>
         </div>
       </div>
     );
@@ -570,21 +576,24 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-full">
-        <div className="flex flex-col items-center gap-4 max-w-md text-center px-4">
-          <p className="text-sm" style={{ color: 'var(--color-loss)' }}>
-            {error}
-          </p>
-          <button
-            onClick={() => queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(workspaceId) })}
-            className="px-4 py-2 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
-            style={{
-              backgroundColor: 'var(--color-btn-primary-bg)',
-              color: 'var(--color-btn-primary-text)',
-            }}
-          >
-            {t('common.retry')}
-          </button>
+      <div className="h-full flex flex-col">
+        <div className="chrome-drag-strip" aria-hidden="true" />
+        <div className="flex-1 min-h-0 flex items-center justify-center">
+          <div className="flex flex-col items-center gap-4 max-w-md text-center px-4">
+            <p className="text-sm" style={{ color: 'var(--color-loss)' }}>
+              {error}
+            </p>
+            <button
+              onClick={() => queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(workspaceId) })}
+              className="px-4 py-2 rounded-md text-sm font-medium transition-opacity hover:opacity-90"
+              style={{
+                backgroundColor: 'var(--color-btn-primary-bg)',
+                color: 'var(--color-btn-primary-text)',
+              }}
+            >
+              {t('common.retry')}
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -601,8 +610,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     >
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col overflow-hidden">
-        {/* Back Button - Fixed at top left */}
-        <div className="flex-shrink-0 px-6 py-4 enter-fade-up">
+        {/* Back Button - Fixed at top left. Doubles as this route's drag region
+            in the desktop shell: it is the top bar the content column already
+            has, so it costs no layout, and the back button wins its own clicks
+            back through the `no-drag` list in chrome.css. */}
+        <div className="flex-shrink-0 px-6 py-4 enter-fade-up" data-chrome="drag">
           <button
             onClick={onBack}
             className="p-2 rounded-md transition-colors"

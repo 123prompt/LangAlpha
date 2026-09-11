@@ -224,7 +224,19 @@ async def fetch_plugin_source(url: str) -> tuple[bytes, str | None]:
                             raise PluginFatal(
                                 "source answered a redirect without a location"
                             )
-                        current = urljoin(current, location)
+                        try:
+                            current = urljoin(current, location)
+                        except ValueError as e:
+                            # The upstream wrote this header, so it can be
+                            # unparseable (``http://[bad`` raises here). A
+                            # ValueError is not PluginFatal, and the endpoint's
+                            # generic handler would answer 409, telling the user
+                            # their package conflicts when the source is simply
+                            # broken.
+                            raise PluginFatal(
+                                f"source returned an invalid redirect "
+                                f"location: {e}"
+                            ) from e
                         continue
                     if response.status_code != 200:
                         raise PluginFatal(

@@ -1,6 +1,6 @@
 /**
  * Partition-timing coverage for the live → accordion lifecycle in
- * MessageContentSegments (textOnly mode).
+ * MessageContentSegments.
  *
  * The partition memo in MessageList.tsx decides whether each reasoning /
  * tool-call item renders in the live zone (`active` / `completing` /
@@ -60,6 +60,10 @@ vi.mock('framer-motion', async () => {
     AnimatePresence: ({ children }: { children?: React.ReactNode }) =>
       React.createElement(React.Fragment, null, children),
     animate: () => ({ stop: () => {} }),
+    useMotionValue: (v: number) => ({ get: () => v, set: () => {}, jump: () => {} }),
+    useIsPresent: () => true,
+    PresenceContext: React.createContext(null),
+    useReducedMotion: () => false,
   };
 });
 
@@ -129,7 +133,6 @@ const baseProps = {
   subagentTasks: {},
   hasError: false,
   isAssistant: true,
-  textOnly: true,
 } satisfies Partial<SegmentsProps>;
 
 const SUMMARY_BUTTON_RE = /toolArtifact/i;

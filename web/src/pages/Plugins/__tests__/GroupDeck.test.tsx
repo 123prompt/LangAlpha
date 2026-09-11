@@ -3,7 +3,7 @@ import { screen, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { Server } from 'lucide-react';
 import { renderWithProviders } from '@/test/utils';
-import { GroupDeck } from '../components/GroupDeck';
+import { GroupDeck, STORE_KEY } from '../components/GroupDeck';
 import type { BulkSelection } from '../components/useBulkSelection';
 
 /**
@@ -75,7 +75,7 @@ describe('GroupDeck', () => {
     expect(screen.getByTestId('row-0')).toBeInTheDocument();
     expect(screen.getByTestId('row-4')).toBeInTheDocument();
     // The choice persists per deck id.
-    expect(JSON.parse(localStorage.getItem('plugins.deckExpanded')!)).toEqual({
+    expect(JSON.parse(localStorage.getItem(STORE_KEY)!)).toEqual({
       't:big': true,
     });
   });
@@ -106,7 +106,7 @@ describe('GroupDeck', () => {
   });
 
   it('forceExpanded overrides a stored collapse and locks the header open', () => {
-    localStorage.setItem('plugins.deckExpanded', JSON.stringify({ 't:big': false }));
+    localStorage.setItem(STORE_KEY, JSON.stringify({ 't:big': false }));
     renderWithProviders(
       <GroupDeck id="t:big" title="Big group" icon={Server} count={6} forceExpanded>
         {rows(6)}

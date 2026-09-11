@@ -202,7 +202,7 @@ class DiskOverview(BaseModel):
 
 
 class DirectorySize(BaseModel):
-    path: str  # e.g. "results/"
+    path: str  # e.g. "work/"
     size: str  # e.g. "1.2G"
 
 

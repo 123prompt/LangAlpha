@@ -35,7 +35,7 @@ async def _reset_ginlix_singleton():
     """Close and reset the ginlix-data httpx client after each test."""
     yield
     try:
-        import mcp_servers.price_data_mcp_server as mod
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
         if hasattr(mod, "_ginlix_http") and mod._ginlix_http is not None:
             await mod._ginlix_http.aclose()
             mod._ginlix_http = None
@@ -65,6 +65,7 @@ _ALL_TABLES = [
     "user_skills",
     "user_plugins",
     "workspace_files",
+    "workspace_file_blobs",
     "watchlist_items",
     "watchlists",
     "user_portfolios",

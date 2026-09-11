@@ -16,6 +16,8 @@ import { deleteUserApiKey, disconnectCodexOAuth, disconnectClaudeOAuth, getCurre
 import type { AccessType } from '@/components/model/types';
 import { isPlatformMode } from '@/config/hostMode';
 import { useAllModels } from '@/hooks/useAllModels';
+import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
+import type { PreferencePatch, PreferencesLike } from '@/lib/modelPreferences';
 
 // ---------------------------------------------------------------------------
 // Method card data
@@ -196,10 +198,9 @@ export default function MethodStep() {
         await deleteUserApiKey(provider.provider).catch(() => {});
         // Clean custom_providers, custom_models, and any model preference
         // fields that reference models from the removed provider.
-        const prefs = preferences as Record<string, unknown> | null;
-        const otherPref = (prefs?.other_preference ?? {}) as Record<string, unknown>;
-        const existingProviders = (otherPref.custom_providers as Array<{ name: string }>) ?? [];
-        const existingModels = (otherPref.custom_models as Array<{ provider: string; name: string }>) ?? [];
+        const modelPref = modelPrefs(preferences);
+        const existingProviders = modelPref.custom_providers ?? [];
+        const existingModels = modelPref.custom_models ?? [];
         const isCustom = existingProviders.some(cp => cp.name === provider.provider);
         const remainingProviders = isCustom ? existingProviders.filter(cp => cp.name !== provider.provider) : existingProviders;
         const remainingModels = existingModels.filter(cm => cm.provider !== provider.provider);
@@ -212,25 +213,39 @@ export default function MethodStep() {
         ]);
         const cleanModelPref = (val: unknown) =>
           typeof val === 'string' && removedModelNames.has(val) ? null : undefined;
-        const prefUpdate: Record<string, unknown> = {
+        // One flat patch: splitPreferenceWrite routes each key to its column,
+        // so fallback (model routing) and starred (UI favorites) landing in
+        // different places is no longer this call site's problem.
+        const prefUpdate: PreferencePatch = {
           custom_providers: remainingProviders.length > 0 ? remainingProviders : null,
           custom_models: remainingModels.length > 0 ? remainingModels : null,
         };
         // Clear subsidiary/preferred model fields if they reference a removed model
-        if (cleanModelPref(otherPref.compaction_model) === null) prefUpdate.compaction_model = null;
-        if (cleanModelPref(otherPref.summarization_model) === null) prefUpdate.summarization_model = null;
-        if (cleanModelPref(otherPref.fetch_model) === null) prefUpdate.fetch_model = null;
-        if (cleanModelPref(otherPref.preferred_model) === null) prefUpdate.preferred_model = null;
-        if (cleanModelPref(otherPref.preferred_flash_model) === null) prefUpdate.preferred_flash_model = null;
-        // Filter starred and fallback model lists
-        const starred = (otherPref.starred_models as string[]) ?? [];
-        const cleanStarred = starred.filter(m => !removedModelNames.has(m));
-        if (cleanStarred.length !== starred.length) prefUpdate.starred_models = cleanStarred.length > 0 ? cleanStarred : null;
-        const fallback = (otherPref.fallback_models as string[]) ?? [];
+        if (cleanModelPref(modelPref.compaction_model) === null) prefUpdate.compaction_model = null;
+        if (cleanModelPref(modelPref.summarization_model) === null) prefUpdate.summarization_model = null;
+        if (cleanModelPref(modelPref.fetch_model) === null) prefUpdate.fetch_model = null;
+        if (cleanModelPref(modelPref.preferred_model) === null) prefUpdate.preferred_model = null;
+        if (cleanModelPref(modelPref.preferred_flash_model) === null) prefUpdate.preferred_flash_model = null;
+        const fallback = modelPref.fallback_models ?? [];
         const cleanFallback = fallback.filter(m => !removedModelNames.has(m));
         if (cleanFallback.length !== fallback.length) prefUpdate.fallback_models = cleanFallback.length > 0 ? cleanFallback : null;
 
-        await updatePreferences.mutateAsync({ other_preference: prefUpdate });
+        // Profiles are keyed by name only, so one left behind is inherited by
+        // whatever answers to that name next. Removing a custom provider
+        // re-exposes any built-in its models shadowed, and that built-in would
+        // pick up the custom model's effort, guidance, compaction and speed.
+        const profiles = modelPref.profiles ?? {};
+        const staleProfiles = Object.keys(profiles).filter((m) => removedModelNames.has(m));
+        if (staleProfiles.length > 0) {
+          prefUpdate.profiles = Object.fromEntries(staleProfiles.map((m) => [m, null]));
+        }
+
+        const starredPrefs = (preferences ?? {}) as PreferencesLike;
+        const starred = (starredPrefs.other_preference?.starred_models as string[]) ?? [];
+        const cleanStarred = starred.filter(m => !removedModelNames.has(m));
+        if (cleanStarred.length !== starred.length) prefUpdate.starred_models = cleanStarred.length > 0 ? cleanStarred : null;
+
+        await updatePreferences.mutateAsync(splitPreferenceWrite(prefUpdate));
       }
       queryClient.invalidateQueries({ queryKey: queryKeys.user.me() });
       queryClient.invalidateQueries({ queryKey: queryKeys.user.apiKeys() });

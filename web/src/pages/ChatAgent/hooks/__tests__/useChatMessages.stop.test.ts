@@ -366,6 +366,7 @@ describe('useChatMessages — stopWorkflow (hard stop)', () => {
       onEvent({ event: 'metadata', thread_id: 'th-stop', run_id: 'run-1' });
       onEvent({ event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'reasoning_signal', content: 'start' });
       onEvent({ event: 'message_chunk', role: 'assistant', agent: 'main', content_type: 'reasoning', content: 'resuming...' });
+      onEvent({ event: 'caught_up' });
       return hang.promise;
     });
 

@@ -31,11 +31,6 @@
     0 6px 12px -4px rgba(20, 20, 23, 0.10);
 }
 
-.context-overflow-pill:focus-visible {
-  outline: 2px solid var(--color-accent-primary, #b88a2c);
-  outline-offset: 2px;
-}
-
 .context-overflow-pill__count {
   font-weight: 600;
   font-variant-numeric: tabular-nums;

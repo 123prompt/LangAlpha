@@ -1,13 +1,20 @@
-"""The ``ai.langalpha`` extension namespace (secrets + bindings).
+"""The ``ai.langalpha`` extension namespace.
 
-``extensions["ai.langalpha"].secrets[]`` declares vault credentials the
-plugin's servers need: the standard blueprint fields plus ``bind`` targets
-that materialize ``${vault:NAME}`` references into the declared servers'
-env/header maps at install time. The portable mcp.json is never rewritten —
-binds land only on the internal rows we create.
+``extensions`` is the only extension point Agent Plugins defines — mcp.json is
+``additionalProperties: false`` at every level — so this is where a package
+says the things the portable document has nowhere to put.
 
-``resolve_binds`` decides where each bind would land; ``materialize_binds``
-writes it.
+``secrets[]`` declares vault credentials the plugin's servers need: the
+standard blueprint fields plus ``bind`` targets that materialize
+``${vault:NAME}`` references into the declared servers' env/header maps at
+install time. The portable mcp.json is never rewritten — binds land only on
+the internal rows we create. ``resolve_binds`` decides where each bind would
+land; ``materialize_binds`` writes it.
+
+``servers{}`` describes each entry: how it reads in the UI and the prompt, and
+how much of its tool surface the agent sees. ``apply_server_metadata`` copies
+it onto the plans. The same key is read from the bundles that ship with the
+app (``ptc_agent.config.plugins``), which is why the model lives there.
 
 Nothing in this namespace is fatal. The block is our own invention, optional
 by construction, and every defect in it is an authoring slip in a field the
@@ -24,10 +31,22 @@ from typing import Any
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from ptc_agent.config.core import VaultBlueprint
+from ptc_agent.config.plugins import NAMESPACE, ServerMeta
+from src.server.models.mcp_server import DESCRIPTION_MAX, INSTRUCTION_MAX
 from src.server.models.plugin import Diagnostic
 from src.server.services.plugins.mcp import McpEntryPlan
 
-NAMESPACE = "ai.langalpha"
+__all__ = [
+    "NAMESPACE",
+    "LangalphaExtension",
+    "PluginSecret",
+    "SecretBind",
+    "ServerMeta",
+    "apply_server_metadata",
+    "materialize_binds",
+    "parse_extension",
+    "resolve_binds",
+]
 
 
 class SecretBind(BaseModel):
@@ -56,7 +75,22 @@ class PluginSecret(VaultBlueprint):
 
 
 class LangalphaExtension(BaseModel):
+    """One model for the whole namespace, whichever kind of package carries it.
+
+    Every key is optional and some are read on only one path — ``icon`` is a
+    bundle's, ``secrets`` an upload's. They are still declared here, because
+    the alternative is that a package borrowing our own bundles' manifest
+    shape fails ``extra=forbid`` and loses the rest of its namespace with it.
+    """
+
     secrets: list[PluginSecret] = Field(default_factory=list)
+    servers: dict[str, ServerMeta] = Field(default_factory=dict)
+    # Accepted and ignored: a package's skills are the directories it carries,
+    # never a claim its manifest makes. Kept so a manifest still naming them
+    # is not rejected whole.
+    skills: list[str] = Field(default_factory=list)
+    #: The site that owns a wrapper bundle's mark. Bundles only.
+    icon: str | None = None
 
     model_config = {"extra": "forbid"}
 
@@ -215,3 +249,56 @@ def materialize_binds(
             continue
         target = bind.plan.config.setdefault(bind.section, {})
         target[bind.field] = f"${{vault:{bind.secret_name}}}"
+
+
+def apply_server_metadata(
+    extension: LangalphaExtension,
+    plans: list[McpEntryPlan],
+    *,
+    document_dropped: bool = False,
+    diagnostics: list[Diagnostic] | None = None,
+) -> None:
+    """Copy each entry's declared description, instruction and exposure mode
+    onto its plan, so the installed row reads the way the package intended
+    rather than falling to our defaults.
+
+    Text past the row's limit is clipped rather than refused: these fields
+    decide how a server introduces itself, and losing the server over the
+    length of its own description would be the wrong trade. Blueprints are not
+    copied — the request model rejects them on a user server, and ``secrets[]``
+    is how a plugin declares a credential it wants the user to hold.
+    """
+    by_key = {p.key: p for p in plans}
+    for key, meta in extension.servers.items():
+        plan = by_key.get(key)
+        if plan is None:
+            if diagnostics is not None and not document_dropped:
+                diagnostics.append(
+                    _diag(
+                        "server_meta_unknown", key,
+                        f"describes unknown server {key!r}",
+                    )
+                )
+            continue
+        if not plan.installable:
+            continue
+        for field, cap in (
+            ("description", DESCRIPTION_MAX),
+            ("instruction", INSTRUCTION_MAX),
+        ):
+            value = getattr(meta, field)
+            if not value:
+                continue
+            if len(value) > cap:
+                value = value[:cap]
+                if diagnostics is not None:
+                    diagnostics.append(
+                        _diag(
+                            "server_meta_clipped", key,
+                            f"{field} is longer than {cap} characters and was "
+                            "clipped",
+                        )
+                    )
+            plan.config[field] = value
+        if meta.tool_exposure_mode is not None:
+            plan.config["tool_exposure_mode"] = meta.tool_exposure_mode

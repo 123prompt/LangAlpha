@@ -165,7 +165,11 @@ jobs:
           SHA: ${{ github.sha }}
           REPO: ${{ github.repository }}
         run: |
-          tag="desktop-v${VERSION}"
+          # Named for the edition it builds. `desktop-v` belongs to the hosted
+          # release, which is cut from the pipeline that holds the signing
+          # certificates, and a tag is claimed by whichever job gets there first.
+          # A fork has neither release to collide with and can use either.
+          tag="desktop-oss-v${VERSION}"
           notes="Self-hosted build. On first launch it asks for the address of your stack."$'\n\n'
           if [ "$SIGNED_MAC" != "true" ]; then
             notes="${notes}macOS builds are unsigned. Open the app once, then go to System Settings > Privacy & Security and click Open Anyway. (Control-click > Open no longer works: Apple removed that bypass in macOS 15.)"$'\n\n'

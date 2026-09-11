@@ -109,7 +109,7 @@ export function McpImportModal({ onClose, onImport, onImported }: McpImportModal
                 placeholder={PLACEHOLDER}
                 rows={12}
                 spellCheck={false}
-                className="w-full px-3 py-2 text-xs rounded-md bg-transparent outline-none font-mono resize-none"
+                className="w-full px-3 py-2 text-xs rounded-md bg-transparent font-mono resize-none"
                 style={{ color: 'var(--color-text-primary)', border: '1px solid var(--color-border-muted)' }}
               />
               {text.trim() && (

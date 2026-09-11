@@ -39,7 +39,7 @@ function Ln({ w, h = 3, c }: { w: string; h?: number; c?: string }) {
   );
 }
 
-function Tag({ children, color = 'var(--iv-blue)' }: { children: ReactNode; color?: string }) {
+function Tag({ children, color = 'var(--iv-accent)' }: { children: ReactNode; color?: string }) {
   return (
     <span
       className="w-fit shrink-0 rounded px-1 py-0.5 font-mono text-[0.5rem] leading-none"
@@ -88,7 +88,7 @@ function Frame({ children, topbar }: { children: ReactNode; topbar?: ReactNode }
           className="flex w-7 shrink-0 flex-col items-center gap-2 border-r py-2.5"
           style={{ borderColor: 'var(--iv-border)' }}
         >
-          <span className="h-2.5 w-2.5 rounded" style={{ background: 'var(--iv-blue)' }} />
+          <span className="h-2.5 w-2.5 rounded" style={{ background: 'var(--iv-accent)' }} />
           {[0, 1, 2].map((i) => (
             <span key={i} className="h-2.5 w-2.5 rounded" style={{ background: 'var(--iv-fill)' }} />
           ))}
@@ -123,7 +123,7 @@ function InputDock({ hot = false, delay, chip }: { hot?: boolean; delay?: number
         </span>
         <span
           className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full"
-          style={{ background: 'var(--iv-blue-deep)' }}
+          style={{ background: 'var(--iv-accent-deep)' }}
         >
           <ArrowUp className="h-2 w-2 text-white" />
         </span>
@@ -145,14 +145,14 @@ function WsCard({ hot = false, flash = false, delay }: { hot?: boolean; flash?: 
         flash
           ? {
               background:
-                'linear-gradient(135deg, rgba(90,130,216,0.22), rgba(90,130,216,0.08))',
-              borderColor: 'rgba(90,130,216,0.3)',
+                'linear-gradient(135deg, hsl(var(--primary) / 0.22), hsl(var(--primary) / 0.08))',
+              borderColor: 'hsl(var(--primary) / 0.3)',
             }
           : undefined
       }
     >
       <div className="flex items-center gap-1">
-        {flash && <Zap className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
+        {flash && <Zap className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-accent)' }} />}
         <Ln w="52%" h={4} c="var(--iv-line-2)" />
       </div>
       <Ln w="88%" />
@@ -173,17 +173,17 @@ function TwoModes() {
       <div className="flex flex-1 gap-2">
         {/* Flash half: coordinating the desk, with quick answers on the side */}
         <Region hot delay={0.12} className="flex flex-1 flex-col gap-1.5 p-2">
-          <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-blue)' }}>
+          <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-accent)' }}>
             <Zap className="h-2.5 w-2.5" />
             <span className="font-mono text-[0.5rem]">Flash</span>
           </div>
           <OrchRow
-            icon={<Folder className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
+            icon={<Folder className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-accent)' }} />}
             label="workspace created"
             delay={0.22}
           />
           <OrchRow
-            icon={<ChevronRight className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
+            icon={<ChevronRight className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-accent)' }} />}
             label="dispatched to PTC"
             delay={0.3}
           />
@@ -231,7 +231,7 @@ function WorkspaceGrid() {
           <Ln w="22%" h={5} c="var(--iv-line-2)" />
           <span
             className="flex items-center gap-1 rounded px-1.5 py-1"
-            style={{ background: 'var(--iv-blue-deep)' }}
+            style={{ background: 'var(--iv-accent-deep)' }}
           >
             <Plus className="h-2 w-2 text-white" />
             <Ln w="30px" h={3} c="rgba(255,255,255,0.8)" />
@@ -342,7 +342,7 @@ function FlashAnswer() {
         <div className="intro-rv mr-24 flex justify-end" style={rv(0.12)}>
           <div
             className="rounded-md rounded-br-sm px-2 py-1.5"
-            style={{ background: 'rgba(90,130,216,0.22)' }}
+            style={{ background: 'hsl(var(--primary) / 0.22)' }}
           >
             <span
               className="block font-mono text-[0.5rem] leading-none"
@@ -353,22 +353,22 @@ function FlashAnswer() {
           </div>
         </div>
         <Region hot delay={0.2} className="flex flex-col gap-1.5 p-2">
-          <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-blue)' }}>
+          <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-accent)' }}>
             <Zap className="h-2.5 w-2.5" />
             <span className="font-mono text-[0.5rem]">flash · orchestrating</span>
           </div>
           <OrchRow
-            icon={<Folder className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
+            icon={<Folder className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-accent)' }} />}
             label="workspace created · NVDA deep dive"
             delay={0.3}
           />
           <OrchRow
-            icon={<ChevronRight className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
+            icon={<ChevronRight className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-accent)' }} />}
             label="task dispatched to PTC"
             delay={0.38}
           />
           <OrchRow
-            icon={<Clock className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-blue)' }} />}
+            icon={<Clock className="h-2 w-2 shrink-0" style={{ color: 'var(--iv-accent)' }} />}
             label="automation · daily earnings brief"
             delay={0.46}
           />
@@ -377,7 +377,7 @@ function FlashAnswer() {
         <div className="intro-rv mr-24 flex justify-end" style={rv(0.54)}>
           <div
             className="rounded-md rounded-br-sm px-2 py-1.5"
-            style={{ background: 'rgba(90,130,216,0.22)' }}
+            style={{ background: 'hsl(var(--primary) / 0.22)' }}
           >
             <span
               className="block font-mono text-[0.5rem] leading-none"
@@ -388,7 +388,7 @@ function FlashAnswer() {
           </div>
         </div>
         <Region delay={0.62} className="flex flex-col gap-1.5 p-2">
-          <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-blue)' }}>
+          <div className="flex items-center gap-1.5" style={{ color: 'var(--iv-accent)' }}>
             <Zap className="h-2.5 w-2.5" />
             <span className="font-mono text-[0.5rem]">flash · 0.9s</span>
           </div>
@@ -455,7 +455,7 @@ function PtcSandbox() {
                   style={{
                     ...rv(0.42 + i * 0.05),
                     height: `${h}%`,
-                    background: i === accent ? 'var(--iv-teal)' : 'rgba(90,130,216,0.7)',
+                    background: i === accent ? 'var(--iv-teal)' : 'hsl(var(--primary) / 0.7)',
                   }}
                 />
               ))}
@@ -537,7 +537,7 @@ function CreateWorkspace() {
               <Ln w="22%" h={5} c="var(--iv-line-2)" />
               <span
                 className="ml-auto mr-16 flex items-center gap-1 rounded px-1.5 py-1"
-                style={{ background: 'var(--iv-blue-deep)' }}
+                style={{ background: 'var(--iv-accent-deep)' }}
               >
                 <Plus className="h-2 w-2 text-white" />
                 <Ln w="30px" h={3} c="rgba(255,255,255,0.8)" />
@@ -617,7 +617,7 @@ function CreateWorkspace() {
               </span>
               <span
                 className="flex items-center px-2 py-1"
-                style={{ background: 'var(--iv-blue-deep)', borderRadius: 5 }}
+                style={{ background: 'var(--iv-accent-deep)', borderRadius: 5 }}
               >
                 <span className="font-mono text-[0.5rem] leading-none text-white">create</span>
               </span>
@@ -641,7 +641,7 @@ function PanelTabs({ active }: { active: 'files' | 'memory' | 'memos' }) {
           className="rounded px-1.5 py-0.5 font-mono text-[0.5rem] leading-none"
           style={
             t === active
-              ? { background: 'var(--iv-blue-deep)', color: '#fff' }
+              ? { background: 'var(--iv-accent-deep)', color: '#fff' }
               : { color: 'var(--iv-text-3)' }
           }
         >
@@ -761,7 +761,7 @@ function Memory() {
       tab="memory"
       bubble={
         <div className="intro-rv flex justify-end" style={rv(0.1)}>
-          <div className="rounded-md rounded-br-sm px-1.5 py-1" style={{ background: 'rgba(90,130,216,0.22)' }}>
+          <div className="rounded-md rounded-br-sm px-1.5 py-1" style={{ background: 'hsl(var(--primary) / 0.22)' }}>
             <span className="block font-mono text-[0.5rem] leading-none" style={{ color: 'var(--iv-text-2)' }}>
               remember this…
             </span>
@@ -797,7 +797,7 @@ function Memo() {
           </Region>
           {['76%', '60%'].map((w, i) => (
             <div key={i} className="intro-rv flex items-center gap-1.5" style={rv(0.42 + i * 0.1)}>
-              <span className="h-2 w-2 shrink-0 rounded-sm" style={{ background: 'var(--iv-blue)' }} />
+              <span className="h-2 w-2 shrink-0 rounded-sm" style={{ background: 'var(--iv-accent)' }} />
               <Ln w={w} />
               <span className="ml-auto">
                 <Tag color="var(--iv-teal)">ready</Tag>
@@ -902,7 +902,7 @@ function DashboardCustomize() {
             <span className="rounded px-1.5 py-0.5 font-mono text-[0.5rem]" style={{ color: 'var(--iv-text-3)' }}>
               Classic
             </span>
-            <span className="rounded px-1.5 py-0.5 font-mono text-[0.5rem] text-white" style={{ background: 'var(--iv-blue-deep)' }}>
+            <span className="rounded px-1.5 py-0.5 font-mono text-[0.5rem] text-white" style={{ background: 'var(--iv-accent-deep)' }}>
               Custom
             </span>
           </span>
@@ -955,8 +955,8 @@ function DashboardAttach() {
                 <Ln w="92%" />
                 <Ln w="64%" />
               </div>
-              <span className="relative flex h-5 w-5 shrink-0 items-center justify-center rounded-full" style={{ background: 'rgba(90,130,216,0.25)' }}>
-                <Paperclip className="h-2.5 w-2.5" style={{ color: 'var(--iv-blue)' }} />
+              <span className="relative flex h-5 w-5 shrink-0 items-center justify-center rounded-full" style={{ background: 'hsl(var(--primary) / 0.25)' }}>
+                <Paperclip className="h-2.5 w-2.5" style={{ color: 'var(--iv-accent)' }} />
                 <span className="intro-pulse intro-pulse--blue absolute -right-0.5 -top-0.5" style={{ width: 5, height: 5 }} />
               </span>
             </div>
@@ -971,9 +971,9 @@ function DashboardAttach() {
           delay={0.36}
           chip={
             /* right-aligned: this scene bleeds off the left edge */
-            <span className="ml-auto flex w-fit items-center gap-1 rounded px-1.5 py-0.5" style={{ background: 'rgba(90,130,216,0.2)' }}>
-              <Paperclip className="h-2 w-2" style={{ color: 'var(--iv-blue)' }} />
-              <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-blue)' }}>
+            <span className="ml-auto flex w-fit items-center gap-1 rounded px-1.5 py-0.5" style={{ background: 'hsl(var(--primary) / 0.2)' }}>
+              <Paperclip className="h-2 w-2" style={{ color: 'var(--iv-accent)' }} />
+              <span className="font-mono text-[0.5rem]" style={{ color: 'var(--iv-accent)' }}>
                 attached
               </span>
             </span>

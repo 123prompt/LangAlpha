@@ -29,6 +29,7 @@ from src.server.services.egress import RelayError, RelayRejection
 from src.server.services.egress.jsonrpc import MAX_BODY_BYTES
 from src.server.services.egress.limits import acquire_slot
 from src.server.services.egress.relay import (
+    MAX_RESPONSE_BYTES,
     WALL_CLOCK_S,
     authenticate_relay,
     open_upstream,
@@ -137,6 +138,7 @@ async def relay(grant_id: str, request: Request) -> Response:
         # fires, or the sandbox disconnects mid-stream.
         try:
             aiter = upstream.aiter_bytes()
+            relayed = 0
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -155,6 +157,21 @@ async def relay(grant_id: str, request: Request) -> Response:
                     logger.warning(
                         "[egress_relay] wall clock cut stream for grant %s",
                         grant_id,
+                    )
+                    break
+                relayed += len(chunk)
+                if relayed > MAX_RESPONSE_BYTES:
+                    # Cut the same way the wall clock does: the body simply
+                    # stops. Truncation is already a shape both clients handle
+                    # (the reply fails to parse and surfaces as a tool error),
+                    # so a flood needs no new error code to be diagnosable, and
+                    # the response headers went out long before the first byte
+                    # arrived — there is no status left to change.
+                    logger.warning(
+                        "[egress_relay] response cap cut stream for grant %s "
+                        "after %d bytes",
+                        grant_id,
+                        relayed,
                     )
                     break
                 yield chunk

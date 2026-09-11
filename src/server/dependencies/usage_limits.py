@@ -71,12 +71,19 @@ def _burst_reap_horizon() -> int:
 
     return get_workflow_timeout() + _BURST_REAP_MARGIN
 
+# -- the declared surface other modules call this one through ------------------
+# The three below are the whole of how this service talks to the quota service:
+# whose client, whether to talk at all, and what it authenticates with. They are
+# public because the credit gate's port needs the same three, and a borrowed
+# underscore name is a dependency no refactor here can see.
+
 # Shared httpx client (created lazily, async-safe)
 _http_client: Optional[httpx.AsyncClient] = None
 _http_client_lock = asyncio.Lock()
 
 
-async def _get_http_client() -> httpx.AsyncClient:
+async def get_http_client() -> httpx.AsyncClient:
+    """The shared client. One per process, closed at shutdown."""
     global _http_client
     async with _http_client_lock:
         if _http_client is None:
@@ -93,9 +100,33 @@ async def close_http_client() -> None:
             _http_client = None
 
 
-def _platform_gating_active() -> bool:
+def platform_gating_active() -> bool:
     """True when platform scope/quota gates should run (not OSS and an auth URL set)."""
     return HOST_MODE != "oss" and bool(AUTH_SERVICE_URL)
+
+
+def service_headers(user_id: Optional[str] = None) -> dict:
+    """Headers for a service-to-service call to the quota service.
+
+    The token is a shared secret, not a JWT, and is omitted when unset — which
+    is a deployment fault rather than a mode: every gated endpoint answers 401
+    without it. Callers that fail open on a non-200 cannot tell that apart from
+    an outage, so they check for it themselves.
+    """
+    headers = {}
+    if user_id:
+        headers["X-User-Id"] = user_id
+    token = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+    if token:
+        headers["X-Service-Token"] = token
+    return headers
+
+
+def service_token_missing() -> bool:
+    """Platform gating is on but nothing is configured to authenticate with."""
+    return platform_gating_active() and not os.getenv(
+        "INTERNAL_SERVICE_TOKEN", ""
+    ).strip()
 
 
 @dataclass
@@ -261,7 +292,7 @@ async def enforce_credit_limit(user_id: str, *, byok: bool = False) -> None:
     it is an unbounded spend by a user the service may well have been about to
     refuse, landing on them later as debt they never agreed to.
     """
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return
 
     try:
@@ -323,15 +354,11 @@ async def _call_validate_for_user(
     — see the fail-open notes at those call sites for why that is safe there and
     not at the credit gate.
     """
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return None
 
-    client = await _get_http_client()
-    headers = {"X-User-Id": user_id}
-
-    internal_token = os.getenv("INTERNAL_SERVICE_TOKEN", "")  # shared secret, not a JWT
-    if internal_token:
-        headers["X-Service-Token"] = internal_token
+    client = await get_http_client()
+    headers = service_headers(user_id)
 
     body = {}
     if check_quota:
@@ -384,7 +411,7 @@ async def enforce_workspace_limit(
     user_id: str = Depends(get_current_user_id),
 ) -> str:
     """FastAPI dependency: enforce active workspace limit via the auth/quota service. No-op in OSS mode."""
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return user_id
 
     result = await _call_validate_for_user(user_id, check_quota="workspace")
@@ -435,7 +462,7 @@ async def _fetch_platform_membership(user_id: str) -> dict:
     ``plan_display_name`` is ``None`` when the user has no active subscription.
     Cached in Redis for 5 minutes. No-op in OSS mode.
     """
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return {"access_tier": -1, "plan_display_name": None}
 
     from src.utils.cache.redis_cache import get_cache_client
@@ -517,7 +544,7 @@ async def _get_user_scopes(user_id: str) -> list[str] | None:
 def require_scope(scope: str):
     """FastAPI dependency factory — checks user has scope. No-op in OSS mode."""
     async def check(user_id: str = Depends(get_current_user_id)):
-        if not _platform_gating_active():
+        if not platform_gating_active():
             return user_id  # OSS mode: everything allowed
         scopes = await _get_user_scopes(user_id)
         if scopes is not None and scope not in scopes:
@@ -537,7 +564,7 @@ async def require_workspace_scope(user_id: str, scope: str) -> None:
     omits scopes (``_get_user_scopes`` returns None). A definitive list —
     including an empty one — is enforced.
     """
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return
     scopes = await _get_user_scopes(user_id)
     if scopes is not None and scope not in scopes:
@@ -547,9 +574,9 @@ async def require_workspace_scope(user_id: str, scope: str) -> None:
 def _extract_capacity(quota: dict) -> tuple[int | None, int | None]:
     """Extract ``(used, limit)`` counts from a platform quota object.
 
-    Prefers the ``capacity_used``/``capacity_limit`` names (see ginlix-platform
-    QuotaInfo), falling back to the legacy ``active``/``limit`` and
-    ``active_workspaces``/``workspace_limit`` aliases.
+    Prefers the ``capacity_used``/``capacity_limit`` names, falling back to the
+    legacy ``active``/``limit`` and ``active_workspaces``/``workspace_limit``
+    aliases.
     """
     used = quota.get("capacity_used", quota.get("active", quota.get("active_workspaces")))
     limit = quota.get("capacity_limit", quota.get("limit", quota.get("workspace_limit")))
@@ -563,7 +590,7 @@ async def enforce_capacity(user_id: str, check_quota: str) -> None:
     ``spec_performance``, ``spec_max``). No-op in OSS mode and fail-open when the
     platform is unreachable or omits the quota object.
     """
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return
 
     result = await _call_validate_for_user(user_id, check_quota=check_quota)
@@ -600,7 +627,7 @@ async def get_capacity_status(user_id: str, check_quota: str) -> Optional[dict]:
     unreachable, or when it reports no counts for ``check_quota``. Never raises — this
     backs a UI hint, not a gate.
     """
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return None
 
     result = await _call_validate_for_user(user_id, check_quota=check_quota)
@@ -706,7 +733,7 @@ async def _scope_entitlement_lost(user_id: str, scope: str) -> bool:
     validate call directly (not the cached ``_get_user_scopes``) so a failed
     fetch is distinguishable from a 200 that simply lacks the scope.
     """
-    if not _platform_gating_active():
+    if not platform_gating_active():
         return False
     result = await _call_validate_for_user(user_id)
     if result is None:

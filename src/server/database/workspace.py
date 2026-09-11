@@ -234,6 +234,35 @@ async def get_workspace_identity(workspace_id: str) -> Optional[Dict[str, Any]]:
         raise
 
 
+async def get_workspace_name_and_description(workspace_id: str) -> Optional[Dict[str, Any]]:
+    """Read only ``name`` + ``description`` — what the agent's prompt calls it.
+
+    Narrow for the same reason as ``get_workspace_identity``: this runs once per
+    agent turn, and ``get_workspace`` would pull the JSONB ``config``/``artifacts``
+    columns to hand back two short strings.
+    """
+    workspace_id = normalize_uuid(workspace_id)
+    if workspace_id is None:
+        return None
+
+    try:
+        async with _ws_cursor() as cur:
+            await cur.execute(
+                """
+                SELECT name, description
+                FROM workspaces
+                WHERE workspace_id = %s AND status != 'deleted'
+                """,
+                (workspace_id,),
+            )
+            result = await cur.fetchone()
+        return dict(result) if result else None
+
+    except Exception as e:
+        logger.error(f"Error reading the name of workspace {workspace_id}: {e}")
+        raise
+
+
 async def get_workspaces_for_user(
     user_id: str,
     limit: int = 20,
@@ -671,6 +700,83 @@ async def set_workspace_always_on(
 ) -> Optional[Dict[str, Any]]:
     """Set the workspace always-on flag; returns updated row, or None if not found."""
     return await _set_workspace_scalar(workspace_id, "is_always_on", enabled, conn=conn)
+
+
+ANY_SANDBOX: Any = object()
+"""Skip the identity guard on the completeness flag, for a runtime with no id."""
+
+
+async def set_files_restore_incomplete(
+    workspace_id: str,
+    incomplete: bool,
+    *,
+    conn=None,
+    sandbox_id: Any = ANY_SANDBOX,
+) -> bool:
+    """Record whether the sandbox is missing files the manifest still lists.
+
+    ``sandbox_id`` is the sandbox the row is expected to name, ``None``
+    included, and the write lands only while it does. A restore runs on a
+    provisional sandbox before the identity CAS picks a winner: a raise names
+    the sandbox that CAS expects to replace and a clear names the sandbox it
+    vouches for, so neither can land on a row another provisioner has since
+    bound. Returns whether the write landed.
+
+    Deliberately not routed through ``_set_workspace_scalar``: that helper's
+    allowlist is for workspace settings a user chooses, this is persistence
+    bookkeeping, and it bumps ``updated_at`` — which orders the workspace
+    gallery, so a failed restore would silently reshuffle the user's list.
+    """
+    guarded = sandbox_id is not ANY_SANDBOX
+    guard = "AND sandbox_id IS NOT DISTINCT FROM %s" if guarded else ""
+    params: tuple = (datetime.now(timezone.utc) if incomplete else None, workspace_id)
+    if guarded:
+        params += (sandbox_id,)
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            f"""
+            UPDATE workspaces
+            SET files_restore_incomplete_at = %s
+            WHERE workspace_id = %s {guard}
+            """,
+            params,
+        )
+        return cur.rowcount > 0
+
+
+async def files_restore_incomplete(workspace_id: str, *, conn=None) -> bool:
+    """Whether a restore is known to have left files unrecovered.
+
+    Raises on a read failure rather than defaulting — the caller gates a
+    destructive operation on this answer, so it must not be able to mistake
+    "could not tell" for "everything is fine".
+    """
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            "SELECT files_restore_incomplete_at FROM workspaces "
+            "WHERE workspace_id = %s",
+            (workspace_id,),
+        )
+        row = await cur.fetchone()
+    return bool(row and row["files_restore_incomplete_at"] is not None)
+
+
+async def workspace_owner(workspace_id: str, conn=None) -> str:
+    """The user whose object-storage namespace holds this workspace's bytes.
+
+    Raises when the workspace does not exist: every caller is about to build
+    a storage key from the answer, and a default would put bytes under a
+    namespace nobody owns.
+    """
+    async with _ws_cursor(conn) as cur:
+        await cur.execute(
+            "SELECT user_id FROM workspaces WHERE workspace_id = %s",
+            (workspace_id,),
+        )
+        row = await cur.fetchone()
+    if not row:
+        raise LookupError(f"Workspace {workspace_id} does not exist")
+    return row["user_id"]
 
 
 async def update_workspace_activity(

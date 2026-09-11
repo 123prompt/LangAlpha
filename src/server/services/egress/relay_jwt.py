@@ -44,6 +44,17 @@ class RelayJwtError(Exception):
     """The presented token failed validation (never says why to the caller)."""
 
 
+# Who is presenting the token. The relay applies one more refusal to a
+# sandbox than to the host: a tool bound directly to the model is not callable
+# from code, or the middleware gating the direct call could be walked around
+# by hand-writing the JSON-RPC in ``ExecuteCode``. A token with no claim is
+# read as the sandbox, so every credential minted before the claim existed
+# keeps the stricter reading.
+CALLER_SANDBOX = "sandbox"
+CALLER_HOST = "host"
+_CALLERS = frozenset({CALLER_SANDBOX, CALLER_HOST})
+
+
 @dataclass(frozen=True)
 class RelayClaims:
     user_id: str
@@ -51,6 +62,7 @@ class RelayClaims:
     sandbox_id: str
     jti: str
     expires_at: int
+    caller: str = CALLER_SANDBOX
 
 
 @dataclass(frozen=True)
@@ -69,7 +81,10 @@ def mint_relay_jwt(
     workspace_id: str,
     sandbox_id: str,
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    caller: str = CALLER_SANDBOX,
 ) -> MintedJwt:
+    if caller not in _CALLERS:
+        raise ValueError(f"unknown relay caller {caller!r}")
     now = int(time.time())
     expires_at = now + ttl_seconds
     token = jwt.encode(
@@ -79,6 +94,7 @@ def mint_relay_jwt(
             "sub": user_id,
             "workspace_id": workspace_id,
             "sandbox_id": sandbox_id,
+            "caller": caller,
             "iat": now,
             "nbf": now,
             "exp": expires_at,
@@ -106,12 +122,16 @@ def validate_relay_jwt(secret: str, token: str) -> RelayClaims:
     for claim in ("sub", "workspace_id", "sandbox_id", "jti"):
         if not isinstance(payload.get(claim), str) or not payload[claim]:
             raise RelayJwtError("invalid relay token")
+    caller = payload.get("caller", CALLER_SANDBOX)
+    if caller not in _CALLERS:
+        raise RelayJwtError("invalid relay token")
     return RelayClaims(
         user_id=payload["sub"],
         workspace_id=payload["workspace_id"],
         sandbox_id=payload["sandbox_id"],
         jti=payload["jti"],
         expires_at=int(payload["exp"]),
+        caller=caller,
     )
 
 

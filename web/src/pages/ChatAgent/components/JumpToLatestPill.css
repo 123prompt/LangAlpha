@@ -44,11 +44,6 @@
   border-color: var(--color-accent-primary);
 }
 
-.jump-to-latest-pill:focus-visible {
-  outline: 2px solid var(--color-accent-primary);
-  outline-offset: 2px;
-}
-
 .jump-to-latest-pill__count {
   /* Text-primary (not accent): the amber accent fails AA contrast on the
      light theme's white pill; bold tabular text-primary is legible in both

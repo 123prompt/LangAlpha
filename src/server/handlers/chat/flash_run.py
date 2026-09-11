@@ -56,6 +56,7 @@ from src.server.utils.multimodal_context import (
 from src.utils.tracking import ExecutionTracker
 from ptc_agent.agent.flash import build_flash_graph
 from ptc_agent.agent.graph import get_user_profile_for_prompt
+from ptc_agent.agent.middleware.credit_gate import run_with_credit_gate
 
 from .request_prep import (
     DISPATCH_STARTED_MARKER,
@@ -76,6 +77,7 @@ from .request_prep import (
     turn_skill_names,
     user_skill_commands,
 )
+from src.server.services.credit_gate_port import build_run_credit_gate
 from src.server.services.runs.admission import (
     RunScope,
     begin_run,
@@ -85,6 +87,7 @@ from src.config.settings import get_flash_recursion_limit
 
 from .admission_gate import admission_conflict_detail, wait_or_steer
 from .error_handling import handle_workflow_error
+from src.server.services.llm.clients import is_own_key_turn
 from src.server.services.llm.config import resolve_llm_config
 from .steering import (
     drain_steering_return_event,
@@ -211,7 +214,11 @@ async def astream_flash_workflow(
         workspace_id = str(flash_ws["workspace_id"])
 
         await ensure_thread(
-            request, thread_id, workspace_id, user_id, msg_type="flash",
+            request,
+            thread_id,
+            workspace_id,
+            user_id,
+            msg_type="flash",
             initial_query=user_input,
         )
 
@@ -242,7 +249,14 @@ async def astream_flash_workflow(
         # Persist query start (with attachment and context metadata for display
         # in history).  This block is flash-specific because of multimodal guard
         # differences vs PTC.
-        effective_model = config.llm.flash if config and config.llm else None
+        # ``flash_name``, not ``flash``: an unset flash model means the turn
+        # runs the main one, and reporting None there left the history row
+        # and the run metadata blank for a turn that had a model all along.
+        effective_model = config.llm.flash_name if config and config.llm else None
+        # Off the resolved credential, not off ``is_byok``: that flag answers
+        # which ladder to try, and an automation with only an OAuth token
+        # passes it false while still paying its own vendor bill.
+        own_key = is_own_key_turn(config)
         query_metadata = {"msg_type": "flash"}
         if effective_model:
             query_metadata["llm_model"] = effective_model
@@ -260,17 +274,20 @@ async def astream_flash_workflow(
                     multimodal_ctxs, thread_id
                 )
             if widget_ctxs:
-                query_metadata["widget_contexts"] = serialize_widget_contexts_for_metadata(
-                    widget_ctxs
+                query_metadata["widget_contexts"] = (
+                    serialize_widget_contexts_for_metadata(widget_ctxs)
                 )
             if chart_selections:
-                query_metadata["chart_selections"] = serialize_chart_selections_for_metadata(
-                    chart_selections
+                query_metadata["chart_selections"] = (
+                    serialize_chart_selections_for_metadata(chart_selections)
                 )
 
         # Persist lightweight additional_context + slash command fallback
         serialize_context_metadata(
-            request, query_metadata, user_input, mode="flash",
+            request,
+            query_metadata,
+            user_input,
+            mode="flash",
             extra_commands=user_skill_commands(config),
             allowed_skills=turn_skill_names(config, "flash"),
         )
@@ -280,12 +297,18 @@ async def astream_flash_workflow(
         query_content = user_input
 
         if request.hitl_response:
-            feedback_action, query_content, hitl_answers, interrupt_ids = (
-                process_hitl_response(request)
-            )
+            (
+                feedback_action,
+                query_content,
+                hitl_answers,
+                interrupt_ids,
+                hitl_decisions,
+            ) = process_hitl_response(request)
             query_metadata["hitl_interrupt_ids"] = interrupt_ids
             if hitl_answers:
                 query_metadata["hitl_answers"] = hitl_answers
+            if hitl_decisions:
+                query_metadata["hitl_decisions"] = hitl_decisions
 
         # =================================================================
         # START txn (v4): query row + in_progress run row + thread
@@ -310,9 +333,7 @@ async def astream_flash_workflow(
                 "report_back_ptc_thread_id": getattr(
                     request, "report_back_ptc_thread_id", None
                 ),
-                "origin_dispatch_gen": getattr(
-                    request, "origin_dispatch_gen", None
-                ),
+                "origin_dispatch_gen": getattr(request, "origin_dispatch_gen", None),
             },
         )
         scope.attach_run(run_handle)
@@ -334,6 +355,18 @@ async def astream_flash_workflow(
 
         token_callback, tool_tracker = init_tracking(thread_id)
 
+        # Runtime credit gate (None when platform gating is inactive) —
+        # same wiring as the PTC path; a Flash turn is shorter but is
+        # metered the same way.
+        credit_gate = build_run_credit_gate(
+            user_id,
+            run_id,
+            token_callback,
+            tool_tracker,
+            effective_model,
+            is_byok=own_key,
+        )
+
         # =================================================================
         # Build Flash Agent Graph
         # =================================================================
@@ -349,6 +382,22 @@ async def astream_flash_workflow(
         if user_id:
             flash_user_profile = await get_user_profile_for_prompt(user_id)
 
+        # The one MCP surface Flash has: tools bound directly through the
+        # relay. A failure here costs the turn those tools, not the turn.
+        from src.server.services.egress.direct_tools import DirectMCPBinding
+        from src.server.services.egress.flash_binding import bind_flash_direct_tools
+
+        try:
+            direct_mcp = await bind_flash_direct_tools(
+                config, user_id=user_id, workspace_id=workspace_id
+            )
+        except Exception:
+            logger.warning(
+                "[FLASH_CHAT] direct MCP binding failed; running without",
+                exc_info=True,
+            )
+            direct_mcp = DirectMCPBinding(user_id=user_id)
+
         # Build flash graph (no sandbox, no session)
         flash_graph = build_flash_graph(
             config=config,
@@ -357,6 +406,7 @@ async def astream_flash_workflow(
             checkpointer=run_handle.checkpointer,
             user_profile=flash_user_profile,
             store=setup.store,
+            direct_mcp=direct_mcp,
         )
 
         messages = normalize_request_messages(request)
@@ -368,7 +418,13 @@ async def astream_flash_workflow(
         # sandbox for file upload).
         multimodal_contexts = parse_multimodal_contexts(request.additional_context)
         if multimodal_contexts:
-            modalities = get_input_modalities(effective_model, custom_modalities=config.input_modalities) if effective_model else ["text"]
+            modalities = (
+                get_input_modalities(
+                    effective_model, custom_modalities=config.input_modalities
+                )
+                if effective_model
+                else ["text"]
+            )
             supported, unsupported, file_only = filter_multimodal_by_capability(
                 multimodal_contexts, modalities
             )
@@ -384,10 +440,16 @@ async def astream_flash_workflow(
                     f"{len(supported)} supported attachment(s)"
                 )
             if unsupported:
-                types = list(set(
-                    "PDF" if (c.data if hasattr(c, "data") else "").startswith("data:application/pdf") else "image"
-                    for c in unsupported
-                ))
+                types = list(
+                    set(
+                        "PDF"
+                        if (c.data if hasattr(c, "data") else "").startswith(
+                            "data:application/pdf"
+                        )
+                        else "image"
+                        for c in unsupported
+                    )
+                )
                 _append_to_last_user_message(
                     messages,
                     build_unsupported_reminder(
@@ -404,14 +466,19 @@ async def astream_flash_workflow(
         # set on normal turns; HITL/replay carry no new user message to attach to.
         if not request.hitl_response and not is_checkpoint_replay:
             skill_contexts = prepare_skill_contexts(
-                messages, request, mode="flash",
+                messages,
+                request,
+                mode="flash",
                 extra_commands=user_skill_commands(config),
                 allowed_skills=turn_skill_names(config, "flash"),
             )
         else:
             skill_contexts = None
         skill_dirs = (
-            [local_dir for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()]
+            [
+                local_dir
+                for local_dir, _ in config.skills.local_skill_dirs_with_sandbox()
+            ]
             + ([config.user_skill_dir] if config.user_skill_dir else [])
             if skill_contexts
             else None
@@ -460,7 +527,6 @@ async def astream_flash_workflow(
             token_callback=token_callback,
             request=request,
             effective_model=effective_model,
-            is_byok=is_byok,
             recursion_limit=get_flash_recursion_limit(),
             skill_contexts=skill_contexts,
             skill_dirs=skill_dirs,
@@ -492,10 +558,17 @@ async def astream_flash_workflow(
             await manager.start_run(
                 thread_id=thread_id,
                 run_id=run_id,
-                workflow_generator=handler.stream_workflow(
-                    graph=flash_graph,
-                    input_state=input_state,
-                    config=graph_config,
+                workflow_generator=run_with_credit_gate(
+                    credit_gate,
+                    # Relay sessions for direct tools open and close with the
+                    # run, in the run's task, not with this request's generator.
+                    direct_mcp.drive(
+                        handler.stream_workflow(
+                            graph=flash_graph,
+                            input_state=input_state,
+                            config=graph_config,
+                        )
+                    ),
                 ),
                 metadata={
                     "workspace_id": workspace_id,
@@ -539,8 +612,10 @@ async def astream_flash_workflow(
                 "superseded by concurrent run (admission fallback)",
                 status="cancelled",
             )
-            result = None if dispatched else await steer_thread(
-                thread_id, user_input, user_id
+            result = (
+                None
+                if dispatched
+                else await steer_thread(thread_id, user_input, user_id)
             )
             if result:
                 await scope.release_slot()

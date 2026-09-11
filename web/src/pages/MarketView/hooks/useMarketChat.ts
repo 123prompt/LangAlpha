@@ -38,6 +38,8 @@ interface ToolCallResult {
   content_type: string;
   tool_call_id: string;
   artifact?: Record<string, unknown>;
+  /** Only ever "error": the backend stamps failure, never success. */
+  status?: string;
 }
 
 interface ToolCallProcess {
@@ -358,7 +360,11 @@ export function useMarketChat(): UseMarketChatReturn {
   function handleToolCallResult({ assistantMessageId, toolCallId, result }: { assistantMessageId: string; toolCallId: string; result: ToolCallResult }): boolean {
     if (!assistantMessageId || !toolCallId) return false;
 
-    const isFailed = typeof result.content === 'string' && (result.content as string).startsWith('ERROR');
+    // The backend's own stamp comes first; the ERROR prefix is the older
+    // signal, kept for the tools that still only carry it in their prose.
+    const isFailed =
+      result.status === 'error' ||
+      (typeof result.content === 'string' && (result.content as string).startsWith('ERROR'));
 
     queueUpdate((prev) =>
       prev.map((msg) => {
@@ -492,6 +498,7 @@ export function useMarketChat(): UseMarketChatReturn {
                   content_type: (event.content_type as string) || 'text',
                   tool_call_id: toolCallId,
                   artifact: event.artifact as Record<string, unknown> | undefined,
+                  status: event.status as string | undefined,
                 },
               });
             }

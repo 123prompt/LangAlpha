@@ -102,6 +102,9 @@ Module._load = function (request, ...rest) {
  * Load the shell modules under a given edition. Config is read at require time,
  * so the cache has to be dropped between editions.
  */
+/** Every shell loaded here, so `cleanup` can close what each one opened. */
+const SHELLS = []
+
 function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = null, loginPath, settings } = {}) {
   if (edition === 'saas') {
     fs.writeFileSync(BUILD_CONFIG, JSON.stringify({
@@ -127,7 +130,7 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
   const store = require(path.join(SRC, 'store.js'))
   if (serverUrl) store.set('serverUrl', serverUrl)
 
-  return {
+  const shell = {
     store,
     config: require(path.join(SRC, 'config.js')),
     origins: require(path.join(SRC, 'origins.js')),
@@ -140,6 +143,14 @@ function loadShell({ edition = 'oss', appOrigin, platformOrigin, serverUrl = nul
     captive: require(path.join(SRC, 'captive.js')),
     main: require(path.join(SRC, 'main.js')),
   }
+  // `oauth` is the one module here that can own an OS resource. A callback
+  // listener outlives the suite that opened it -- and a suite need not have
+  // asked for one, since a sign-in refused for want of a port starts one so the
+  // next attempt is not refused for a condition that already cleared. Left open,
+  // it holds the runner's event loop past the last test and the file is reported
+  // cancelled rather than passed.
+  SHELLS.push(shell.oauth)
+  return shell
 }
 
 /**
@@ -169,6 +180,7 @@ function tempDir(prefix) {
 }
 
 function cleanup() {
+  for (const oauth of SHELLS.splice(0)) oauth.stopCallbackServer()
   if (STASHED_BUILD_CONFIG) fs.writeFileSync(BUILD_CONFIG, STASHED_BUILD_CONFIG)
   else fs.rmSync(BUILD_CONFIG, { force: true })
   fs.rmSync(userData, { recursive: true, force: true })

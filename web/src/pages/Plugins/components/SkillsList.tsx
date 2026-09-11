@@ -27,12 +27,16 @@ import { EmptyState } from './EmptyState';
 import { GroupDeck } from './GroupDeck';
 import { ListControls } from './ListControls';
 import { PluginSuppressedBadge } from './PluginBadges';
-import { ScopeControl } from './ScopeControl';
+import { ScopeControl, scopeLocked } from './ScopeControl';
 import { SkillDetail } from './SkillDetail';
 import { SkillRow } from './SkillRow';
 import { SkillUploadModal } from './SkillUploadModal';
 import { rowSelection } from './useBulkSelection';
-import { isPluginOwned } from '../utils/provenance';
+import {
+  isEffectivelyEnabled,
+  isPluginOwned,
+  isPluginSuppressed,
+} from '../utils/provenance';
 
 /**
  * The Plugins → Skills tab, in the all-scopes inventory shape: platform
@@ -66,14 +70,21 @@ export function SkillsList() {
   const visible = allSkills.filter(
     (s) =>
       matchesFilter(surface.filter, s.name, s.description, s.plugin_name) &&
-      surface.matchesState(s.enabled),
+      surface.matchesState(s.enabled, isPluginSuppressed(s)),
   );
 
-  const platformSkills = visible.filter((s) => s.origin === 'platform');
+  // Grouped by the package that owns the row, not by which tier it lives in:
+  // a shipped bundle and an installed plugin are the same claim on a skill,
+  // and splitting them put four bundles' worth of rows under one anonymous
+  // "Platform skills" heading. What is left there is a skill no package
+  // claims — an operator's own skills root, and nothing in a stock build.
+  const platformSkills = visible.filter(
+    (s) => s.origin === 'platform' && !s.plugin_name,
+  );
   const ownSkills = visible.filter((s) => s.origin === 'user' && !s.plugin_name);
   const pluginSections = [
     ...groupBy(
-      visible.filter((s) => s.origin === 'user' && s.plugin_name),
+      visible.filter((s) => s.origin !== 'workspace' && s.plugin_name),
       (s) => s.plugin_name as string,
     ).entries(),
   ].sort(([a], [b]) => a.localeCompare(b));
@@ -149,7 +160,7 @@ export function SkillsList() {
         title={title}
         icon={icon}
         count={rows.length}
-        enabledCount={rows.filter((s) => s.enabled).length}
+        enabledCount={rows.filter(isEffectivelyEnabled).length}
         badge={badge}
         action={action}
         forceExpanded={surface.forceExpanded}
@@ -165,20 +176,26 @@ export function SkillsList() {
     );
   }
 
-  /** Jump to the plugin's card. The overlay open here belongs to this tab, so
-   *  it goes; every other param travels. */
-  function openPluginsTab() {
-    const next = withDetail(searchParams, null);
+  /** Open the plugin's own card. The deck already knows which one it is, so
+   *  the detail ref carries that name rather than landing on the bare list.
+   *  The overlay open here belongs to this tab, so it goes; every other param
+   *  travels. */
+  function openPluginDetail(name: string) {
+    const next = withDetail(searchParams, {
+      kind: 'plugin',
+      name,
+      workspaceId: null,
+    });
     next.set('tab', 'plugins');
     setSearchParams(next, { replace: true });
   }
 
-  const openPluginAction = (
+  const openPluginAction = (name: string) => (
     <button
       type="button"
       title={t('plugins.groups.openPlugin')}
       aria-label={t('plugins.groups.openPlugin')}
-      onClick={openPluginsTab}
+      onClick={() => openPluginDetail(name)}
       className="p-1 rounded transition-colors hover:bg-foreground/10"
       style={{ color: 'var(--color-text-tertiary)' }}
     >
@@ -202,6 +219,7 @@ export function SkillsList() {
         onFilterChange={surface.setFilter}
         stateFilter={surface.stateFilter}
         onStateFilterChange={surface.setStateFilter}
+        showAttention
         selecting={selection.selecting}
         onStartSelect={selection.start}
         selectDisabled={allSkills.length === 0}
@@ -211,24 +229,25 @@ export function SkillsList() {
         <ListEmpty>{t('plugins.filter.noMatches')}</ListEmpty>
       )}
 
-      {renderDeck({
-        id: 'skills:platform',
-        title: t('plugins.skills.platform'),
-        icon: BookOpen,
-        rows: platformSkills,
-        scopeControl: (skill) => (
-          <ScopeControl
-            workspaces={wsOptions}
-            scopeWorkspaceId={null}
-            disabledWorkspaceIds={skill.disabled_workspace_ids ?? []}
-            checklistLocked={!skill.enabled}
-            busy={actions.togglingName === skillRowKey(skill)}
-            onSetWorkspaceDisabled={(wsId, disabled) =>
-              actions.setWorkspaceDisabled(skill, wsId, disabled)
-            }
-          />
-        ),
-      })}
+      {platformSkills.length > 0 &&
+        renderDeck({
+          id: 'skills:platform',
+          title: t('plugins.skills.platform'),
+          icon: BookOpen,
+          rows: platformSkills,
+          scopeControl: (skill) => (
+            <ScopeControl
+              workspaces={wsOptions}
+              scopeWorkspaceId={null}
+              disabledWorkspaceIds={skill.disabled_workspace_ids ?? []}
+              checklistLocked={scopeLocked(skill)}
+              busy={actions.togglingName === skillRowKey(skill)}
+              onSetWorkspaceDisabled={(wsId, disabled) =>
+                actions.setWorkspaceDisabled(skill, wsId, disabled)
+              }
+            />
+          ),
+        })}
 
       {/* Filtered-empty hides the whole section: the top-level noMatches
           notice already covers it, and a bare header reads as a glitch. */}
@@ -260,7 +279,7 @@ export function SkillsList() {
                   workspaces={wsOptions}
                   scopeWorkspaceId={null}
                   disabledWorkspaceIds={skill.disabled_workspace_ids ?? []}
-                  checklistLocked={!skill.enabled}
+                  checklistLocked={scopeLocked(skill)}
                   busy={
                     actions.togglingName === skillRowKey(skill) ||
                     actions.movingName === skillRowKey(skill)
@@ -285,18 +304,18 @@ export function SkillsList() {
           icon: Blocks,
           rows,
           badge: <PluginSuppressedBadge row={rows[0]} />,
-          action: openPluginAction,
+          action: openPluginAction(pluginName),
           scopeControl: (skill) => (
             <ScopeControl
               workspaces={wsOptions}
               scopeWorkspaceId={null}
               disabledWorkspaceIds={skill.disabled_workspace_ids ?? []}
-              checklistLocked={!skill.enabled}
+              checklistLocked={scopeLocked(skill)}
               busy={actions.togglingName === skillRowKey(skill)}
               moveBlockedReason={
-                // Plugin-installed skills live at the account tier (moving one
-                // into a workspace would detach it as a side effect of a scope
-                // change).
+                // A package's skills live at the account tier — moving one
+                // into a workspace would detach it from its owner as a side
+                // effect of a scope change.
                 t('plugins.scope.movePluginBlocked', { plugin: pluginName })
               }
               onSetWorkspaceDisabled={(wsId, disabled) =>

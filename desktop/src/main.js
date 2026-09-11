@@ -405,6 +405,10 @@ function shellArgs({ chromeHidden }) {
     // as a switch. See the note in preload.js.
     `--langalpha-shell-version=${app.getVersion()}`,
     `--langalpha-window-chrome=${chromeHidden ? 'hidden' : 'native'}`,
+    // Which scheme this edition answers on. The page cannot derive it: both
+    // editions install side by side, and an email link marked for the wrong one
+    // opens the other build, or nothing.
+    `--langalpha-shell-scheme=${config.scheme}`,
   ]
 }
 
@@ -640,6 +644,34 @@ function openDeepLink(win, raw, base) {
 function registerIpc() {
   ipcMain.handle('shell:open-external', (_event, url) => openExternally(url))
 
+  // The one auth-shaped thing the page may ask for, and it hands back a local
+  // URL rather than anything secret. Our own sign-in stays intercepted and
+  // unreachable from here; this is for a connector whose authorization server
+  // refuses a hosted callback, where the page has to name the loopback URI when
+  // it asks its backend to mint the flow. `oauth.beginMcp` re-checks the asking
+  // window itself, so a message from anywhere unexpected is refused there.
+  ipcMain.handle('shell:mcp-oauth-begin', (event, returnUrl) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return win ? oauth.beginMcp(returnUrl, win) : null
+  })
+
+  // The second half of the handshake: the flow's `state` exists only after the
+  // backend has minted it, and until the shell has been told it, the armed flow
+  // accepts no callback. `oauth.bindMcp` re-checks the window and the flow id.
+  ipcMain.handle('shell:mcp-oauth-bind', (event, flowId, state) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return win ? oauth.bindMcp(win, flowId, state) : false
+  })
+
+  // The other half of that handshake: the page armed before it knew whether
+  // its backend would mint a flow at all, so it needs a way to say it did not.
+  // Named by flow id, so a start that failed cannot stand down a later connect
+  // that is still running.
+  ipcMain.handle('shell:mcp-oauth-cancel', (event, flowId) => {
+    const win = BrowserWindow.fromWebContents(event.sender)
+    return win ? oauth.cancelMcp(win, flowId) : false
+  })
+
   // Theme has to come from the page: the shell cannot read a CSS variable, and
   // the user's choice lives in the renderer's localStorage, not the OS setting.
   ipcMain.on('shell:set-theme', (event, value) => {
@@ -787,8 +819,9 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-// Release the loopback port on the way out. A relaunch that finds 8788 still in
-// TIME_WAIT falls through to 8789, and only three ports are allowlisted.
+// Release the loopback port on the way out, and with it every flow still armed
+// on it. The port itself the OS reclaims either way; what this is for is the
+// flows, which would otherwise sit on timers in a process that is leaving.
 app.on('before-quit', () => {
   oauth.stopCallbackServer()
   updater.stop()

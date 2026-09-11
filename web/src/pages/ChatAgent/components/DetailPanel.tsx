@@ -1,7 +1,8 @@
 import React from 'react';
 import { useIsMobile } from '@/hooks/useIsMobile';
-import { X, Zap } from 'lucide-react';
-import { getDisplayName, getToolIcon } from './toolDisplayConfig';
+import { X, Zap, XCircle } from 'lucide-react';
+import { getDisplayName } from './toolDisplayConfig';
+import { ToolIcon } from './ToolIcon';
 import Markdown from './Markdown';
 import iconRobo from '../../../assets/img/icon-robo.png';
 import iconRoboSing from '../../../assets/img/icon-robo-sing.png';
@@ -74,9 +75,10 @@ function DetailPanel({ toolCallProcess, planData, onClose, onOpenFile, onOpenSub
   const toolName = toolCallProcess.toolName || '';
   const toolArgs = toolCallProcess.toolCall?.args;
   const isTaskTool = toolName === 'Task' || toolName === 'task';
-  const displayName = isTaskTool ? t('toolArtifact.subagentTask') : getDisplayName(toolName, t, toolArgs);
-  const IconComponent = getToolIcon(toolName, toolArgs);
   const artifact = toolCallProcess.toolCallResult?.artifact;
+  const displayName = isTaskTool
+    ? t('toolArtifact.subagentTask')
+    : getDisplayName(toolName, t, toolArgs, artifact);
   const content = toolCallProcess.toolCallResult?.content;
   const subagentType = isTaskTool ? ((toolCallProcess.toolCall?.args?.subagent_type as string) || 'general-purpose') : '';
   // Status only — a Task's reply exists from the moment it is dispatched, so
@@ -86,6 +88,9 @@ function DetailPanel({ toolCallProcess, planData, onClose, onOpenFile, onOpenSub
   // or stopped task is as done working as a finished one.
   const isSubagentLive =
     isTaskTool && taskCardStatusKind(toolCallProcess._subagentStatus) === 'running';
+  // A task's own status chip already reports its outcome, so only a plain tool
+  // call marks its header failed.
+  const isFailed = !isTaskTool && toolCallProcess.isFailed === true;
 
   return (
     <div
@@ -104,14 +109,26 @@ function DetailPanel({ toolCallProcess, planData, onClose, onOpenFile, onOpenSub
           {isTaskTool ? (
             <img src={isSubagentLive ? iconRoboSing : iconRobo} alt="Subagent" className="w-5 h-5 flex-shrink-0" />
           ) : (
-            <IconComponent className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
+            <ToolIcon
+              toolName={toolName}
+              args={toolArgs}
+              className="h-4 w-4 flex-shrink-0"
+              style={{ color: isFailed ? 'var(--color-loss)' : 'var(--color-accent-primary)' }}
+            />
           )}
           <span
             className="font-semibold truncate"
-            style={{ color: 'var(--color-text-primary)', fontSize: '0.875rem' }}
+            style={{ color: isFailed ? 'var(--color-loss)' : 'var(--color-text-primary)', fontSize: '0.875rem' }}
           >
             {displayName}
           </span>
+          {isFailed && (
+            <XCircle
+              className="h-4 w-4 flex-shrink-0"
+              aria-label={t('toolArtifact.a11y.toolCallFailed')}
+              style={{ color: 'var(--color-loss)' }}
+            />
+          )}
           {isTaskTool && subagentType && (
             <span style={{ color: 'var(--Labels-Tertiary)', fontSize: '0.8125rem' }}>
               — {subagentType}

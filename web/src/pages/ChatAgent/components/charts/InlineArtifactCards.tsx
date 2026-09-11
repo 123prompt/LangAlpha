@@ -81,6 +81,14 @@ function abbreviateSector(name: string): string {
   return ABBREVIATIONS[name] || name;
 }
 
+/** Recharts makes its chart surface a tab stop -- `tabindex="0"`,
+ *  `role="application"` -- so arrow keys can walk a tooltip's active index.
+ *  Neither card below renders a <Tooltip>, so the stop navigates nothing: a
+ *  Tab press spent on a picture, announced to assistive tech as an
+ *  application. (The stray focus ring these charts used to draw came from
+ *  elsewhere and is fixed in styles/tokens.css, not by this flag.) */
+const NO_KEYBOARD_LAYER = false;
+
 /** Measures container width via ResizeObserver and passes it to children as a render prop.
  *  Replaces ResponsiveContainer to avoid the Recharts width(-1) warning on first render. */
 function MeasuredContainer({ height, children }: { height: number; children: (width: number) => React.ReactNode }): React.ReactElement {
@@ -165,7 +173,13 @@ export function InlineStockPriceCard({ artifact, onClick }: InlineCardProps): Re
       {/* Sparkline */}
       <MeasuredContainer height={isMobile ? 48 : 64}>
         {(w) => (
-          <AreaChart width={w} height={isMobile ? 48 : 64} data={sparkData} margin={{ top: 4, right: 2, bottom: 2, left: 2 }}>
+          <AreaChart
+            width={w}
+            height={isMobile ? 48 : 64}
+            data={sparkData}
+            margin={{ top: 4, right: 2, bottom: 2, left: 2 }}
+            accessibilityLayer={NO_KEYBOARD_LAYER}
+          >
             <defs>
               <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
                 <stop offset="0%" stopColor={color} stopOpacity={0.3} />
@@ -450,6 +464,7 @@ export function InlineSectorPerformanceCard({ artifact, onClick }: InlineCardPro
             data={chartData}
             layout="vertical"
             margin={{ left: 0, right: isMobile ? 40 : 50, top: 0, bottom: 0 }}
+            accessibilityLayer={NO_KEYBOARD_LAYER}
           >
             <XAxis type="number" hide />
             <YAxis

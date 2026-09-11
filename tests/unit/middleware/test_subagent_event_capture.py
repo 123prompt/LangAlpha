@@ -15,15 +15,35 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import base64
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import redis.exceptions as redis_exceptions
+from langchain_core.messages import ToolMessage
+
+from langchain_core.messages import ToolMessage
+from langgraph.types import Command
 
 from src.utils.cache import stream_append
 
+from ptc_agent.agent.middleware.background_subagent.event_capture import (
+    SubagentEventCaptureMiddleware,
+    _tool_message_to_event_data,
+)
+from ptc_agent.agent.middleware.background_subagent.middleware import (
+    current_background_tool_call_id,
+)
+
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
+)
+from ptc_agent.agent.middleware.file_operations.multimodal import (
+    attach_to_tool_result,
+    build_content_blocks,
+)
+from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
+    strip_unsupported_content_blocks,
 )
 
 
@@ -1029,3 +1049,121 @@ async def test_an_ordinary_subagent_refreshes_nobody() -> None:
     await registry.append_captured_event(task.tool_call_id, _text_event(0))
 
     assert other.last_updated_at == 0.0
+
+
+def _attachment_tool_message(payload: bytes) -> ToolMessage:
+    """A visual ``Read`` result, assembled by the two functions that ship it."""
+    blocks = build_content_blocks(
+        base64.b64encode(payload).decode(), "chart.png", "image/png", None
+    )
+    return attach_to_tool_result(
+        ToolMessage(content="Loading image: chart.png", tool_call_id="tc1"), blocks
+    )
+
+
+def test_an_attachment_is_captured_as_its_acknowledgment() -> None:
+    """The bytes stay out of the captured event; the client gets the ack.
+
+    A subagent's ``Read`` result reaches this middleware with the attachment on
+    it, so stringifying the content would fill the whole 256 KiB budget with
+    base64 in place of the one line the user is meant to see.
+    """
+    msg = _attachment_tool_message(b"\x89PNG" + b"\x00" * 300_000)
+
+    data = _tool_message_to_event_data(msg, "task:x")
+
+    assert data["content"] == "Loading image: chart.png\n[Viewing image]"
+    assert "truncated" not in data["content"]
+
+
+def test_a_stripped_attachment_is_captured_as_its_placeholder() -> None:
+    """The strip runs inside the subagent too, and leaves an all-text list."""
+    stripped = strip_unsupported_content_blocks(
+        [_attachment_tool_message(b"\x89PNG")], has_image=False, has_pdf=False
+    )[0]
+
+    data = _tool_message_to_event_data(stripped, "task:x")
+
+    assert "not visible to the current model" in data["content"]
+
+
+def test_an_unrecognized_block_list_still_reaches_the_client() -> None:
+    """``str`` stays the fallback, so an extractor miss cannot blank a result."""
+    msg = ToolMessage(content=[{"rows": [1, 2]}], tool_call_id="tc1")
+
+    data = _tool_message_to_event_data(msg, "task:x")
+
+    assert data["content"] == "[{'rows': [1, 2]}]"
+
+
+# --- captured tool_call_result payload -------------------------------------
+#
+# These events feed the per-task stream, which the SSE producer never touches,
+# so the ``status`` the tool error handler stamped has to be carried here or the
+# client has only the failure prose to go on.
+
+
+def test_error_status_rides_the_captured_result() -> None:
+    msg = ToolMessage(
+        content="Tool 'WebFetch' failed: connection reset",
+        tool_call_id="tc1",
+        status="error",
+    )
+
+    data = _tool_message_to_event_data(msg, "task:x")
+
+    assert data["status"] == "error"
+
+
+def test_a_successful_result_carries_its_status_key() -> None:
+    msg = ToolMessage(content="ok", tool_call_id="tc1")
+
+    assert _tool_message_to_event_data(msg, "task:x")["status"] == "success"
+
+
+def test_successful_refusal_prose_from_a_direct_mcp_tool_keeps_its_success() -> None:
+    """A direct MCP tool whose successful output opens with "Refused:" reads as
+    a refusal to every prose heuristic, so its success has to ride the wire."""
+    msg = ToolMessage(content="Refused: 7 applications", tool_call_id="tc1")
+
+    data = _tool_message_to_event_data(msg, "task:x")
+
+    assert data["content"] == "Refused: 7 applications"
+    assert data["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_command_wrapped_error_result_keeps_its_status() -> None:
+    """A tool returning a Command goes through the same builder as a bare
+    ToolMessage, so the two capture paths cannot disagree."""
+    registry = MagicMock()
+    registry._tasks = {}
+    registry.update_metrics = AsyncMock()
+    registry.append_captured_event = AsyncMock()
+    middleware = SubagentEventCaptureMiddleware(registry=registry)
+
+    command = Command(
+        update={
+            "messages": [
+                ToolMessage(content="Refused: not permitted", tool_call_id="tc1", status="error")
+            ]
+        }
+    )
+    request = MagicMock()
+    request.tool_call = {"name": "mcp__moomoo__place_order", "id": "tc1"}
+
+    async def handler(_req):
+        return command
+
+    token = current_background_tool_call_id.set("tc1")
+    try:
+        await middleware.awrap_tool_call(request, handler)
+    finally:
+        current_background_tool_call_id.reset(token)
+
+    captured = [
+        call.args[1]
+        for call in registry.append_captured_event.await_args_list
+        if call.args[1]["event"] == "tool_call_result"
+    ]
+    assert captured and captured[0]["data"]["status"] == "error"
