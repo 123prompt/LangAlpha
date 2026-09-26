@@ -9,7 +9,7 @@ import types
 
 import pypdf
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
 from ptc_agent.agent.middleware.file_operations.multimodal_strip import (
@@ -52,6 +52,28 @@ class TestStripUnsupportedContentBlocks:
         ]
         result = strip_unsupported_content_blocks(msgs, has_image=True, has_pdf=True)
         assert result is msgs  # exact same object, no copy
+
+    def test_the_guidance_rides_on_the_first_placeholder_only(self):
+        msgs = [
+            HumanMessage(content=[
+                {"type": "text", "text": "first"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]),
+            HumanMessage(content=[
+                {"type": "text", "text": "second"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,def"}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,ghi"}},
+            ]),
+        ]
+        result = strip_unsupported_content_blocks(
+            msgs, has_image=False, has_pdf=False, guidance="Ask for a description."
+        )
+        placeholders = [
+            b["text"] for m in result for b in m.content if "not visible" in b["text"]
+        ]
+        assert len(placeholders) == 3
+        assert "Ask for a description." in placeholders[0]
+        assert all("Ask for a description" not in p for p in placeholders[1:])
 
     def test_text_only_strips_image_blocks(self):
         msgs = [
@@ -367,29 +389,50 @@ class TestManifestModelStampRoundTrip:
         assert get_input_modalities(stamped) != ["text"]
 
 
-class TestTheNoteReachesTheModelThatCannotSee:
-    """The note is appended on the call where the strip fired, so it lands on
-    the model that actually cannot see the file rather than being frozen into
-    the transcript at tool time under whatever model was configured then."""
+class TestTheGuidanceRidesInThePlaceholder:
+    """Decided on the call where the strip fired, so it lands on the model that
+    actually cannot see the file rather than being frozen into the transcript
+    at tool time under whatever model was configured then. It rides inside the
+    placeholder, next to the block it explains, and the system prompt is left
+    untouched so the cached prefix does not move on that call."""
+
+    def _request(self):
+        return _ModelCallRequest("glm-5.2", [
+            HumanMessage(content=[
+                {"type": "text", "text": "Look at this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+            ]),
+        ], system_message=SystemMessage(content=[{"type": "text", "text": "prefix"}]))
 
     @pytest.mark.asyncio
-    async def test_the_note_reaches_the_model_that_actually_cannot_see(self):
+    async def test_the_guidance_reaches_the_model_that_actually_cannot_see(self):
         seen = {}
 
         async def handler(request):
             seen["request"] = request
             return "ok"
 
-        request = _ModelCallRequest("glm-5.2", [
-            HumanMessage(content=[
-                {"type": "text", "text": "Look at this"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-            ]),
-        ])
-        mw = MultimodalStripMiddleware()
-        await mw.awrap_model_call(request, handler)
+        mw = MultimodalStripMiddleware(can_extract=True)
+        await mw.awrap_model_call(self._request(), handler)
 
-        assert mw.unsupported_note in _system_text(seen["request"])
+        placeholder = seen["request"].messages[0].content[1]["text"]
+        assert placeholder.startswith("[Image attached in a prior turn, not visible to the current model.")
+        assert mw.placeholder_guidance in placeholder
+        assert "extract it yourself" in placeholder
+        assert _system_text(seen["request"]) == "prefix"
+
+    @pytest.mark.asyncio
+    async def test_a_flash_agent_is_not_told_to_extract(self):
+        seen = {}
+
+        async def handler(request):
+            seen["request"] = request
+            return "ok"
+
+        await MultimodalStripMiddleware(can_extract=False).awrap_model_call(self._request(), handler)
+        placeholder = seen["request"].messages[0].content[1]["text"]
+        assert "extract it yourself" not in placeholder
+        assert "switching to a model that accepts it" in placeholder
 
 
 def _batch(*after_ai):
@@ -571,7 +614,7 @@ class TestPDFPageCeilingIsPerTarget:
         blocks, request = await _blocks_reaching("claude-sonnet-4-6", _pdf_block(300))
         assert [b["type"] for b in blocks] == ["text", "text"]
         assert "300 pages" in blocks[1]["text"]
-        assert _STRIP.unsupported_note in _system_text(request)
+        assert _STRIP.placeholder_guidance in blocks[1]["text"]
 
     @pytest.mark.asyncio
     async def test_a_pdf_inside_the_200k_ceiling_still_reaches_it(self):

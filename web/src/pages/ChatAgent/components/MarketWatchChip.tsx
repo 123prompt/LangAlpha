@@ -12,7 +12,7 @@ interface MarketWatchChipProps {
   /** Epoch-seconds timestamp of the last live stamp, when known (tooltip only). */
   lastUpdate?: number | null;
   /** When provided, the chip renders as a button that deep-links into the live
-   *  watch detail (the RightPanel "Status" tab); omit for the read-only chip. */
+   *  watch detail (the file panel's Status tab); omit for the read-only chip. */
   onClick?: () => void;
 }
 

@@ -34,9 +34,10 @@ from src.utils.cache.redis_cache import get_cache_client
 
 logger = logging.getLogger(__name__)
 
+# v4: user_message items carry run_completed_at (v3 entries predate the field).
 # v3: fingerprinted keys (v1/v2 entries are tail-only, so a v2 hit could
 # serve a projection built before the turn's archive drain landed).
-_KEY_PREFIX = "replay:turn:v3"
+_KEY_PREFIX = "replay:turn:v4"
 # Entries beyond this are pathological (widget-heavy legacy stored events);
 # skip caching rather than bloat Redis — replay just rebuilds those threads.
 _MAX_ENTRY_BYTES = 512 * 1024

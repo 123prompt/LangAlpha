@@ -653,20 +653,25 @@ async def test_get_workspace_threads_invalid_sort(mock_db_connection, mock_curso
 
 @pytest.mark.asyncio
 async def test_update_thread_sharing(mock_db_connection, mock_cursor):
-    """update_thread_sharing updates is_shared and optional share_token."""
+    """Sharing mints the token in the same UPDATE, only where there is none."""
     from src.server.database.conversation import update_thread_sharing
+    from src.server.database.share_codes import is_share_code
 
     row = _thread_row(is_shared=True, share_token="tok-abc")
     row["share_permissions"] = None
     row["shared_at"] = None
     mock_cursor.fetchone.return_value = row
 
-    result = await update_thread_sharing("t-1", is_shared=True, share_token="tok-abc")
+    result = await update_thread_sharing("t-1", is_shared=True)
 
     assert result is not None
-    sql = mock_cursor.execute.call_args[0][0]
+    sql, params = mock_cursor.execute.call_args[0]
     assert "is_shared = %s" in sql
-    assert "share_token = %s" in sql
+    assert "share_token = COALESCE(share_token, %s)" in sql
+    assert is_share_code(params[1])
+
+    await update_thread_sharing("t-1", is_shared=False)
+    assert "share_token" not in mock_cursor.execute.call_args[0][0].split("RETURNING")[0]
 
 
 @pytest.mark.asyncio

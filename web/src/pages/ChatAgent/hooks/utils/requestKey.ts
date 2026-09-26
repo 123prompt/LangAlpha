@@ -9,6 +9,8 @@
  * identical message is a genuinely new logical send.
  */
 
+import { randomUUID } from '@/lib/randomUUID';
+
 export interface RequestKeyTracker {
   /** Key for this send; reuses the pending key iff the fingerprint matches (a retransmit). */
   take: (fingerprint: string) => string;
@@ -23,7 +25,7 @@ export function createRequestKeyTracker(): RequestKeyTracker {
     if (pending && pending.fingerprint === fingerprint) {
       return pending.key;
     }
-    pending = { key: crypto.randomUUID(), fingerprint };
+    pending = { key: randomUUID(), fingerprint };
     return pending.key;
   }
 

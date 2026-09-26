@@ -68,7 +68,7 @@ export interface StatusPanelProps {
 }
 
 /**
- * The RightPanel "Status" tab body. Phase 1 shows one section — the live market
+ * The file panel's Status tab body. Phase 1 shows one section — the live market
  * watch (symbols + the quote block streamed by `market_watch_update` events).
  * Structured so later status surfaces can be appended as more sections.
  */

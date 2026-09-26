@@ -1,5 +1,3 @@
-import React from 'react';
-import { useTranslation } from 'react-i18next';
 import {
   Dialog,
   DialogContent,
@@ -8,24 +6,25 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
-import type { Workspace } from '@/types/api';
+import type { Computer } from '@/types/api';
 
 interface AlwaysOnConfirmDialogProps {
-  /** Only name + status are read — narrowed so nav-tree rows open this without a cast. */
-  target: Partial<Pick<Workspace, 'name' | 'status'>> | null;
+  target: Pick<Computer, 'name' | 'status'> | null;
   onClose: () => void;
   onConfirm: () => void;
   busy: boolean;
 }
 
 /**
- * Confirm enabling always-on (24/7 billing). A stopped workspace starts its
- * sandbox immediately, so the copy calls that out.
+ * Confirm enabling always-on (24/7 billing) for a computer. A stopped or
+ * never-started machine starts immediately (the server's CLAIMABLE_FOR_START),
+ * so the copy calls that out.
  */
 function AlwaysOnConfirmDialog({ target, onClose, onConfirm, busy }: AlwaysOnConfirmDialogProps) {
   const { t } = useTranslation();
-  const isStopped = target?.status === 'stopped';
+  const startsNow = target?.status === 'stopped' || target?.status === 'creating';
 
   return (
     <Dialog open={!!target} onOpenChange={(open) => { if (!open && !busy) onClose(); }}>
@@ -33,14 +32,14 @@ function AlwaysOnConfirmDialog({ target, onClose, onConfirm, busy }: AlwaysOnCon
         <DialogHeader>
           <DialogTitle>{t('workspace.alwaysOnEnable', 'Turn on always-on')}</DialogTitle>
           <DialogDescription>
-            {isStopped
-              ? t('workspace.alwaysOnConfirmStopped', {
+            {startsNow
+              ? t('computer.alwaysOnConfirmStopped', {
                   name: target?.name ?? '',
-                  defaultValue: 'Start "{{name}}" now and keep it running 24/7? The sandbox starts immediately, skips idle shutdown, and keeps billing until you turn always-on off.',
+                  defaultValue: 'Start "{{name}}" and keep it running 24/7? Every workspace on it stays available. The computer starts immediately and keeps billing until always-on is turned off.',
                 })
-              : t('workspace.alwaysOnConfirm', {
+              : t('computer.alwaysOnConfirm', {
                   name: target?.name ?? '',
-                  defaultValue: 'Keep "{{name}}" running 24/7? The sandbox skips idle shutdown and keeps billing until you turn always-on off.',
+                  defaultValue: 'Keep "{{name}}" running 24/7? Every workspace on it stays available. The computer skips idle shutdown and keeps billing until always-on is turned off.',
                 })}
           </DialogDescription>
         </DialogHeader>

@@ -42,7 +42,6 @@ const props: SegmentsProps = {
   todoListProcesses: {},
   subagentTasks: STOPPED_TASK,
   isStreaming: false,
-  isAssistant: true,
 };
 
 function renderWith(telemetry: Partial<SubagentTelemetry> | undefined) {

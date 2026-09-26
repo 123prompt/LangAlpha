@@ -60,10 +60,12 @@ DEFAULT_ENV = REPO / ".env"
 # Frontier-calibrated bands. (lower_bound_inclusive, tier) high->low.
 # Placed in the GAPS of the observed distribution, not at round numbers: a
 # threshold sitting on top of a model flips that badge on the next AA refresh.
-# Intelligence has no clean cut above 50 (17 of 23 models fall in 51.5..63.1),
-# so band 5 stays crowded on purpose and 54 is only the widest gap available.
-INTEL_BANDS = [(54, 5), (49, 4), (42, 3), (35, 2), (0, 1)]   # <- AA intelligence index
-SPEED_BANDS = [(150, 5), (100, 4), (65, 3), (45, 2), (0, 1)]  # <- AA output tokens/sec
+# Re-placed for the rescaled index: the frontier now tops out near 58 rather
+# than 63, so the old 54 cut left one model in band 5. Each cut sits in a gap
+# of at least 1.5 points (48.5: 47.5|49.6, 43: 42.1|43.6, 35.5: 33.7|37.3,
+# 27: 25.2|29.2); speed cuts moved off the three models sitting on 65 tok/s.
+INTEL_BANDS = [(48.5, 5), (43, 4), (35.5, 3), (27, 2), (0, 1)]  # <- AA intelligence index
+SPEED_BANDS = [(150, 5), (92, 4), (63, 3), (44, 2), (0, 1)]     # <- AA output tokens/sec
 
 # Our access/region/serving variants that map onto a base model's AA rating.
 VARIANT_SUFFIXES = (
@@ -85,6 +87,8 @@ AA_SLUG_ALIASES = {
     # DashScope's `qwen3.8-flash` is the productionised Qwen3.8-Flash-Next
     # (same weights, 262k native context served extended to 1M).
     "qwen3.8-flash": "qwen3-8-flash-next",
+    # The key predates the point release; the entry serves V4.1 Flash.
+    "deepseek-flash": "deepseek-v4-1-flash",
 }
 
 
@@ -135,11 +139,12 @@ def fetch_aa(key: str, use_cache: bool) -> list[dict]:
     return out
 
 
-def tokens(s: str) -> frozenset[str]:
-    """Order-insensitive token set, parens + release qualifiers dropped:
-    'claude-haiku-4-5' ~ 'Claude 4.5 Haiku', 'gemini-3.1-pro' ~ 'Gemini 3.1 Pro Preview'."""
+def tokens(s: str) -> tuple[str, ...]:
+    """Order-insensitive token multiset, parens + release qualifiers dropped:
+    'claude-haiku-4-5' ~ 'Claude 4.5 Haiku', 'gemini-3.1-pro' ~ 'Gemini 3.1 Pro Preview'.
+    A multiset, not a set: a set folds 'Opus 5.5' into 'Opus 5'."""
     s = re.sub(r"\(.*?\)", "", s.lower())
-    return frozenset(t for t in re.findall(r"[a-z]+|\d+", s) if t and t not in STOP_TOKENS)
+    return tuple(sorted(t for t in re.findall(r"[a-z]+|\d+", s) if t and t not in STOP_TOKENS))
 
 
 def base_name(model_key: str) -> str:
@@ -234,7 +239,7 @@ def main() -> None:
     write_fields = {f.strip() for f in args.fields.split(",") if f.strip()}
 
     aa = fetch_aa(get_key(args.env_file), use_cache=not args.no_cache)
-    by_tokens: dict[frozenset[str], list[dict]] = {}
+    by_tokens: dict[tuple[str, ...], list[dict]] = {}
     by_slug: dict[str, dict] = {}
     for m in aa:
         by_slug[m["slug"]] = m

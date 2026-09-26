@@ -2,33 +2,27 @@
  * Inline preview for an agent ``chart_annotation`` artifact in the chat
  * transcript.
  *
- * Two-stage on the standalone ChatAgent page (no live chart present):
- *   1. a full-bleed "spotlight" card — the symbol's real (clean) price chart;
- *      ticker, latest price, window change and an annotation legend float over
- *      soft scrims, all from the same bars (annotations are listed, not drawn);
- *   2. clicking opens a roomy modal with the full interactive chart (candles,
- *      MA, volume, RSI, the annotations) plus a button to open it in MarketView.
+ * On the standalone ChatAgent page (no live chart present) it is a full-bleed
+ * "spotlight" card — the symbol's real (clean) price chart; ticker, latest
+ * price, window change and an annotation legend float over soft scrims, all
+ * from the same bars (annotations are listed, not drawn). A click opens the
+ * symbol's chart tab in the host's panel: the workspace panel, where the
+ * drawing is live, or a share's, which shows the prices alone. A mount with
+ * no panel goes to the MarketView page instead.
  *
  * Inside the MarketView desktop panel the real chart already shows the drawing
  * live, so the card collapses to a one-line confirmation chip (see
  * ChartSurfaceContext).
  */
 
-import React, { Suspense, lazy, useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
-import { LineChart, ExternalLink, Check, ArrowRight, X } from 'lucide-react';
-
-import {
-  Dialog,
-  DialogOverlay,
-  DialogPortal,
-  DialogClose,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { LineChart, Check, ArrowRight } from 'lucide-react';
+import { useMessageActions } from '../messageList/MessageActionsContext';
 import { useIsMobile } from '@/hooks/useIsMobile';
+
 import type { StoredAnnotation } from '@/pages/MarketView/stores/chartAnnotationStore';
 import {
   chartAnnotationStore,
@@ -43,18 +37,10 @@ import { useWorkspaceId } from '../../contexts/WorkspaceContext';
 import { useChartSurface } from '../../contexts/ChartSurfaceContext';
 import { AnnotationPreviewChart } from './AnnotationPreviewChart';
 import { CARD_BG, CARD_BORDER } from './inlineCardsShared';
-
-// Lazy: the surface pulls in the whole MarketView chart stack (lightweight-charts,
-// html2canvas, TradingView). Keep it out of the chat bundle until a chart opens.
-const MarketChartSurface = lazy(() =>
-  import('@/pages/MarketView/components/MarketChartSurface').then((m) => ({
-    default: m.MarketChartSurface,
-  })),
-);
+import { buildMarketViewUrl } from '@/pages/MarketView/utils/marketRoute';
 
 const TEXT_COLOR = 'var(--color-text-tertiary)';
 const ACCENT = 'var(--color-accent-primary)';
-const ACCENT_SOFT = 'var(--color-accent-soft)';
 const FOCUS_RING = 'var(--color-focus-ring)';
 
 const RESTING_SHADOW = '0 1px 2px rgba(0,0,0,0.05), 0 16px 36px -18px rgba(0,0,0,0.5)';
@@ -83,7 +69,6 @@ const MAX_LEGEND = 3;
 
 interface InlineChartAnnotationCardProps {
   artifact: Record<string, unknown> | null | undefined;
-  onClick?: () => void;
 }
 
 export function InlineChartAnnotationCard({
@@ -92,6 +77,7 @@ export function InlineChartAnnotationCard({
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
+  const { onOpenChart } = useMessageActions();
   const params = useParams();
   const ctxWorkspaceId = useWorkspaceId();
   const { chartPresent, activeSymbol, activeTimeframe, onJumpToChart } = useChartSurface();
@@ -106,12 +92,14 @@ export function InlineChartAnnotationCard({
   );
   const workspaceId = (artifact?.workspace_id as string | undefined) || ctxWorkspaceId || undefined;
   const threadId = params.threadId as string | undefined;
+  // A transcript mounted with no workspace is a share: the owner's hosts always
+  // name one. The drawing lives in a workspace's store, so a chart opened from
+  // here carries none, and the card must not promise it.
+  const pricesOnly = ctxWorkspaceId === null;
 
   // Whether this instance is currently cleared from the chart (MarketView only).
   const displayCleared = useDisplayCleared(workspaceId, symbol, timeframe);
 
-  // Stage-2 modal open state (standalone ChatAgent page only).
-  const [open, setOpen] = useState(false);
   // The card lifts for either device; only a keyboard also gets a ring, since
   // the rounded corners mean the outline is suppressed and drawn as a shadow.
   const [hover, setHover] = useState(false);
@@ -132,15 +120,25 @@ export function InlineChartAnnotationCard({
 
   const handleOpenInMarketView = useCallback(() => {
     if (!symbol) return;
-    const sp = new URLSearchParams();
-    sp.set('symbol', symbol);
-    sp.set('tf', timeframe);
-    sp.set('mode', 'ptc');
-    if (workspaceId) sp.set('ws', workspaceId);
-    if (threadId && threadId !== '__default__') sp.set('thread', threadId);
-    sp.set('returnTo', location.pathname + location.search);
-    navigate(`/market?${sp.toString()}`);
+    navigate(buildMarketViewUrl({
+      symbol,
+      timeframe,
+      workspaceId,
+      threadId: threadId !== '__default__' ? threadId : null,
+      returnTo: location.pathname + location.search,
+    }));
   }, [symbol, timeframe, workspaceId, threadId, location, navigate]);
+
+  // The chart tab beside the chat is where the drawing is live, so the card
+  // goes straight there. A mount without a panel to land in still has the
+  // MarketView page. Either way the card asks for the drawing, so one the user
+  // cleared from that chart comes back, as the MarketView chip does it.
+  const handleOpen = useCallback(() => {
+    if (!symbol) return;
+    if (workspaceId) chartAnnotationStore.restoreDisplay(workspaceId, makeChartId(symbol, timeframe));
+    if (onOpenChart) onOpenChart({ symbol, timeframe, workspaceId });
+    else handleOpenInMarketView();
+  }, [symbol, timeframe, workspaceId, onOpenChart, handleOpenInMarketView]);
 
   if (!artifact || !symbol) return null;
 
@@ -243,386 +241,277 @@ export function InlineChartAnnotationCard({
   const shownVisuals = visuals.slice(0, MAX_LEGEND);
   const extraCount = visuals.length - shownVisuals.length;
 
-  // Stage 1 — the "spotlight" card: a clean full-bleed price chart; ticker /
-  // price float over soft scrims, an annotation legend sits bottom-left, and the
-  // CTA opens the full interactive chart (where the annotations are drawn).
+  // A clean full-bleed price chart: ticker and price float over soft scrims,
+  // an annotation legend sits bottom-left, and the CTA opens the chart tab
+  // (where the annotations are drawn).
   return (
-    <>
-      <div
-        role="button"
-        tabIndex={0}
-        aria-label={t('chat.chartAnnotationCard.cardAria', { symbol, timeframe, count })}
-        onClick={() => setOpen(true)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            setOpen(true);
-          }
-        }}
-        onMouseEnter={() => setHover(true)}
-        onMouseLeave={() => setHover(false)}
-        // :focus-visible is the only thing that answers whether a keyboard
-        // brought focus here; the ring stays off a click. The colour is the
-        // shared focus token rather than the accent, which reads as selected.
-        onFocus={(e) => setKeyboardFocus(e.currentTarget.matches(':focus-visible'))}
-        onBlur={() => setKeyboardFocus(false)}
-        style={{
-          position: 'relative',
-          background: CARD_BG,
-          border: `1px solid ${keyboardFocus ? FOCUS_RING : raised ? ACCENT : CARD_BORDER}`,
-          borderRadius: 20,
-          overflow: 'hidden',
-          cursor: 'pointer',
-          // The ring is a shadow, because the card's 20px corners want one that
-          // follows them. Forced colors drops shadows, so the keyboard state
-          // also carries a transparent outline: invisible here, painted in the
-          // system's focus color there, and the only indicator left in it.
-          outline: keyboardFocus ? '2px solid transparent' : 'none',
-          userSelect: 'none',
-          transform: raised ? 'translateY(-2px)' : 'none',
-          boxShadow: keyboardFocus
-            ? `0 0 0 2px ${FOCUS_RING}, ${RAISED_SHADOW}`
-            : raised ? RAISED_SHADOW : RESTING_SHADOW,
-          transition: 'border-color 0.16s, box-shadow 0.16s, transform 0.16s',
-        }}
-      >
-        {/* Full-bleed plot — the real chart, or a loading / empty fallback. */}
-        <div style={{ position: 'relative', height: plotHeight }}>
-          {barsLoading ? (
-            <div style={CENTERED}>
-              <span style={{ fontSize: '0.75rem', color: TEXT_COLOR }}>
-                {t('chat.chartAnnotationCard.loadingChart')}
-              </span>
-            </div>
-          ) : hasChart ? (
-            // Clean price line only — the legend below conveys the annotations.
-            <AnnotationPreviewChart
-              bars={viewBars}
-              trendColor={trendColor}
-              showLastPrice
-            />
-          ) : (
-            <div style={CENTERED}>
-              <span
-                style={{
-                  display: 'inline-flex',
-                  flexDirection: 'column',
-                  alignItems: 'center',
-                  gap: 6,
-                  color: TEXT_COLOR,
-                }}
-              >
-                <LineChart size={26} style={{ opacity: 0.5 }} />
-                <span style={{ fontSize: '0.75rem' }}>
-                  {t('chat.chartAnnotationCard.previewUnavailable')}
-                </span>
-              </span>
-            </div>
-          )}
-
-          {/* Scrims keep the floating chrome legible over the chart. */}
-          {hasChart && (
-            <>
-              <div
-                style={{
-                  position: 'absolute',
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  height: 78,
-                  background: SCRIM_TOP,
-                  pointerEvents: 'none',
-                }}
-              />
-              <div
-                style={{
-                  position: 'absolute',
-                  bottom: 0,
-                  left: 0,
-                  right: 0,
-                  height: 92,
-                  background: SCRIM_BOTTOM,
-                  pointerEvents: 'none',
-                }}
-              />
-            </>
-          )}
-
-          {/* Top-left — ticker, latest price, window change. */}
-          <div
-            style={{
-              position: 'absolute',
-              top: 15,
-              left: 17,
-              display: 'flex',
-              alignItems: 'baseline',
-              gap: 9,
-              minWidth: 0,
-            }}
-          >
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label={t(
+        pricesOnly ? 'chat.chartAnnotationCard.cardAriaPricesOnly' : 'chat.chartAnnotationCard.cardAria',
+        { symbol, timeframe, count },
+      )}
+      onClick={handleOpen}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          handleOpen();
+        }
+      }}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      // :focus-visible is the only thing that answers whether a keyboard
+      // brought focus here; the ring stays off a click. The colour is the
+      // shared focus token rather than the accent, which reads as selected.
+      onFocus={(e) => setKeyboardFocus(e.currentTarget.matches(':focus-visible'))}
+      onBlur={() => setKeyboardFocus(false)}
+      style={{
+        position: 'relative',
+        background: CARD_BG,
+        border: `1px solid ${keyboardFocus ? FOCUS_RING : raised ? ACCENT : CARD_BORDER}`,
+        borderRadius: 20,
+        overflow: 'hidden',
+        cursor: 'pointer',
+        // The ring is a shadow, because the card's 20px corners want one that
+        // follows them. Forced colors drops shadows, so the keyboard state
+        // also carries a transparent outline: invisible here, painted in the
+        // system's focus color there, and the only indicator left in it.
+        outline: keyboardFocus ? '2px solid transparent' : 'none',
+        userSelect: 'none',
+        transform: raised ? 'translateY(-2px)' : 'none',
+        boxShadow: keyboardFocus
+          ? `0 0 0 2px ${FOCUS_RING}, ${RAISED_SHADOW}`
+          : raised ? RAISED_SHADOW : RESTING_SHADOW,
+        transition: 'border-color 0.16s, box-shadow 0.16s, transform 0.16s',
+      }}
+    >
+      {/* Full-bleed plot — the real chart, or a loading / empty fallback. */}
+      <div style={{ position: 'relative', height: plotHeight }}>
+        {barsLoading ? (
+          <div style={CENTERED}>
+            <span style={{ fontSize: '0.75rem', color: TEXT_COLOR }}>
+              {t('chat.chartAnnotationCard.loadingChart')}
+            </span>
+          </div>
+        ) : hasChart ? (
+          // Clean price line only — the legend below conveys the annotations.
+          <AnnotationPreviewChart
+            bars={viewBars}
+            trendColor={trendColor}
+            showLastPrice
+          />
+        ) : (
+          <div style={CENTERED}>
             <span
               style={{
-                fontSize: '1.3125rem',
-                fontWeight: 700,
-                color: 'var(--color-text-primary)',
-                letterSpacing: '-0.01em',
+                display: 'inline-flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                gap: 6,
+                color: TEXT_COLOR,
               }}
             >
-              {symbol}
+              <LineChart size={26} style={{ opacity: 0.5 }} />
+              <span style={{ fontSize: '0.75rem' }}>
+                {t('chat.chartAnnotationCard.previewUnavailable')}
+              </span>
             </span>
-            {lastClose != null && (
-              <span style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--color-text-primary)' }}>
-                ${lastClose.toLocaleString('en-US', {
-                  minimumFractionDigits: 2,
-                  maximumFractionDigits: 2,
-                })}
-              </span>
-            )}
-            {pct != null && (
-              <span
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 3,
-                  fontSize: '0.8125rem',
-                  fontWeight: 600,
-                  color: trendColor,
-                }}
-              >
-                <span
-                  style={{
-                    width: 0,
-                    height: 0,
-                    borderLeft: '3.5px solid transparent',
-                    borderRight: '3.5px solid transparent',
-                    ...(up
-                      ? { borderBottom: `5px solid ${trendColor}` }
-                      : { borderTop: `5px solid ${trendColor}` }),
-                  }}
-                />
-                {pct >= 0 ? '+' : ''}
-                {pct.toFixed(2)}%
-              </span>
-            )}
           </div>
+        )}
 
-          {/* Top-right — timeframe pill. */}
-          <span
-            style={{
-              position: 'absolute',
-              top: 16,
-              right: 16,
-              fontSize: '0.6875rem',
-              fontWeight: 700,
-              letterSpacing: '0.03em',
-              color: TEXT_COLOR,
-              background: GLASS_BG,
-              border: `1px solid ${GLASS_BORDER}`,
-              backdropFilter: 'blur(8px)',
-              padding: '4px 9px',
-              borderRadius: 7,
-            }}
-          >
-            {INTERVAL_LABEL[timeframe] ?? timeframe}
-          </span>
-
-          {/* Bottom-left — annotation legend (the real annotations). */}
-          {hasChart && shownVisuals.length > 0 && (
+        {/* Scrims keep the floating chrome legible over the chart. */}
+        {hasChart && (
+          <>
             <div
               style={{
                 position: 'absolute',
-                bottom: 15,
-                left: 17,
-                display: 'flex',
-                flexWrap: 'wrap',
-                alignItems: 'center',
-                gap: 14,
-                maxWidth: '62%',
+                top: 0,
+                left: 0,
+                right: 0,
+                height: 78,
+                background: SCRIM_TOP,
+                pointerEvents: 'none',
               }}
-            >
-              {/* `initial={false}` keeps the first paint (and history replay)
-                  instant; only annotations that arrive while the pinned card is
-                  already mounted animate in, so the legend grows smoothly as the
-                  agent draws. */}
-              <AnimatePresence initial={false}>
-                {shownVisuals.map((v, i) => (
-                  <motion.span
-                    key={annotations[i]?.annotation_id || `legend-${i}`}
-                    initial={reduceMotion ? false : { opacity: 0, y: 3, scale: 0.96 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
-                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -3, scale: 0.96 }}
-                    transition={{ duration: reduceMotion ? 0 : 0.2, ease: 'easeOut' }}
-                    style={{
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 6,
-                      fontSize: '0.7188rem',
-                      fontWeight: 600,
-                      color: 'var(--color-text-secondary)',
-                    }}
-                  >
-                    <span
-                      style={{ width: 8, height: 8, borderRadius: 2.5, backgroundColor: v.color, flexShrink: 0 }}
-                    />
-                    <span
-                      style={{
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                        maxWidth: 130,
-                      }}
-                    >
-                      {v.label}
-                    </span>
-                  </motion.span>
-                ))}
-              </AnimatePresence>
-              {extraCount > 0 && (
-                <span style={{ fontSize: '0.7188rem', fontWeight: 600, color: TEXT_COLOR }}>+{extraCount}</span>
-              )}
-            </div>
-          )}
-
-          {/* Bottom-right — CTA (glass → accent whenever the card is raised). */}
-          <span
-            style={{
-              position: 'absolute',
-              bottom: 14,
-              right: 14,
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 7,
-              fontSize: '0.8125rem',
-              fontWeight: 600,
-              padding: '9px 15px',
-              borderRadius: 11,
-              backdropFilter: 'blur(8px)',
-              background: raised ? ACCENT : GLASS_BG,
-              border: `1px solid ${raised ? 'transparent' : GLASS_BORDER}`,
-              color: raised ? '#fff' : 'var(--color-text-primary)',
-              transition: 'background 0.16s, color 0.16s, border-color 0.16s',
-            }}
-          >
-            {t('chat.chartAnnotationCard.openAnnotatedChart')}
-            <ArrowRight
-              size={14}
-              style={{ transform: raised ? 'translateX(3px)' : 'none', transition: 'transform 0.16s' }}
             />
-          </span>
-        </div>
-      </div>
-
-      {/* Stage 2 — the modal: a ~3/4-viewport, self-contained replica of the
-          MarketView chart surface (same header, toolbar, candles, MA, volume,
-          RSI and the agent's annotations). */}
-      <Dialog open={open} onOpenChange={setOpen}>
-        <DialogPortal>
-          <DialogOverlay />
-          <DialogPrimitive.Content
-            aria-describedby={undefined}
-            className="fixed left-1/2 top-1/2 z-[1030] flex flex-col -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border bg-background shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95"
-            style={{
-              width: isMobile ? '96vw' : '75vw',
-              height: isMobile ? '88vh' : '80vh',
-              maxWidth: 'none',
-              maxHeight: '94vh',
-            }}
-          >
-            <DialogTitle className="sr-only">
-              {t('chat.chartAnnotationCard.dialogTitle', {
-                symbol,
-                timeframe: INTERVAL_LABEL[timeframe] ?? timeframe,
-                count,
-              })}
-            </DialogTitle>
-
-            {/* Slim modal chrome — keeps the close + "Open in MarketView"
-                buttons off the chart's own header (which has the price). */}
             <div
               style={{
-                display: 'flex',
+                position: 'absolute',
+                bottom: 0,
+                left: 0,
+                right: 0,
+                height: 92,
+                background: SCRIM_BOTTOM,
+                pointerEvents: 'none',
+              }}
+            />
+          </>
+        )}
+
+        {/* Top-left — ticker, latest price, window change. */}
+        <div
+          style={{
+            position: 'absolute',
+            top: 15,
+            left: 17,
+            display: 'flex',
+            alignItems: 'baseline',
+            gap: 9,
+            minWidth: 0,
+          }}
+        >
+          <span
+            style={{
+              fontSize: '1.3125rem',
+              fontWeight: 700,
+              color: 'var(--color-text-primary)',
+              letterSpacing: '-0.01em',
+            }}
+          >
+            {symbol}
+          </span>
+          {lastClose != null && (
+            <span style={{ fontSize: '1rem', fontWeight: 700, color: 'var(--color-text-primary)' }}>
+              ${lastClose.toLocaleString('en-US', {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+              })}
+            </span>
+          )}
+          {pct != null && (
+            <span
+              style={{
+                display: 'inline-flex',
                 alignItems: 'center',
-                justifyContent: 'flex-end',
-                gap: 8,
-                padding: '8px 10px',
-                borderBottom: `1px solid ${CARD_BORDER}`,
-                flexShrink: 0,
+                gap: 3,
+                fontSize: '0.8125rem',
+                fontWeight: 600,
+                color: trendColor,
               }}
             >
-              <button
-                type="button"
-                onClick={handleOpenInMarketView}
+              <span
                 style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  padding: '6px 12px',
-                  borderRadius: 8,
-                  border: `1px solid ${CARD_BORDER}`,
-                  background: ACCENT_SOFT,
-                  color: ACCENT,
-                  fontSize: '0.75rem',
-                  fontWeight: 600,
-                  cursor: 'pointer',
-                  whiteSpace: 'nowrap',
-                  transition: 'border-color 0.15s',
+                  width: 0,
+                  height: 0,
+                  borderLeft: '3.5px solid transparent',
+                  borderRight: '3.5px solid transparent',
+                  ...(up
+                    ? { borderBottom: `5px solid ${trendColor}` }
+                    : { borderTop: `5px solid ${trendColor}` }),
                 }}
-                onMouseEnter={(e) => (e.currentTarget.style.borderColor = ACCENT)}
-                onMouseLeave={(e) => (e.currentTarget.style.borderColor = CARD_BORDER)}
-              >
-                {t('chat.chartAnnotationCard.openInMarketView')}
-                <ExternalLink size={13} />
-              </button>
-              <DialogClose
-                aria-label={t('chat.chartAnnotationCard.close')}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  width: 30,
-                  height: 30,
-                  borderRadius: 8,
-                  border: `1px solid ${CARD_BORDER}`,
-                  background: 'transparent',
-                  color: TEXT_COLOR,
-                  cursor: 'pointer',
-                }}
-              >
-                <X size={16} />
-              </DialogClose>
-            </div>
+              />
+              {pct >= 0 ? '+' : ''}
+              {pct.toFixed(2)}%
+            </span>
+          )}
+        </div>
 
-            {/* The chart surface fills the rest — mounted only while open. */}
-            <div style={{ flex: 1, minHeight: 0 }}>
-              {open && (
-                <Suspense
-                  fallback={
-                    <div
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        height: '100%',
-                        fontSize: '0.8125rem',
-                        color: TEXT_COLOR,
-                      }}
-                    >
-                      {t('chat.chartAnnotationCard.loadingChart')}
-                    </div>
-                  }
+        {/* Top-right — timeframe pill. */}
+        <span
+          style={{
+            position: 'absolute',
+            top: 16,
+            right: 16,
+            fontSize: '0.6875rem',
+            fontWeight: 700,
+            letterSpacing: '0.03em',
+            color: TEXT_COLOR,
+            background: GLASS_BG,
+            border: `1px solid ${GLASS_BORDER}`,
+            backdropFilter: 'blur(8px)',
+            padding: '4px 9px',
+            borderRadius: 7,
+          }}
+        >
+          {INTERVAL_LABEL[timeframe] ?? timeframe}
+        </span>
+
+        {/* Bottom-left — annotation legend (the real annotations). */}
+        {hasChart && shownVisuals.length > 0 && (
+          <div
+            style={{
+              position: 'absolute',
+              bottom: 15,
+              left: 17,
+              display: 'flex',
+              flexWrap: 'wrap',
+              alignItems: 'center',
+              gap: 14,
+              maxWidth: '62%',
+            }}
+          >
+            {/* `initial={false}` keeps the first paint (and history replay)
+                instant; only annotations that arrive while the pinned card is
+                already mounted animate in, so the legend grows smoothly as the
+                agent draws. */}
+            <AnimatePresence initial={false}>
+              {shownVisuals.map((v, i) => (
+                <motion.span
+                  key={annotations[i]?.annotation_id || `legend-${i}`}
+                  initial={reduceMotion ? false : { opacity: 0, y: 3, scale: 0.96 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -3, scale: 0.96 }}
+                  transition={{ duration: reduceMotion ? 0 : 0.2, ease: 'easeOut' }}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    fontSize: '0.7188rem',
+                    fontWeight: 600,
+                    color: 'var(--color-text-secondary)',
+                  }}
                 >
-                  <MarketChartSurface
-                    symbol={symbol}
-                    timeframe={timeframe}
-                    workspaceId={workspaceId ?? null}
+                  <span
+                    style={{ width: 8, height: 8, borderRadius: 2.5, backgroundColor: v.color, flexShrink: 0 }}
                   />
-                </Suspense>
-              )}
-            </div>
-          </DialogPrimitive.Content>
-        </DialogPortal>
-      </Dialog>
-    </>
+                  <span
+                    style={{
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      maxWidth: 130,
+                    }}
+                  >
+                    {v.label}
+                  </span>
+                </motion.span>
+              ))}
+            </AnimatePresence>
+            {extraCount > 0 && (
+              <span style={{ fontSize: '0.7188rem', fontWeight: 600, color: TEXT_COLOR }}>+{extraCount}</span>
+            )}
+          </div>
+        )}
+
+        {/* Bottom-right — CTA (glass → accent whenever the card is raised).
+            The accent fill is the sanctioned exception recorded in DESIGN.md. */}
+        <span
+          style={{
+            position: 'absolute',
+            bottom: 14,
+            right: 14,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 7,
+            fontSize: '0.8125rem',
+            fontWeight: 600,
+            padding: '9px 15px',
+            borderRadius: 11,
+            backdropFilter: 'blur(8px)',
+            background: raised ? ACCENT : GLASS_BG,
+            border: `1px solid ${raised ? 'transparent' : GLASS_BORDER}`,
+            color: raised ? 'var(--color-text-on-accent)' : 'var(--color-text-primary)',
+            transition: 'background 0.16s, color 0.16s, border-color 0.16s',
+          }}
+        >
+          {t(pricesOnly ? 'chat.chartAnnotationCard.openChart' : 'chat.chartAnnotationCard.openAnnotatedChart')}
+          <ArrowRight
+            size={14}
+            style={{ transform: raised ? 'translateX(3px)' : 'none', transition: 'transform 0.16s' }}
+          />
+        </span>
+      </div>
+    </div>
   );
 }
 

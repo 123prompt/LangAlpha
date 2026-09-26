@@ -6,10 +6,9 @@
  *     - fallback → "Falling back to <toModel>…"
  *   - FallbackSuggestionPill: rendered only when `fallbackSuggestion &&
  *     !isLoading && toModel !== nextSendModel`, with a switch action and a
- *     dismiss. `nextSendModel = inputModel ?? (lastThreadModel ||
- *     activePreferredModel)` — the chat input's live selection (what the next
- *     send re-uses), NOT the durable preference, which a thread's own model
- *     overrides on every send.
+ *     dismiss. `nextSendModel = inputModel ?? activePreferredModel`: the chat
+ *     input's live selection (what the next send uses), with the preference
+ *     standing in until the input reports.
  *
  * Copy is asserted through the real i18n instance (global test setup) against
  * the chat.modelRetrying / chat.modelFallingBack / chat.modelTroubleSuggestion
@@ -73,7 +72,6 @@ describe('FallbackSuggestionPill', () => {
         fallbackSuggestion={suggestion}
         isLoading={false}
         inputModel={null}
-        lastThreadModel={null}
         activePreferredModel="model-alpha"
         onSwitchModel={noop}
         onDismiss={noop}
@@ -109,11 +107,10 @@ describe('FallbackSuggestionPill', () => {
   });
 
   it('still renders when the durable preference is the working model but the input re-sends the broken one', () => {
-    // Regression: the thread's own model (input selection) overrides the
-    // preference on every send — a "correct" preference must not hide the pill.
+    // The input's selection is what gets sent, so it outranks the preference:
+    // a "correct" preference must not hide the pill.
     renderPill({
       inputModel: 'model-alpha',
-      lastThreadModel: 'model-alpha',
       activePreferredModel: 'model-beta',
     });
     expect(screen.getByRole('status')).toBeInTheDocument();
@@ -122,16 +119,6 @@ describe('FallbackSuggestionPill', () => {
   it('renders nothing once the input selection is already the working model', () => {
     const { container } = renderPill({
       inputModel: 'model-beta',
-      lastThreadModel: 'model-alpha',
-      activePreferredModel: 'model-alpha',
-    });
-    expect(container.firstChild).toBeNull();
-  });
-
-  it('falls back to the thread model before the preference while the input has not reported', () => {
-    const { container } = renderPill({
-      inputModel: null,
-      lastThreadModel: 'model-beta',
       activePreferredModel: 'model-alpha',
     });
     expect(container.firstChild).toBeNull();

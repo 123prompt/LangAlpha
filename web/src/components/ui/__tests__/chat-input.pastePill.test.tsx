@@ -22,6 +22,7 @@ vi.mock('@/hooks/usePreferences', () => ({
 
 vi.mock('../use-toast', () => ({
   useToast: () => ({ toast: vi.fn() }),
+  toast: vi.fn(),
 }));
 
 function renderInput(onSend = vi.fn()) {

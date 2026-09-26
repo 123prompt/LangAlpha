@@ -11,10 +11,12 @@ import { getChatSession } from './hooks/utils/chatSessionRestore';
 import { useChatViewCache } from './hooks/useChatViewCache';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { useWarmWorkspaceSandbox } from './hooks/useWarmWorkspaceSandbox';
+import { useComputerStatusFanout } from './hooks/useComputers';
 import { warmWorkspace } from './utils/warmWorkspace';
 import { isValidUuid } from './utils/uuid';
 import { shouldLeaveThreadRoute } from './utils/threadRouteGuard';
 import ChatView from './components/ChatView';
+import ComputersDialogHost from './components/ComputersDialogHost';
 import './ChatAgent.css';
 
 // View depth for direction-aware transitions: gallery(0) → threads(1) → chat(2)
@@ -182,6 +184,12 @@ function ChatAgent(): React.ReactElement | null {
   // path also calls warmWorkspace via handleWorkspaceSelect; both share
   // the same in-flight dedupe Map.
   const warmingState = useWarmWorkspaceSandbox(workspaceId);
+
+  // One watch for every machine in flight, mounted above all three surfaces
+  // that can start or stop one (the gallery, the thread gallery's panel, the
+  // file panel's). Each of them arms it the same way, by writing the action's
+  // own status into the cache, so the watch cannot live on one of them.
+  useComputerStatusFanout();
 
   // Track in-progress __default__ → real threadId resolutions. Keyed by workspaceId:
   // at most one such resolution can be in flight per workspace (a fresh __default__
@@ -399,14 +407,18 @@ function ChatAgent(): React.ReactElement | null {
         {!threadId && galleryContent}
         {chatViews}
         {accessDeniedContent}
+        <ComputersDialogHost />
       </div>
     );
   }
 
   return (
     <div style={{ height: '100%', position: 'relative' }}>
-      {/* Gallery views — animated transitions (R6: z-index:1 so exit fades above chat) */}
-      <div style={{ position: threadId ? 'absolute' : 'relative', height: threadId ? 0 : '100%', width: '100%', zIndex: 1, overflow: 'hidden' }}>
+      {/* Gallery views — animated transitions. No z-index on this wrapper: it
+          would make it a stacking context, and every dialog the gallery opens
+          (sandbox settings and the MCP and skill forms inside it) would paint
+          under the app sidebar however high its own layer. */}
+      <div style={{ position: threadId ? 'absolute' : 'relative', height: threadId ? 0 : '100%', width: '100%', overflow: 'hidden' }}>
         <AnimatePresence mode="wait" custom={navDirection}>
           {!threadId && (
             <motion.div
@@ -427,6 +439,9 @@ function ChatAgent(): React.ReactElement | null {
       {/* Cached ChatViews — visibility toggled, never unmounted on thread switch */}
       {chatViews}
       {accessDeniedContent}
+      {/* Computer management and change-spec, opened from the gallery, a
+          card's machine line, or a disk warning in any chat. */}
+      <ComputersDialogHost />
     </div>
   );
 }

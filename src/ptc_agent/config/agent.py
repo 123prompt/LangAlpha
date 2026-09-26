@@ -24,6 +24,7 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
     create_default_security_config,
+    default_sandbox_skills_base,
     validate_daytona_api_key,
 )
 
@@ -229,6 +230,17 @@ class LLMConfig(BaseModel):
         """
         return self.flash or self.name
 
+    # Blank compaction/fetch mean "whatever flash is for this turn". Resolved on
+    # read, not at load: a user's flash preference replaces ``flash`` per turn,
+    # and a value baked in at load would keep the deployment's flash instead.
+    @property
+    def compaction_name(self) -> str | None:
+        return self.compaction or self.flash
+
+    @property
+    def fetch_name(self) -> str | None:
+        return self.fetch or self.flash
+
 
 class AgentConfig(BaseModel):
     """Agent-specific configuration.
@@ -312,7 +324,8 @@ class AgentConfig(BaseModel):
     # Written alongside the clients above, because a role without a client of
     # its own still runs a model: by name, or by inheriting the main one.
     role_prompt_guidance: dict[str, str] = Field(default_factory=dict, exclude=True)
-    fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)  # Pre-resolved fallback instances
+    # None permits standalone name resolution; [] means resolution rejected all candidates.
+    fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)
     # Display names aligned index-for-index with ``fallback_llm_clients``
     # (skipped fallbacks drop from both lists).
     fallback_llm_names: list[str] | None = Field(default=None, exclude=True)
@@ -508,7 +521,7 @@ class AgentConfig(BaseModel):
             user_skills_dir=kwargs.pop("user_skills_dir", "~/.ptc-agent/skills"),
             sandbox_skills_base=kwargs.pop(
                 "sandbox_skills_base",
-                f"{filesystem_config.working_directory}/.agents/skills",
+                default_sandbox_skills_base(filesystem_config.working_directory),
             ),
         )
 
@@ -613,19 +626,19 @@ class AgentConfig(BaseModel):
     def to_core_config(self) -> CoreConfig:
         """Convert to CoreConfig for use with SessionManager.
 
-        Returns:
-            CoreConfig instance with sandbox/MCP settings
+        Every section is deep-copied, so a CoreConfig shares no mutable state
+        with the AgentConfig it came from or with any sibling CoreConfig. One
+        CoreConfig is one workspace's sandbox: sharing these by reference made
+        a per-workspace change to the effective MCP server set, the resource
+        tier, the working directory or the platform-secret version land on
+        every other workspace in the process at the same time.
         """
         core_config = CoreConfig(
-            sandbox=self.sandbox,
-            security=self.security,
-            # Deep-copy the MCP config so each CoreConfig (hence each workspace
-            # sandbox) owns its MCPConfig. Sharing it by reference made every
-            # workspace's effective server set the same object — Phase 2 swaps
-            # in per-workspace servers, which must not bleed across workspaces.
+            sandbox=self.sandbox.model_copy(deep=True),
+            security=self.security.model_copy(deep=True),
             mcp=self.mcp.model_copy(deep=True),
-            logging=self.logging,
-            filesystem=self.filesystem,
+            logging=self.logging.model_copy(deep=True),
+            filesystem=self.filesystem.model_copy(deep=True),
         )
         core_config.config_file_dir = self.config_file_dir
         return core_config

@@ -46,6 +46,7 @@ import alibabacloud_oss_v2 as oss
 import alibabacloud_oss_v2.exceptions as oss_exceptions
 
 from src.utils.mime import resolve_content_type
+from src.utils.storage.key_prefix import full_key
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -131,7 +132,7 @@ def upload_file(key: str, file_path: str, content_type: str | None = None) -> bo
         with path_obj.open("rb") as f:
             result = client.put_object(oss.PutObjectRequest(
                 bucket=OSSConfig.BUCKET_NAME,
-                key=key,
+                key=full_key(key),
                 body=f,
                 content_type=content_type,
             ))
@@ -223,7 +224,7 @@ def upload_bytes(
 
         result = client.put_object(oss.PutObjectRequest(
             bucket=OSSConfig.BUCKET_NAME,
-            key=key,
+            key=full_key(key),
             body=data,
             content_type=content_type,
         ))
@@ -251,7 +252,7 @@ def get_bytes_range(key: str, start: int, length: int) -> bytes | None:
         client = get_oss_client()
         result = client.get_object(oss.GetObjectRequest(
             bucket=OSSConfig.BUCKET_NAME,
-            key=key,
+            key=full_key(key),
             range_header=f"bytes={start}-{start + length - 1}",
         ))
         body = getattr(result, "body", None)
@@ -284,7 +285,7 @@ def get_bytes(key: str) -> bytes | None:
         client = get_oss_client()
         result = client.get_object(oss.GetObjectRequest(
             bucket=OSSConfig.BUCKET_NAME,
-            key=key,
+            key=full_key(key),
         ))
         body = getattr(result, "body", None)
         if body is None:
@@ -320,7 +321,7 @@ def does_object_exist(key: str) -> bool:
         client = get_oss_client()
         client.head_object(oss.HeadObjectRequest(
             bucket=OSSConfig.BUCKET_NAME,
-            key=key,
+            key=full_key(key),
         ))
         return True
 
@@ -352,7 +353,7 @@ def delete_object(key: str) -> bool:
 
         result = client.delete_object(oss.DeleteObjectRequest(
             bucket=OSSConfig.BUCKET_NAME,
-            key=key,
+            key=full_key(key),
         ))
 
         logger.debug(f"Deleted {key} from OSS, status: {result.status_code}")
@@ -382,7 +383,7 @@ def get_public_url(key: str) -> str:
         >>> get_public_url("images/photo.png")
         'https://${OSS_BUCKET_NAME}.${OSS_ENDPOINT}/images/photo.png'
     """
-    return f"{OSSConfig.get_public_url_base()}/{key}"
+    return f"{OSSConfig.get_public_url_base()}/{full_key(key)}"
 
 
 def get_signed_upload_url(
@@ -402,7 +403,14 @@ def get_signed_upload_url(
     return None
 
 
-def get_signed_url(key: str, expires_in: int = 3600) -> str | None:
+def get_signed_url(
+    key: str,
+    expires_in: int = 3600,
+    *,
+    content_disposition: str | None = None,
+    content_type: str | None = None,
+    for_browser: bool = False,
+) -> str | None:
     """Generate a signed URL for temporary access to a private object.
 
     Args:
@@ -421,7 +429,9 @@ def get_signed_url(key: str, expires_in: int = 3600) -> str | None:
 
         result = client.presign(oss.GetObjectRequest(
             bucket=OSSConfig.BUCKET_NAME,
-            key=key,
+            key=full_key(key),
+            response_content_disposition=content_disposition,
+            response_content_type=content_type,
         ), expires=expires_in)
 
         return result.url

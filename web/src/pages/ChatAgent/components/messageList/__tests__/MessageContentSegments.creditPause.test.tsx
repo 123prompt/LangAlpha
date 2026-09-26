@@ -55,7 +55,6 @@ function props(creditPauses: Record<string, CreditPauseState>): SegmentsProps {
     subagentTasks: RUNNING_TASK,
     creditPauses,
     isStreaming: false,
-    isAssistant: true,
   };
 }
 

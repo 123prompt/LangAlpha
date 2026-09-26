@@ -187,8 +187,10 @@ class ModelConfig:
                 entry["oauth_plans"] = model_info["oauth_plans"]
             # Optional editorial metadata for the model-detail flyout. Additive —
             # only surfaced for models that authored it in models.json; the
-            # frontend renders only the rows that are present.
+            # frontend renders only the rows that are present. `display_name` is
+            # what the pickers print in place of the key.
             for key in (
+                "display_name",
                 "speed",
                 "intelligence",
                 "context",

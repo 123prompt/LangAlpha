@@ -12,7 +12,11 @@ import os
 from typing import Any, Dict, List, Optional
 
 from src.config.core import get_infrastructure_config
-from src.config.models import NewsPollConfig, WorkflowOrchestrationConfig
+from src.config.models import (
+    NewsPollConfig,
+    OrderReconcileConfig,
+    WorkflowOrchestrationConfig,
+)
 
 # Re-export env-var constants for backward compatibility
 from src.config.env import (  # noqa: F401
@@ -199,6 +203,11 @@ def get_news_poll_config() -> NewsPollConfig:
     return get_infrastructure_config().news_poll
 
 
+def get_order_reconcile_config() -> OrderReconcileConfig:
+    """Order reconciliation sweep config (enabled / cadence / windows / batch)."""
+    return get_infrastructure_config().order_reconcile
+
+
 def get_redis_max_connections() -> int:
     """Get Redis connection pool max connections.
 
@@ -374,10 +383,6 @@ def get_market_watch_min_interval() -> int:
 
 def get_market_watch_max_symbols() -> int:
     return get_infrastructure_config().market_watch.max_symbols
-
-
-def get_market_watch_cache_pin() -> bool:
-    return get_infrastructure_config().market_watch.cache_breakpoint_pin
 
 
 def get_redis_ttl_market_watch() -> int:

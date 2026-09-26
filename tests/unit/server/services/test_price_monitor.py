@@ -1,6 +1,6 @@
 """Unit tests for PriceMonitorService — price monitoring and automation triggering."""
 
-import asyncio
+import time
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from src.server.models.automation import MarketType, PriceConditionType, PriceTriggerConfig, RetriggerMode
+from src.server.models.automation import MarketType, PriceTriggerConfig
 from src.server.services.price_monitor import (
     ConditionEvaluator,
     PriceMonitorService,
@@ -248,14 +248,10 @@ class TestTryTrigger:
         mock_scheduler = MagicMock()
         mock_scheduler.server_id = "test-server"
 
-        mock_executor = AsyncMock()
-
         with (
             patch("src.utils.cache.redis_cache.get_cache_client", return_value=mock_cache),
-            patch("src.server.database.automation.create_execution", new_callable=AsyncMock, return_value="exec-123") as mock_create_exec,
-            patch("src.server.database.automation.update_automation_next_run", new_callable=AsyncMock) as mock_update,
+            patch("src.server.database.automation.claim_price_firing", new_callable=AsyncMock, return_value="exec-123") as mock_claim,
             patch("src.server.services.automation_scheduler.AutomationScheduler.get_instance", return_value=mock_scheduler),
-            patch("src.server.services.automation_executor.AutomationExecutor.get_instance", return_value=mock_executor),
         ):
             await svc._try_trigger(auto, config, 149.0)
 
@@ -264,13 +260,12 @@ class TestTryTrigger:
             call_kwargs = mock_redis_client.set.call_args
             assert call_kwargs.kwargs["nx"] is True
 
-            # Execution was created
-            mock_create_exec.assert_called_once()
+            # Claimed 'executing', with its execution, before dispatch
+            mock_claim.assert_called_once_with(auto["automation_id"], "test-server")
 
-            # Status was set to 'executing' before dispatch
-            mock_update.assert_called_once_with(
-                auto["automation_id"], next_run_at=None, status="executing",
-            )
+            # Dispatched through the scheduler, which holds it for shutdown
+            mock_scheduler.dispatch.assert_called_once()
+            assert mock_scheduler.dispatch.call_args.args == (auto, "exec-123")
 
     @pytest.mark.asyncio
     async def test_skips_when_lock_not_acquired(self):
@@ -293,6 +288,26 @@ class TestTryTrigger:
             # (no exception means success)
 
     @pytest.mark.asyncio
+    async def test_an_alert_paused_since_the_load_is_not_dispatched(self):
+        svc = PriceMonitorService()
+        auto = _make_automation()
+        config = PriceTriggerConfig(**auto["trigger_config"])
+        mock_scheduler = MagicMock(server_id="s1")
+
+        with (
+            patch("src.utils.cache.redis_cache.get_cache_client", return_value=MagicMock(enabled=False, client=None)),
+            patch("src.server.database.automation.claim_price_firing", new_callable=AsyncMock, return_value=None),
+            patch("src.server.services.automation_scheduler.AutomationScheduler.get_instance", return_value=mock_scheduler),
+        ):
+            await svc._try_trigger(auto, config, 149.0)
+
+        mock_scheduler.dispatch.assert_not_called()
+        # Nothing fired, so a resume is heard from the next reload on.
+        from src.server.services.price_monitor import _REFRESH_INTERVAL
+        held = svc._local_locks[auto["automation_id"]] - time.monotonic()
+        assert 0 < held <= _REFRESH_INTERVAL
+
+    @pytest.mark.asyncio
     async def test_falls_back_to_in_memory_lock_when_redis_unavailable(self):
         svc = PriceMonitorService()
         auto = _make_automation()
@@ -306,10 +321,8 @@ class TestTryTrigger:
 
         with (
             patch("src.utils.cache.redis_cache.get_cache_client", return_value=mock_cache),
-            patch("src.server.database.automation.create_execution", new_callable=AsyncMock, return_value="exec-1"),
-            patch("src.server.database.automation.update_automation_next_run", new_callable=AsyncMock),
+            patch("src.server.database.automation.claim_price_firing", new_callable=AsyncMock, return_value="exec-1"),
             patch("src.server.services.automation_scheduler.AutomationScheduler.get_instance", return_value=MagicMock(server_id="s1")),
-            patch("src.server.services.automation_executor.AutomationExecutor.get_instance", return_value=AsyncMock()),
         ):
             await svc._try_trigger(auto, config, 149.0)
             assert auto["automation_id"] in svc._local_locks
@@ -667,10 +680,8 @@ class TestTryTriggerLockTTL:
 
         with (
             patch("src.utils.cache.redis_cache.get_cache_client", return_value=mock_cache),
-            patch("src.server.database.automation.create_execution", new_callable=AsyncMock, return_value="exec-1"),
-            patch("src.server.database.automation.update_automation_next_run", new_callable=AsyncMock),
+            patch("src.server.database.automation.claim_price_firing", new_callable=AsyncMock, return_value="exec-1"),
             patch("src.server.services.automation_scheduler.AutomationScheduler.get_instance", return_value=MagicMock(server_id="s1")),
-            patch("src.server.services.automation_executor.AutomationExecutor.get_instance", return_value=AsyncMock()),
         ):
             await svc._try_trigger(auto, config, 149.0)
             call_kwargs = mock_redis_client.set.call_args
@@ -690,10 +701,8 @@ class TestTryTriggerLockTTL:
         with (
             patch("src.utils.cache.redis_cache.get_cache_client", return_value=mock_cache),
             patch("src.server.services.price_monitor._seconds_until_next_market_open", return_value=70200),
-            patch("src.server.database.automation.create_execution", new_callable=AsyncMock, return_value="exec-1"),
-            patch("src.server.database.automation.update_automation_next_run", new_callable=AsyncMock),
+            patch("src.server.database.automation.claim_price_firing", new_callable=AsyncMock, return_value="exec-1"),
             patch("src.server.services.automation_scheduler.AutomationScheduler.get_instance", return_value=MagicMock(server_id="s1")),
-            patch("src.server.services.automation_executor.AutomationExecutor.get_instance", return_value=AsyncMock()),
         ):
             await svc._try_trigger(auto, config, 149.0)
             call_kwargs = mock_redis_client.set.call_args
@@ -712,10 +721,8 @@ class TestTryTriggerLockTTL:
 
         with (
             patch("src.utils.cache.redis_cache.get_cache_client", return_value=mock_cache),
-            patch("src.server.database.automation.create_execution", new_callable=AsyncMock, return_value="exec-1"),
-            patch("src.server.database.automation.update_automation_next_run", new_callable=AsyncMock),
+            patch("src.server.database.automation.claim_price_firing", new_callable=AsyncMock, return_value="exec-1"),
             patch("src.server.services.automation_scheduler.AutomationScheduler.get_instance", return_value=MagicMock(server_id="s1")),
-            patch("src.server.services.automation_executor.AutomationExecutor.get_instance", return_value=AsyncMock()),
         ):
             await svc._try_trigger(auto, config, 149.0)
             call_kwargs = mock_redis_client.set.call_args

@@ -12,7 +12,13 @@ import mimetypes
 from dataclasses import dataclass
 from typing import Any
 
-from src.server.database.blob_keys import BLOB_CONTENT_TYPE, blob_key
+from ptc_agent.core.paths import WorkspaceLayout
+from src.server.database.blob_keys import (
+    BLOB_CONTENT_TYPE,
+    RELAY_MAX_BYTES,
+    blob_key,
+)
+from src.server.database.workspace_file import bulk_upsert_files
 from src.server.database.workspace_file_blobs import (
     BlobUploadError,
     register_blobs,
@@ -26,9 +32,14 @@ from src.server.services.persistence._rows import (
     _pack_row,
     _row_base,
     _stamp_matches,
-    _transfer_mode,
 )
+from src.server.services.persistence.sync_result import UnsavedFile, UnsavedReason
 from src.server.services.persistence.transfer import (
+    transfer_mode,
+    INPROCESS_MAX_INFLIGHT_BYTES,
+    MULTIPART_THRESHOLD_BYTES,
+    SINGLE_PUT_MAX_BYTES,
+    ByteBudget,
     pack_direct,
     unlink_direct,
     ScanEntry,
@@ -36,12 +47,37 @@ from src.server.services.persistence.transfer import (
     push_direct,
     transfer_timeout_s,
 )
-from src.utils.storage import get_signed_upload_url
+from src.utils.storage import (
+    abort_multipart_upload,
+    complete_multipart_upload,
+    create_signed_multipart_upload,
+    delete_object,
+    get_signed_upload_url,
+    sha256_object,
+)
 
 # Files moved through this process (inline rows, or blobs when direct
-# transfer is unavailable). The sandbox's own download semaphore is the
-# tighter bound; this one keeps the gather from fanning out unboundedly.
+# transfer is unavailable). The count keeps the gather from fanning out
+# unboundedly; INPROCESS_MAX_INFLIGHT_BYTES bounds what those files weigh, which
+# is the bound that matters now that the direct path caps no file.
 RELAY_CONCURRENCY = 8
+
+
+def _entry_abs_path(entry: ScanEntry, layout: WorkspaceLayout) -> str:
+    """Where a scanned entry lives in the sandbox.
+
+    A user's file is relative to the project folder it was scanned under.
+    A pack chunk is the machine's own scratch, staged beside the computer
+    root rather than inside any one folder, so it arrives already absolute.
+    """
+    if entry.path.startswith("/"):
+        return entry.path
+    return f"{layout.workspace}/{entry.path}"
+
+
+def _machine_layout(layout: WorkspaceLayout) -> WorkspaceLayout:
+    """The computer's own root, which is where pack chunks are staged."""
+    return WorkspaceLayout(layout.root)
 
 logger = logging.getLogger(__name__)
 
@@ -62,31 +98,41 @@ async def _persist_blobs(
     entries: list[ScanEntry],
     *,
     unlink_after: bool = False,
-) -> tuple[list[dict[str, Any]], int]:
+    layout: WorkspaceLayout,
+) -> tuple[list[dict[str, Any]], list[UnsavedFile]]:
     """Make sure every entry's digest has an object, then build its row.
 
     Digests the registry already knows under the owner are done before any
     byte moves. The rest go direct when the store and sandbox allow it, and
     through this process otherwise. An entry whose digest still has no
-    object at the end is dropped from the batch and counted as an error:
+    object at the end is dropped from the batch and returned as unsaved:
     its old row survives, and the next sync retries.
     """
     wanted = {e.sha256 for e in entries if e.sha256}
     have = await registered_blobs(user_id, list(wanted))
     need = wanted - have
-    mode = _transfer_mode(sandbox)
+    mode = transfer_mode(sandbox)
     if unlink_after and have:
         # A chunk the registry already holds is never pushed, so nothing
         # downstream would remove it; it would sit until the age sweep.
         await _unlink_chunks(
-            sandbox, [e.path for e in entries if e.sha256 in have], workspace_id
+            sandbox,
+            [e.path for e in entries if e.sha256 in have],
+            workspace_id,
+            layout,
         )
 
     # The store answering at all makes a rejection final this pass, so only
     # the digests it never reached fall through to the relay.
     outcome = (
         await _push_direct(
-            user_id, workspace_id, sandbox, entries, need, unlink_after=unlink_after
+            user_id,
+            workspace_id,
+            sandbox,
+            entries,
+            need,
+            unlink_after=unlink_after,
+            layout=layout,
         )
         if need and mode == "direct"
         else None
@@ -103,57 +149,65 @@ async def _persist_blobs(
             entries,
             relay_need,
             unlink_after=unlink_after,
+            layout=layout,
         )
         registered |= relayed
         changed |= relay_changed
 
     available = have | registered
     rows: list[dict[str, Any]] = []
-    errors = 0
+    unsaved: list[UnsavedFile] = []
     for entry in entries:
         if entry.sha256 in available:
             rows.append(_blob_row(entry))
+        elif entry.sha256 in changed:
+            unsaved.append(UnsavedFile(entry.path, "changed", entry.size))
         else:
-            errors += 1
-            if entry.sha256 not in changed:
-                logger.error(
-                    f"Blob upload failed for {entry.path} "
-                    f"(workspace {workspace_id}, sha {entry.sha256}); "
-                    f"keeping the previous manifest row"
-                )
+            unsaved.append(UnsavedFile(entry.path, "failed", entry.size))
+            logger.error(
+                f"Blob upload failed for {entry.path} "
+                f"(workspace {workspace_id}, sha {entry.sha256}); "
+                f"keeping the previous manifest row"
+            )
     if changed:
         logger.info(
             f"{len(changed)} file(s) in workspace {workspace_id} changed "
             f"during sync and will be picked up next pass"
         )
-    return rows, errors
+    return rows, unsaved
 
 
-async def _push_direct(
+async def _sign_push_items(
     user_id: str,
     workspace_id: str,
-    sandbox: Any,
-    entries: list[ScanEntry],
-    need: set[str],
+    representative: dict[str, ScanEntry],
     *,
-    unlink_after: bool = False,
-) -> DirectPush | None:
-    """Presign one PUT per missing digest and let the sandbox upload.
+    expires: int,
+    unlink_after: bool,
+) -> (
+    tuple[
+        list[dict[str, Any]], dict[str, tuple[str, int]], dict[str, dict[str, Any]]
+    ]
+    | None
+):
+    """Presign an upload per digest; returns the runtime's items, open uploads,
+    and the results of digests no upload could carry.
 
-    ``None`` means the direct path was not usable at all (no presigning, or
-    the store unreachable from the sandbox); otherwise the digests the store
-    never answered for come back in ``unreachable``. Either way the caller
-    owns the fallback.
+    Each open upload maps its digest to (upload id, part count).
+
+    ``None`` means the store cannot presign at all, so nothing was opened and
+    the caller relays. Signing is local work on a thread each; a large first
+    backup has thousands of digests, and one at a time serializes what has no
+    order.
+
+    A digest large enough that one PUT is a long time to hold a socket open
+    gets a multipart upload *as well as* its single PUT: a failed part costs
+    that part rather than the whole file. Nothing resumes across syncs; the
+    upload id lives for this call only. The two signatures are alternatives,
+    not stages, because a sandbox running a transfer runtime that predates
+    parts ignores them and sends the whole file, and the result says which
+    happened.
     """
-    representative: dict[str, ScanEntry] = {}
-    for entry in entries:
-        if entry.sha256 in need and entry.sha256 not in representative:
-            representative[entry.sha256] = entry
-    total = sum(e.size for e in representative.values())
-    expires = transfer_timeout_s(total) + 60
-
-    # Signing is local work on a thread each; a large first backup has
-    # thousands of digests, and one at a time serializes what has no order.
     signatures = await asyncio.gather(
         *(
             asyncio.to_thread(
@@ -167,28 +221,271 @@ async def _push_direct(
             for sha, entry in representative.items()
         )
     )
-    items: list[dict[str, Any]] = []
-    for (sha, entry), signed in zip(representative.items(), signatures):
-        if signed is None:
-            logger.info(
-                f"Store cannot presign uploads; relaying {len(need)} "
-                f"blob(s) for workspace {workspace_id}"
-            )
-            return None
-        url, headers = signed
-        items.append(
-            {
-                "path": entry.path,
-                "sha256": sha,
-                "size": entry.size,
-                "url": url,
-                "headers": headers,
-                "unlink": unlink_after,
-            }
+    if any(s is None for s in signatures):
+        logger.info(
+            f"Store cannot presign uploads; relaying "
+            f"{len(representative)} blob(s) for workspace {workspace_id}"
         )
+        return None
 
+    large = {
+        sha: entry
+        for sha, entry in representative.items()
+        if entry.size >= MULTIPART_THRESHOLD_BYTES
+    }
+    creating = asyncio.gather(
+        *(
+            asyncio.to_thread(
+                create_signed_multipart_upload,
+                blob_key(user_id, sha),
+                content_length=entry.size,
+                content_type=BLOB_CONTENT_TYPE,
+                expires_in=expires,
+            )
+            for sha, entry in large.items()
+        ),
+        return_exceptions=True,
+    )
+    try:
+        created = await asyncio.shield(creating)
+    except asyncio.CancelledError:
+        # The store calls run on in their threads and open uploads nobody
+        # would hold the ids of, so they are aborted once they return.
+        creating.add_done_callback(
+            lambda done: _abort_orphans(user_id, large, done)
+        )
+        raise
+    uploads, parts, failure = _opened_uploads(large, created)
+    if failure is not None:
+        # The caller never sees uploads from a call that raised, so the ones
+        # that did open are settled here rather than left to the lifecycle rule.
+        await _settle_multipart(user_id, uploads, {})
+        raise failure
+
+    items: list[dict[str, Any]] = []
+    withheld: dict[str, dict[str, Any]] = {}
+    for (sha, entry), signed in zip(representative.items(), signatures):
+        if sha not in parts and entry.size > SINGLE_PUT_MAX_BYTES:
+            # The store refuses a single PUT this size after the whole body
+            # has crossed the link, so sending one spends the transfer to
+            # learn what the size already says. Next sync asks for parts again.
+            withheld[sha] = {
+                "status": "failed",
+                "error": "too large for one upload and the store would not split it",
+            }
+            continue
+        url, headers = signed
+        item: dict[str, Any] = {
+            "path": entry.path,
+            "sha256": sha,
+            "size": entry.size,
+            "url": url,
+            "headers": headers,
+            "unlink": unlink_after,
+        }
+        if sha in parts:
+            item["parts"] = parts[sha]
+        items.append(item)
     items.sort(key=lambda i: int(i.get("size") or 0), reverse=True)
-    results = await push_direct(sandbox, items)
+    return items, uploads, withheld
+
+
+def _opened_uploads(
+    large: dict[str, ScanEntry], created: list[Any]
+) -> tuple[
+    dict[str, tuple[str, int]], dict[str, list[dict[str, Any]]], BaseException | None
+]:
+    uploads: dict[str, tuple[str, int]] = {}
+    parts: dict[str, list[dict[str, Any]]] = {}
+    failure: BaseException | None = None
+    for sha, opened in zip(large, created):
+        if isinstance(opened, BaseException):
+            failure = failure or opened
+        # A store that will not open a multipart upload still takes the
+        # single PUT this digest is already signed for.
+        elif opened is not None:
+            upload_id, parts[sha] = opened
+            uploads[sha] = (upload_id, len(parts[sha]))
+    return uploads, parts, failure
+
+
+_orphan_aborts: set[asyncio.Task[Any]] = set()
+
+
+def _abort_orphans(
+    user_id: str, large: dict[str, ScanEntry], done: asyncio.Future[list[Any]]
+) -> None:
+    if done.cancelled():
+        return
+    uploads, _, _ = _opened_uploads(large, done.result())
+    if uploads:
+        task = asyncio.get_running_loop().create_task(
+            _settle_multipart(user_id, uploads, {})
+        )
+        _orphan_aborts.add(task)
+        task.add_done_callback(_orphan_aborts.discard)
+
+
+def _assembly_refusal(
+    sha: str, part_count: int, result: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Why a multipart result must not be assembled, as the status to record.
+
+    Parts are signed for their length only, so the store would assemble
+    whatever same-sized bytes arrived under the digest's key. The runtime's
+    hash of what it sent catches a file that changed mid-upload before any
+    assembly, and a result without one (a runtime from before the hash) is
+    not trusted. It is the runtime's word, though, so the assembled object is
+    still read back before it counts as stored.
+    """
+    etags = result.get("etags") or []
+    if sorted(int(n) for n, _ in etags) != list(range(1, part_count + 1)):
+        return {**result, "status": "failed", "error": "multipart upload is missing parts"}
+    sent = result.get("sent_sha256")
+    if sent != sha:
+        return {
+            **result,
+            "status": "changed" if sent else "failed",
+            "error": "sent bytes do not match the digest"
+            if sent
+            else "runtime reported no digest for its parts",
+        }
+    return None
+
+
+async def _settle_multipart(
+    user_id: str,
+    uploads: dict[str, tuple[str, int]],
+    results: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Assemble the uploads whose parts landed as the digest's bytes, discard the rest.
+
+    Returns ``results`` with any digest whose object did not make it into the
+    store no longer saying ``ok``, so one status stays the whole truth about
+    a digest. An assembled object counts only once the server has hashed it
+    back: a digest names its bytes for every later sync and download link,
+    and the code that uploaded the parts runs as the workspace's user. Aborting is best effort and this reports when it fails: an
+    upload left open holds its parts as storage nothing lists and no registry
+    row references, which only the bucket's lifecycle rule reaps.
+    """
+    settled = dict(results)
+
+    async def _one(sha: str, upload: tuple[str, int]) -> None:
+        upload_id, part_count = upload
+        key = blob_key(user_id, sha)
+        result = settled.get(sha) or {}
+        etags = result.get("etags") if result.get("status") == "ok" else None
+        refusal = _assembly_refusal(sha, part_count, result) if etags else None
+        if refusal is not None:
+            settled[sha] = refusal
+            etags = None
+        if etags:
+            done = await asyncio.to_thread(
+                complete_multipart_upload,
+                key,
+                upload_id,
+                [(int(number), str(etag)) for number, etag in etags],
+            )
+            if done:
+                held = await asyncio.to_thread(sha256_object, key, transfer_timeout_s)
+                if held == sha:
+                    return
+                if held is not None:
+                    # Wrong bytes under a digest's name are worse than none:
+                    # a missing object is re-sent, a wrong one is trusted.
+                    logger.error(
+                        f"Assembled {key} hashes to {held}, not its digest; deleting it"
+                    )
+                    await asyncio.to_thread(delete_object, key)
+                # Unreadable is left unregistered, so the next sync sends it again.
+                settled[sha] = {
+                    **result,
+                    "status": "failed",
+                    "error": "assembled object does not match its digest"
+                    if held is not None
+                    else "assembled object could not be read back",
+                }
+                return
+            settled[sha] = {
+                **result,
+                "status": "failed",
+                "error": "multipart upload could not be assembled",
+            }
+        if not await asyncio.to_thread(abort_multipart_upload, key, upload_id):
+            logger.error(
+                f"Leaked multipart upload {upload_id} on {key}: its parts are "
+                f"stored and billed, and no listing shows them. The bucket's "
+                f"AbortIncompleteMultipartUpload rule is what will reap it"
+            )
+
+    # An upload whose sibling raised still has to be settled, so a failure
+    # here is reported rather than allowed to cancel the rest.
+    outcomes = await asyncio.gather(
+        *(_one(sha, uid) for sha, uid in uploads.items()),
+        return_exceptions=True,
+    )
+    for (sha, (upload_id, _)), outcome in zip(uploads.items(), outcomes):
+        if isinstance(outcome, BaseException):
+            logger.error(
+                f"Leaked multipart upload {upload_id} on "
+                f"{blob_key(user_id, sha)}: settling it raised {outcome!r}"
+            )
+            settled[sha] = {
+                **(settled.get(sha) or {}),
+                "status": "failed",
+                "error": f"multipart settle failed: {outcome!r}",
+            }
+    return settled
+
+
+async def _push_direct(
+    user_id: str,
+    workspace_id: str,
+    sandbox: Any,
+    entries: list[ScanEntry],
+    need: set[str],
+    *,
+    unlink_after: bool = False,
+    layout: WorkspaceLayout,
+) -> DirectPush | None:
+    """Presign an upload per missing digest and let the sandbox move the bytes.
+
+    ``None`` means the direct path was not usable at all (no presigning, or
+    the store unreachable from the sandbox); otherwise the digests the store
+    never answered for come back in ``unreachable``. Either way the caller
+    owns the fallback.
+    """
+    representative: dict[str, ScanEntry] = {}
+    for entry in entries:
+        if entry.sha256 in need and entry.sha256 not in representative:
+            representative[entry.sha256] = entry
+    total = sum(e.size for e in representative.values())
+    expires = transfer_timeout_s(total) + 60
+
+    # Every upload opened by the signing has to be settled whether the push
+    # returned, raised, or was cancelled, so the settle is the exit path
+    # rather than a step on it, and the signing sits inside it too: a
+    # cancellation landing between the two would otherwise strand them.
+    uploads: dict[str, tuple[str, int]] = {}
+    results: dict[str, dict[str, Any]] = {}
+    try:
+        signed = await _sign_push_items(
+            user_id,
+            workspace_id,
+            representative,
+            expires=expires,
+            unlink_after=unlink_after,
+        )
+        if signed is None:
+            return None
+        items, uploads, withheld = signed
+        results = {
+            **withheld,
+            **(await push_direct(sandbox, items, layout=layout) if items else {}),
+        }
+    finally:
+        results = await _settle_multipart(user_id, uploads, results)
+
     if all_unreachable(results):
         logger.warning(
             f"Sandbox for workspace {workspace_id} could not reach object "
@@ -207,7 +504,6 @@ async def _push_direct(
             f"workspace {workspace_id} could not reach object storage; "
             f"relaying those through the server"
         )
-
     ok = [
         (sha, representative[sha].size)
         for sha, r in results.items()
@@ -238,6 +534,7 @@ async def _relay_blobs(
     need: set[str],
     *,
     unlink_after: bool = False,
+    layout: WorkspaceLayout,
 ) -> tuple[set[str], set[str]]:
     """Copy missing digests through this process: download, hash, PUT."""
     representative: dict[str, ScanEntry] = {}
@@ -247,13 +544,30 @@ async def _relay_blobs(
 
     registered: set[str] = set()
     changed: set[str] = set()
-    sem = asyncio.Semaphore(RELAY_CONCURRENCY)
+    budget = ByteBudget(INPROCESS_MAX_INFLIGHT_BYTES, RELAY_CONCURRENCY)
 
     async def _one(sha: str, entry: ScanEntry) -> None:
-        async with sem:
+        if entry.size > RELAY_MAX_BYTES:
+            # The direct path caps nothing, so a file this large is normal
+            # until the store turns out to be unreachable and the push lands
+            # here instead. Downloading it would pull the whole thing into
+            # this process. Left unregistered, so the caller reports it
+            # unsaved as ``failed``, keeps the previous row, and the next sync
+            # retries: unlike a
+            # scan-time rejection this is a passing condition, not a limit
+            # the file will always exceed. Checked before the budget, since
+            # holding weight for bytes we refuse to move helps nobody.
+            logger.error(
+                f"Cannot relay {entry.path} for workspace {workspace_id}: "
+                f"{entry.size} bytes exceeds the {RELAY_MAX_BYTES} byte "
+                f"relay limit, and object storage was unreachable from "
+                f"the sandbox. Keeping the previous manifest row"
+            )
+            return
+        async with budget.hold(entry.size):
             try:
                 content = await sandbox.adownload_file_bytes(
-                    f"{sandbox.working_dir}/{entry.path}"
+                    _entry_abs_path(entry, layout)
                 )
                 if content is None:
                     changed.add(sha)
@@ -278,13 +592,17 @@ async def _relay_blobs(
 
     await asyncio.gather(*(_one(s, e) for s, e in representative.items()))
     if unlink_after:
-        await _unlink_chunks(sandbox, [e.path for e in entries], workspace_id)
+        await _unlink_chunks(
+            sandbox, [e.path for e in entries], workspace_id, layout
+        )
     return registered, changed
 
 
-async def _unlink_chunks(sandbox: Any, paths: list[str], workspace_id: str) -> None:
+async def _unlink_chunks(
+    sandbox: Any, paths: list[str], workspace_id: str, layout: WorkspaceLayout
+) -> None:
     try:
-        await unlink_direct(sandbox, paths)
+        await unlink_direct(sandbox, paths, layout=layout)
     except Exception as e:
         # Cosmetic: the next pack op sweeps what is left by age.
         logger.info(f"Could not remove pack chunks for {workspace_id}: {e}")
@@ -298,8 +616,9 @@ async def _persist_packed(
     existing: dict[str, dict[str, Any]],
     *,
     may_prune: bool = True,
-) -> tuple[list[dict[str, Any]], int, int]:
-    """Rows for every small file, via the pack set. Returns (rows, errors, skipped).
+    layout: WorkspaceLayout,
+) -> tuple[list[dict[str, Any]], list[UnsavedFile], int]:
+    """Rows for every small file, via the pack set. Returns (rows, unsaved, skipped).
 
     The pack set is rewritten whole whenever a member changed, appeared or
     left, so a workspace never trails half-dead chunks and a restore stays
@@ -336,11 +655,12 @@ async def _persist_packed(
                         e, db["pack_sha256"], db["pack_offset"], is_binary=db.get("is_binary")
                     )
                 )
-        return rows, 0, len(members)
+        return rows, [], len(members)
 
     out = await pack_direct(
         sandbox,
         [{"path": e.path, "sha256": e.sha256, "size": e.size} for e in members],
+        layout=layout,
     )
     chunks = out["chunks"]
     changed = set(out["changed"])
@@ -360,18 +680,30 @@ async def _persist_packed(
         )
         for c in chunks
     ]
+    # The chunks themselves belong to the machine, not to the project folder
+    # the members came from, so they push and unlink at the computer root;
+    # ``_entry_abs_path`` reads their absolute paths as such.
     chunk_rows, _ = await _persist_blobs(
-        user_id, workspace_id, sandbox, chunk_entries, unlink_after=True
+        user_id,
+        workspace_id,
+        sandbox,
+        chunk_entries,
+        unlink_after=True,
+        layout=_machine_layout(layout),
     )
     available = {r["blob_sha256"] for r in chunk_rows}
 
+    def unsaved_member(path: str, reason: UnsavedReason) -> UnsavedFile:
+        e = by_path.get(path)
+        return UnsavedFile(path, reason, e.size if e else None)
+
     rows = []
-    errors = len(changed)
+    unsaved = [unsaved_member(path, "changed") for path in sorted(changed)]
     for c in chunks:
         if c["sha256"] not in available:
             # The old rows survive, still pointing at the previous chunk,
             # which stays referenced and restorable; next sync retries.
-            errors += len(c["members"])
+            unsaved.extend(unsaved_member(m["path"], "failed") for m in c["members"])
             continue
         for m in c["members"]:
             e = by_path.get(m["path"])
@@ -389,63 +721,102 @@ async def _persist_packed(
         f"Packed {len(rows)} file(s) into {len(chunks)} chunk(s) "
         f"for workspace {workspace_id}"
     )
-    return rows, errors, 0
+    return rows, unsaved, 0
+
+
+def _batched_by_weight(
+    entries: list[ScanEntry], max_bytes: int, max_count: int
+) -> list[list[ScanEntry]]:
+    """Split entries into runs bounded by combined size and by count.
+
+    An entry heavier than the whole allowance gets a run to itself rather
+    than one that can never be filled.
+    """
+    batches: list[list[ScanEntry]] = []
+    run: list[ScanEntry] = []
+    weight = 0
+    for entry in entries:
+        size = max(int(entry.size or 0), 0)
+        if run and (len(run) >= max_count or weight + size > max_bytes):
+            batches.append(run)
+            run, weight = [], 0
+        run.append(entry)
+        weight += size
+    if run:
+        batches.append(run)
+    return batches
 
 
 async def _persist_inline(
-    workspace_id: str, sandbox: Any, entries: list[ScanEntry]
-) -> tuple[list[dict[str, Any]], int]:
-    """No object store: bytes go into the manifest row itself."""
-    rows: list[dict[str, Any]] = []
-    errors = 0
-    sem = asyncio.Semaphore(RELAY_CONCURRENCY)
+    workspace_id: str,
+    sandbox: Any,
+    entries: list[ScanEntry],
+    *,
+    layout: WorkspaceLayout,
+    conn: Any,
+) -> tuple[int, list[UnsavedFile]]:
+    """No object store: bytes go into the manifest row itself.
 
-    async def _one(entry: ScanEntry) -> dict[str, Any] | None:
-        async with sem:
-            try:
-                content = await sandbox.adownload_file_bytes(
-                    f"{sandbox.working_dir}/{entry.path}"
-                )
-                if content is None:
-                    return None
-                # The row describes the bytes it carries, so hash and size
-                # come from the download even if the scan saw an earlier
-                # version of the file.
-                content_hash = hashlib.sha256(content).hexdigest()
-                is_binary = _detect_is_binary(entry.path, content)
-                content_text = None
-                content_binary = None
-                if is_binary:
+    Written a batch at a time rather than gathered and upserted once, because
+    an inline row *is* its bytes: holding every row for one final write would
+    make the peak the whole changed working set, which is exactly what
+    bounding in-flight bytes is supposed to prevent. Each batch's rows are
+    released as soon as they are stored, so the bound is the batch.
+    """
+    synced = 0
+    unsaved: list[UnsavedFile] = []
+
+    async def _one(entry: ScanEntry) -> dict[str, Any] | UnsavedFile:
+        try:
+            content = await sandbox.adownload_file_bytes(
+                _entry_abs_path(entry, layout)
+            )
+            if content is None:
+                return UnsavedFile(entry.path, "changed", entry.size)
+            # The row describes the bytes it carries, so hash and size
+            # come from the download even if the scan saw an earlier
+            # version of the file.
+            content_hash = hashlib.sha256(content).hexdigest()
+            is_binary = _detect_is_binary(entry.path, content)
+            content_text = None
+            content_binary = None
+            if is_binary:
+                content_binary = content
+            else:
+                try:
+                    content_text = content.decode("utf-8")
+                except UnicodeDecodeError:
+                    is_binary = True
                     content_binary = content
-                else:
-                    try:
-                        content_text = content.decode("utf-8")
-                    except UnicodeDecodeError:
-                        is_binary = True
-                        content_binary = content
-                row = _row_base(entry)
-                mime, _ = mimetypes.guess_type(entry.path)
-                row.update(
-                    {
-                        "file_size": len(content),
-                        "content_hash": content_hash,
-                        "content_text": content_text,
-                        "content_binary": content_binary,
-                        "mime_type": mime,
-                        "is_binary": is_binary,
-                    }
-                )
-                return row
-            except Exception as e:
-                logger.warning(
-                    f"Error downloading file {entry.path} "
-                    f"for workspace {workspace_id}: {e}"
-                )
-                return None
+            row = _row_base(entry)
+            mime, _ = mimetypes.guess_type(entry.path)
+            row.update(
+                {
+                    "file_size": len(content),
+                    "content_hash": content_hash,
+                    "content_text": content_text,
+                    "content_binary": content_binary,
+                    "mime_type": mime,
+                    "is_binary": is_binary,
+                }
+            )
+            return row
+        except Exception as e:
+            logger.warning(
+                f"Error downloading file {entry.path} "
+                f"for workspace {workspace_id}: {e}"
+            )
+            return UnsavedFile(entry.path, "failed", entry.size)
 
-    for payload in await asyncio.gather(*(_one(e) for e in entries)):
-        if payload is None:
-            errors += 1
-        else:
-            rows.append(payload)
-    return rows, errors
+    for batch in _batched_by_weight(
+        entries, INPROCESS_MAX_INFLIGHT_BYTES, RELAY_CONCURRENCY
+    ):
+        rows: list[dict[str, Any]] = []
+        for payload in await asyncio.gather(*(_one(e) for e in batch)):
+            if isinstance(payload, UnsavedFile):
+                unsaved.append(payload)
+            else:
+                rows.append(payload)
+        if rows:
+            synced += await bulk_upsert_files(workspace_id, rows, conn=conn)
+    return synced, unsaved

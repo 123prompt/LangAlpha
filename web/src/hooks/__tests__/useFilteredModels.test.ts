@@ -505,6 +505,31 @@ describe('buildVisibleModels', () => {
     expect(result.customPairs.has('byok-variant::model-shared')).toBe(true);
   });
 
+  it('a shadowing custom entry is labeled by its own name, not the built-in it shadows', () => {
+    // The custom form's name is the label its author typed, and the entry may
+    // route to a different model_id than the built-in whose name it took, so
+    // the built-in's display_name must not follow it. What the model declares
+    // about itself still carries over.
+    const rawApiModels = {
+      'parent-prov': { models: ['model-shared', 'model-other'], display_name: 'Parent' },
+    };
+    const rawMetadata: Record<string, ModelMetadataEntry> = {
+      'model-shared': { provider: 'parent-prov', display_name: 'Model Shared', prompt_guidance: 'lean' },
+      'model-other': { provider: 'parent-prov', display_name: 'Model Other' },
+    };
+    const customModels = [
+      { name: 'model-shared', model_id: 'another-upstream-model', provider: 'byok-variant' },
+    ];
+
+    const result = buildVisibleModels(rawApiModels, rawMetadata, customModels, {}, null, []);
+
+    expect(result.metadata['model-shared'].display_name).toBeUndefined();
+    expect(result.metadata['model-shared'].prompt_guidance).toBe('lean');
+    expect(result.metadata['model-other'].display_name).toBe('Model Other');
+    // The API payload the metadata was copied from keeps its label.
+    expect(rawMetadata['model-shared'].display_name).toBe('Model Shared');
+  });
+
   it('platform mode: filters by tier, custom models pass', () => {
     const rawApiModels = {
       openai: { models: ['gpt-4o', 'gpt-4o-mini'], display_name: 'OpenAI' },

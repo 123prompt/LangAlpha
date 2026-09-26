@@ -5,12 +5,20 @@ Defines Pydantic models for creating, updating, listing, and viewing
 automations and their execution history.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from croniter import croniter
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 # =============================================================================
@@ -131,30 +139,94 @@ class DeliveryConfig(BaseModel):
 # =============================================================================
 
 
-class AutomationCreate(BaseModel):
+TriggerType = Literal["cron", "once", "price"]
+
+# The schedule field each kind of trigger reads, and reads alone.
+_SCHEDULE_FIELD: Dict[str, str] = {
+    "cron": "cron_expression",
+    "once": "next_run_at",
+    "price": "trigger_config",
+}
+
+
+def error_sentences(e: ValidationError) -> str:
+    """Each refusal as its field and the validator's own sentence, without the
+    framing, input dump and link that a ValidationError's str() adds."""
+    parts = []
+    for err in e.errors(include_url=False):
+        msg = err["msg"].removeprefix("Value error, ")
+        field = ".".join(str(p) for p in err["loc"])
+        parts.append(f"{field}: {msg}" if field else msg)
+    return "; ".join(parts)
+
+
+class _ScheduleFields(BaseModel):
+    """The schedule fields, which a create and an update check the same way."""
+
+    cron_expression: Optional[str] = Field(
+        None, description="Cron expression (required for trigger_type='cron')"
+    )
+    trigger_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Trigger parameters. Required for 'price' type (PriceTriggerConfig schema).",
+    )
+    next_run_at: Optional[datetime] = Field(
+        None,
+        description="Scheduled time for one-time triggers; one without an offset is UTC",
+    )
+
+    @field_validator("cron_expression")
+    @classmethod
+    def _cron_parses(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not croniter.is_valid(v):
+            raise ValueError(f"Invalid cron expression: '{v}'")
+        return v
+
+    @field_validator("trigger_config")
+    @classmethod
+    def _price_monitor_can_read(
+        cls, v: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        # The monitor skips a config it cannot parse without a word, so one
+        # stored unchecked leaves an alert that reads as watching and never
+        # fires. The config is stored as sent: the monitor parses it again.
+        if v is not None:
+            try:
+                PriceTriggerConfig(**v)
+            except ValidationError as e:
+                raise ValueError(f"Invalid price trigger config: {error_sentences(e)}")
+        return v
+
+    @field_validator("next_run_at")
+    @classmethod
+    def _utc_when_naive(cls, v: Optional[datetime]) -> Optional[datetime]:
+        return v.replace(tzinfo=UTC) if v is not None and v.tzinfo is None else v
+
+    def _refuse_other_kinds(self, kind: str) -> None:
+        # Refused rather than stored: a next_run_at on a price row would have
+        # the scheduler claim and fire it.
+        foreign = [
+            field for other, field in _SCHEDULE_FIELD.items()
+            if other != kind and getattr(self, field) is not None
+        ]
+        if foreign:
+            raise ValueError(
+                f"{', '.join(foreign)} doesn't apply to a '{kind}' automation"
+            )
+
+
+class AutomationCreate(_ScheduleFields):
     """Request model for creating an automation."""
 
     name: str = Field(..., max_length=255, description="Display name for the automation")
     description: Optional[str] = Field(None, description="Optional description")
 
     # Trigger
-    trigger_type: Literal["cron", "once", "price"] = Field(
+    trigger_type: TriggerType = Field(
         ..., description="'cron' for recurring, 'once' for one-time, 'price' for price-triggered"
-    )
-    cron_expression: Optional[str] = Field(
-        None, description="Cron expression (required for trigger_type='cron')"
     )
     timezone: str = Field(
         default="UTC", description="IANA timezone (e.g., 'America/New_York')"
-    )
-    trigger_config: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Trigger parameters. Required for 'price' type (PriceTriggerConfig schema).",
-    )
-
-    # Scheduling for one-time triggers
-    next_run_at: Optional[datetime] = Field(
-        None, description="Scheduled time for one-time triggers (UTC)"
     )
 
     # Agent config
@@ -198,24 +270,29 @@ class AutomationCreate(BaseModel):
         default=None, description="Arbitrary metadata"
     )
 
-    @field_validator("cron_expression")
-    @classmethod
-    def validate_cron_if_needed(cls, v, info):
-        # Actual cron validation done in handler (requires croniter import)
-        return v
+    @model_validator(mode="after")
+    def _schedule_fits_the_kind(self) -> "AutomationCreate":
+        field = _SCHEDULE_FIELD[self.trigger_type]
+        if getattr(self, field) is None:
+            raise ValueError(f"{field} is required for trigger_type='{self.trigger_type}'")
+        self._refuse_other_kinds(self.trigger_type)
+        return self
 
 
-class AutomationUpdate(BaseModel):
-    """Request model for partial update of an automation."""
+class AutomationUpdate(_ScheduleFields):
+    """Request model for partial update of an automation.
+
+    The kind of trigger is fixed at create, so the schedule fields are checked
+    against the stored kind, which the handler passes as the validation
+    context's ``trigger_type`` once it has read the row. ``trigger_type`` here
+    is accepted only to be refused when it differs from the stored one.
+    """
 
     name: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = None
 
-    # Trigger
-    cron_expression: Optional[str] = None
+    trigger_type: Optional[TriggerType] = None
     timezone: Optional[str] = None
-    trigger_config: Optional[Dict[str, Any]] = None
-    next_run_at: Optional[datetime] = None
 
     # Agent config
     agent_mode: Optional[Literal["ptc", "flash"]] = None
@@ -238,10 +315,59 @@ class AutomationUpdate(BaseModel):
     )
     metadata: Optional[Dict[str, Any]] = None
 
+    @model_validator(mode="after")
+    def _keeps_the_stored_kind(self, info: ValidationInfo) -> "AutomationUpdate":
+        kind = (info.context or {}).get("trigger_type")
+        if kind is None:
+            return self
+        if self.trigger_type not in (None, kind):
+            raise ValueError(
+                f"trigger_type can't change from '{kind}' to "
+                f"'{self.trigger_type}'; create a new automation instead"
+            )
+        self._refuse_other_kinds(kind)
+        return self
+
 
 # =============================================================================
 # Response Models
 # =============================================================================
+
+
+ExecutionStatus = Literal[
+    "pending", "waiting", "running", "completed", "failed", "timeout", "skipped"
+]
+# Why a ``skipped`` firing did not run to its end: someone skipped it or
+# stopped its run, its thread stayed busy (or an earlier firing was already
+# waiting), or the server stopped while it waited.
+SkipReason = Literal["user", "thread_busy", "interrupted"]
+# A ``failed`` firing the user has to act on: a usage limit refused it or
+# paused its run, or the provider rejected the user's own key.
+FailureReason = Literal["usage_limit", "provider_auth"]
+
+
+class AutomationExecutionResponse(BaseModel):
+    """One execution: a history row, and an automation's newest run."""
+
+    automation_execution_id: UUID
+    automation_id: UUID
+    # Open strings on the way out, whose known values are the Literals above:
+    # a build rolled back under rows a newer one wrote must still answer, and
+    # this row rides on every automation in the list.
+    status: str
+    conversation_thread_id: Optional[UUID] = None
+    scheduled_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    skip_reason: Optional[str] = None
+    failure_reason: Optional[str] = None
+    server_id: Optional[str] = None
+    delivery_result: Optional[List[Dict[str, Any]]] = None
+    created_at: datetime
+    excerpt: Optional[str] = None
+
+    model_config = {"from_attributes": True}
 
 
 class AutomationResponse(BaseModel):
@@ -272,12 +398,17 @@ class AutomationResponse(BaseModel):
     status: str
     max_failures: int
     failure_count: int
+    # Why the server switched a disabled automation off: 'provider_auth' (the
+    # provider rejected the user's own key) or 'max_failures'.
+    disable_reason: Optional[str] = None
 
     delivery_config: Optional[DeliveryConfig] = None
     metadata: Optional[Dict[str, Any]] = None
 
     created_at: datetime
     updated_at: datetime
+
+    last_execution: Optional[AutomationExecutionResponse] = None
 
     model_config = {"from_attributes": True}
 
@@ -289,26 +420,24 @@ class AutomationsListResponse(BaseModel):
     total: int
 
 
-class AutomationExecutionResponse(BaseModel):
-    """Response model for a single automation execution."""
-
-    automation_execution_id: UUID
-    automation_id: UUID
-    status: str
-    conversation_thread_id: Optional[UUID] = None
-    scheduled_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    error_message: Optional[str] = None
-    server_id: Optional[str] = None
-    delivery_result: Optional[List[Dict[str, Any]]] = None
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
 class AutomationExecutionsListResponse(BaseModel):
     """Response model for listing automation executions."""
 
     executions: List[AutomationExecutionResponse]
+    total: int
+
+
+class AutomationRunResponse(AutomationExecutionResponse):
+    """An execution in the user-wide run feed, with its automation's identity."""
+
+    automation_name: str
+    agent_mode: str
+    trigger_type: str
+    workspace_id: Optional[UUID] = None
+
+
+class AutomationRunsListResponse(BaseModel):
+    """Response model for the user-wide run feed."""
+
+    executions: List[AutomationRunResponse]
     total: int

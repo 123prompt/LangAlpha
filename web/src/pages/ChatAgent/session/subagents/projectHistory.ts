@@ -93,6 +93,7 @@ export function projectSubagentHistory(
           contentType: contentType as string,
           content: event.content as string,
           finishReason: event.finish_reason,
+          elapsedMs: typeof event.elapsed_ms === 'number' ? event.elapsed_ms : undefined,
           refs: tempRefs,
           updateSubagentCard: historyUpdateSubagentCard,
         });

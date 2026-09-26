@@ -42,6 +42,7 @@ from src.server.services.runs import (
     subagent_collection,
     teardown,
 )
+from src.server.services.runs.sse_producer import model_call_failure
 from src.server.services.runs.stream_writer import TransportLostError
 from src.server.dependencies.usage_limits import release_burst_slot
 
@@ -202,6 +203,40 @@ class LocalRunExecutor:
         except Exception:
             logger.warning(
                 f"Workspace activity probe failed for {workspace_id}; "
+                "treating as active",
+                exc_info=True,
+            )
+            return True
+
+    async def has_active_tasks_for_computer(
+        self, computer_id: str, *, workspace_id: str | None = None
+    ) -> bool:
+        """Whether any workspace bound to the computer still has work running.
+
+        What gates tearing a machine down, where ``has_active_tasks_for_workspace``
+        would answer for one project on it. ``workspace_id`` is the project the
+        caller already has in hand, used only for the cheap in-process
+        pre-check; the durable half spans the whole computer either way. Same
+        fail-closed contract: a probe failure counts as active.
+        """
+        if workspace_id is not None:
+            async with self.task_lock:
+                for info in self.executions.values():
+                    if (
+                        info.metadata.get("workspace_id") == workspace_id
+                        and info.status is LocalRunStatus.RUNNING
+                    ):
+                        return True
+        try:
+            from src.server.database.runs import subagent_runs as sr_db
+            from src.server.database.runs import lifecycle as tl_db
+
+            if await tl_db.computer_has_active_run(computer_id):
+                return True
+            return await sr_db.count_open_runs_for_computer(computer_id) > 0
+        except Exception:
+            logger.warning(
+                f"Computer activity probe failed for {computer_id}; "
                 "treating as active",
                 exc_info=True,
             )
@@ -497,6 +532,9 @@ class LocalRunExecutor:
                     cancel_event=task_info.cancel_event,
                 )
             )
+            task_info.task.add_done_callback(
+                lambda t, info=task_info: self._drop_finished_task(info, t)
+            )
             task_info.started_at = datetime.now()
 
             self.executions[key] = task_info
@@ -692,7 +730,9 @@ class LocalRunExecutor:
                 f"[LocalRunExecutor] Workflow {key} failed: {e}",
                 exc_info=True
             )
-            await self._finalize_run(thread_id, run_id, kind="failed", error=str(e))
+            await self._finalize_run(
+                thread_id, run_id, kind="failed", error=str(e), exc=e
+            )
 
     async def _flush_checkpoint(self, thread_id: str, run_id: str) -> None:
         """Resolve the run's graph and flush its checkpoint on user stop."""
@@ -895,6 +935,28 @@ class LocalRunExecutor:
         info.metadata.pop("run_handle", None)
         info.metadata.pop("artifact_hook", None)
 
+    @staticmethod
+    def _drop_finished_task(info: LocalRunExecution, task: asyncio.Task) -> None:
+        """Let go of the run's tasks once it finishes.
+
+        A task keeps its copied context alive, and with it every request-scoped
+        object that context references. The entry itself stays for the
+        result TTL, so holding the done task would pin all of that for as long.
+        Every reader already treats a missing task as a finished one.
+        """
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error(
+                f"[LocalRunExecutor] Run task ({info.thread_id}, {info.run_id}) "
+                f"ended with an unhandled error",
+                exc_info=exc,
+            )
+        if info.task is task:
+            info.task = None
+        # The inner task copied the same context; _release_terminal_refs
+        # only drops it when finalize concludes, so a failed finalize kept it.
+        if info.inner_task is not None and info.inner_task.done():
+            info.inner_task = None
+
     async def _finalize_run(
         self,
         thread_id: str,
@@ -902,6 +964,7 @@ class LocalRunExecutor:
         *,
         kind: Literal["stream_end", "cancelled", "failed"],
         error: Optional[str] = None,
+        exc: Optional[BaseException] = None,
     ):
         """Resolve the run's outcome in-band and drive the single finalize CAS.
 
@@ -950,6 +1013,18 @@ class LocalRunExecutor:
             workspace_id=workspace_id,
             user_id=user_id,
         )
+        if exc is not None:
+            persist_metadata = {
+                **persist_metadata,
+                **model_call_failure(
+                    exc,
+                    getattr(
+                        getattr(handler, "agent_config", None),
+                        "credential_source",
+                        None,
+                    ),
+                ),
+            }
 
         # ---- the single terminal transition ----
         # finalize_applied gates every terminal business effect below: losers

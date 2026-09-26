@@ -3,7 +3,7 @@ FastAPI application setup, initialization, and middleware configuration.
 
 This module contains:
 - Application lifespan management (startup/shutdown)
-- Global state initialization (agent_config, session_service, checkpointer)
+- Global state initialization (agent_config, workspace_manager, checkpointer)
 - Middleware setup (CORS, request ID)
 - Router registration
 """
@@ -16,6 +16,7 @@ This module contains:
 # async code runs to avoid "ProactorEventLoop" errors when opening connection pools.
 import sys
 import asyncio
+import gc
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -80,7 +81,6 @@ agent_config = None  # PTC Agent configuration (loaded from config files)
 # Plugins page keeps the live read, where showing an edited manifest at once
 # is the point. See services/plugins/bundled.enforcement_owners.
 bundle_owners = None
-session_service = None  # PTC Session service instance
 workspace_manager = None  # Workspace manager instance
 checkpointer = None  # PTC Agent LangGraph checkpointer for state persistence
 store = None  # LangGraph Store for cross-turn metadata persistence
@@ -170,7 +170,6 @@ async def lifespan(app: FastAPI):
     global \
         agent_config, \
         bundle_owners, \
-        session_service, \
         workspace_manager, \
         checkpointer, \
         store, \
@@ -264,6 +263,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Redis cache initialization failed: {e}")
         logger.warning("Server will continue without caching")
+
+    # Sandbox path writes take a Redis lease so the workers agree on one
+    # writer per file. Fails open when the cache is down (see the module).
+    from src.server.services.path_lock_coordination import install as install_path_lease
+
+    install_path_lease()
 
     # Pre-build market calendars so session lookups never build on a request path
     try:
@@ -371,23 +376,12 @@ async def lifespan(app: FastAPI):
         llm_service = LLMService(agent_config=agent_config, logger=logger)
         logger.info("LLMService initialized")
 
-        # Initialize session service
+        # Initialize workspace manager
         # Derive idle timeout from Daytona auto-stop so the server cleans up
         # *before* Daytona kills the sandbox (10-min buffer, 5-min floor).
         daytona_auto_stop = agent_config.daytona.auto_stop_interval  # seconds
         server_idle_timeout = max(daytona_auto_stop - 600, 300)
 
-        from src.server.services.session_manager import SessionService
-
-        session_service = SessionService.get_instance(
-            config=agent_config,
-            idle_timeout=server_idle_timeout,
-            cleanup_interval=300,  # 5 minutes
-        )
-        await session_service.start_cleanup_task()
-        logger.info("PTC Session Service initialized")
-
-        # Initialize workspace manager
         from src.server.services.workspace_manager import WorkspaceManager
 
         workspace_manager = WorkspaceManager.get_instance(
@@ -500,12 +494,13 @@ async def lifespan(app: FastAPI):
     # slots leaking).
     from src.server.services.report_back import subagent
     from src.server.services.report_back.flash import core as flash_core
-    from src.server.services import thread_lifecycle_feed
+    from src.server.services import automation_settlement, thread_lifecycle_feed
     from src.server.services.hook_outbox import HookOutboxDrainer
 
     flash_core.register_outbox_executors()
     subagent.register_outbox_executors()
     thread_lifecycle_feed.register_outbox_executors()
+    automation_settlement.register_outbox_executors()
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
@@ -599,6 +594,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start NewsRefreshService: {e}")
 
+    # Start OrderReconciler (asks each brokerage what became of an open order)
+    try:
+        from src.server.services.orders import OrderReconciler
+
+        OrderReconciler.get_instance().start()
+    except Exception as e:
+        logger.warning(f"Failed to start OrderReconciler: {e}")
+
     # Start ProvenanceGCService (daily mark-sweep of orphaned result bodies)
     try:
         from src.server.services.provenance_gc import ProvenanceGCService
@@ -617,6 +620,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start WorkspaceFileGCService: {e}")
 
+    # A multipart upload the process died holding is never aborted by us;
+    # only the bucket's own expiry rule reclaims its parts. The check only
+    # feeds a warning, so an unresponsive store must not hold up startup.
+    try:
+        from src.utils.storage import has_multipart_cleanup_rule
+
+        if (
+            await asyncio.wait_for(
+                asyncio.to_thread(has_multipart_cleanup_rule), timeout=5
+            )
+            is False
+        ):
+            logger.warning(
+                "Storage bucket has no rule expiring incomplete multipart uploads; "
+                "parts of an upload interrupted mid-transfer will be kept and billed. "
+                "Add an AbortIncompleteMultipartUpload lifecycle rule (e.g. 1 day)."
+            )
+    except Exception as e:
+        logger.info(f"Skipped the multipart cleanup rule check: {e!r}")
+
     # Confirm the runtime credit gate can reach its lease service, and on
     # terms its refresher can work with. Both failures it catches are silent
     # at request time.
@@ -626,6 +649,18 @@ async def lifespan(app: FastAPI):
         await verify_credit_gate_wiring()
     except Exception as e:
         logger.warning(f"Credit gate wiring check failed: {e}")
+
+    from src.server.auth.jwt_bearer import warm_jwks
+
+    await warm_jwks()
+
+    # Startup leaves ~700k import-time objects (pydantic schemas, routes,
+    # module state) that never die, and every full collection re-walks them
+    # while the loop is frozen. Freezing moves them out of the collector for
+    # good; the collect first keeps startup garbage from being frozen with them.
+    gc.collect()
+    gc.freeze()
+    logger.info(f"Froze {gc.get_freeze_count()} startup objects out of the GC")
 
     yield  # Server is running
 
@@ -697,6 +732,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error shutting down NewsRefreshService: {e}")
 
+    # 0.2b. Shutdown OrderReconciler
+    try:
+        from src.server.services.orders import OrderReconciler
+
+        await OrderReconciler.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error shutting down OrderReconciler: {e}")
+
     # 0.3. Shutdown MarketInsightService
     try:
         from src.server.services.insight_service import InsightService
@@ -746,11 +789,11 @@ async def lifespan(app: FastAPI):
             # Drain in-flight warm tasks first so a task cancelled mid-Phase-2
             # reverts its 'starting' row to 'stopped' (CancelledError revert)
             # instead of being torn down abruptly and left wedged.
-            from src.server.app.workspaces import drain_warm_tasks
+            from src.server.app.background_starts import drain_start_tasks
 
-            await drain_warm_tasks()
+            await drain_start_tasks()
         except Exception as e:
-            logger.warning(f"Error draining warm tasks: {e}")
+            logger.warning(f"Error draining background starts: {e}")
         try:
             logger.info("Shutting down Workspace Manager...")
             await workspace_manager.shutdown()
@@ -758,14 +801,16 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Error during Workspace Manager shutdown: {e}")
 
-    # 4. Shutdown PTC Session Service (stop sandboxes)
-    if session_service is not None:
-        try:
-            logger.info("Shutting down PTC Session Service...")
-            await session_service.shutdown()
-            logger.info("PTC Session Service shutdown complete")
-        except Exception as e:
-            logger.warning(f"Error during PTC Session Service shutdown: {e}")
+    # 4. Forget this worker's PTC handles. A sibling worker may still be using
+    # the same computer, so process shutdown must not stop the shared sandbox.
+    try:
+        from ptc_agent.core.session import SessionManager
+
+        logger.info("Detaching PTC sessions...")
+        SessionManager.detach_all()
+        logger.info("PTC sessions detached")
+    except Exception as e:
+        logger.warning(f"Error stopping PTC sessions: {e}")
 
     # 4.5. Drop the global MCP registry reference (frozen snapshot — no
     # subprocesses to terminate). Hygiene only.
@@ -793,6 +838,16 @@ async def lifespan(app: FastAPI):
         logger.info("HookOutboxDrainer stopped")
     except Exception as e:
         logger.warning(f"Error stopping HookOutboxDrainer: {e}")
+
+    # Then the automation settlements still sending their webhooks, now that
+    # every settler (scheduler, price monitor, drainer) has stopped and before
+    # the pools they write to close: a settled row is never found again.
+    try:
+        from src.server.services.automation_settlement import drain_tails
+
+        await drain_tails()
+    except Exception as e:
+        logger.warning(f"Error draining automation settlements: {e}")
 
     # 6c. Close the writer-guard pool AFTER BTM shutdown: the final
     # finalizes run on pinned guard sessions checked out of this pool.
@@ -987,8 +1042,23 @@ class MalformedIdDiagnosticMiddleware:
         await self.app(scope, receive, send)
 
 
+class _GZipExceptFileDownloads(GZipMiddleware):
+    """GZip, except the workspace file download.
+
+    That body is the file's own bytes, often already compressed, and can be
+    gigabytes streamed from a sandbox: compressing it spends a worker's CPU
+    for little, and drops the Content-Length the client's progress bar needs.
+    """
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].endswith("/files/download"):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 # Register GZip compression middleware (compresses JSON responses >= 1KB)
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(_GZipExceptFileDownloads, minimum_size=1000)
 
 # TEMP (malformed-id-diag): log malformed workspace/thread ids + Referer so the next
 # real prod occurrence names the SPA route that built the bad request.
@@ -1066,6 +1136,7 @@ from src.server.app.threads import router as threads_router
 from src.server.app.sessions import router as sessions_router
 from src.server.app.cache import router as cache_router
 from src.server.app.utilities import health_router
+from src.server.app.computers import router as computers_router
 from src.server.app.workspaces import router as workspaces_router
 from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
@@ -1086,7 +1157,9 @@ from src.server.app.api_keys import router as api_keys_router
 from src.server.app.automations import router as automations_router
 from src.server.app.insights import router as insights_router
 from src.server.app.oauth import router as oauth_router
+from src.server.app.orders import router as orders_router
 from src.server.app.public import router as public_router
+from src.server.app.share_links import router as share_links_router
 from src.server.app.skills import router as skills_router
 from src.server.app.skills import workspace_router as workspace_skills_router
 from src.server.app.vault import router as vault_router
@@ -1095,6 +1168,9 @@ from src.server.app.memory import router as memory_router
 from src.server.app.workflows import include_workflow_router
 from src.server.app.egress_relay import router as egress_relay_router
 from src.server.app.mcp_catalog import router as mcp_catalog_router
+from src.server.app.mcp_brokerages import router as mcp_brokerages_router
+from src.server.app.mcp_builtin import router as mcp_builtin_router
+from src.server.app.mcp_icons import router as mcp_icons_router
 from src.server.app.mcp_oauth import router as mcp_oauth_router
 from src.server.app.plugins import router as plugins_router
 from src.server.app.user_vault import router as user_vault_router
@@ -1124,6 +1200,9 @@ else:
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
 app.include_router(workspaces_router)  # /api/v1/workspaces/* - Workspace CRUD
+app.include_router(
+    computers_router
+)  # /api/v1/computers/* - Computer lifecycle (the workspace routes alias these)
 app.include_router(
     workspace_files_router
 )  # /api/v1/workspaces/{id}/files/* - Live file access
@@ -1163,8 +1242,14 @@ app.include_router(
 app.include_router(insights_router)  # /api/v1/insights/* - AI market insights
 app.include_router(oauth_router)  # /api/v1/oauth/* - OAuth provider connections (Codex)
 app.include_router(
+    orders_router
+)  # /api/v1/orders/* - Order attempt ledger (read-only, user-scoped)
+app.include_router(
     public_router
 )  # /api/v1/public/* - Public shared thread access (no auth)
+app.include_router(
+    share_links_router
+)  # /api/v1/workspaces/{id}/share-links, file-grant - Owner share links
 app.include_router(skills_router)  # /api/v1/skills - Available agent skills
 app.include_router(
     workspace_skills_router
@@ -1183,6 +1268,15 @@ app.include_router(
     mcp_catalog_router
 )  # /api/v1/mcp/servers - User-level MCP servers (Plugins backing store)
 app.include_router(
+    mcp_builtin_router
+)  # /api/v1/mcp/builtin-servers - This build's own MCP servers, per-user toggle
+app.include_router(
+    mcp_brokerages_router
+)  # /api/v1/mcp/brokerages - Shipped brokerage connectors
+app.include_router(
+    mcp_icons_router
+)  # /api/v1/mcp/server-icons/{handle} - Marks MCP servers declare, proxied
+app.include_router(
     mcp_oauth_router
 )  # /api/v1/mcp/servers/{name}/oauth + /api/v1/mcp/oauth/callback - MCP OAuth
 app.include_router(
@@ -1200,10 +1294,10 @@ app.include_router(
 app.include_router(health_router)  # /health - Health check
 app.include_router(
     preview_redirect_router
-)  # /api/v1/preview/{workspace_id}/{port} - Unauthenticated preview URL redirect
+)  # /api/v1/preview/{workspace_id}/{port} - Old preview URLs, redirected to /a/<code>
 app.include_router(
     wsfiles_router
-)  # /api/v1/wsfiles/{workspace_id}/{path} - Unauthenticated path-style file serving
+)  # /api/v1/wsfiles/g/{grant}/{path} - Grant-gated path-style file serving
 
 app.include_router(
     market_data_ws_router

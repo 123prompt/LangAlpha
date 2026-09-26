@@ -14,6 +14,7 @@ from src.server.contracts.status import (
 )
 from src.server.database import pool
 from src.server.database.conversation import _sql, errors
+from src.server.database.share_codes import mint_share_code
 from src.server.utils.pg_sanitize import normalize_uuid
 
 logger = logging.getLogger(__name__)
@@ -768,17 +769,19 @@ async def stamp_thread_seen(
 async def update_thread_sharing(
     conversation_thread_id: str,
     is_shared: bool,
-    share_token: Optional[str] = None,
     share_permissions: Optional[Dict[str, Any]] = None,
     shared_at: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update sharing settings for a thread.
 
+    Sharing mints the token in the same statement, and only where there is
+    none: the URL a thread was first shared under survives a stop and a
+    re-share, and two shares racing on different workers agree on one token.
+
     Args:
         conversation_thread_id: Thread ID
         is_shared: Whether the thread is publicly shared
-        share_token: Opaque share token (set on first enable)
         share_permissions: Permission dict e.g. {"allow_files": false, "allow_download": false}
         shared_at: Timestamp of last enable
     """
@@ -788,9 +791,9 @@ async def update_thread_sharing(
                 sets = ["is_shared = %s", "updated_at = NOW()"]
                 params: list = [is_shared]
 
-                if share_token is not None:
-                    sets.append("share_token = %s")
-                    params.append(share_token)
+                if is_shared:
+                    sets.append("share_token = COALESCE(share_token, %s)")
+                    params.append(mint_share_code())
 
                 if share_permissions is not None:
                     sets.append("share_permissions = %s")

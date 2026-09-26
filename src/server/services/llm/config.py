@@ -102,6 +102,11 @@ def select_model(
                 f"[CHAT] No {pref_key} set, using system default: {getattr(config.llm, model_field, None) or config.llm.name}"
             )
 
+    # A PTC turn never runs the flash model, but the fetch role still defaults
+    # to it, so the user's flash choice has to reach ``llm.flash`` here too.
+    if mode != "flash" and model_pref.get("preferred_flash_model"):
+        config.llm.flash = model_pref["preferred_flash_model"]
+
     # Both "compaction_model" (new) and "summarization_model" (legacy) map to
     # the renamed ``compaction`` field; legacy is read so existing rows keep
     # working. Order matters: legacy first, so the new key wins when both are set.

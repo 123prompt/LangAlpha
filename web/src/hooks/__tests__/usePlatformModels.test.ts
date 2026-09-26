@@ -46,10 +46,23 @@ describe('usePlatformModels', () => {
     const { result } = renderHookWithProviders(() => usePlatformModels());
 
     await waitFor(() => {
-      expect(result.current).toEqual(payload);
+      expect(result.current.platform).toEqual(payload);
     });
 
     expect(mockGet).toHaveBeenCalledWith('/api/auth/models');
+  });
+
+  it('reports loading until the access answer arrives, then stops on either outcome', async () => {
+    let answer!: (v: { data: PlatformModelsResponse }) => void;
+    mockGet.mockReturnValue(new Promise((r) => { answer = r; }));
+
+    const { result } = renderHookWithProviders(() => usePlatformModels());
+    // Pending reads the same as fail-open (`platform` null), so only
+    // `isLoading` tells a caller the locked models are not known yet.
+    expect(result.current).toEqual({ platform: null, isLoading: true });
+
+    answer({ data: { model_tier: 1, byok_providers: [], oauth_providers: [] } });
+    await waitFor(() => { expect(result.current.isLoading).toBe(false); });
   });
 
   it('returns null on network error (fail-open)', async () => {
@@ -60,7 +73,7 @@ describe('usePlatformModels', () => {
     // Should stay null — the hook never throws
     await waitFor(() => {
       // Give React Query time to process the error
-      expect(result.current).toBeNull();
+      expect(result.current.platform).toBeNull();
     });
   });
 
@@ -73,7 +86,7 @@ describe('usePlatformModels', () => {
     const { result } = renderHookWithProviders(() => usePlatformModels());
 
     await waitFor(() => {
-      expect(result.current).toBeNull();
+      expect(result.current.platform).toBeNull();
     });
   });
 });

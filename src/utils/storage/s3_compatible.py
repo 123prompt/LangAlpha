@@ -21,6 +21,10 @@ Environment Variables:
     STORAGE_READ_TIMEOUT_S    - boto3 read timeout in seconds (default: 30)
     STORAGE_MAX_POOL_CONNECTIONS - boto3 connection pool size (default: 32)
     STORAGE_ADDRESSING_STYLE  - Bucket addressing: virtual (default) | path | auto
+    STORAGE_BROWSER_ENDPOINT_URL - Endpoint browsers reach for signed download
+                                   links, when it differs from STORAGE_ENDPOINT_URL
+    STORAGE_KEY_PREFIX        - Namespace for every key this process stores, for
+                                environments that share one bucket (default: none)
 
 Endpoint / addressing:
     AWS S3:        No endpoint needed, just credentials + bucket + region
@@ -33,12 +37,23 @@ Most cloud S3-compatible services use virtual-hosted addressing (the default);
 self-hosted / path-only backends (e.g. MinIO) require STORAGE_ADDRESSING_STYLE=path.
 For a custom endpoint, give the bare host with no bucket subdomain — embedding the
 bucket double-prefixes object keys under virtual addressing.
+
+Multipart uploads:
+    An upload opened and never completed keeps its parts as storage that no
+    listing shows. This module aborts on every failure it can see, but that
+    is a cost optimisation, not the guarantee: a process that dies mid-upload
+    aborts nothing. The bucket's own AbortIncompleteMultipartUpload lifecycle
+    rule is what actually reaps them, and it is required configuration. R2
+    applies one after 7 days by default; S3 has none until you add it.
 """
 
 import base64
+import hashlib
 import logging
 import os
 import threading
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +63,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from src.utils.mime import resolve_content_type
+from src.utils.storage.key_prefix import KEY_PREFIX, full_key
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +101,10 @@ class StorageConfig:
     REGION = os.getenv("STORAGE_REGION") or os.getenv("S3_REGION", "us-east-1")
     ENDPOINT_URL = os.getenv("STORAGE_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL")
     PUBLIC_URL_BASE = os.getenv("STORAGE_PUBLIC_URL_BASE") or os.getenv("S3_PUBLIC_URL_BASE")
+    # The endpoint a browser reaches the store at, when it differs from the
+    # one this process uses (a MinIO addressed by its compose service name).
+    # Links handed to a browser are signed for this host instead.
+    BROWSER_ENDPOINT_URL = os.getenv("STORAGE_BROWSER_ENDPOINT_URL")
     MAX_UPLOAD_SIZE = int(os.getenv("STORAGE_MAX_UPLOAD_SIZE", str(10 * 1024 * 1024)))
 
     DEFAULT_IMAGE_PREFIX = os.getenv("STORAGE_DEFAULT_IMAGE_PREFIX", "images/")
@@ -127,6 +147,7 @@ class StorageConfig:
 # happen exactly once; the unlocked fast path keeps the steady state free.
 _CLIENT: Any | None = None
 _RANGE_CLIENT: Any | None = None
+_BROWSER_CLIENT: Any | None = None
 _CLIENT_MU = threading.Lock()
 
 
@@ -160,7 +181,22 @@ def _get_range_client() -> Any:
     return _RANGE_CLIENT
 
 
-def _build_client(**config_overrides: Any) -> Any:
+def _get_browser_client() -> Any:
+    """The client that signs links a browser follows; signing makes no request."""
+    if not StorageConfig.BROWSER_ENDPOINT_URL:
+        return _get_client()
+    global _BROWSER_CLIENT
+    if _BROWSER_CLIENT is not None:
+        return _BROWSER_CLIENT
+    with _CLIENT_MU:
+        if _BROWSER_CLIENT is None:
+            _BROWSER_CLIENT = _build_client(
+                endpoint_url=StorageConfig.BROWSER_ENDPOINT_URL
+            )
+    return _BROWSER_CLIENT
+
+
+def _build_client(*, endpoint_url: str | None = None, **config_overrides: Any) -> Any:
     kwargs: dict[str, Any] = {
         "aws_access_key_id": StorageConfig.ACCESS_KEY_ID,
         "aws_secret_access_key": StorageConfig.SECRET_ACCESS_KEY,
@@ -175,17 +211,28 @@ def _build_client(**config_overrides: Any) -> Any:
             **config_overrides,
         ),
     }
-    if StorageConfig.ENDPOINT_URL:
-        kwargs["endpoint_url"] = StorageConfig.ENDPOINT_URL
-    return boto3.client("s3", **kwargs)
+    if endpoint_url or StorageConfig.ENDPOINT_URL:
+        kwargs["endpoint_url"] = endpoint_url or StorageConfig.ENDPOINT_URL
+    client = boto3.client("s3", **kwargs)
+    if KEY_PREFIX:
+        # On the client rather than at each call, so no operation, presigned
+        # or not, can reach the bucket outside the namespace.
+        client.meta.events.register("before-parameter-build.s3", _prefix_object_key)
+    return client
+
+
+def _prefix_object_key(params: dict[str, Any], **_: Any) -> None:
+    if "Key" in params:
+        params["Key"] = full_key(params["Key"])
 
 
 def _reset_client_for_test() -> None:
     """Drop the cached clients. Test-only — production never re-initializes."""
-    global _CLIENT, _RANGE_CLIENT
+    global _CLIENT, _RANGE_CLIENT, _BROWSER_CLIENT
     with _CLIENT_MU:
         _CLIENT = None
         _RANGE_CLIENT = None
+        _BROWSER_CLIENT = None
 
 
 def upload_file(key: str, file_path: str, content_type: str | None = None) -> bool:
@@ -366,7 +413,7 @@ def delete_object(key: str) -> bool:
 
 def get_public_url(key: str) -> str:
     """Get the public URL for an uploaded object."""
-    return f"{StorageConfig.get_public_url_base()}/{key}"
+    return f"{StorageConfig.get_public_url_base()}/{full_key(key)}"
 
 
 def get_signed_upload_url(
@@ -409,13 +456,183 @@ def get_signed_upload_url(
     }
 
 
-def get_signed_url(key: str, expires_in: int = 3600) -> str | None:
-    """Generate a pre-signed URL for temporary access."""
+# The store's own multipart limits, and the part size chosen against them.
+# Every part but the last must be at least _MIN_PART_BYTES and they must all
+# be the same size for stores that require uniform parts, so one size is
+# picked here and the last part is whatever remains. _TARGET_PART_BYTES is
+# what a retry costs and what a stalled request has to move before its socket
+# timeout; it only grows for an object too large to fit _MAX_PARTS at that
+# size, which is the one case where the store's ceiling binds first.
+_MIN_PART_BYTES = 5 * 1024 * 1024
+_MAX_PARTS = 10_000
+_TARGET_PART_BYTES = 64 * 1024 * 1024
+
+
+def create_signed_multipart_upload(
+    key: str,
+    *,
+    content_length: int,
+    content_type: str,
+    expires_in: int = 900,
+) -> tuple[str, list[dict[str, Any]]] | None:
+    """Open a multipart upload and presign one PUT per part.
+
+    Returns ``(upload_id, parts)``, each part carrying its number, URL and
+    byte length, or ``None`` when the object is not worth splitting or the
+    store refused; the caller's single-PUT signature covers both. Unlike
+    :func:`get_signed_upload_url`, nothing here binds the object to its
+    digest: multipart offers only a checksum-of-checksums for SHA-256, and
+    the per-part digests are not known at signing time. Each part's length is
+    signed, so an uploader cannot write more than it was granted, and the
+    digest a reader checks against the key is verified when the bytes are
+    read back.
+    """
+    part_size = max(_MIN_PART_BYTES, _TARGET_PART_BYTES, -(-content_length // _MAX_PARTS))
+    if content_length <= part_size:
+        # One part is a PUT with extra steps, and a zero-length one is
+        # rejected outright. The caller's single-PUT signature covers this.
+        return None
+    part_count = -(-content_length // part_size)
     try:
         client = _get_client()
+        created = client.create_multipart_upload(
+            Bucket=StorageConfig.BUCKET_NAME, Key=key, ContentType=content_type
+        )
+        upload_id = created["UploadId"]
+    except Exception as e:
+        logger.error(f"Failed to open a multipart upload for {key}: {e}")
+        return None
+
+    parts: list[dict[str, Any]] = []
+    try:
+        for number in range(1, part_count + 1):
+            offset = (number - 1) * part_size
+            size = min(part_size, content_length - offset)
+            url = client.generate_presigned_url(
+                "upload_part",
+                Params={
+                    "Bucket": StorageConfig.BUCKET_NAME,
+                    "Key": key,
+                    "UploadId": upload_id,
+                    "PartNumber": number,
+                    "ContentLength": size,
+                },
+                ExpiresIn=expires_in,
+            )
+            parts.append(
+                {"part_number": number, "offset": offset, "size": size, "url": url}
+            )
+    except Exception as e:
+        # Nothing has been uploaded yet, but the open upload would sit as an
+        # invisible partial object until a lifecycle rule reaped it.
+        logger.error(f"Failed to presign multipart parts for {key}: {e}")
+        abort_multipart_upload(key, upload_id)
+        return None
+    return upload_id, parts
+
+
+def complete_multipart_upload(
+    key: str, upload_id: str, parts: list[tuple[int, str]]
+) -> bool:
+    """Assemble an uploaded multipart into its object. ``parts`` is (number, etag)."""
+    try:
+        client = _get_client()
+        client.complete_multipart_upload(
+            Bucket=StorageConfig.BUCKET_NAME,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={
+                "Parts": [
+                    {"PartNumber": number, "ETag": etag}
+                    for number, etag in sorted(parts)
+                ]
+            },
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to complete multipart upload for {key}: {e}")
+        return False
+
+
+def sha256_object(
+    key: str, deadline_for: Callable[[int], float] | None = None
+) -> str | None:
+    """Hash the bytes the store holds under ``key``, streamed. ``None`` if unreadable.
+
+    The store checks a multipart part for its length only, so reading the
+    assembled object back is the one way to learn what it actually holds.
+    The SDK's own checksum check is off, as for a range: this is that check.
+    ``deadline_for`` maps the object's size to seconds for the whole read:
+    the socket timeout only catches a store gone silent, not one that
+    trickles, and this runs in a thread nothing can cancel.
+    """
+    body = None
+    try:
+        response = _get_range_client().get_object(
+            Bucket=StorageConfig.BUCKET_NAME, Key=key
+        )
+        body = response["Body"]
+        ends = None
+        if deadline_for is not None:
+            ends = time.monotonic() + deadline_for(int(response["ContentLength"]))
+        digest = hashlib.sha256()
+        for chunk in body.iter_chunks(chunk_size=64 * 1024):
+            if ends is not None and time.monotonic() > ends:
+                raise TimeoutError("read-back passed its deadline")
+            digest.update(chunk)
+        return digest.hexdigest()
+    except Exception as e:
+        logger.error(f"Failed to read back {key}: {e}")
+        return None
+    finally:
+        if body is not None:
+            body.close()
+
+
+def abort_multipart_upload(key: str, upload_id: str) -> bool:
+    """Discard an unfinished multipart upload and the parts already stored.
+
+    Returns whether the store agreed. An upload left open holds its parts as
+    an object nothing lists and no registry row references, so a caller that
+    cannot reach this, or gets ``False`` back, has leaked storage that only
+    the bucket's lifecycle rule will reap.
+    """
+    try:
+        client = _get_client()
+        client.abort_multipart_upload(
+            Bucket=StorageConfig.BUCKET_NAME, Key=key, UploadId=upload_id
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Failed to abort multipart upload for {key}: {e}")
+        return False
+
+
+def get_signed_url(
+    key: str,
+    expires_in: int = 3600,
+    *,
+    content_disposition: str | None = None,
+    content_type: str | None = None,
+    for_browser: bool = False,
+) -> str | None:
+    """Generate a pre-signed URL for temporary access.
+
+    ``content_disposition`` and ``content_type`` override the stored object's
+    headers on the response, so a content-addressed object can be handed to a
+    browser under its user-facing name and type. ``for_browser`` signs for
+    ``STORAGE_BROWSER_ENDPOINT_URL`` when one is set.
+    """
+    params: dict[str, Any] = {"Bucket": StorageConfig.BUCKET_NAME, "Key": key}
+    if content_disposition:
+        params["ResponseContentDisposition"] = content_disposition
+    if content_type:
+        params["ResponseContentType"] = content_type
+    try:
+        client = _get_browser_client() if for_browser else _get_client()
         return client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": StorageConfig.BUCKET_NAME, "Key": key},
+            Params=params,
             ExpiresIn=expires_in,
         )
     except ClientError as e:
@@ -471,6 +688,30 @@ def sanitize_storage_key(name: str, data_url: str | None = None) -> str:
     if ext and not safe.lower().endswith(ext):
         safe = f"{safe}{ext}"
     return safe
+
+
+def has_multipart_cleanup_rule() -> bool | None:
+    """Whether the bucket expires multipart uploads nobody finished.
+
+    ``None`` when the store would not say (no permission, or an API that does
+    not serve lifecycle config). An upload whose abort never ran, because the
+    process died between opening it and settling it, holds its parts as bytes
+    nothing lists; only this rule ever reclaims them.
+    """
+    try:
+        config = _get_client().get_bucket_lifecycle_configuration(
+            Bucket=StorageConfig.BUCKET_NAME
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "NoSuchLifecycleConfiguration":
+            return False
+        return None
+    except Exception:
+        return None
+    return any(
+        rule.get("Status") == "Enabled" and "AbortIncompleteMultipartUpload" in rule
+        for rule in config.get("Rules", [])
+    )
 
 
 def verify_connection() -> bool:

@@ -24,6 +24,7 @@ from typing import Any
 import structlog
 
 from ptc_agent.agent.backends.langgraph_store import lock_for_namespace
+from ptc_agent.agent.backends.results import EditTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from src.server.services import user_data_io as io
 
@@ -363,7 +364,7 @@ class UserDataBackend:
         new_string: str,
         *,
         replace_all: bool = False,
-    ) -> dict[str, Any]:
+    ) -> EditTextResult:
         filename = self._filename(file_path)
         if filename is None:
             return {"success": False, "error": f"File not found: {file_path}"}
@@ -419,6 +420,7 @@ class UserDataBackend:
         return {
             "success": True,
             "occurrences": occurrences if replace_all else 1,
+            "size": len(new_content),
             "message": (
                 f"Edited {file_path} ({occurrences} occurrences replaced)"
                 if replace_all

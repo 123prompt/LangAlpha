@@ -12,17 +12,29 @@
 import { QueryClient } from '@tanstack/react-query';
 
 import { queryKeys } from '@/lib/queryKeys';
+import type { ComputersResponse, Workspace, WorkspacesResponse } from '@/types/api';
 
 import { getWorkspace, startWorkspace } from './api';
 
-interface WorkspaceLike {
-  workspace_id?: string;
-  id?: string;
-  status?: string;
-  [key: string]: unknown;
-}
-
 const inFlight = new Map<string, Promise<void>>();
+
+/**
+ * Every workspace the list caches currently hold, across pages and sort orders.
+ *
+ * The one place that knows the shape those entries have, so a reader asking
+ * "what does the app believe about the workspaces right now" does not sniff a
+ * cache value or cast it.
+ */
+export function cachedWorkspaceLists(queryClient: QueryClient): Workspace[] {
+  const rows: Workspace[] = [];
+  const entries = queryClient.getQueriesData<WorkspacesResponse>({
+    queryKey: queryKeys.workspaces.lists(),
+  });
+  for (const [, data] of entries) {
+    if (data?.workspaces) rows.push(...data.workspaces);
+  }
+  return rows;
+}
 
 /**
  * Write `status` into both the workspace detail cache and any active
@@ -35,29 +47,58 @@ export function patchWorkspaceStatusInCaches(
   queryClient: QueryClient,
   workspaceId: string,
   status: string,
+  computerId?: string,
 ): void {
-  queryClient.setQueryData<WorkspaceLike | undefined>(
+  queryClient.setQueryData<Workspace | undefined>(
     queryKeys.workspaces.detail(workspaceId),
-    (prev) => (prev ? { ...prev, status } : prev),
+    (prev) => prev
+      ? { ...prev, status, ...(computerId ? { computer_id: computerId } : {}) }
+      : prev,
   );
-  const patchOne = (w: WorkspaceLike): WorkspaceLike =>
-    (w.workspace_id ?? w.id) === workspaceId ? { ...w, status } : w;
-  queryClient.setQueriesData<unknown>(
+  queryClient.setQueriesData<WorkspacesResponse | undefined>(
     { queryKey: queryKeys.workspaces.lists() },
-    (prev: unknown) => {
-      if (!prev) return prev;
-      if (Array.isArray(prev)) {
-        return (prev as WorkspaceLike[]).map(patchOne);
-      }
-      if (typeof prev === 'object' && prev !== null) {
-        const obj = prev as { workspaces?: WorkspaceLike[] };
-        if (Array.isArray(obj.workspaces)) {
-          return { ...obj, workspaces: obj.workspaces.map(patchOne) };
-        }
-      }
-      return prev;
+    (prev) => {
+      if (!prev?.workspaces) return prev;
+      return {
+        ...prev,
+        workspaces: prev.workspaces.map((w) =>
+          w.workspace_id === workspaceId
+            ? { ...w, status, ...(computerId ? { computer_id: computerId } : {}) }
+            : w,
+        ),
+      };
     },
   );
+}
+
+/** Update one machine and every cached workspace bound to it. */
+export function patchComputerStatusInCaches(
+  queryClient: QueryClient,
+  computerId: string,
+  status: string,
+): void {
+  queryClient.setQueriesData<ComputersResponse | undefined>(
+    { queryKey: queryKeys.computers.lists() },
+    (prev) => !prev?.computers ? prev : {
+      ...prev,
+      computers: prev.computers.map((computer) =>
+        computer.computer_id === computerId ? { ...computer, status } : computer,
+      ),
+    },
+  );
+  queryClient.setQueriesData<Workspace | undefined>(
+    { queryKey: queryKeys.workspaces.details() },
+    (prev) => prev?.computer_id === computerId && prev.status !== 'deleted'
+      ? { ...prev, status }
+      : prev,
+  );
+  const workspaceIds = new Set(
+    cachedWorkspaceLists(queryClient)
+      .filter((workspace) =>
+        workspace.computer_id === computerId && workspace.status !== 'deleted')
+      .map((workspace) => workspace.workspace_id),
+  );
+  for (const id of workspaceIds) patchWorkspaceStatusInCaches(queryClient, id, status);
 }
 
 /** Two-level warming state the chat spinner renders: not warming, a generic
@@ -90,10 +131,10 @@ export function warmWorkspace(
   const existing = inFlight.get(workspaceId);
   if (existing) return existing;
 
-  const cached = queryClient.getQueryData<WorkspaceLike>(
+  const cached = queryClient.getQueryData<Workspace>(
     queryKeys.workspaces.detail(workspaceId),
   );
-  if (cached && cached.status && cached.status !== 'stopped') {
+  if (cached && cached.status && !['stopped', 'running'].includes(cached.status)) {
     return Promise.resolve();
   }
 
@@ -105,7 +146,7 @@ export function warmWorkspace(
           queryKey: queryKeys.workspaces.detail(workspaceId),
           queryFn: () => getWorkspace(workspaceId),
         }));
-      if (!detail || detail.status !== 'stopped') return;
+      if (!detail?.status || !['stopped', 'running'].includes(detail.status)) return;
 
       const resp = await startWorkspace(workspaceId, { lazy: true });
       // Only reflect the 202 'starting' if nothing has advanced the cache past
@@ -113,11 +154,15 @@ export function warmWorkspace(
       // a fast 'running' (or 'error') before this slower patch lands; without
       // the guard, 'starting' would clobber it and wedge the UI on 'starting'
       // until the next refetch.
-      const current = queryClient.getQueryData<WorkspaceLike>(
+      const current = queryClient.getQueryData<Workspace>(
         queryKeys.workspaces.detail(workspaceId),
       );
       if (!current?.status || current.status === 'stopped') {
-        patchWorkspaceStatusInCaches(queryClient, workspaceId, resp.status);
+        if (detail.computer_id) {
+          patchComputerStatusInCaches(queryClient, detail.computer_id, resp.status);
+        } else {
+          patchWorkspaceStatusInCaches(queryClient, workspaceId, resp.status);
+        }
       }
     } catch (err) {
       // Best-effort warming — chat-time start path surfaces real errors with

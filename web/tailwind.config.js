@@ -10,7 +10,7 @@ export default {
       fontFamily: {
         // Route the `font-mono` utility onto the locked JetBrains Mono face
         // (DESIGN.md); without this it silently resolves to ui-monospace.
-        mono: ["JetBrains Mono", "Menlo", "ui-monospace", "SFMono-Regular", "monospace"],
+        mono: ["JetBrains Mono", "Menlo", "Noto Sans SC", "ui-monospace", "SFMono-Regular", "monospace"],
       },
       colors: {
         border: "hsl(var(--border))",

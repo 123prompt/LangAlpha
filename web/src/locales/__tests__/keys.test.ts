@@ -25,16 +25,18 @@ const T_CALL = /\bt\(\s*['"]([a-zA-Z0-9_.]+)['"]/g;
 // Match `titleKey: 'foo.bar'` / `descriptionKey: 'foo.bar'` / etc. — keys
 // stored in widget definitions, STATUS_UI tables, and PresetMeta. Catches our
 // static metadata references that aren't wrapped in t().
-const KEY_PROP = /\b(?:titleKey|descriptionKey|nameKey|tagKey|bestForKey|labelKey|blurbKey)\s*[:=]\s*['"]([a-zA-Z0-9_.]+)['"]/g;
+const KEY_PROP = /\b(?:titleKey|descriptionKey|nameKey|tagKey|bestForKey|labelKey|blurbKey|messageKey|noteKey)\s*[:=]\s*['"]([a-zA-Z0-9_.]+)['"]/g;
 // Bare quoted keys held in const maps and passed to a helper rather than to
 // `t()` directly: SOURCE_KEY / BUCKET_KEY on the dashboard, the tab-label map
-// and the skill-action failure helper under plugins. Scoped to those two
-// namespaces rather than swept tree-wide, because `isLocaleKey` only checks
+// and the skill-action failure helper under plugins, and the probe verdict
+// tables under mcp, and the status, group and delivery tables under
+// automation. Scoped to those namespaces rather than swept tree-wide,
+// because `isLocaleKey` only checks
 // the first segment and plenty of dotted non-keys (module paths, filenames)
 // would otherwise qualify. The cost of being in this list is that a namespace
 // here may not also be used for storage keys or other dotted identifiers --
 // see `plugins:deckExpanded`, which uses a colon for exactly that reason.
-const KEY_VALUE = /['"]((?:dashboard|plugins)\.[a-zA-Z0-9_.]+)['"]/g;
+const KEY_VALUE = /['"]((?:dashboard|plugins|orders|mcp|automation|timezone)\.[a-zA-Z0-9_.]+)['"]/g;
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -61,9 +63,10 @@ function lookup(obj: unknown, key: string): unknown {
 }
 
 // i18next falls back to plural-suffixed variants (`_one` / `_other` /
-// `_zero`) when the bare key is absent and the call passes `count`. A test
-// that only checks the bare key would falsely flag those plural-only entries.
-const PLURAL_SUFFIXES = ['', '_one', '_other', '_zero', '_two', '_few', '_many'];
+// `_zero`) when the bare key is absent and the call passes `count`, and to
+// `_ordinal_*` ones when it also passes `ordinal: true`. A test that only
+// checks the bare key would falsely flag those plural-only entries.
+const PLURAL_SUFFIXES = ['', '_one', '_other', '_zero', '_two', '_few', '_many', '_ordinal_other'];
 function resolveAnyVariant(obj: unknown, key: string): boolean {
   for (const suffix of PLURAL_SUFFIXES) {
     if (typeof lookup(obj, key + suffix) === 'string') return true;
@@ -92,6 +95,138 @@ function collectKeys(): { keys: Set<string>; perFile: Map<string, string[]> } {
   }
   return { keys, perFile };
 }
+
+// ── Interpolation ─────────────────────────────────────────
+//
+// A `{{var}}` the call does not pass renders literally ("No quote for
+// {{symbol}}"), and nothing else catches it: the key resolves, the types
+// pass. So for each `t('key', …)` whose options are an object literal, every
+// variable in the key's strings (each plural variant, both catalogs) has to
+// be among the names the literal passes. A call whose options are a variable
+// or carry a spread is skipped, since what it passes is not in the text.
+
+const VAR = /\{\{\s*-?\s*([A-Za-z_$][\w$]*)/g;
+
+function stringVariants(obj: unknown, key: string): string[] {
+  return PLURAL_SUFFIXES.map((suffix) => lookup(obj, key + suffix)).filter((v): v is string => typeof v === 'string');
+}
+
+/** The source from `start` (an opening bracket) to its match, skipping
+ *  brackets inside string and template literals. */
+function balanced(src: string, start: number): string | null {
+  const open = src[start];
+  const close = open === '{' ? '}' : ')';
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = start; i < src.length; i++) {
+    const c = src[i];
+    if (quote) {
+      if (c === '\\') i++;
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') quote = c;
+    else if (c === '{' || c === '(' || c === '[') depth++;
+    else if (c === '}' || c === ')' || c === ']') {
+      depth--;
+      if (depth === 0) return c === close ? src.slice(start + 1, i) : null;
+    }
+  }
+  return null;
+}
+
+/** The top-level property names of an object literal's body, or null when a
+ *  spread makes them unknowable. */
+function literalNames(body: string): Set<string> | null {
+  const names = new Set<string>();
+  let depth = 0;
+  let quote: string | null = null;
+  let part = '';
+  const parts: string[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (quote) {
+      part += c;
+      if (c === '\\') part += body[++i] ?? '';
+      else if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') quote = c;
+    else if (c === '{' || c === '(' || c === '[') depth++;
+    else if (c === '}' || c === ')' || c === ']') depth--;
+    if (c === ',' && depth === 0) {
+      parts.push(part);
+      part = '';
+    } else part += c;
+  }
+  parts.push(part);
+  for (const raw of parts) {
+    const p = raw.trim();
+    if (!p) continue;
+    if (p.startsWith('...')) return null;
+    const m = /^(?:['"]([^'"]+)['"]|([A-Za-z_$][\w$]*))\s*(?::|$)/.exec(p);
+    if (m) names.add(m[1] ?? m[2]);
+  }
+  return names;
+}
+
+interface TCallSite {
+  key: string;
+  file: string;
+  /** Names the options literal passes; empty when there are no options. */
+  passed: Set<string>;
+}
+
+function collectCallSites(): TCallSite[] {
+  const sites: TCallSite[] = [];
+  const call = /\bt\(\s*['"]([a-zA-Z0-9_.]+)['"]\s*/g;
+  for (const file of walk(SRC_DIR)) {
+    const src = readFileSync(file, 'utf8');
+    call.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = call.exec(src)) !== null) {
+      if (!isLocaleKey(m[1])) continue;
+      let i = call.lastIndex;
+      let passed: Set<string> | null = new Set();
+      if (src[i] === ',') {
+        i++;
+        while (/\s/.test(src[i] ?? '')) i++;
+        if (src[i] !== '{') continue; // options held in a variable
+        const body = balanced(src, i);
+        if (body === null) continue;
+        passed = literalNames(body);
+      } else if (src[i] !== ')') {
+        continue;
+      }
+      if (passed) sites.push({ key: m[1], file: file.replace(REPO_ROOT + '/', ''), passed });
+    }
+  }
+  return sites;
+}
+
+describe('locale interpolation (src-wide)', () => {
+  const sites = collectCallSites();
+
+  it('finds call sites to check (sanity check)', () => {
+    expect(sites.filter((s) => s.passed.size > 0).length).toBeGreaterThan(50);
+  });
+
+  it('every {{variable}} in a key is passed where the key is used', () => {
+    const offenders: string[] = [];
+    for (const site of sites) {
+      for (const [name, catalog] of [['en-US', enUS], ['zh-CN', zhCN]] as const) {
+        const missing = new Set<string>();
+        for (const text of stringVariants(catalog, site.key)) {
+          VAR.lastIndex = 0;
+          let v: RegExpExecArray | null;
+          while ((v = VAR.exec(text)) !== null) if (!site.passed.has(v[1])) missing.add(v[1]);
+        }
+        if (missing.size) offenders.push(`  - ${site.key} (${name}) needs ${[...missing].join(', ')} in ${site.file}`);
+      }
+    }
+    if (offenders.length > 0) throw new Error(`Interpolation variables not passed (${offenders.length}):\n${offenders.join('\n')}`);
+  });
+});
 
 describe('locale key parity (src-wide)', () => {
   const { keys, perFile } = collectKeys();

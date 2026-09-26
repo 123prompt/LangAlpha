@@ -17,7 +17,6 @@ from typing import Any
 from langchain.agents.middleware import AgentMiddleware
 
 from ptc_agent.agent.middleware._message_utils import order_tool_results_first
-from ptc_agent.agent.middleware._utils import append_to_system_message
 from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES, block_type
 from src.llms.llm import get_input_modalities, get_max_pdf_pages
 
@@ -27,9 +26,18 @@ def _placeholder_for(
     has_image: bool,
     has_pdf: bool,
     max_pdf_pages: int | None,
+    guidance: str = "",
 ) -> dict[str, str] | None:
-    """The text block replacing one this target can't read, or None to keep it."""
+    """The text block replacing one this target can't read, or None to keep it.
+
+    ``guidance`` is what to do about it, and rides inside the placeholder so it
+    sits next to the block it explains, on the message the model is reading;
+    the caller passes it for the first placeholder of a call and nothing after.
+    Appending it to the system prompt instead moved the cached prefix on every
+    call where a strip fired, which rewrote the whole history behind it.
+    """
     kind = block_type(block)
+    tail = f" {guidance}" if guidance else ""
 
     # Matched on the type alone: this is the only thing standing between a
     # mid-thread switch and a 400, and failing closed costs one placeholder
@@ -37,7 +45,7 @@ def _placeholder_for(
     if kind in IMAGE_BLOCK_TYPES and not has_image:
         return {
             "type": "text",
-            "text": "[Image attached in a prior turn, not visible to the current model]",
+            "text": f"[Image attached in a prior turn, not visible to the current model.{tail}]",
         }
 
     if kind not in FILE_BLOCK_TYPES:
@@ -49,7 +57,7 @@ def _placeholder_for(
     if not has_pdf:
         return {
             "type": "text",
-            "text": "[PDF attached in a prior turn, not visible to the current model]",
+            "text": f"[PDF attached in a prior turn, not visible to the current model.{tail}]",
         }
 
     # Over the target's page ceiling. Unstamped blocks pass: they predate the
@@ -62,7 +70,7 @@ def _placeholder_for(
             "type": "text",
             "text": (
                 f"[PDF attached in a prior turn, {pages} pages, over the current "
-                f"model's {max_pdf_pages}-page limit]"
+                f"model's {max_pdf_pages}-page limit.{tail}]"
             ),
         }
     return None
@@ -73,6 +81,7 @@ def strip_unsupported_content_blocks(
     has_image: bool,
     has_pdf: bool,
     max_pdf_pages: int | None = None,
+    guidance: str = "",
 ) -> list:
     """Replace image/file blocks this target can't read with text placeholders.
 
@@ -87,6 +96,11 @@ def strip_unsupported_content_blocks(
     """
     result: list = []
     modified = False
+    # The guidance rides on the first placeholder only: the advice is the
+    # same for every block, and the first is the one whose text never moves
+    # when a later turn adds another attachment, so the prefix behind it
+    # stays cached.
+    said = False
 
     for msg in messages:
         content = getattr(msg, "content", None)
@@ -97,8 +111,12 @@ def strip_unsupported_content_blocks(
         new_blocks = []
         changed = False
         for block in content:
-            placeholder = _placeholder_for(block, has_image, has_pdf, max_pdf_pages)
-            changed |= placeholder is not None
+            placeholder = _placeholder_for(
+                block, has_image, has_pdf, max_pdf_pages, "" if said else guidance
+            )
+            if placeholder is not None:
+                changed = True
+                said = True
             new_blocks.append(block if placeholder is None else placeholder)
 
         if not changed:
@@ -110,34 +128,28 @@ def strip_unsupported_content_blocks(
     return result if modified else messages
 
 
-def _unsupported_note(can_extract: bool) -> str:
-    """The reminder appended to the system prompt on a call where a strip fired.
+def _placeholder_guidance(can_extract: bool) -> str:
+    """What the model should do about a block it cannot see, one sentence or two.
 
-    One note for both strip reasons: the placeholder already states which one
-    applied, next to the block it replaced, so branching the reminder would only
-    duplicate that where the model is less likely to be reading.
+    Rides inside every placeholder rather than in the system prompt, so the
+    advice is decided on the call where the target is known (a fallback or a
+    subagent is judged on its own model) without the cached prefix moving.
 
     ``can_extract`` says whether the agent has a workspace to work the file in.
     The Flash assistant has no filesystem or code tool at all, so telling it to
     extract the file itself would send it looking for a tool it never had.
     """
     extract = (
-        "The file is still in the workspace, so prefer extracting it yourself rather "
-        "than giving up on it: pull a PDF's text or render its pages to images with "
-        "Python in the sandbox, and run OCR or image analysis the same way. "
+        "The file is still in the workspace: extract it yourself with Python in the "
+        "sandbox (a PDF's text or page renders, OCR or image analysis) before giving up. "
         if can_extract
         else ""
     )
     return (
-        "\n\n<system-reminder>"
-        "Content shown as a bracketed placeholder is not visible to the current model; "
-        "the placeholder states why. "
         f"{extract}"
-        "When that cannot answer the question, be transparent with the user about the "
-        "limitation: an unsupported input type means switching to a model that accepts "
-        "it, and a page-limit rejection means splitting the document or moving to a "
-        "model with a longer context. Work in best effort to answer their query."
-        "</system-reminder>"
+        "If that cannot answer the question, tell the user: an unsupported input type "
+        "means switching to a model that accepts it, a page-limit rejection means "
+        "splitting the document or a longer-context model. Answer in best effort otherwise."
     )
 
 
@@ -162,12 +174,12 @@ class MultimodalStripMiddleware(AgentMiddleware):
                 ``custom_modalities`` applies to the target in hand.
             custom_modalities: Per-model modality override from user preferences.
             can_extract: Whether this agent has a workspace it could extract an
-                unreadable file in, which changes the advice in the reminder.
+                unreadable file in, which changes the advice in the placeholder.
         """
         super().__init__()
         self.model_name = model_name
         self.custom_modalities = custom_modalities
-        self.unsupported_note = _unsupported_note(can_extract)
+        self.placeholder_guidance = _placeholder_guidance(can_extract)
 
     def _resolve_target(self, request: Any) -> tuple[str | None, list[str]]:
         """Name and modalities of the model this request will actually reach.
@@ -199,7 +211,6 @@ class MultimodalStripMiddleware(AgentMiddleware):
         # Runs for every target, not just modality-limited ones: the interleaving
         # only arises where injection succeeded, which is a model that can see it.
         messages = order_tool_results_first(request.messages)
-        overrides: dict[str, Any] = {}
 
         stamped, modalities = self._resolve_target(request)
         has_image = "image" in modalities
@@ -209,22 +220,16 @@ class MultimodalStripMiddleware(AgentMiddleware):
         # the tool side deliberately no longer attempts.
         max_pdf_pages = get_max_pdf_pages(stamped) if stamped and has_pdf else None
 
-        sanitized = strip_unsupported_content_blocks(
-            messages, has_image, has_pdf, max_pdf_pages
+        # Decided on the call where the target is known: a tool-time note judged
+        # the configured model and froze that verdict into the transcript, which
+        # a subagent on its own model then inherited wrongly. The system prompt
+        # is left alone so the cached prefix does not move with the strip.
+        messages = strip_unsupported_content_blocks(
+            messages, has_image, has_pdf, max_pdf_pages, self.placeholder_guidance
         )
-        if sanitized is not messages:
-            messages = sanitized
-            # Told to the model that actually can't see the file, on the call
-            # where that is true. The tool-time note this replaces judged the
-            # configured model and froze that verdict into the transcript,
-            # which a subagent on its own model then inherited wrongly.
-            overrides["system_message"] = append_to_system_message(
-                request.system_message, self.unsupported_note
-            )
-
         if messages is not request.messages:
-            overrides["messages"] = messages
-        return await handler(request.override(**overrides) if overrides else request)
+            return await handler(request.override(messages=messages))
+        return await handler(request)
 
 
 __all__ = ["MultimodalStripMiddleware", "strip_unsupported_content_blocks"]

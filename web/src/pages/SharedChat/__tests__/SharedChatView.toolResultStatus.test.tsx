@@ -12,10 +12,10 @@ import { render, waitFor } from '@testing-library/react';
 const capturedMessages: Record<string, unknown>[][] = [];
 
 vi.mock('react-router-dom', () => ({
-  useParams: () => ({ shareToken: 'tok' }),
   Link: ({ children }: { children?: React.ReactNode }) => <span>{children}</span>,
 }));
 
+vi.mock('../../../contexts/AuthContext', () => ({ useAuth: () => ({ isLoggedIn: false }) }));
 vi.mock('../../../contexts/ThemeContext', () => ({
   useTheme: () => ({ theme: 'light' }),
 }));
@@ -52,18 +52,21 @@ const replayEvents = [
 ];
 
 vi.mock('../api', () => ({
-  getSharedThread: vi.fn(async () => ({ title: 'Shared', workspace_name: null })),
   replaySharedThread: vi.fn(async (_token: string, onEvent: (e: unknown) => void) => {
     replayEvents.forEach(onEvent);
   }),
   getSharedFiles: vi.fn(async () => []),
   readSharedFile: vi.fn(async () => ''),
-  downloadSharedFileAs: vi.fn(async () => undefined),
-  fetchSharedServeObjectUrl: vi.fn(async () => ''),
-  fetchSharedServeArrayBuffer: vi.fn(async () => new ArrayBuffer(0)),
+  downloadSharedFile: vi.fn(async () => undefined),
+  servedObjectUrl: vi.fn(async () => ''),
+  servedBytes: vi.fn(async () => new ArrayBuffer(0)),
+  sharedServePrefix: (token: string) => `/api/v1/public/shared/${token}/files/serve/`,
 }));
 
 import SharedChatView from '../SharedChatView';
+import type { SharedThreadMetadata } from '../api';
+
+const metadata = { kind: 'thread', thread_id: 't1', title: 'Shared', workspace_name: '', msg_type: 'chat', created_at: '', updated_at: '', permissions: {} } as SharedThreadMetadata;
 
 describe('SharedChatView tool result replay', () => {
   beforeEach(() => {
@@ -71,7 +74,7 @@ describe('SharedChatView tool result replay', () => {
   });
 
   it('carries the wire status so a rejected call replays as a failure', async () => {
-    render(<SharedChatView />);
+    render(<SharedChatView shareToken="tok" metadata={metadata} />);
 
     await waitFor(() => {
       expect(capturedMessages.length).toBeGreaterThan(0);

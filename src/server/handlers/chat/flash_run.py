@@ -45,26 +45,20 @@ from src.server.utils.chart_selection_context import (
     parse_chart_selection_contexts,
     serialize_chart_selections_for_metadata,
 )
-from src.llms.llm import get_input_modalities
 from src.server.utils.multimodal_context import (
     build_attachment_metadata,
-    build_unsupported_reminder,
-    filter_multimodal_by_capability,
-    inject_multimodal_context,
     parse_multimodal_contexts,
 )
-from src.utils.tracking import ExecutionTracker
 from ptc_agent.agent.flash import build_flash_graph
-from ptc_agent.agent.graph import get_user_profile_for_prompt
+from ptc_agent.agent.graph import fetch_user_data_counts, get_user_profile_for_prompt
 from ptc_agent.agent.middleware.credit_gate import run_with_credit_gate
 
 from .request_prep import (
     DISPATCH_STARTED_MARKER,
-    _append_to_last_user_message,
     _resolve_fork,
-    _resolve_timezone,
     apply_fetch_override,
     build_graph_config,
+    build_turn_context,
     ensure_thread,
     init_tracking,
     inject_inline_reminders,
@@ -85,7 +79,8 @@ from src.server.services.runs.admission import (
 )
 from src.config.settings import get_flash_recursion_limit
 
-from .admission_gate import admission_conflict_detail, wait_or_steer
+from .admission_gate import admission_conflict_detail, steer_allowed, wait_or_steer
+from .attachments import attach_flash_request_files
 from .error_handling import handle_workflow_error
 from src.server.services.llm.clients import is_own_key_turn
 from src.server.services.llm.config import resolve_llm_config
@@ -125,12 +120,14 @@ async def astream_flash_workflow(
     config=None,
     dispatched: bool = False,
     flash_workspace: dict | None = None,
+    steerable: bool = True,
+    run_metadata: dict | None = None,
 ):
     """Async generator that streams Flash agent workflow events.
 
     Flash mode: no sandbox, no MCP, external tools only (web search, market
     data, SEC filings). State keyed by ``(thread_id, run_id)``; same
-    contract as PTC.
+    contract as PTC, ``steerable`` and ``run_metadata`` included.
     """
     start_time = time.time()
     handler = None
@@ -139,9 +136,8 @@ async def astream_flash_workflow(
     flash_graph = None
     run_handle = None
     workspace_id = None
-    timezone_str = None
+    turn_context = None
 
-    ExecutionTracker.start_tracking()
     logger.info(f"[FLASH_CHAT] Starting flash workflow: thread_id={thread_id}")
 
     # Owns the burst lease, admission lock, and open START row until the
@@ -180,18 +176,15 @@ async def astream_flash_workflow(
         # message is neither a run nor a turn (v4 identity model); its
         # content is archived on the owning response's metadata at finalize.
         # Admit a fresh turn, steer the running one, or 409 —
-        # see ``wait_or_steer``. Dispatched flows pass ``can_steer=False``:
-        # any in-flight run is a hard conflict, never a steer. Foreground
-        # turns steer; retries never do — a /retry that finds another live
-        # run is a hard conflict, not an (empty) steering message into
-        # that run.
+        # see ``wait_or_steer``; who may steer at all is ``steer_allowed``.
+        can_steer = steer_allowed(request, dispatched=dispatched, steerable=steerable)
         ready, steering_event = await wait_or_steer(
             manager,
             thread_id,
             user_input,
             user_id,
             steer_only=request.steer_only,
-            can_steer=not dispatched and request.retry_of_run_id is None,
+            can_steer=can_steer,
         )
         if not ready:
             await scope.release_slot()
@@ -213,13 +206,17 @@ async def astream_flash_workflow(
             flash_ws = await get_or_create_flash_workspace(user_id)
         workspace_id = str(flash_ws["workspace_id"])
 
-        await ensure_thread(
+        prior_thread = await ensure_thread(
             request,
             thread_id,
             workspace_id,
             user_id,
             msg_type="flash",
             initial_query=user_input,
+        )
+        user_profile = await get_user_profile_for_prompt(user_id) if user_id else None
+        turn_context = build_turn_context(
+            request, prior_thread, user_profile=user_profile
         )
 
         query_type, fork = _resolve_fork(request=request)
@@ -297,18 +294,10 @@ async def astream_flash_workflow(
         query_content = user_input
 
         if request.hitl_response:
-            (
-                feedback_action,
-                query_content,
-                hitl_answers,
-                interrupt_ids,
-                hitl_decisions,
-            ) = process_hitl_response(request)
-            query_metadata["hitl_interrupt_ids"] = interrupt_ids
-            if hitl_answers:
-                query_metadata["hitl_answers"] = hitl_answers
-            if hitl_decisions:
-                query_metadata["hitl_decisions"] = hitl_decisions
+            prepared = process_hitl_response(request)
+            feedback_action = prepared.feedback_action
+            query_content = prepared.query_content
+            query_metadata.update(prepared.metadata)
 
         # =================================================================
         # START txn (v4): query row + in_progress run row + thread
@@ -334,6 +323,7 @@ async def astream_flash_workflow(
                     request, "report_back_ptc_thread_id", None
                 ),
                 "origin_dispatch_gen": getattr(request, "origin_dispatch_gen", None),
+                **(run_metadata or {}),
             },
         )
         scope.attach_run(run_handle)
@@ -371,32 +361,28 @@ async def astream_flash_workflow(
         # Build Flash Agent Graph
         # =================================================================
 
-        # Resolve timezone for metadata (observability only -- agent clock
-        # uses DB user_profile)
-        timezone_str = _resolve_timezone(request.timezone, request.locale)
-
         # Propagate fetch model override to tool context
         apply_fetch_override(config)
 
-        flash_user_profile = None
-        if user_id:
-            flash_user_profile = await get_user_profile_for_prompt(user_id)
+        # The counts are read per turn for the same reason they are on the PTC
+        # path: the preferred market is voted from the watchlist, and the
+        # cached profile carries no symbols.
+        user_data_counts = await fetch_user_data_counts(user_id)
 
-        # The one MCP surface Flash has: tools bound directly through the
-        # relay. A failure here costs the turn those tools, not the turn.
-        from src.server.services.egress.direct_tools import DirectMCPBinding
+        # The one MCP surface Flash has: tools bound directly through the relay.
+        from src.server.services.egress.direct_tools import direct_tools_for_turn
         from src.server.services.egress.flash_binding import bind_flash_direct_tools
 
-        try:
-            direct_mcp = await bind_flash_direct_tools(
+        direct_mcp, order_ledger = await direct_tools_for_turn(
+            bind_flash_direct_tools(
                 config, user_id=user_id, workspace_id=workspace_id
-            )
-        except Exception:
-            logger.warning(
-                "[FLASH_CHAT] direct MCP binding failed; running without",
-                exc_info=True,
-            )
-            direct_mcp = DirectMCPBinding(user_id=user_id)
+            ),
+            user_id=user_id,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            run_id=run_id,
+            turn_index=run_handle.turn_index,
+        )
 
         # Build flash graph (no sandbox, no session)
         flash_graph = build_flash_graph(
@@ -404,62 +390,22 @@ async def astream_flash_workflow(
             # I2: flash turns write checkpoints too — same fenced session
             # rule as PTC (InsightService, checkpointer-less, is exempt).
             checkpointer=run_handle.checkpointer,
-            user_profile=flash_user_profile,
+            user_profile=user_profile,
+            user_data_counts=user_data_counts,
             store=setup.store,
+            user_id=user_id,
             direct_mcp=direct_mcp,
+            order_ledger=order_ledger,
+            turn_context=turn_context,
         )
 
         messages = normalize_request_messages(request)
 
         # Multimodal Context Injection (images and PDFs) -- Flash-specific
         # ordering: inject multimodal before skills.
-        # Filter by model capability: supported items are injected as native
-        # content blocks; unsupported items get a text note (Flash has no
-        # sandbox for file upload).
-        multimodal_contexts = parse_multimodal_contexts(request.additional_context)
-        if multimodal_contexts:
-            modalities = (
-                get_input_modalities(
-                    effective_model, custom_modalities=config.input_modalities
-                )
-                if effective_model
-                else ["text"]
-            )
-            supported, unsupported, file_only = filter_multimodal_by_capability(
-                multimodal_contexts, modalities
-            )
-            if file_only:
-                logger.warning(
-                    f"[FLASH_CHAT] {len(file_only)} file-only attachment(s) "
-                    f"ignored (Flash mode has no sandbox)"
-                )
-            if supported:
-                messages = inject_multimodal_context(messages, supported)
-                logger.info(
-                    f"[FLASH_CHAT] Multimodal context injected: "
-                    f"{len(supported)} supported attachment(s)"
-                )
-            if unsupported:
-                types = list(
-                    set(
-                        "PDF"
-                        if (c.data if hasattr(c, "data") else "").startswith(
-                            "data:application/pdf"
-                        )
-                        else "image"
-                        for c in unsupported
-                    )
-                )
-                _append_to_last_user_message(
-                    messages,
-                    build_unsupported_reminder(
-                        [f"The user attached {', '.join(types)} file(s)."]
-                    ),
-                )
-                logger.info(
-                    f"[FLASH_CHAT] {len(unsupported)} unsupported attachment(s) "
-                    f"noted for {effective_model}"
-                )
+        messages = attach_flash_request_files(
+            messages, request, effective_model, config
+        )
 
         # Skill Context Resolution (Flash) — body injection happens in
         # SkillsMiddleware, which dedups bodies already live in the thread. Only
@@ -523,7 +469,7 @@ async def astream_flash_workflow(
             user_id=user_id,
             workspace_id=workspace_id,
             mode="flash",
-            timezone_str=timezone_str,
+            timezone_str=turn_context.tool_timezone,
             token_callback=token_callback,
             request=request,
             effective_model=effective_model,
@@ -579,7 +525,7 @@ async def astream_flash_workflow(
                     "is_byok": is_byok,
                     "burst_slot_id": request.burst_slot_id,
                     "locale": request.locale,
-                    "timezone": timezone_str,
+                    "timezone": turn_context.tool_timezone,
                     "handler": handler,
                     "token_callback": token_callback,
                     "run_handle": run_handle,
@@ -600,22 +546,25 @@ async def astream_flash_workflow(
             # Race condition: another request registered first -- queue the
             # message. The admission lock should normally prevent reaching
             # this branch, but it's kept as a belt-and-braces fallback.
-            # Dispatched flows (can_steer=False) must never steer, even in this
-            # fallback: leave result None so they fall through to the 409, same
-            # as the primary wait_or_steer path.
+            # A request ``steer_allowed`` refuses must not steer here either:
+            # leave result None so it falls through to the 409, same as the
+            # primary wait_or_steer path.
             #
             # v4: START already created this run's in_progress row; whichever
             # way this branch exits (steer away or 409), no executor will ever
             # own it — release the durable slot first.
+            # Marked, so the run's terminal hooks can tell a turn that never
+            # ran from one a stop or a shutdown cancelled.
             await RunCoordinator.get_instance().fail_open_run(
                 run_handle,
                 "superseded by concurrent run (admission fallback)",
                 status="cancelled",
+                metadata={"superseded": True},
             )
             result = (
-                None
-                if dispatched
-                else await steer_thread(thread_id, user_input, user_id)
+                await steer_thread(thread_id, user_input, user_id)
+                if can_steer
+                else None
             )
             if result:
                 await scope.release_slot()
@@ -689,7 +638,7 @@ async def astream_flash_workflow(
             is_byok=is_byok,
             msg_type="flash",
             log_prefix="FLASH_CHAT",
-            timezone_str=timezone_str,
+            turn_context=turn_context,
         ):
             yield event
 
@@ -699,4 +648,3 @@ async def astream_flash_workflow(
         # Backstop for any error path that bypassed the normal release
         # (e.g., exception before start_run); idempotent on the scope.
         scope.release_admission()
-        ExecutionTracker.stop_tracking()

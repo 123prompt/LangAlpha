@@ -1,9 +1,9 @@
 """
 Tests for price trigger handling in automation_handler.py.
 
-Covers create_automation and resume_automation for trigger_type='price',
-validating trigger_config requirements, next_run_at behavior, and
-status constraints.
+Covers create_automation and resume_automation for trigger_type='price':
+next_run_at behavior and status constraints. What a price config must hold is
+AutomationCreate's to check (test_automation_models.py).
 """
 
 import uuid
@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.server.handlers.automation_handler import create_automation, resume_automation
+from src.server.models.automation import AutomationCreate
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,7 +42,7 @@ VALID_TRIGGER_CONFIG_MULTI = {
 
 
 def _make_create_data(**overrides):
-    """Build a minimal valid create_automation data dict for price triggers."""
+    """Build a minimal valid price-trigger create request."""
     data = {
         "name": "Price Alert",
         "trigger_type": "price",
@@ -50,7 +51,7 @@ def _make_create_data(**overrides):
         "timezone": "UTC",
     }
     data.update(overrides)
-    return data
+    return AutomationCreate(**data)
 
 
 def _make_automation_row(**overrides):
@@ -125,83 +126,6 @@ class TestCreatePriceAutomation:
 
         assert result["trigger_config"] == VALID_TRIGGER_CONFIG_MULTI
         mock_auto_db.create_automation.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    @patch("src.server.handlers.automation_handler.auto_db")
-    async def test_create_price_automation_missing_trigger_config(self, mock_auto_db):
-        """Raises ValueError when trigger_config is missing for price type."""
-        data = _make_create_data(trigger_config=None)
-
-        with pytest.raises(ValueError, match="trigger_config is required"):
-            await create_automation(USER_ID, data)
-
-        mock_auto_db.create_automation.assert_not_called()
-
-    @pytest.mark.asyncio
-    @patch("src.server.handlers.automation_handler.auto_db")
-    async def test_create_price_automation_empty_trigger_config(self, mock_auto_db):
-        """Raises ValueError when trigger_config is empty dict for price type."""
-        data = _make_create_data()
-        data.pop("trigger_config")  # remove key entirely
-
-        with pytest.raises(ValueError, match="trigger_config is required"):
-            await create_automation(USER_ID, data)
-
-        mock_auto_db.create_automation.assert_not_called()
-
-    @pytest.mark.asyncio
-    @patch("src.server.handlers.automation_handler.auto_db")
-    async def test_create_price_automation_missing_symbol(self, mock_auto_db):
-        """Raises ValueError when trigger_config is missing 'symbol'."""
-        data = _make_create_data(trigger_config={
-            "conditions": [{"type": "price_above", "value": 100.0}],
-        })
-
-        with pytest.raises(ValueError, match="Invalid price trigger config"):
-            await create_automation(USER_ID, data)
-
-        mock_auto_db.create_automation.assert_not_called()
-
-    @pytest.mark.asyncio
-    @patch("src.server.handlers.automation_handler.auto_db")
-    async def test_create_price_automation_missing_conditions(self, mock_auto_db):
-        """Raises ValueError when trigger_config is missing 'conditions'."""
-        data = _make_create_data(trigger_config={
-            "symbol": "AAPL",
-        })
-
-        with pytest.raises(ValueError, match="Invalid price trigger config"):
-            await create_automation(USER_ID, data)
-
-        mock_auto_db.create_automation.assert_not_called()
-
-    @pytest.mark.asyncio
-    @patch("src.server.handlers.automation_handler.auto_db")
-    async def test_create_price_automation_empty_conditions(self, mock_auto_db):
-        """Raises ValueError when conditions list is empty."""
-        data = _make_create_data(trigger_config={
-            "symbol": "AAPL",
-            "conditions": [],
-        })
-
-        with pytest.raises(ValueError, match="Invalid price trigger config"):
-            await create_automation(USER_ID, data)
-
-        mock_auto_db.create_automation.assert_not_called()
-
-    @pytest.mark.asyncio
-    @patch("src.server.handlers.automation_handler.auto_db")
-    async def test_create_price_automation_invalid_condition_type(self, mock_auto_db):
-        """Raises ValueError when a condition has an invalid type."""
-        data = _make_create_data(trigger_config={
-            "symbol": "AAPL",
-            "conditions": [{"type": "invalid_type", "value": 100.0}],
-        })
-
-        with pytest.raises(ValueError, match="Invalid price trigger config"):
-            await create_automation(USER_ID, data)
-
-        mock_auto_db.create_automation.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("src.server.handlers.automation_handler.auto_db")
@@ -298,6 +222,8 @@ class TestResumePriceAutomation:
         call_kwargs = mock_auto_db.update_automation.call_args.kwargs
         assert call_kwargs["failure_count"] == 0
         assert "next_run_at" not in call_kwargs
+        # Why it was switched off no longer applies, and goes in the same write.
+        assert call_kwargs["disable_reason"] is None
 
     @pytest.mark.asyncio
     @patch("src.server.handlers.automation_handler.auto_db")

@@ -24,6 +24,7 @@ from typing_extensions import NotRequired
 
 from ptc_agent.agent.middleware.compaction.types import CompactionEvent
 from ptc_agent.agent.state import DeltaAgentState
+from src.server.services.history.projector import is_run_boundary_message
 from src.server.utils.checkpoint_helpers import walk_current_branch_boundaries
 
 logger = logging.getLogger(__name__)
@@ -360,8 +361,10 @@ class CheckpointHistoryReader:
             start_ids = {m.id for m in start_msgs if m.id is not None}
             slice_msgs = [m for m in end_msgs if m.id not in start_ids]
 
+            # A stamped injection is not the turn's input: a runtime-update
+            # row lands in the same slice, right after the real user message.
             user_message = next(
-                (m for m in slice_msgs if isinstance(m, HumanMessage)), None
+                (m for m in slice_msgs if is_run_boundary_message(m)), None
             )
             # A resume checkpoint's metadata belongs to the interrupted run,
             # not the resume turn — don't propagate its run_id/turn_index.

@@ -557,3 +557,28 @@ class TestTheCutoffSearchIsOnePass:
         assert utils.find_group_safe_cutoff(history, 20) == 0
         assert calls == 1
 
+
+
+class TestStripBase64PreservesSiblingKeys:
+    """Redacting a data URI must not strip the block's other keys."""
+
+    def test_text_block_keys_survive_the_redaction(self) -> None:
+        block = {
+            "type": "text",
+            "text": f"see data:image/png;base64,{'A' * 120}",
+            "phase": "final_answer",
+            "index": 0,
+        }
+        stripped = utils.strip_base64_from_content([block])
+        assert stripped == [
+            {
+                "type": "text",
+                "text": "see [base64 data removed]",
+                "phase": "final_answer",
+                "index": 0,
+            }
+        ]
+
+    def test_clean_text_block_is_returned_untouched(self) -> None:
+        content = [{"type": "text", "text": "no data uri", "phase": "commentary"}]
+        assert utils.strip_base64_from_content(content) is content

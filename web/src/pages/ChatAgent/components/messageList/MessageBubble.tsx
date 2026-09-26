@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef, useMemo, memo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, Copy, FileSearch, Info, Pencil, RefreshCw, RotateCcw, StopCircle, ThumbsDown, ThumbsUp, User } from 'lucide-react';
+import { Check, Copy, FileSearch, Info, Pencil, RefreshCw, RotateCcw, StopCircle, ThumbsDown, ThumbsUp } from 'lucide-react';
 import ThumbDownModal from '../ThumbDownModal';
-import logoLight from '../../../../assets/img/logo.svg';
-import logoDark from '../../../../assets/img/logo-dark.svg';
-import { useTheme } from '../../../../contexts/ThemeContext';
 import LissajousLoading from '@/components/ui/lissajous-loading';
-import { useUser } from '@/hooks/useUser';
+import { AnimatePresence, motion } from 'framer-motion';
+import { EXIT_TWEEN } from './liveZoneTiming';
+import { visibleParagraphPrefix } from '@/lib/paragraphGate';
+import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import { CitationMetadataProvider } from '../CitationMetadataContext';
 import { CreditPausePendingProvider } from '../CreditPausePendingContext';
 import TextMessageContent from '../TextMessageContent';
@@ -21,8 +21,11 @@ import { useMessageActions } from './MessageActionsContext';
 import { useArrivalQuiet, useLiveToolRunning } from './useArrivalQuiet';
 import { isSteeringUserMessage } from './messagePredicates';
 import { assistantText } from './messageText';
+import { TurnFileCards } from './TurnFileCards';
+import type { TurnFile } from '../../utils/turnFiles';
+import { projectMessageContent, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
-import type { ContentSegmentRecord, FeedbackResult, MessageRecord, ToolCallProcessRecord } from './types';
+import type { ContentSegmentRecord, FeedbackResult, FoldState, MessageRecord, ToolCallProcessRecord } from './types';
 
 // --- MessageBubble ---
 
@@ -36,6 +39,7 @@ const USER_MESSAGE_COLLAPSE_PX = 240;
 
 interface MessageBubbleProps {
   message: MessageRecord;
+  contentProjection?: ContentProjection;
   /** Backend turn this bubble belongs to (a steering continuation folds back
    *  into the turn it continues). Feedback is addressed by turn, not bubble. */
   turnIndex: number;
@@ -43,11 +47,18 @@ interface MessageBubbleProps {
    *  turn (steering splits one turn across several bubbles). Regenerate renders
    *  only on the tail. Computed positionally in MessageList. */
   isTurnTail: boolean;
+  /** The turn is still running, tool execution and gaps between model calls
+   *  included. `message.isStreaming` alone drops between two model calls, and
+   *  the deliverables of a running turn are not deliverables yet. */
+  isTurnLive?: boolean;
+  /** Files this whole turn wrote or pointed at, rendered as cards on the tail. */
+  turnFiles?: TurnFile[];
   /** This turn's stored rating, or null. */
   feedback?: FeedbackResult | null;
   isLoading?: boolean;
-  hideAvatar?: boolean;
-  compactToolCalls?: boolean;
+  /** How much of the turn this bubble draws (see `FoldState`). Every bubble of
+   *  a turn gets the same value; `unfolded` is the transcript as it always was. */
+  fold?: FoldState;
   isSubagentView?: boolean;
   readOnly?: boolean;
   allowFiles?: boolean;
@@ -61,13 +72,10 @@ interface MessageBubbleProps {
  * MessageActionsContext (one identity-stable object per host), so a streamed
  * chunk never re-renders settled bubbles through a handler identity.
  */
-export const MessageBubble = memo(function MessageBubble({ message, turnIndex, isTurnTail, feedback, isLoading, hideAvatar, compactToolCalls, isSubagentView, readOnly, allowFiles, isMobile, flashContext }: MessageBubbleProps): React.ReactElement {
-  const { onOpenFile, onOpenSources, onEditMessage, onRegenerate, onRetry, onThumbUp, onThumbDown, onReportWithAgent } = useMessageActions();
+export const MessageBubble = memo(function MessageBubble({ message, contentProjection, turnIndex, isTurnTail, isTurnLive, turnFiles, feedback, isLoading, fold = 'unfolded', isSubagentView, readOnly, allowFiles, isMobile, flashContext }: MessageBubbleProps): React.ReactElement | null {
+  const { onOpenFile, onDownloadFile, onRevealFiles, onOpenSources, onEditMessage, onRegenerate, onRetry, onThumbUp, onThumbDown, onReportWithAgent } = useMessageActions();
   const { t } = useTranslation();
-  const { user } = useUser();
-  const { theme } = useTheme();
-  const logo = theme === 'light' ? logoDark : logoLight;
-  const avatarUrl = user?.avatar_url as string | undefined;
+  const projection = contentProjection ?? projectMessageContent(message, isSubagentView);
   const isUser = (message.role as string) === 'user';
   const isAssistant = (message.role as string) === 'assistant';
   const isPendingDelivery = isUser && ((message.isPending as boolean) || (message.steering as boolean) || (message.queued as boolean));
@@ -124,13 +132,20 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
   // only made visible after streaming settles. Keeping them mounted prevents a
   // ~32px layout jump on sibling messages when streaming ends.
   const canShowActions = !isSubagentView && !readOnly;
-  const showActions = canShowActions && !(message.isStreaming as boolean) && !isLoading;
+  const isStreaming = message.isStreaming as boolean;
+  const turnLive = isTurnLive ?? isStreaming;
+  // A background task outliving its stream leaves both `isStreaming` and
+  // `isLoading` false while the turn is still working, and rating or
+  // regenerating a reply the task can still change asks about an answer that
+  // does not exist yet. `isLoading` stays in the condition on its own account:
+  // it hides every other turn's controls while the session loads.
+  const showActions = canShowActions && !turnLive && !isLoading;
 
   // The stream stamps `arrivalSeq` on every landed reply text, reasoning text
   // or tool-argument chunk, whatever the typewriter has shown of it. The
   // streaming indicator hides while it climbs and shows in the pauses. A tool
   // whose card is visibly running counts as busy too.
-  const isStreaming = message.isStreaming as boolean;
+  const { streamingMode } = useTranscriptDisplay();
   const toolCallProcesses = message.toolCallProcesses as Record<string, ToolCallProcessRecord> | undefined;
   const arrivalSeq = (message.arrivalSeq as number | undefined) ?? 0;
   const toolRunning = useLiveToolRunning(toolCallProcesses, isStreaming);
@@ -145,6 +160,21 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
     if (!isAssistant || isSubagentView) return 0;
     return countDedupedSources(message.provenanceRecords as Record<string, ProvenanceRecord> | undefined);
   }, [message.provenanceRecords, isAssistant, isSubagentView]);
+
+  // A mid-turn bubble of a folded turn is process by definition: its prose is
+  // commentary the answer superseded, and its activity is behind the fold row.
+  // Once that is taken away it can have nothing left to draw, and an assistant
+  // bubble with nothing in it is an avatar beside a blank column — the same
+  // thing `isOrphanAssistantMessage` keeps off screen. The bubble stays in
+  // state either way: turn indices are counted positionally over it.
+  const foldedAway = fold === 'collapsed'
+    && isAssistant
+    && !isTurnTail
+    && !(message.error as boolean)
+    && !(message.stopped as boolean)
+    && sourceCount === 0
+    && !projection.hasRetained;
+  if (foldedAway) return null;
 
   const resizeTextarea = () => {
     const el = editTextareaRef.current;
@@ -197,20 +227,123 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
     }).catch(() => {});
   };
 
+  // Whether this bubble ends in a deck. The bubble above reads it too: its own
+  // bottom padding and the deck's top margin are one gap with two owners, and
+  // stacking both is what put ~29px between the reply and its first card.
+  const showTurnFiles = !!(
+    isAssistant && isTurnTail && !turnLive && onOpenFile
+    && (!readOnly || allowFiles) && turnFiles && turnFiles.length > 0
+  );
+
+  // The footer actions, built once and placed by role. An assistant bubble
+  // shows them on the same line as its Sources pill, above the deliverables, so
+  // the turn still ends on the deck rather than on a row of icons; a user
+  // bubble keeps them underneath, where there is nothing to share a line with.
+  // Always mounted (reserves space), visibility toggled: aria-hidden + inert
+  // keep the buttons out of the a11y tree and tab order while opacity-0 is
+  // hiding them, so screen readers don't announce "Copy, Thumbs up, ..." for
+  // every streaming message.
+  const actionsRow = canShowActions && !isEditing ? (
+  <div
+    aria-hidden={!showActions}
+    inert={!showActions || undefined}
+    className={`flex gap-1 transition-opacity ${
+      showActions
+        ? (isMobile ? 'opacity-70' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100')
+        : 'opacity-0 pointer-events-none'
+    } ${
+      // The top margin belongs to the user placement only: under a bubble the
+      // row needs its own gap, while beside the Sources pill the meta row's
+      // `items-center` is what puts it on the line.
+      isUser ? 'justify-end mt-0.5' : 'justify-start'
+    }`}
+  >
+    {/* User message actions. Steering bubbles get no edit pencil:
+        they're injected mid-turn and have no turn checkpoint of their
+        own, so an edit fork would target the NEXT turn and leave the
+        original steering text in the agent's context. */}
+    {isUser && onEditMessage && !isSteeringUserMessage(message) && (
+      <button
+        onClick={handleStartEdit}
+        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
+        title={t('chat.actions.editMessage')}
+      >
+        <Pencil className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+      </button>
+    )}
+
+    {/* Copy — both roles (a user bubble falls back to message.content).
+        Then assistant-only: ThumbUp -> ThumbDown -> Regenerate/Retry */}
+    <button
+      onClick={handleCopy}
+      className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
+      title={copied ? t('chat.actions.copied') : t('chat.actions.copyMessage')}
+    >
+      {copied
+        ? <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-profit)' }} />
+        : <Copy className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+      }
+    </button>
+    {isAssistant && !(message.error as boolean) && onThumbUp && (
+      <button
+        onClick={handleThumbUpClick}
+        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
+        title={feedbackRating === 'thumbs_up' ? t('chat.actions.removeRating') : t('chat.actions.goodResponse')}
+      >
+        <ThumbsUp
+          className="h-3.5 w-3.5"
+          fill={feedbackRating === 'thumbs_up' ? 'currentColor' : 'none'}
+          style={{ color: feedbackRating === 'thumbs_up' ? 'var(--color-profit)' : 'var(--color-text-tertiary)' }}
+        />
+      </button>
+    )}
+    {isAssistant && !(message.error as boolean) && onThumbDown && (
+      <button
+        onClick={() => setShowThumbDownModal(true)}
+        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
+        title={feedbackRating === 'thumbs_down' ? t('chat.actions.feedbackSubmitted') : t('chat.actions.reportIssue')}
+      >
+        <ThumbsDown
+          className="h-3.5 w-3.5"
+          fill={feedbackRating === 'thumbs_down' ? 'currentColor' : 'none'}
+          style={{ color: feedbackRating === 'thumbs_down' ? 'var(--color-loss)' : 'var(--color-text-tertiary)' }}
+        />
+      </button>
+    )}
+    {/* One regenerate per backend turn, on the turn's last bubble —
+        regenerating re-runs the whole turn from its input checkpoint
+        (mid-run steering can't be replayed), so the affordance sits
+        at the end of the full response. */}
+    {isAssistant && !(message.error as boolean) && onRegenerate && isTurnTail && (
+      <button
+        onClick={() => onRegenerate(message.id as string)}
+        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
+        title={t('chat.actions.regenerate')}
+      >
+        <RefreshCw className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+      </button>
+    )}
+    {isAssistant && (message.error as boolean) && onRetry && (
+      <button
+        onClick={onRetry}
+        className="p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
+        title={t('chat.actions.retry')}
+      >
+        <RotateCcw className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
+      </button>
+    )}
+  </div>
+  ) : null;
+
   return (
     <div
       data-message-id={message.id as string}
-      className={`group flex items-start ${isMobile ? 'gap-3' : 'gap-4'} ${isUser ? 'justify-end' : 'justify-start'}`}
+      data-message-role={isUser ? 'user' : 'assistant'}
+      className={`group flex items-start ${isUser ? 'justify-end' : 'justify-start'}`}
     >
-      {/* Assistant avatar - shown on the left */}
-      {isAssistant && !hideAvatar && (
-        <div className={`flex-shrink-0 flex items-center justify-center ${isMobile ? 'w-6 h-6' : 'w-8 h-8'}`}>
-          <img src={logo} alt="Assistant" className={isMobile ? 'w-6 h-6' : 'w-8 h-8'} />
-        </div>
-      )}
 
       {/* Message content column -- bubble + standalone attachment cards */}
-      <div className={`${isUser ? (isEditing && isMobile ? 'w-full' : 'max-w-[80%]') + ' flex flex-col items-end gap-2' : `w-full min-w-0${isMobile ? '' : ' pt-1'}`}`}>
+      <div className={isUser ? (isEditing && isMobile ? 'w-full' : 'max-w-[80%]') + ' flex flex-col items-end gap-2' : 'w-full min-w-0'}>
 
         {/* ===== EDIT MODE (user messages) ===== */}
         {isEditing && isUser ? (
@@ -287,7 +420,7 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
           className={`rounded-lg ${
             isUser
               ? `${isMobile ? 'px-3 py-2' : 'px-4 py-3'} rounded-tr-none overflow-hidden`
-              : `pl-0 pr-0 ${isMobile ? 'pb-2' : 'pb-3'} rounded-tl-none`
+              : `pl-0 pr-0 ${showTurnFiles ? 'pb-0' : isMobile ? 'pb-2' : 'pb-3'} rounded-tl-none`
           }`}
           style={{
             backgroundColor: isUser
@@ -313,6 +446,7 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
             <CitationMetadataProvider toolCallProcesses={(message.toolCallProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}>
             <CreditPausePendingProvider creditPauses={message.creditPauses as Record<string, CreditPauseState> | undefined}>
             <MessageContentSegments
+              contentProjection={projection}
               segments={message.contentSegments as ContentSegmentRecord[]}
               reasoningProcesses={(message.reasoningProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
               toolCallProcesses={(message.toolCallProcesses as Record<string, ToolCallProcessRecord>) || EMPTY_OBJ}
@@ -326,8 +460,8 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
               isStreaming={message.isStreaming as boolean}
               hasError={message.error as boolean}
               structuredError={message.structuredError as import('@/utils/rateLimitError').StructuredError | undefined}
-              isAssistant={isAssistant}
-              compactToolCalls={compactToolCalls}
+              fold={fold}
+              isTurnTail={isTurnTail}
               isSubagentView={isSubagentView}
               ptcAgentProposals={(message.ptcAgentProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
               secretaryActionProposals={(message.secretaryActionProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
@@ -335,7 +469,6 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
               toolApprovals={(message.toolApprovals as Record<string, ToolApprovalState>) || EMPTY_OBJ}
               htmlWidgetProcesses={(message.htmlWidgetProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
               readOnly={readOnly}
-              allowFiles={allowFiles}
               flashContext={flashContext}
             />
             </CreditPausePendingProvider>
@@ -361,54 +494,57 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
               liveness signal), in a pause it fades back in so the turn never
               looks finished. Fading rather than unmounting keeps its row, so
               the transcript bottom does not hop by a line on every pause. */}
+          <AnimatePresence initial={false}>
           {isStreaming && (() => {
-            const contentSegments = message.contentSegments as ContentSegmentRecord[] | undefined;
-            const hasContent = contentSegments?.some(s => s.content?.trim()) || (message.content as string)?.trim();
+            const hasContent = projection.blocks.length > 0 || (message.content as string)?.trim();
             // A tool call being generated shows its own row in the activity
             // block; the spinner fades for it like for any other activity.
             const preparingTool = Object.keys((message.pendingToolCallChunks as Record<string, unknown>) || {}).length > 0;
-            const quiet = arrivalQuiet && !preparingTool;
+            // Arriving bytes are not visible progress while paragraph delivery
+            // is holding the tail back. The question is whether anything that
+            // arrived is unpainted, not whether the whole bubble is blank:
+            // requiring every block to be wholly invisible text went false for
+            // the rest of the reply the moment the first paragraph landed, and
+            // was never true at all once the turn called a tool, so the
+            // indicator vanished and a reply mid-paragraph looked finished.
+            const waitingForParagraph = streamingMode === 'paragraph'
+              && projection.blocks.some((block) => {
+                if (block.type !== 'text') return false;
+                const content = block.segment.content || '';
+                return visibleParagraphPrefix(content).length < content.length;
+              });
+            const quiet = (arrivalQuiet || waitingForParagraph) && !preparingTool;
+            const size = isMobile ? 20 : 24;
+            // The row leaves in px, never from `auto`: an auto exit inside the
+            // chat scroller forces a layout a row short and clamps the scroll.
             return (
-              <div
-                className={`${hasContent ? 'mt-2' : 'mt-0'} transition-opacity duration-200`}
-                style={{ opacity: quiet ? 1 : 0 }}
+              <motion.div
+                key="streaming-indicator"
+                className="transition-opacity duration-200"
+                style={{ opacity: quiet ? 1 : 0, height: size, marginTop: hasContent ? 12 : 0, overflow: 'hidden' }}
+                exit={{ height: 0, marginTop: 0, opacity: 0, transition: EXIT_TWEEN }}
                 aria-hidden={!quiet}
                 data-testid="streaming-indicator"
                 data-quiet={quiet ? 'true' : 'false'}
               >
                 <LissajousLoading className={`${isMobile ? 'w-5 h-5' : 'w-6 h-6'} text-neutral-500 dark:text-neutral-400`} />
-              </div>
+              </motion.div>
             );
           })()}
+          </AnimatePresence>
         </div>
 
-        {/* Sources pill -- always-visible row (not the hover-gated footer
-            below). Mounted from the first source onward and only faded in once
-            the turn has finished: a count that climbs mid-stream reads as
-            activity, but unmounting the row until then would hop the whole
-            transcript by a line the moment the turn ends. While faded the row
-            is inert, so the invisible button takes neither a click nor a tab
-            stop. Clicking opens the Sources tab in the right panel. */}
-        {isAssistant && !isSubagentView && sourceCount > 0 && (
-          <div
-            className="flex justify-start mt-1 transition-opacity duration-200"
-            style={{ opacity: isStreaming ? 0 : 1 }}
-            inert={isStreaming}
-          >
-            <button
-              type="button"
-              onClick={() => onOpenSources?.(message.id as string)}
-              className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors"
-              style={{
-                backgroundColor: 'var(--color-bg-elevated)',
-                color: 'var(--color-text-secondary)',
-              }}
-              title={t('chat.sources.title')}
-            >
-              <FileSearch className="h-3.5 w-3.5" />
-              {t('chat.sources.pill', { count: sourceCount })}
-            </button>
-          </div>
+        {/* The turn's deliverables, on its last bubble, directly under the
+            reply. A long turn names its files somewhere in the prose or only
+            inside a tool call, so the deck gathers them where the reader
+            finishes reading, with nothing between. */}
+        {showTurnFiles && (
+          <TurnFileCards
+            files={turnFiles}
+            onOpenFile={onOpenFile}
+            onDownloadFile={onDownloadFile}
+            onReveal={() => onRevealFiles?.(message.id as string)}
+          />
         )}
 
         {/* Per-message "⏹ Stopped" marker — the turn was hard-stopped by the
@@ -421,6 +557,50 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
           >
             <StopCircle className="h-3.5 w-3.5 flex-shrink-0" />
             <span>{t('chat.stoppedChip')}</span>
+          </div>
+        )}
+
+        {/* The assistant's meta row: what the turn drew on, and what you can do
+            with it, on one line closing the turn.
+
+            It comes last because the actions are hover-gated but always
+            mounted, and a row that reserves space it does not fill is a hole
+            wherever it sits mid-turn: between the reply and the deck it read as
+            40px of nothing until the pointer arrived. At the end of the turn
+            the same reserved space is just the gap before the next message.
+
+            The Sources pill is always visible, while the actions beside it stay
+            hover-gated, so the two keep their own opacity. The pill is mounted
+            from the first source onward and only faded in once the turn has
+            finished: a count that climbs mid-stream reads as activity, but
+            unmounting it until then would hop the whole transcript by a line
+            the moment the turn ends. While faded it is inert, so the invisible
+            button takes neither a click nor a tab stop. Clicking it opens the
+            Sources tab in the right panel. */}
+        {isAssistant && ((sourceCount > 0 && !isSubagentView) || actionsRow) && (
+          <div className={`flex items-center gap-2 ${showTurnFiles ? 'mt-3' : 'mt-1'}`}>
+            {sourceCount > 0 && !isSubagentView && (
+            <div
+              className="transition-opacity duration-200"
+              style={{ opacity: turnLive ? 0 : 1 }}
+              inert={turnLive}
+            >
+              <button
+                type="button"
+                onClick={() => onOpenSources?.(message.id as string)}
+                className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors"
+                style={{
+                  backgroundColor: 'var(--color-bg-elevated)',
+                  color: 'var(--color-text-secondary)',
+                }}
+                title={t('chat.sources.title')}
+              >
+                <FileSearch className="h-3.5 w-3.5" />
+                {t('chat.sources.pill', { count: sourceCount })}
+              </button>
+            </div>
+            )}
+            {actionsRow}
           </div>
         )}
 
@@ -448,98 +628,7 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
         </>
         )}
 
-        {/* Message action buttons -- always mounted (reserves space), visibility toggled.
-            aria-hidden + inert keep the buttons out of the a11y tree and tab order
-            while opacity-0 is hiding them, so screen readers don't announce
-            "Copy, Thumbs up, ..." for every streaming message. */}
-        {canShowActions && !isEditing && (
-          <div
-            aria-hidden={!showActions}
-            inert={!showActions || undefined}
-            className={`flex gap-1 mt-0.5 transition-opacity ${
-              showActions
-                ? (isMobile ? 'opacity-70' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100')
-                : 'opacity-0 pointer-events-none'
-            } ${
-              isUser ? 'justify-end' : 'justify-start'
-            }`}
-          >
-            {/* User message actions. Steering bubbles get no edit pencil:
-                they're injected mid-turn and have no turn checkpoint of their
-                own, so an edit fork would target the NEXT turn and leave the
-                original steering text in the agent's context. */}
-            {isUser && onEditMessage && !isSteeringUserMessage(message) && (
-              <button
-                onClick={handleStartEdit}
-                className="p-1 rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
-                title={t('chat.actions.editMessage')}
-              >
-                <Pencil className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
-              </button>
-            )}
-
-            {/* Copy — both roles (a user bubble falls back to message.content).
-                Then assistant-only: ThumbUp -> ThumbDown -> Regenerate/Retry */}
-            <button
-              onClick={handleCopy}
-              className="p-1 rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
-              title={copied ? t('chat.actions.copied') : t('chat.actions.copyMessage')}
-            >
-              {copied
-                ? <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-profit)' }} />
-                : <Copy className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
-              }
-            </button>
-            {isAssistant && !(message.error as boolean) && onThumbUp && (
-              <button
-                onClick={handleThumbUpClick}
-                className="p-1 rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
-                title={feedbackRating === 'thumbs_up' ? t('chat.actions.removeRating') : t('chat.actions.goodResponse')}
-              >
-                <ThumbsUp
-                  className="h-3.5 w-3.5"
-                  fill={feedbackRating === 'thumbs_up' ? 'currentColor' : 'none'}
-                  style={{ color: feedbackRating === 'thumbs_up' ? 'var(--color-profit)' : 'var(--color-text-tertiary)' }}
-                />
-              </button>
-            )}
-            {isAssistant && !(message.error as boolean) && onThumbDown && (
-              <button
-                onClick={() => setShowThumbDownModal(true)}
-                className="p-1 rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
-                title={feedbackRating === 'thumbs_down' ? t('chat.actions.feedbackSubmitted') : t('chat.actions.reportIssue')}
-              >
-                <ThumbsDown
-                  className="h-3.5 w-3.5"
-                  fill={feedbackRating === 'thumbs_down' ? 'currentColor' : 'none'}
-                  style={{ color: feedbackRating === 'thumbs_down' ? 'var(--color-loss)' : 'var(--color-text-tertiary)' }}
-                />
-              </button>
-            )}
-            {/* One regenerate per backend turn, on the turn's last bubble —
-                regenerating re-runs the whole turn from its input checkpoint
-                (mid-run steering can't be replayed), so the affordance sits
-                at the end of the full response. */}
-            {isAssistant && !(message.error as boolean) && onRegenerate && isTurnTail && (
-              <button
-                onClick={() => onRegenerate(message.id as string)}
-                className="p-1 rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
-                title={t('chat.actions.regenerate')}
-              >
-                <RefreshCw className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
-              </button>
-            )}
-            {isAssistant && (message.error as boolean) && onRetry && (
-              <button
-                onClick={onRetry}
-                className="p-1 rounded transition-colors hover:bg-[var(--color-bg-elevated)]"
-                title={t('chat.actions.retry')}
-              >
-                <RotateCcw className="h-3.5 w-3.5" style={{ color: 'var(--color-text-tertiary)' }} />
-              </button>
-            )}
-          </div>
-        )}
+        {isUser && actionsRow}
 
         {/* ThumbDown feedback modal */}
         {showThumbDownModal && (
@@ -554,20 +643,6 @@ export const MessageBubble = memo(function MessageBubble({ message, turnIndex, i
           />
         )}
       </div>
-
-      {/* User avatar - shown on the right (hidden during edit on mobile) */}
-      {isUser && !hideAvatar && !(isEditing && isMobile) && (
-        <div
-          className={`flex-shrink-0 rounded-full flex items-center justify-center overflow-hidden ${isMobile ? 'w-6 h-6' : 'w-8 h-8'}`}
-          style={{ backgroundColor: 'var(--color-accent-soft)' }}
-        >
-          {avatarUrl ? (
-            <img src={avatarUrl} alt="User" className="w-full h-full object-cover" />
-          ) : (
-            <User className={isMobile ? 'h-3 w-3' : 'h-4 w-4'} style={{ color: 'var(--color-accent-primary)' }} />
-          )}
-        </div>
-      )}
     </div>
   );
 });

@@ -110,14 +110,12 @@ export default defineConfig(({ mode }) => {
       host: '127.0.0.1',
       // Unset leaves Vite's default host checking in place.
       allowedHosts: allowedHosts.length ? allowedHosts : undefined,
-      // In Docker on macOS the bind mount doesn't forward fsevents, so Vite's
-      // watcher silently dies and HMR stops (edits don't hot-reload; a reload
-      // can even serve the stale transform). Enable polling ONLY when
-      // CHOKIDAR_USEPOLLING=true (set by docker-compose for the containerized
-      // dev server) — native `pnpm dev` stays event-based with no CPU overhead.
-      watch: process.env.CHOKIDAR_USEPOLLING === 'true'
-        ? { usePolling: true, interval: 100 }
-        : undefined,
+      watch: {
+        // The docker-compose pnpm store volume sits inside the project root and
+        // holds ~40k files; watching it costs one inotify watch per file, enough
+        // to exhaust a Linux host's per-user limit.
+        ignored: ['**/.pnpm-store/**'],
+      },
       // When served behind the nginx dev proxy (oss.localhost etc.), the HMR
       // WebSocket must dial the proxy port, not the Vite port. Seed
       // VITE_HMR_CLIENT_PORT (e.g. =80) in .env.local, or pass it inline.

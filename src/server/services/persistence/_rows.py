@@ -13,7 +13,6 @@ from typing import Any
 
 from src.server.database.workspace_file import micros_to_datetime
 from src.server.services.persistence.transfer import ScanEntry
-from src.utils.storage import get_blob_transfer_mode
 
 # Extensions treated as binary before any bytes are read, for rows whose
 # content this process never sees (the sandbox sniffs the rest).
@@ -116,18 +115,6 @@ def _detect_is_binary(file_path: str, content: bytes) -> bool:
         return False
     except UnicodeDecodeError:
         return True
-
-
-def _transfer_mode(sandbox: Any) -> str:
-    # PTCSandbox holds the whole CoreConfig; the provider name is on its
-    # sandbox section. Anything else (a mock, a foreign runtime) reads as
-    # an unknown provider and relays.
-    config = getattr(sandbox, "config", None)
-    section = getattr(config, "sandbox", None)
-    provider = getattr(section, "provider", None)
-    if not isinstance(provider, str):
-        provider = None
-    return get_blob_transfer_mode(provider)
 
 
 def _row_base(entry: ScanEntry) -> dict[str, Any]:

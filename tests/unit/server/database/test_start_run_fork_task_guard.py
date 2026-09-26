@@ -33,7 +33,7 @@ FORK = ForkSpec(from_turn=2, checkpoint_id="ckpt-1")
 def _clean_thread(mock_cursor):
     """No duplicate request_key, no live root run — the two probes the fork
     path makes before it reaches the subagent guard."""
-    mock_cursor.fetchone.side_effect = [None, None]
+    mock_cursor.fetchone.side_effect = [{"status": "running"}, None, None]
 
 
 async def _start(conn):

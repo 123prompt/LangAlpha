@@ -3,11 +3,12 @@ Tests for src/server/handlers/chat/request_prep.py — chat request preparation.
 
 Covers:
 - classify_error: recoverable vs non-recoverable error classification
-- process_hitl_response: 5-tuple return, various HITL scenarios
+- process_hitl_response: the PreparedHitl record, various HITL scenarios
 - normalize_request_messages: dict conversion, multimodal, empty
 - init_tracking: returns (TokenTrackingManager, ToolUsageTracker)
 - apply_fetch_override: sets context vars
-- ensure_thread: correct DB call with kwargs
+- ensure_thread: correct DB call with kwargs, and the prior-row snapshot
+- build_turn_context: request wins over the thread's stored origin
 - inject_skills: skill injection for flash and ptc modes
 - build_graph_config: mode parameterization, optional fields
 - wait_or_steer: ready, steered, and 409 cases
@@ -15,12 +16,15 @@ Covers:
 - setup_steering_tracking: wires callback on handler
 """
 
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import psycopg
 import pytest
 
+from ptc_agent.config import LLMConfig
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from src.server.handlers.chat.request_prep import PriorThread, build_turn_context
 from src.server.models.additional_context import SkillContext
 
 PREP = "src.server.handlers.chat.request_prep"
@@ -202,143 +206,123 @@ class TestClassifyNonRecoverableErrorType:
 
 
 class TestProcessHitlResponse:
+    """Every scenario runs through the wire type, because the handler now
+    normalizes to it once and reads plain attributes below that."""
+
     def _make_request(self, hitl_response):
         req = MagicMock()
         req.hitl_response = hitl_response
         return req
 
-    def test_approve_with_message(self):
+    def _prepared(self, hitl_response, **summary):
         from src.server.handlers.chat.request_prep import process_hitl_response
 
-        response = MagicMock()
-        response.decisions = [MagicMock(type="approve", message="yes please")]
-        req = self._make_request({"int-1": response})
+        with patch(f"{PREP}.summarize_hitl_response_map", return_value=summary):
+            return process_hitl_response(self._make_request(hitl_response))
 
-        with patch(
-            f"{PREP}.summarize_hitl_response_map",
-            return_value={
-                "feedback_action": "QUESTION_ANSWERED",
-                "content": "approved: yes please",
-                "interrupt_ids": ["int-1"],
-            },
-        ):
-            action, content, answers, ids, decisions = process_hitl_response(req)
-
-        assert action == "QUESTION_ANSWERED"
-        assert ids == ["int-1"]
-        assert answers["int-1"] == "yes please"
+    def test_approve_with_message(self):
+        prepared = self._prepared(
+            {"int-1": {"decisions": [{"type": "approve", "message": "yes please"}]}},
+            feedback_action="QUESTION_ANSWERED",
+            content="approved: yes please",
+            interrupt_ids=["int-1"],
+        )
+        assert prepared.feedback_action == "QUESTION_ANSWERED"
+        assert prepared.query_content == "approved: yes please"
+        assert prepared.metadata["hitl_interrupt_ids"] == ["int-1"]
+        assert prepared.metadata["hitl_answers"]["int-1"] == "yes please"
 
     def test_reject_without_message(self):
-        from src.server.handlers.chat.request_prep import process_hitl_response
+        prepared = self._prepared(
+            {"int-1": {"decisions": [{"type": "reject", "message": ""}]}},
+            feedback_action="QUESTION_SKIPPED",
+            content="rejected",
+            interrupt_ids=["int-1"],
+        )
+        assert prepared.feedback_action == "QUESTION_SKIPPED"
+        assert prepared.metadata["hitl_answers"]["int-1"] is None
 
-        response = MagicMock()
-        response.decisions = [MagicMock(type="reject", message="")]
-        req = self._make_request({"int-1": response})
+    def test_a_validated_model_and_the_raw_dict_agree(self):
+        """The wire type is ``Dict[str, HITLResponse]``, but a caller that built
+        the request itself hands over what the client sent."""
+        from src.server.models.chat import HITLResponse
 
-        with patch(
-            f"{PREP}.summarize_hitl_response_map",
-            return_value={
-                "feedback_action": "QUESTION_SKIPPED",
-                "content": "rejected",
-                "interrupt_ids": ["int-1"],
-            },
-        ):
-            action, content, answers, ids, decisions = process_hitl_response(req)
-
-        assert action == "QUESTION_SKIPPED"
-        assert answers["int-1"] is None
-
-    def test_dict_style_response(self):
-        """HITL response as plain dict (not Pydantic model)."""
-        from src.server.handlers.chat.request_prep import process_hitl_response
-
-        response = {"decisions": [{"type": "approve", "message": "ok"}]}
-        req = self._make_request({"int-1": response})
-
-        with patch(
-            f"{PREP}.summarize_hitl_response_map",
-            return_value={
-                "feedback_action": "QUESTION_ANSWERED",
-                "content": "ok",
-                "interrupt_ids": ["int-1"],
-            },
-        ):
-            action, content, answers, ids, decisions = process_hitl_response(req)
-
-        assert answers["int-1"] == "ok"
+        raw = {"decisions": [{"type": "approve", "message": "ok"}]}
+        summary = dict(
+            feedback_action="QUESTION_ANSWERED", content="ok", interrupt_ids=["int-1"]
+        )
+        assert self._prepared({"int-1": raw}, **summary) == self._prepared(
+            {"int-1": HITLResponse.model_validate(raw)}, **summary
+        )
 
     def test_multiple_interrupts(self):
-        from src.server.handlers.chat.request_prep import process_hitl_response
-
-        r1 = MagicMock()
-        r1.decisions = [MagicMock(type="approve", message="answer 1")]
-        r2 = MagicMock()
-        r2.decisions = [MagicMock(type="reject", message="")]
-        req = self._make_request({"int-1": r1, "int-2": r2})
-
-        with patch(
-            f"{PREP}.summarize_hitl_response_map",
-            return_value={
-                "feedback_action": "QUESTION_ANSWERED",
-                "content": "mixed",
-                "interrupt_ids": ["int-1", "int-2"],
+        prepared = self._prepared(
+            {
+                "int-1": {"decisions": [{"type": "approve", "message": "answer 1"}]},
+                "int-2": {"decisions": [{"type": "reject", "message": ""}]},
             },
-        ):
-            action, content, answers, ids, decisions = process_hitl_response(req)
-
-        assert action == "QUESTION_ANSWERED"
-        assert answers["int-1"] == "answer 1"
-        assert answers["int-2"] is None
+            feedback_action="QUESTION_ANSWERED",
+            content="mixed",
+            interrupt_ids=["int-1", "int-2"],
+        )
+        assert prepared.feedback_action == "QUESTION_ANSWERED"
+        assert prepared.metadata["hitl_answers"] == {
+            "int-1": "answer 1",
+            "int-2": None,
+        }
 
     def test_empty_decisions(self):
-        from src.server.handlers.chat.request_prep import process_hitl_response
-
-        response = MagicMock()
-        response.decisions = []
-        req = self._make_request({"int-1": response})
-
-        with patch(
-            f"{PREP}.summarize_hitl_response_map",
-            return_value={
-                "feedback_action": "QUESTION_SKIPPED",
-                "content": "",
-                "interrupt_ids": ["int-1"],
-            },
-        ):
-            action, content, answers, ids, decisions = process_hitl_response(req)
-
-        assert answers == {}
-        assert decisions == {}
-        assert action == "QUESTION_SKIPPED"
+        prepared = self._prepared(
+            {"int-1": {"decisions": []}},
+            feedback_action="QUESTION_SKIPPED",
+            content="",
+            interrupt_ids=["int-1"],
+        )
+        assert prepared.feedback_action == "QUESTION_SKIPPED"
+        # Nothing to file beyond the ids, so nothing is filed.
+        assert prepared.metadata == {"hitl_interrupt_ids": ["int-1"]}
 
     def test_batch_records_a_decision_per_action_request(self):
         """A mixed batch keeps every verdict, which hitl_answers cannot."""
-        from src.server.handlers.chat.request_prep import process_hitl_response
-
-        response = {
-            "decisions": [
-                {"type": "approve", "message": None},
-                {"type": "reject", "message": "not this one"},
-            ]
-        }
-        req = self._make_request({"int-1": response})
-
-        with patch(
-            f"{PREP}.summarize_hitl_response_map",
-            return_value={
-                "feedback_action": "QUESTION_SKIPPED",
-                "content": "not this one",
-                "interrupt_ids": ["int-1"],
+        prepared = self._prepared(
+            {
+                "int-1": {
+                    "decisions": [
+                        {"type": "approve", "message": None},
+                        {"type": "reject", "message": "not this one"},
+                    ]
+                }
             },
-        ):
-            _action, _content, answers, _ids, decisions = process_hitl_response(req)
-
-        assert decisions["int-1"] == [
+            feedback_action="QUESTION_SKIPPED",
+            content="not this one",
+            interrupt_ids=["int-1"],
+        )
+        assert prepared.metadata["hitl_decisions"]["int-1"] == [
             {"type": "approve", "message": None},
             {"type": "reject", "message": "not this one"},
         ]
         # The collapsed record cannot tell this from rejecting both.
-        assert answers == {}
+        assert "hitl_answers" not in prepared.metadata
+
+    def test_an_order_verdict_is_filed_under_its_attempt(self):
+        """An order authorizes one execution of one call, so its answer is
+        keyed by attempt id and never by a position in a list."""
+        prepared = self._prepared(
+            {
+                "int-1": {
+                    "decisions": [],
+                    "order_decisions": {
+                        "att-1": {"type": "reject", "message": "too big"}
+                    },
+                }
+            },
+            feedback_action="DECLINED",
+            content="too big",
+            interrupt_ids=["int-1"],
+        )
+        assert prepared.metadata["order_decisions"] == {
+            "att-1": {"type": "reject", "message": "too big"}
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +428,7 @@ class TestApplyFetchOverride:
         from src.server.handlers.chat.request_prep import apply_fetch_override
 
         config = MagicMock()
-        config.llm.fetch = "gpt-4o-mini"
+        config.llm = LLMConfig(name="main-model", fetch="gpt-4o-mini")
         config.subsidiary_llm_clients = {"fetch": MagicMock()}
 
         with (
@@ -458,11 +442,28 @@ class TestApplyFetchOverride:
             config.subsidiary_llm_clients["fetch"]
         )
 
-    def test_skips_when_no_fetch(self):
+    def test_blank_fetch_defaults_to_flash(self):
         from src.server.handlers.chat.request_prep import apply_fetch_override
 
         config = MagicMock()
-        config.llm.fetch = None
+        config.llm = LLMConfig(name="main-model", fetch=None, flash="gpt-4o-mini")
+        config.subsidiary_llm_clients = {}
+
+        with (
+            patch(f"{PREP}.fetch_model_override") as mock_model_var,
+            patch(f"{PREP}.fetch_llm_client_override") as mock_client_var,
+        ):
+            apply_fetch_override(config)
+
+        mock_model_var.set.assert_called_once_with("gpt-4o-mini")
+        mock_client_var.set.assert_not_called()
+
+    def test_skips_when_no_fetch_or_flash(self):
+        from src.server.handlers.chat.request_prep import apply_fetch_override
+
+        config = MagicMock()
+        config.llm = LLMConfig(name="main-model", fetch=None, flash=None)
+        config.subsidiary_llm_clients = {}
 
         with (
             patch(f"{PREP}.fetch_model_override") as mock_model_var,
@@ -477,7 +478,7 @@ class TestApplyFetchOverride:
         from src.server.handlers.chat.request_prep import apply_fetch_override
 
         config = MagicMock()
-        config.llm.fetch = "gpt-4o-mini"
+        config.llm = LLMConfig(name="main-model", fetch="gpt-4o-mini")
         config.subsidiary_llm_clients = {}
 
         with (
@@ -529,7 +530,7 @@ class TestApplyFetchOverrideContextVars:
         """
         fake_client = MagicMock(name="byok-fetch-client")
         config = MagicMock()
-        config.llm.fetch = "claude-haiku-4-5"
+        config.llm = LLMConfig(name="main-model", fetch="claude-haiku-4-5")
         config.subsidiary_llm_clients = {"fetch": fake_client}
 
         snap = self._run_and_capture(config)
@@ -542,7 +543,7 @@ class TestApplyFetchOverrideContextVars:
         client context var must remain None so fetch.py uses LLM(model).get_llm().
         """
         config = MagicMock()
-        config.llm.fetch = "claude-haiku-4-5"
+        config.llm = LLMConfig(name="main-model", fetch="claude-haiku-4-5")
         config.subsidiary_llm_clients = {}  # platform user — nothing materialized
 
         snap = self._run_and_capture(config)
@@ -550,11 +551,25 @@ class TestApplyFetchOverrideContextVars:
         assert snap["model"] == "claude-haiku-4-5"
         assert snap["client"] is None  # default — fetch.py takes the platform path
 
-    def test_no_fetch_model_leaves_both_vars_unset(self):
-        """When config.llm.fetch is falsy neither context var should be set."""
+    def test_blank_fetch_forwards_flash_role_client(self):
+        """A blank fetch means the flash model, and role_registry resolves a
+        client for it. That client must reach web_fetch, or an OAuth user's
+        extraction goes out on a server key it does not have.
+        """
+        fake_client = MagicMock(name="oauth-fetch-client")
         config = MagicMock()
-        config.llm.fetch = None
-        config.subsidiary_llm_clients = {"fetch": MagicMock()}  # should be ignored
+        config.llm = LLMConfig(name="main-model", fetch=None, flash="claude-sonnet-4-6-oauth")
+        config.subsidiary_llm_clients = {"fetch": fake_client}
+
+        snap = self._run_and_capture(config)
+
+        assert snap["model"] == "claude-sonnet-4-6-oauth"
+        assert snap["client"] is fake_client
+
+    def test_no_fetch_or_flash_leaves_both_vars_unset(self):
+        config = MagicMock()
+        config.llm = LLMConfig(name="main-model", fetch=None, flash=None)
+        config.subsidiary_llm_clients = {}
 
         snap = self._run_and_capture(config)
 
@@ -568,7 +583,7 @@ class TestApplyFetchOverrideContextVars:
         """
         fake_client = MagicMock(name="shared-client")
         config = MagicMock()
-        config.llm.fetch = "claude-haiku-4-5"
+        config.llm = LLMConfig(name="main-model", fetch="claude-haiku-4-5")
         config.subsidiary_llm_clients = {"fetch": fake_client}
 
         snap = self._run_and_capture(config)
@@ -586,7 +601,7 @@ class TestApplyFetchOverrideContextVars:
         leak_sentinel = MagicMock(name="leaked-client")
 
         config_with = MagicMock()
-        config_with.llm.fetch = "some-model"
+        config_with.llm = LLMConfig(name="main-model", fetch="some-model")
         config_with.subsidiary_llm_clients = {"fetch": leak_sentinel}
 
         # First run sets the client in its own context copy.
@@ -606,6 +621,16 @@ class TestApplyFetchOverrideContextVars:
 
 
 class TestEnsureThread:
+    @pytest.fixture(autouse=True)
+    def _no_prior_row(self):
+        """Default every case to a thread that does not exist yet."""
+        with patch(
+            f"{PREP}.qr_db.get_thread_by_id",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_read:
+            yield mock_read
+
     @pytest.mark.asyncio
     async def test_basic_call(self):
         from src.server.handlers.chat.request_prep import ensure_thread
@@ -741,6 +766,237 @@ class TestEnsureThread:
         mock_schedule.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_prior_row_read_before_the_ensure_stamps_it(self):
+        """The read has to see the row as it was, so it runs first."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+
+        calls: list[str] = []
+        stamp = datetime(2026, 3, 1, 14, 30, tzinfo=UTC)
+
+        async def _read(_thread_id):
+            calls.append("read")
+            return {"updated_at": stamp, "metadata": {"origin": {"type": "automation"}}}
+
+        async def _ensure(**_kwargs):
+            calls.append("ensure")
+            return False
+
+        with (
+            patch(f"{PREP}.qr_db.get_thread_by_id", new=_read),
+            patch(f"{PREP}.qr_db.ensure_thread_exists", new=_ensure),
+            patch(
+                f"{PREP}.tl_db.get_latest_attempt",
+                new_callable=AsyncMock,
+                return_value={"created_at": stamp},
+            ),
+        ):
+            prior = await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query="hi"
+            )
+
+        assert calls == ["read", "ensure"]
+        assert prior.last_turn_at == stamp
+
+    @pytest.mark.asyncio
+    async def test_the_prior_turn_is_the_last_attempt_not_the_thread_stamp(self):
+        """A rename or a share bumps ``updated_at`` between turns, and a losing
+        concurrent POST bumps it on another worker; an attempt row is written
+        only by an admitted turn."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+        renamed_at = datetime(2026, 3, 4, 9, 0, tzinfo=UTC)
+        last_turn = datetime(2026, 3, 1, 14, 30, tzinfo=UTC)
+
+        with (
+            patch(
+                f"{PREP}.qr_db.get_thread_by_id",
+                new_callable=AsyncMock,
+                return_value={"updated_at": renamed_at},
+            ),
+            patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock),
+            patch(
+                f"{PREP}.tl_db.get_latest_attempt",
+                new_callable=AsyncMock,
+                return_value={"created_at": last_turn},
+            ),
+        ):
+            prior = await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query=""
+            )
+
+        assert prior.last_turn_at == last_turn
+
+    @pytest.mark.asyncio
+    async def test_naive_prior_stamp_becomes_aware(self):
+        """A naive stamp would raise against the envelope's aware clock."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+
+        with (
+            patch(
+                f"{PREP}.qr_db.get_thread_by_id",
+                new_callable=AsyncMock,
+                return_value={"updated_at": datetime(2026, 3, 1, 14, 30)},
+            ),
+            patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock),
+            patch(
+                f"{PREP}.tl_db.get_latest_attempt",
+                new_callable=AsyncMock,
+                return_value={"created_at": datetime(2026, 3, 1, 14, 30)},
+            ),
+        ):
+            prior = await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query=""
+            )
+
+        assert prior.last_turn_at == datetime(2026, 3, 1, 14, 30, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_a_fork_measures_from_the_turn_before_the_fork(self):
+        """An edit of turn 3 discards turns 3 and later; the history the model
+        reads ends at turn 2, so that is the prior turn."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+        request.fork_from_turn = 3
+        request.checkpoint_id = "ckpt-3"
+        before = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
+
+        with (
+            patch(
+                f"{PREP}.qr_db.get_thread_by_id",
+                new_callable=AsyncMock,
+                return_value={"updated_at": datetime(2026, 3, 4, 9, 0, tzinfo=UTC)},
+            ),
+            patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock),
+            patch(
+                f"{PREP}.tl_db.get_latest_attempt",
+                new_callable=AsyncMock,
+                return_value={"created_at": before},
+            ) as latest,
+        ):
+            prior = await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query=""
+            )
+
+        latest.assert_awaited_once_with("t-1", before_turn=3)
+        assert prior.last_turn_at == before
+
+    @pytest.mark.asyncio
+    async def test_a_plain_turn_reads_the_newest_attempt(self):
+        """Without a checkpoint there is no fork, whatever ``fork_from_turn`` says."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+        request.fork_from_turn = None
+        request.checkpoint_id = None
+
+        with (
+            patch(
+                f"{PREP}.qr_db.get_thread_by_id",
+                new_callable=AsyncMock,
+                return_value={"updated_at": datetime(2026, 3, 4, 9, 0, tzinfo=UTC)},
+            ),
+            patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock),
+            patch(
+                f"{PREP}.tl_db.get_latest_attempt", new_callable=AsyncMock, return_value=None
+            ) as latest,
+        ):
+            await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query=""
+            )
+
+        latest.assert_awaited_once_with("t-1", before_turn=None)
+
+    @pytest.mark.asyncio
+    async def test_a_thread_that_never_ran_has_no_prior_turn(self):
+        """The create-first web flow leaves a thread behind when the send never
+        happened; its ``updated_at`` is not a turn."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+
+        with (
+            patch(
+                f"{PREP}.qr_db.get_thread_by_id",
+                new_callable=AsyncMock,
+                return_value={"updated_at": datetime(2026, 3, 1, 14, 30, tzinfo=UTC)},
+            ),
+            patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock),
+            patch(f"{PREP}.tl_db.get_latest_attempt", new_callable=AsyncMock, return_value=None),
+        ):
+            prior = await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query=""
+            )
+
+        assert prior.last_turn_at is None
+
+    @pytest.mark.asyncio
+    async def test_first_turn_has_no_prior(self):
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+
+        with patch(f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock):
+            prior = await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query="hi"
+            )
+
+        assert prior.last_turn_at is None
+
+    @pytest.mark.asyncio
+    async def test_failed_prior_read_still_starts_the_turn(self):
+        """Context, not correctness: a read failure degrades to no prior."""
+        from src.server.handlers.chat.request_prep import ensure_thread
+
+        request = MagicMock()
+        request.external_thread_id = None
+        request.platform = None
+        request.origin = None
+
+        with (
+            patch(
+                f"{PREP}.qr_db.get_thread_by_id",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("pool down"),
+            ),
+            patch(
+                f"{PREP}.qr_db.ensure_thread_exists", new_callable=AsyncMock
+            ) as mock_db,
+        ):
+            prior = await ensure_thread(
+                request, "t-1", "ws-1", "u-1", msg_type="ptc", initial_query="hi"
+            )
+
+        assert prior == PriorThread()
+        mock_db.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_no_title_generation_without_llm_service(self):
         """The scheduler owns llm_service resolution, so neither creation door
         carries a `getattr(setup, ...)` locator that could drift."""
@@ -757,6 +1013,48 @@ class TestEnsureThread:
                 )
                 is None
             )
+
+
+# ---------------------------------------------------------------------------
+# build_turn_context
+# ---------------------------------------------------------------------------
+
+
+class TestBuildTurnContext:
+    def _request(self, origin=None, platform=None, surface_rules=None):
+        request = MagicMock(timezone="UTC", locale="en-US")
+        request.origin = origin
+        request.platform = platform
+        request.surface_rules = surface_rules
+        return request
+
+    def test_origin_comes_from_the_request(self):
+        from src.server.models.chat import ThreadOrigin
+
+        ctx = build_turn_context(
+            self._request(origin=ThreadOrigin(type="agent", id="flash-t-1")),
+            PriorThread(),
+            user_profile=None,
+        )
+
+        assert ctx.origin == "agent"
+
+    def test_a_manual_follow_up_carries_no_origin(self):
+        """A person replying in an automation's thread is waiting; the thread's origin must not say otherwise."""
+        ctx = build_turn_context(self._request(), PriorThread(), user_profile=None)
+
+        assert ctx.origin is None
+
+    def test_surface_comes_from_the_request_alone(self):
+        stamp = datetime(2026, 3, 1, 14, 30, tzinfo=UTC)
+        ctx = build_turn_context(
+            self._request(platform="slack", surface_rules="reply in one block"),
+            PriorThread(last_turn_at=stamp),
+            user_profile=None,
+        )
+
+        assert (ctx.platform, ctx.surface_rules) == ("slack", "reply in one block")
+        assert ctx.last_turn_at == stamp
 
 
 # ---------------------------------------------------------------------------
@@ -1781,50 +2079,69 @@ class TestPrepareSkillContexts:
 
 
 # ---------------------------------------------------------------------------
-# _resolve_timezone
+# build_turn_context: the turn's zones
 # ---------------------------------------------------------------------------
 
 
-class TestResolveTimezone:
-    def test_valid_timezone(self):
-        from src.server.handlers.chat.request_prep import _resolve_timezone
+class TestTurnZones:
+    def _zones(self, request_tz, locale="en-US", profile=None):
+        request = MagicMock(timezone=request_tz, locale=locale)
+        request.origin = None
+        ctx = build_turn_context(request, PriorThread(), user_profile=profile)
+        return ctx.timezone, ctx.tool_timezone
 
-        result = _resolve_timezone("America/New_York", "en-US")
-        assert result == "America/New_York"
+    def test_valid_request_zone(self):
+        assert self._zones("America/New_York") == (
+            "America/New_York",
+            "America/New_York",
+        )
 
-    def test_invalid_timezone_falls_back(self):
-        from src.server.handlers.chat.request_prep import _resolve_timezone
-
+    def test_invalid_zone_falls_back_to_the_locale(self):
         with patch(
             f"{PREP}.get_locale_config",
             return_value={"timezone": "Asia/Shanghai"},
         ):
-            result = _resolve_timezone("Invalid/Zone", "zh-CN")
+            assert self._zones("Invalid/Zone", "zh-CN") == (None, "Asia/Shanghai")
 
-        assert result == "Asia/Shanghai"
-
-    def test_none_timezone_falls_back(self):
-        from src.server.handlers.chat.request_prep import _resolve_timezone
-
-        with patch(
-            f"{PREP}.get_locale_config",
-            return_value={"timezone": "UTC"},
-        ):
-            result = _resolve_timezone(None, "en-US")
-
-        assert result == "UTC"
+    @pytest.mark.parametrize("malformed", ["../etc/passwd", "America", "x" * 300])
+    def test_a_malformed_zone_falls_back_like_an_unknown_one(self, malformed):
+        """ZoneInfo refuses these as ValueError or OSError, not as an unknown
+        name; the turn must still get a clock rather than fail."""
+        with patch(f"{PREP}.get_locale_config", return_value={"timezone": "UTC"}):
+            assert self._zones(malformed) == (None, "UTC")
 
     def test_none_locale_uses_default(self):
-        from src.server.handlers.chat.request_prep import _resolve_timezone
-
         with patch(
             f"{PREP}.get_locale_config",
             return_value={"timezone": "UTC"},
         ) as mock_locale:
-            result = _resolve_timezone(None, None)
+            assert self._zones(None, None) == (None, "UTC")
 
         mock_locale.assert_called_once_with("en-US", "en")
-        assert result == "UTC"
+
+    def test_profile_zone_wins_over_the_request(self):
+        zones = self._zones("America/New_York", profile={"timezone": "Asia/Shanghai"})
+        assert zones == ("Asia/Shanghai", "Asia/Shanghai")
+
+    def test_invalid_profile_zone_falls_to_the_request(self):
+        zones = self._zones("Europe/London", profile={"timezone": "Not/AZone"})
+        assert zones == ("Europe/London", "Europe/London")
+
+    def test_a_channel_turn_with_no_zone_gets_the_profile_zone(self):
+        """The gateway and the automation executor send neither zone nor
+        locale; the agent's clock is on the profile zone, so tools must be."""
+        zones = self._zones(None, None, profile={"timezone": "Asia/Shanghai"})
+        assert zones == ("Asia/Shanghai", "Asia/Shanghai")
+
+    def test_an_unnamed_zone_reaches_tools_but_not_the_stamp(self):
+        """An automation's request names no zone, and a failed profile read
+        answers None: tools read the locale default, but the stamp is given no
+        zone, so it keeps the one the frozen identity states."""
+        with patch(
+            f"{PREP}.get_locale_config",
+            return_value={"timezone": "America/New_York"},
+        ):
+            assert self._zones(None, None, profile=None) == (None, "America/New_York")
 
 
 class TestInjectInlineReminders:

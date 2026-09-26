@@ -456,7 +456,7 @@ class TestReadOnly:
 class TestCacheInvalidation:
     """Writes through the backend must invalidate the shared per-request cache.
 
-    Otherwise the next ``MemoryContextMiddleware`` read in the same turn
+    Otherwise the next runtime-context baseline read in the same turn
     would serve the pre-write value.
     """
 

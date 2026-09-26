@@ -28,6 +28,7 @@ import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
 
 import { chartSelectionStore, isConfirmedFor, useChartSelections, type ChartSelection } from '../stores/chartSelectionStore';
 import { toUnixSeconds } from '../utils/annotationGeometry';
+import { pricePaneElement, pricePaneHeight } from '../utils/paneBounds';
 import './SelectionCommentOverlay.css';
 
 const GAP = 8;
@@ -141,7 +142,14 @@ export const SelectionCommentOverlay = React.memo(function SelectionCommentOverl
     }
     const host = hostRef.current;
     const paneW = host?.clientWidth ?? 0;
-    const paneH = host?.clientHeight ?? 0;
+    // The host spans the RSI pane too; pins and the composer stay on the price
+    // pane, and with no pane measured yet they have nowhere to sit.
+    const paneH = pricePaneHeight(chart);
+    if (paneH <= 0) {
+      setPins((p) => (p.length ? [] : p));
+      setComposer(null);
+      return;
+    }
 
     // The selection's right + left (time) edges and top (high price) edge. A
     // price level spans full width, so both edges are the right side.
@@ -201,6 +209,8 @@ export const SelectionCommentOverlay = React.memo(function SelectionCommentOverl
   }, [chartRef, seriesRef]);
 
   // Reposition on pan/zoom + resize + selection changes, coalesced per frame.
+  // The price pane is observed on its own: a drag on the pane separator
+  // moves it without changing the host.
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) {
@@ -233,6 +243,8 @@ export const SelectionCommentOverlay = React.memo(function SelectionCommentOverl
     if (host && typeof ResizeObserver !== 'undefined') {
       ro = new ResizeObserver(() => schedule());
       ro.observe(host);
+      const pane = pricePaneElement(chart);
+      if (pane) ro.observe(pane);
     }
     const raf = requestAnimationFrame(() => recompute());
     return () => {

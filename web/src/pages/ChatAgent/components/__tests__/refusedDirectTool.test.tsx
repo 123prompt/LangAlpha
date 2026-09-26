@@ -39,6 +39,7 @@ vi.mock('../Markdown', () => ({
 
 vi.mock('../charts/InlineArtifactCards', () => ({
   INLINE_ARTIFACT_TOOLS: new Set<string>(),
+  isInlineArtifactReady: () => false,
   INLINE_ARTIFACT_MAP: {},
   InlineStockPriceCard: () => null,
   InlineCompanyOverviewCard: () => null,
@@ -53,7 +54,9 @@ vi.mock('../charts/InlineArtifactCards', () => ({
 vi.mock('../charts/InlineAutomationCards', () => ({ InlineAutomationCard: () => null }));
 vi.mock('../charts/InlinePreviewCard', () => ({ InlinePreviewCard: () => null }));
 vi.mock('../ToolCallDetailView', () => ({ default: () => <div data-testid="detail-body" /> }));
-vi.mock('@/hooks/useIsMobile', () => ({ useIsMobile: () => false }));
+// The detail header is the mobile sheet's; a desktop tab is named by its strip.
+const viewport = vi.hoisted(() => ({ mobile: false }));
+vi.mock('@/hooks/useIsMobile', () => ({ useIsMobile: () => viewport.mobile }));
 
 // The vendor mark reaches for the brokerage list over React Query; the icon
 // identity is not what these tests are about.
@@ -125,7 +128,7 @@ describe('a refused direct MCP tool call', () => {
 
     const activity = blocks.find((b) => b.type === 'activity');
     expect(activity).toBeDefined();
-    const item = (activity as { items: Array<Record<string, unknown>> }).items[0];
+    const item = activity!.items[0];
     expect(item._liveState).toBe('failed');
   });
 
@@ -141,7 +144,7 @@ describe('a refused direct MCP tool call', () => {
       },
     ];
 
-    const { container } = render(<ActivityBlock items={items as never} isStreaming={false} isFirst={false} />);
+    const { container } = render(<ActivityBlock items={items as never} isStreaming={false} />);
     fireEvent.click(screen.getByRole('button', { name: /toolArtifact/i }));
 
     const failedRow = container.querySelector('.titem.failed');
@@ -151,16 +154,26 @@ describe('a refused direct MCP tool call', () => {
     );
   });
 
-  it('says so in the detail panel header', () => {
-    const proc = refusedProc();
-    render(<DetailPanel toolCallProcess={proc as never} onClose={() => {}} />);
-    expect(screen.getByLabelText('toolArtifact.a11y.toolCallFailed')).toBeInTheDocument();
+  it('says so in the detail sheet header', () => {
+    viewport.mobile = true;
+    try {
+      const proc = refusedProc();
+      render(<DetailPanel toolCallProcess={proc as never} />);
+      expect(screen.getByLabelText('toolArtifact.a11y.toolCallFailed')).toBeInTheDocument();
+    } finally {
+      viewport.mobile = false;
+    }
   });
 
   it('leaves a successful call unmarked in the header', () => {
-    const proc = { ...refusedProc(), isFailed: false };
-    render(<DetailPanel toolCallProcess={proc as never} onClose={() => {}} />);
-    expect(screen.queryByLabelText('toolArtifact.a11y.toolCallFailed')).toBeNull();
+    viewport.mobile = true;
+    try {
+      const proc = { ...refusedProc(), isFailed: false };
+      render(<DetailPanel toolCallProcess={proc as never} />);
+      expect(screen.queryByLabelText('toolArtifact.a11y.toolCallFailed')).toBeNull();
+    } finally {
+      viewport.mobile = false;
+    }
   });
 });
 
@@ -186,8 +199,13 @@ describe('a successful direct MCP tool call whose output opens with "Refused:"',
     ).toBe(false);
   });
 
-  it('stays unmarked in the detail panel header', () => {
-    render(<DetailPanel toolCallProcess={procFor(SUCCESS_TEXT, 'success') as never} onClose={() => {}} />);
-    expect(screen.queryByLabelText('toolArtifact.a11y.toolCallFailed')).toBeNull();
+  it('stays unmarked in the detail sheet header', () => {
+    viewport.mobile = true;
+    try {
+      render(<DetailPanel toolCallProcess={procFor(SUCCESS_TEXT, 'success') as never} />);
+      expect(screen.queryByLabelText('toolArtifact.a11y.toolCallFailed')).toBeNull();
+    } finally {
+      viewport.mobile = false;
+    }
   });
 });

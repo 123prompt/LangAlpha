@@ -76,6 +76,11 @@ doubled edge on the boxed controls, an outline under forced colors. The exemptio
 is the `.login-page` surface itself, not the route it mounts on: the same build
 serves the app from that route once someone is signed in.
 
+One CTA is a sanctioned exception: the chart annotation card's "Open chart"
+pill takes the accent fill while the card is raised (hover or keyboard focus),
+with `--color-text-on-accent` for its text, because the whole card is the
+control and the pill only names where the raise leads.
+
 Semantic color (profit/loss/warning/danger) is separate from the accent and
 never substitutes for it.
 

@@ -30,6 +30,8 @@ LIFECYCLE_TYPES = {
     "thread_deleted",
     "thread_archived",
     "thread_unarchived",
+    "automation_waiting",
+    "automation_waiting_ended",
 }
 
 
@@ -69,6 +71,28 @@ def test_every_pinned_type_builds_the_one_wire_shape(type_name):
         "interrupt_reason",
     }
     assert event["v"] == thread_lifecycle_feed.EVENT_VERSION
+
+
+@pytest.mark.parametrize("waiting", [True, False])
+def test_automation_wait_events_name_their_firing(waiting):
+    event = thread_lifecycle_feed.build_automation_wait_event(
+        thread_id="t-1", automation_execution_id="exec-1", waiting=waiting
+    )
+    assert event["type"] == (
+        "automation_waiting" if waiting else "automation_waiting_ended"
+    )
+    assert event["automation_execution_id"] == "exec-1"
+    assert set(event) == {
+        "v",
+        "type",
+        "thread_id",
+        "workspace_id",
+        "run_id",
+        "run_seq",
+        "status",
+        "interrupt_reason",
+        "automation_execution_id",
+    }
 
 
 def test_interrupt_reason_is_nulled_off_the_interrupted_status():

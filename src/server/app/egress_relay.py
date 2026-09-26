@@ -24,6 +24,7 @@ from contextlib import AsyncExitStack
 import anyio
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from src.server.services.egress import RelayError, RelayRejection
 from src.server.services.egress.jsonrpc import MAX_BODY_BYTES
@@ -32,6 +33,7 @@ from src.server.services.egress.relay import (
     MAX_RESPONSE_BYTES,
     WALL_CLOCK_S,
     authenticate_relay,
+    log_order_frame,
     open_upstream,
     prepare_relay,
     sandbox_response_headers,
@@ -61,6 +63,11 @@ async def _read_capped_body(request: Request) -> bytes:
     streaming read then enforces the same bound so a chunked or lying-length
     body can't slip a huge payload into memory. Same 400/"exceeds" contract the
     canonicalizer would raise — only now the bytes are never all held at once.
+
+    A caller that hangs up mid-body is refused rather than left to raise: the
+    refusal path is what releases the slot and the upstream connection, and it
+    is the difference between one line and an ASGI traceback for a client that
+    merely went away.
     """
     cap = MAX_BODY_BYTES
     content_length = request.headers.get("content-length")
@@ -75,13 +82,18 @@ async def _read_capped_body(request: Request) -> bytes:
             )
     chunks: list[bytes] = []
     total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > cap:
-            raise RelayRejection(
-                400, RelayError.BAD_REQUEST, f"body exceeds {cap} bytes"
-            )
-        chunks.append(chunk)
+    try:
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > cap:
+                raise RelayRejection(
+                    400, RelayError.BAD_REQUEST, f"body exceeds {cap} bytes"
+                )
+            chunks.append(chunk)
+    except ClientDisconnect:
+        raise RelayRejection(
+            400, RelayError.BAD_REQUEST, "client closed the request"
+        ) from None
     return b"".join(chunks)
 
 
@@ -113,10 +125,14 @@ async def relay(grant_id: str, request: Request) -> Response:
                 claims = authenticate_relay(request.headers.get("authorization"))
                 await resources.enter_async_context(acquire_slot(grant_id))
                 raw_body = await _read_capped_body(request)
+                incoming = dict(request.headers)
                 prepared = await prepare_relay(
-                    grant_id, claims=claims, raw_body=raw_body
+                    grant_id, claims=claims, raw_body=raw_body, headers=incoming
                 )
-                upstream = await open_upstream(prepared, dict(request.headers))
+                upstream = await open_upstream(prepared, incoming)
+                # After the vendor answered, so the one line an order writes
+                # carries the status rather than only the intent.
+                log_order_frame(prepared, upstream.status_code)
         except TimeoutError:
             raise RelayRejection(
                 504, RelayError.WALL_CLOCK, "relay wall clock exceeded"

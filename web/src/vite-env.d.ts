@@ -14,6 +14,7 @@ interface ImportMetaEnv {
   // Origin (or same-host path) of the platform console — account, plans,
   // integrations. Cross-app links only; never a router target.
   readonly VITE_PLATFORM_URL?: string;
+  readonly VITE_CONTACT_EMAILS?: string;
 }
 interface ImportMeta {
   readonly env: ImportMetaEnv;

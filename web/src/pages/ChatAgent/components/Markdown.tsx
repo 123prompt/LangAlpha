@@ -11,8 +11,10 @@ import SyntaxHighlighter, { oneDark, oneLight } from './SyntaxHighlighter';
 import { Copy, Check } from 'lucide-react';
 import { useTheme } from '@/contexts/ThemeContext';
 import WorkspaceImage from './WorkspaceImage';
-import { isFilePath, isImagePath, normalizeFilePath, parseWsPath } from './FileCard';
+import { isFilePath, isImagePath, normalizeFilePath, parseWsPath } from '../utils/filePaths';
+import { parseAgentPath } from '../utils/agentPaths';
 import { normalizeFileRefs } from '../utils/normalizeFileRefs';
+import { splitFileLocation, type OpenFileHandler } from '../utils/fileLocation';
 import { mapOutsideCode, mapOutsideMultilineCode } from '../utils/markdownSegments';
 import { splitMarkdownBlocks } from '../utils/markdownBlocks';
 import CitationBubble from './CitationBubble';
@@ -647,12 +649,14 @@ interface MarkdownProps {
   className?: string;
   style?: React.CSSProperties;
   /** Called when a file link is clicked. workspaceId is set for cross-workspace (ws://) references. */
-  onOpenFile?: (path: string, workspaceId?: string) => void;
+  onOpenFile?: OpenFileHandler;
+  /** Called with the fragment of a same-document link (`[Valuation](#valuation)`). */
+  onAnchorLink?: (fragment: string) => void;
   /** Force code blocks to use a specific syntax theme regardless of app theme */
   codeTheme?: 'light' | 'dark';
 }
 
-function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, codeTheme }: MarkdownProps): React.ReactElement {
+function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, codeTheme }: MarkdownProps): React.ReactElement {
   const config = VARIANTS[variant];
   // Every pass below rewrites prose before the markdown parser sees it, so each
   // one has to say how much of the string it may touch. Inside code, markdown
@@ -685,7 +689,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       result = { ...result, pre: themedPre };
     }
 
-    if (!onOpenFile && variant !== 'chat') return result;
+    if (!onOpenFile && !onAnchorLink && variant !== 'chat') return result;
 
     // Fallback: detect __wsref__ links inside inline code spans that survived
     // normalizeFileRefs' backtick unwrapping (e.g., nested backticks, extra whitespace).
@@ -705,11 +709,12 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
               return <WorkspaceImage src={href} alt={linkText} />;
             }
             const wsRef = parseWsPath(href);
+            const { path, location } = splitFileLocation(href);
             return (
               <a
                 className="underline hover:opacity-80 transition-opacity cursor-pointer"
                 style={{ color: 'var(--color-accent-primary)' }}
-                onClick={(e: React.MouseEvent) => { e.preventDefault(); onOpenFile(normalizeFilePath(href), wsRef?.workspaceId); }}
+                onClick={(e: React.MouseEvent) => { e.preventDefault(); onOpenFile(normalizeFilePath(path), wsRef?.workspaceId, location ?? undefined, { rooted: parseAgentPath(path).absolute || !!wsRef }); }}
               >{linkText}</a>
             );
           }
@@ -720,20 +725,32 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
     }
 
     const fileAwareA = ({ node: _node, href, children, ...props }: MarkdownComponentProps) => {
+      if (onAnchorLink && href?.startsWith('#') && href.length > 1) {
+        return (
+          <a
+            className="underline hover:opacity-80 transition-opacity cursor-pointer"
+            style={{ color: 'var(--color-accent-primary)' }}
+            href={href}
+            onClick={(e: React.MouseEvent) => { e.preventDefault(); onAnchorLink(href.slice(1)); }}
+            {...props}
+          >{children}</a>
+        );
+      }
       if (isFilePath(href)) {
-        // Image file linked as [name](path.png) -- render as embedded image
-        // For ws:// paths, pass the full href so WorkspaceImage can extract the workspace
+        // Image file linked as [name](path.png) -- render as embedded image.
+        // The destination goes over raw: WorkspaceImage reads it the same way
+        // this link does, and normalizing here would decode it twice.
         if (isImagePath(href)) {
-          const wsRef = parseWsPath(href);
-          return <WorkspaceImage src={wsRef ? href : normalizeFilePath(href)} alt={typeof children === 'string' ? children : ''} />;
+          return <WorkspaceImage src={href} alt={typeof children === 'string' ? children : ''} />;
         }
         if (onOpenFile) {
           const wsRef = parseWsPath(href);
+          const { path, location } = splitFileLocation(href!);
           return (
             <a
               className="underline hover:opacity-80 transition-opacity cursor-pointer"
               style={{ color: 'var(--color-accent-primary)' }}
-              onClick={(e: React.MouseEvent) => { e.preventDefault(); onOpenFile(normalizeFilePath(href), wsRef?.workspaceId); }}
+              onClick={(e: React.MouseEvent) => { e.preventDefault(); onOpenFile(normalizeFilePath(path), wsRef?.workspaceId, location ?? undefined, { rooted: parseAgentPath(path).absolute || !!wsRef }); }}
               {...props}
             >{children}</a>
           );
@@ -746,7 +763,7 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       return <DefaultA node={_node} href={href} {...props}>{children}</DefaultA>;
     };
     return { ...result, a: fileAwareA };
-  }, [onOpenFile, variant, config.components, codeTheme]);
+  }, [onOpenFile, onAnchorLink, variant, config.components, codeTheme]);
 
   // Rendered markdown is always long-form reading content — every call site
   // (transcript, detail panels, memos, plans) gets the content face here.

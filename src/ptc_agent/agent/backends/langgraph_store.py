@@ -13,6 +13,7 @@ from typing import Any
 import structlog
 from langgraph.store.base import BaseStore
 
+from ptc_agent.agent.backends.results import EditTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.backends.store_cache import RequestScopedStoreCache
 
@@ -277,7 +278,7 @@ class StoreBackend:
         replace_all: bool = False,
         base_content: str | None = None,
         max_bytes: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> EditTextResult:
         """Edit a stored file; ``base_content`` forks it when the key is absent.
 
         An overlay tier (shipped scripts shadowed by the user's own) passes the
@@ -382,6 +383,7 @@ class StoreBackend:
         return {
             "success": True,
             "occurrences": occurrences if replace_all else 1,
+            "size": len(new_content),
             "message": (
                 f"Edited {file_path} ({occurrences} occurrences replaced)"
                 if replace_all

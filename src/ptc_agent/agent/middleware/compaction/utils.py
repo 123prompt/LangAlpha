@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import tiktoken
@@ -46,7 +46,7 @@ def resolve_compaction_client(config: AgentConfig) -> Any | None:
     (credentialed users) or None (platform users keep the cheap name-based
     model). Without one, fall back to a copy of the main client.
     """
-    has_compaction_model = bool(config.llm and config.llm.compaction)
+    has_compaction_model = bool(config.llm and config.llm.compaction_name)
     return config.client_for_role("compaction", fallback_to_main=not has_compaction_model)
 
 
@@ -226,11 +226,10 @@ def strip_base64_from_content(content: str | list) -> str | list:
         elif block_type == "text":
             text = block.get("text", "")
             if isinstance(text, str) and _DATA_URI_RE.search(text):
+                # Rebuild from the block so sibling keys (annotations, phase,
+                # index) survive the redaction.
                 new_blocks.append(
-                    {
-                        "type": "text",
-                        "text": _DATA_URI_RE.sub("[base64 data removed]", text),
-                    }
+                    {**block, "text": _DATA_URI_RE.sub("[base64 data removed]", text)}
                 )
                 changed = True
                 continue
@@ -813,19 +812,32 @@ def get_effective_messages(
     if event is None:
         return messages
 
-    cutoff = event["cutoff_index"]
+    cutoff = resolve_cutoff_index(messages, event)
+    tail = strip_orphan_tool_messages(messages[cutoff:])
+    return [event["summary_message"], *tail]
+
+
+def resolve_cutoff_index(messages: Sequence[AnyMessage], event: Mapping[str, Any]) -> int:
+    """Where ``event``'s boundary falls in ``messages`` as they are now.
+
+    The one reader of ``cutoff_index`` outside this module is the turn row,
+    which scans the tail the model can still read. It has to agree with the
+    slice the model gets, so both resolve the boundary here: the stored index
+    is trusted only while it still points at the anchor, and re-found by id
+    otherwise. Legacy events (no anchor) keep the positional index as-is.
+    """
+    raw = event.get("cutoff_index")
+    cutoff = raw if isinstance(raw, int) and raw >= 0 else 0
     anchor_id = event.get("anchor_message_id")
     # O(1) happy path: only re-scan when the positional cutoff has drifted off
-    # the anchor. Legacy events (no anchor) keep the positional index as-is.
+    # the anchor.
     if anchor_id is not None and not (
         0 <= cutoff < len(messages) and message_id(messages[cutoff]) == anchor_id
     ):
-        resolved = _resolve_anchor_index(messages, anchor_id)
+        resolved = _resolve_anchor_index(list(messages), anchor_id)
         if resolved is not None:
             cutoff = resolved
-
-    tail = strip_orphan_tool_messages(messages[cutoff:])
-    return [event["summary_message"], *tail]
+    return cutoff
 
 
 # File-note suffix appended to the summary message content; the parser splits

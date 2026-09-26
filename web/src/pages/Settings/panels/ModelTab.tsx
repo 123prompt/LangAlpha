@@ -12,6 +12,7 @@ import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
 import { PerModelMatrix } from '@/components/model/PerModelMatrix';
 import { AccountTuningDefaults } from '@/components/model/AccountTuningDefaults';
 import { useAllModels } from '@/hooks/useAllModels';
+import { modelLabel, modelMatches } from '@/lib/modelLabel';
 import { isPlatformMode } from '@/config/hostMode';
 import { useTranslation } from 'react-i18next';
 import { ConnectedAccounts } from './ConnectedAccounts';
@@ -185,6 +186,7 @@ export function ModelTab() {
               below in Advanced, so the component's own drawer stays closed. */}
           <ModelTierConfig
             models={visibleModels}
+            metadata={modelMetadata}
             primaryModel={mPref.preferred_model ?? ''}
             onPrimaryModelChange={(v) => write({ preferred_model: v || null })}
             flashModel={mPref.preferred_flash_model ?? ''}
@@ -212,13 +214,13 @@ export function ModelTab() {
                     color: 'var(--color-text-secondary)',
                   }}
                 >
-                  {key}
+                  {modelLabel(key, modelMetadata)}
                   <button
                     type="button"
                     onClick={() => setStarred(starredModels.filter(k => k !== key))}
                     className="ml-0.5 hover:opacity-70"
                     style={{ color: 'var(--color-text-tertiary)' }}
-                    aria-label={`Remove ${key}`}
+                    aria-label={t('settings.removeModel', { model: modelLabel(key, modelMetadata) })}
                   >
                     &times;
                   </button>
@@ -268,9 +270,7 @@ export function ModelTab() {
                 {Object.entries(visibleModels).map(([provider, providerData]) => {
                   const models: string[] = providerData?.models || [];
                   const query = modelPickerSearch.toLowerCase();
-                  const filtered = query
-                    ? models.filter(m => m.toLowerCase().includes(query))
-                    : models;
+                  const filtered = models.filter(m => modelMatches(m, query, modelMetadata));
                   if (filtered.length === 0) return null;
                   const displayName = providerData?.display_name || provider.charAt(0).toUpperCase() + provider.slice(1);
                   return (
@@ -295,7 +295,7 @@ export function ModelTab() {
                             onMouseEnter={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'var(--color-bg-elevated)'; }}
                             onMouseLeave={(e) => { if (!isStarred) e.currentTarget.style.backgroundColor = 'transparent'; }}
                           >
-                            <span>{m}</span>
+                            <span>{modelLabel(m, modelMetadata)}</span>
                             {isStarred && <Pin className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
                           </button>
                         );
@@ -344,6 +344,7 @@ export function ModelTab() {
                   models={visibleModels}
                   placeholder={t('settings.modelTuning.defaultsToFlash')}
                   modelAccess={modelAccessMap}
+                  metadata={modelMetadata}
                 />
                 <ModelSelector
                   label={t('settings.modelTuning.compactionModel')}
@@ -359,11 +360,13 @@ export function ModelTab() {
                   models={visibleModels}
                   placeholder={t('settings.modelTuning.defaultsToFlash')}
                   modelAccess={modelAccessMap}
+                  metadata={modelMetadata}
                 />
                 <FallbackModelsPicker
                   selected={fallbackModels}
                   onChange={(list) => write({ fallback_models: list })}
                   models={visibleModels}
+                  metadata={modelMetadata}
                 />
               </div>
             </div>

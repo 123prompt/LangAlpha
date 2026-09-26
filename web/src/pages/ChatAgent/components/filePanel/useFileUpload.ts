@@ -28,9 +28,11 @@ export function useFileUpload({ workspaceId, onRefreshFiles }: {
       const e = err as { response?: { status?: number; data?: { detail?: string } }; message?: string };
       console.error('[FilePanel] Upload failed:', err);
       let msg = e?.response?.data?.detail || e?.message || 'Upload failed';
+      // The server's 413 names its own limit; one without a detail came from
+      // something in front of it, whose limit this page cannot know.
       if (e?.response?.status === 413 && !e?.response?.data?.detail) {
         const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-        msg = `File is too large (${sizeMB} MB). Maximum upload size is 250 MB.`;
+        msg = `File is too large to upload (${sizeMB} MB).`;
       }
       setUploadError(msg);
       setUploadProgress(null);

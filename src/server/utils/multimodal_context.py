@@ -11,6 +11,8 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from ptc_agent.core.project_context import ProjectContext
+
 from src.server.models.additional_context import MultimodalContext
 from src.utils.storage import get_public_url, is_storage_enabled, sanitize_storage_key, upload_base64
 
@@ -282,6 +284,8 @@ async def upload_to_sandbox(
     contexts: list,
     sandbox,
     upload_dir: str = "uploads",
+    *,
+    project: ProjectContext | None = None,
 ) -> List[Optional[str]]:
     """Upload multimodal files to the sandbox filesystem.
 
@@ -293,6 +297,7 @@ async def upload_to_sandbox(
         sandbox: The sandbox instance (must expose ``aupload_file_bytes``,
             ``normalize_path``, and optionally ``virtualize_path``).
         upload_dir: Sub-directory under ``work/`` to store uploads.
+        project: Resolved workspace when upload precedes the turn's context binding.
 
     Returns:
         List of virtual paths parallel to the input list (``None`` on failure).
@@ -321,7 +326,7 @@ async def upload_to_sandbox(
             filename = f"{safe_desc}_{unique_id}{ext}" if safe_desc else f"{unique_id}{ext}"
 
             rel_path = f"work/{upload_dir}/{filename}"
-            abs_path = sandbox.normalize_path(rel_path)
+            abs_path = sandbox.normalize_path(rel_path, project=project)
 
             ok = await sandbox.aupload_file_bytes(abs_path, file_bytes)
             if ok:

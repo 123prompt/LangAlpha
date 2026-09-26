@@ -390,43 +390,51 @@ class PriceMonitorService:
             automation_id, config.symbol, current_price,
         )
 
+        from src.server.database import automation as auto_db
+        from src.server.services.automation_scheduler import AutomationScheduler
+        from src.server.services.automation_settlement import Outcome, settle
+
+        scheduler = AutomationScheduler.get_instance()
         try:
-            from src.server.database import automation as auto_db
-            from src.server.services.automation_executor import AutomationExecutor
-            from src.server.services.automation_scheduler import AutomationScheduler
-
-            scheduler = AutomationScheduler.get_instance()
-            executor = AutomationExecutor.get_instance()
-
-            # Create execution record
-            execution_id = await auto_db.create_execution(
-                automation_id=automation_id,
-                scheduled_at=datetime.now(timezone.utc),
-                server_id=scheduler.server_id,
-            )
-
-            # Mark as executing BEFORE dispatch so DB reload excludes it
-            await auto_db.update_automation_next_run(
-                automation_id, next_run_at=None, status="executing",
-            )
-
-            # Dispatch execution
-            asyncio.create_task(
-                executor.execute(automation, execution_id),
-                name=f"price_exec_{automation_id[:8]}",
+            # 'executing' before dispatch, so a reload excludes it.
+            execution_id = await auto_db.claim_price_firing(
+                automation_id, scheduler.server_id
             )
         except Exception:
+            logger.error(
+                "[PriceMonitor] Failed to claim a firing for %s",
+                automation_id, exc_info=True,
+            )
+            await self._hold_until_reload(automation_id, lock_key, lock_ttl)
+            return
+        if execution_id is None:
+            logger.info(
+                "[PriceMonitor] Not triggering %s: no longer active",
+                automation_id,
+            )
+            await self._hold_until_reload(automation_id, lock_key, lock_ttl)
+            return
+
+        try:
+            scheduler.dispatch(
+                automation, execution_id, name=f"price_exec_{automation_id[:8]}"
+            )
+        except Exception as e:
             logger.error(
                 "[PriceMonitor] Failed to dispatch execution for %s",
                 automation_id, exc_info=True,
             )
-            # Restore status if it was set to 'executing' before the failure
+            # The claimed firing never ran: ours, which puts the alert back
+            # to watching without a strike. Should this fail too, the sweep
+            # settles the firing once its heartbeat goes quiet.
             try:
-                await auto_db.restore_executing_to_active(automation_id)
+                await settle(
+                    automation, execution_id, Outcome.FAILED_OURS, error=str(e)
+                )
             except Exception:
                 logger.error(
-                    "[PriceMonitor] Failed to restore status for %s",
-                    automation_id, exc_info=True,
+                    "[PriceMonitor] Failed to settle undispatched %s",
+                    execution_id, exc_info=True,
                 )
 
     # ─── Dedup Locking ────────────────────────────────────────────────
@@ -461,6 +469,26 @@ class PriceMonitorService:
 
         self._local_locks[automation_id] = now + lock_ttl
         return True
+
+    async def _hold_until_reload(
+        self, automation_id: str, lock_key: str, lock_ttl: int
+    ) -> None:
+        """Keep the lock of a trigger that fired nothing, refused or unclaimed,
+        only until the next reload, which drops an alert that is no longer
+        active: the full TTL would mute the alert for the day, even one paused
+        and resumed within it."""
+        if lock_ttl <= _REFRESH_INTERVAL:
+            return
+        try:
+            from src.utils.cache.redis_cache import get_cache_client
+
+            cache = get_cache_client()
+            if cache.enabled and cache.client:
+                await cache.client.expire(lock_key, _REFRESH_INTERVAL)
+        except Exception:
+            pass
+        if automation_id in self._local_locks:
+            self._local_locks[automation_id] = time.monotonic() + _REFRESH_INTERVAL
 
     # ─── Background Loops ────────────────────────────────────────────
 

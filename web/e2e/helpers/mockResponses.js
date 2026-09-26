@@ -39,7 +39,24 @@ export const defaultResponses = {
       },
     },
   },
-  'GET /workspaces': { workspaces: [], total: 0, limit: 20, offset: 0 },
+  'GET /workspaces': (route) => {
+    const includeFlash = new URL(route.request().url()).searchParams.get('include_flash') === 'true';
+    const workspaces = includeFlash
+      ? [{
+          workspace_id: 'ws-flash',
+          name: 'Flash',
+          status: 'flash',
+          config: {},
+          created_at: '2025-01-01T00:00:00Z',
+          updated_at: '2025-01-01T00:00:00Z',
+        }]
+      : [];
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ workspaces, total: workspaces.length, limit: 20, offset: 0 }),
+    });
+  },
   // What ChatAgent fetches one path segment below /chat. Left unmocked these
   // 404, and ThreadGallery's not-found effect navigates back to /chat -- so a
   // test that names /chat/<id> silently measures the workspace gallery above it

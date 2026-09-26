@@ -450,7 +450,7 @@ const KNOWN_ANNOTATION_TYPES: ReadonlySet<string> = new Set<AnnotationType>([
   'fib_retracement',
 ]);
 
-// A marker with no valid shape makes lightweight-charts' setMarkers() throw,
+// A marker with no valid shape makes the lightweight-charts markers plugin throw,
 // which would blank the whole (shared) marker layer — earnings + grades too.
 // Reject it at the store boundary so one bad agent marker can't take them down.
 const VALID_MARKER_SHAPES: ReadonlySet<string> = new Set([

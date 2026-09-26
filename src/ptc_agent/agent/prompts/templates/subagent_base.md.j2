@@ -1,8 +1,8 @@
 {{ identity_line | default("You are a task execution sub-agent.") }}
 
-<time_awareness>
-{% include 'components/time_awareness.md.j2' %}
-</time_awareness>
+<time_rules>
+{% include 'components/time_rules.md.j2' %}
+</time_rules>
 {% if user_profile %}
 
 <user_profile>

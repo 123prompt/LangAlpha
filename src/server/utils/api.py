@@ -10,6 +10,7 @@ import inspect
 import logging
 import os
 import re
+from dataclasses import dataclass
 from typing import Annotated, Callable, Optional, TypeVar
 from urllib.parse import parse_qs
 
@@ -91,7 +92,7 @@ async def get_current_user_id(
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing authentication")
 
-    return _decode_token(credentials.credentials).user_id
+    return (await _decode_token(credentials.credentials)).user_id
 
 
 # Annotated type for cleaner endpoint signatures
@@ -116,11 +117,47 @@ async def get_optional_user_id(
         return LOCAL_DEV_USER_ID
     if credentials is None:
         return None
-    return _decode_token(credentials.credentials).user_id
+    return (await _decode_token(credentials.credentials)).user_id
 
 
 # The resolved user id, or None for an anonymous caller.
 OptionalUserId = Annotated[Optional[str], Depends(get_optional_user_id)]
+
+
+@dataclass(frozen=True)
+class Viewer:
+    """Who is looking at a public page, as far as their credential could say.
+
+    ``unconfirmed`` holds the 503 from a credential that arrived while the
+    signing keys could not be fetched. That viewer may be the owner, so a page
+    must not tell them a link does not exist.
+    """
+
+    user_id: Optional[str]
+    unconfirmed: Optional[HTTPException] = None
+
+
+async def get_viewer(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> Viewer:
+    """Like ``get_optional_user_id``, but a credential it cannot confirm reads as anonymous.
+
+    For public pages that also have an owner's view: a visitor whose session
+    expired, or who arrives while the signing keys cannot be fetched, must
+    still get the public answer.
+    """
+    try:
+        return Viewer(await get_optional_user_id(request, credentials))
+    except HTTPException as e:
+        if e.status_code == 401:
+            return Viewer(None)
+        if e.status_code == 503:
+            return Viewer(None, unconfirmed=e)
+        raise
+
+
+PageViewer = Annotated[Viewer, Depends(get_viewer)]
 
 
 async def get_stamp_auth(

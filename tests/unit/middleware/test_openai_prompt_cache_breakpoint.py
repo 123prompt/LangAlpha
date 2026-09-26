@@ -1,14 +1,19 @@
 """OpenAI prompt-cache breakpoint placement across the middleware chain.
 
 Mirror of test_prompt_cache_breakpoint.py for OpenAIPromptCachingMiddleware:
-verifies the breakpoint marker lands on the last static block (skills), that
-dynamic blocks appended by inner middleware stay unmarked, that gating is
-manifest-driven (prompt_cache_options on the model), and that the marker plus
+verifies the breakpoint marker lands on the static prefix's own block, that
+the per-thread baseline block appended by inner middleware takes a marker of
+its own, that breakpoint 4 lands on the turn row in the message list rather
+than on the system message, that gating is manifest-driven
+(prompt_cache_options on the model), and that the marker plus
 prompt_cache_options survive all the way into the Responses API payload.
+
+Nothing appends a system block between the prefix and the baseline any more:
+the skills manifest and the MCP roster are frozen into the baseline.
 """
 
-from collections.abc import Awaitable, Callable
-from unittest.mock import AsyncMock, MagicMock
+from datetime import UTC, datetime
+from unittest.mock import MagicMock
 
 import pytest
 from langchain.agents.middleware.types import ModelRequest, ModelResponse
@@ -19,8 +24,14 @@ from langchain_openai import ChatOpenAI
 
 from ptc_agent.agent.middleware._utils import append_to_system_message
 from ptc_agent.agent.middleware.openai_prompt_caching import OpenAIPromptCachingMiddleware
-from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
-from ptc_agent.agent.middleware.workspace_context import WorkspaceContextMiddleware
+from ptc_agent.agent.middleware.runtime_context import (
+    ENVELOPE_CLOSE,
+    ENVELOPE_OPEN,
+    BaselineContextMiddleware,
+    TailEnvelopeMiddleware,
+    TurnContextMiddleware,
+)
+from ptc_agent.agent.middleware.runtime_context.changes import sha256_text
 
 
 # ---------------------------------------------------------------------------
@@ -42,28 +53,65 @@ def _make_openai_model(prompt_cache_options=None, openai_api_base=None):
     return model
 
 
-def _make_model_request(system_prompt: str, model) -> ModelRequest:
+_AGENT_MD = "# Workspace\nNotes"
+
+SKILLS_MANIFEST = "## Available Skills\n\n- **pdf**: read and write PDFs"
+
+
+def _baseline_state() -> dict:
+    """A frozen baseline as ``before_agent`` would have written it."""
+    return {
+        "runtime_baseline": {
+            "epoch": 1,
+            "built_at": "2027-04-05T12:00:00+00:00",
+            "workspace": {"name": "", "description": ""},
+            "identity": {
+                "name": "User",
+                "timezone": "UTC",
+                "locale": "en-US",
+                "preferred_market": "US",
+            },
+            "agent_md": {
+                "text": _AGENT_MD,
+                "sha256": sha256_text(_AGENT_MD),
+                "path": "/agent.md",
+                "exists": True,
+            },
+            "memory": {},
+            "blocks": {
+                "skills": {
+                    "text": SKILLS_MANIFEST,
+                    "sha256": sha256_text(SKILLS_MANIFEST),
+                    "path": "<skills>",
+                    "exists": True,
+                }
+            },
+            "memo": {},
+            "memory_fill": {"percent": 0, "ceiling_tokens": 2048},
+        }
+    }
+
+
+NOW = datetime(2027, 4, 5, 12, 0, tzinfo=UTC)
+
+
+async def _turn_rows() -> list:
+    """The turn's anchor row, exactly as the turn middleware writes it."""
+    written = await TurnContextMiddleware(now=NOW, preferred_market="US").abefore_agent(
+        {}
+    )
+    return list((written or {}).get("messages") or [])
+
+
+def _make_model_request(
+    system_prompt: str, model, rows: list | None = None
+) -> ModelRequest:
     return ModelRequest(
         model=model,
-        messages=[],
+        messages=[HumanMessage(content="What moved today?"), *(rows or [])],
         system_prompt=system_prompt,
+        state=_baseline_state(),
     )
-
-
-def _fake_skills_middleware():
-    class FakeSkillsMiddleware:
-        async def awrap_model_call(
-            self,
-            request: ModelRequest,
-            handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-        ) -> ModelResponse:
-            new_sys = append_to_system_message(
-                request.system_message,
-                "<skills_manifest>\n- skill_a\n- skill_b\n</skills_manifest>",
-            )
-            return await handler(request.override(system_message=new_sys))
-
-    return FakeSkillsMiddleware()
 
 
 def _compose_middleware(middlewares, final_handler):
@@ -84,10 +132,7 @@ def _compose_middleware(middlewares, final_handler):
 
 
 def _build_chain(captured: dict):
-    """The agent.py stack shape: skills → anthropic → openai → workspace → runtime."""
-    session = MagicMock()
-    session.get_agent_md = AsyncMock(return_value="# Workspace\nNotes")
-    session.conversation_id = "ws-test"
+    """The agent.py stack shape: anthropic → openai → baseline → tail."""
 
     async def capture(req):
         captured["req"] = req
@@ -95,14 +140,10 @@ def _build_chain(captured: dict):
 
     return _compose_middleware(
         [
-            _fake_skills_middleware(),
             AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
             OpenAIPromptCachingMiddleware(),
-            WorkspaceContextMiddleware(session=session),
-            RuntimeContextMiddleware(
-                current_time="12:00 PM UTC, Monday, April 5, 2027",
-                user_profile={"name": "Casey", "timezone": "UTC", "locale": "en-US"},
-            ),
+            BaselineContextMiddleware(session=None, guidance="lean"),
+            TailEnvelopeMiddleware(now=NOW, guidance="lean"),
         ],
         capture,
     )
@@ -116,26 +157,57 @@ def _build_chain(captured: dict):
 class TestOpenAIPromptCacheBreakpoint:
     @pytest.mark.asyncio
     async def test_block_ordering_and_breakpoint(self):
-        """Marker on the skills block only; anthropic cache_control absent."""
+        """Marker on the prefix and the baseline; anthropic cache_control absent."""
+        captured: dict = {}
+        chain = _build_chain(captured)
+        model = _make_openai_model(prompt_cache_options={"mode": "implicit"})
+
+        await chain(
+            _make_model_request("Static system prompt.", model, await _turn_rows())
+        )
+
+        content = captured["req"].system_message.content
+        assert isinstance(content, list)
+        assert len(content) == 2
+
+        # The static prefix is the last block the caching middleware sees, so
+        # it takes breakpoint 2 itself.
+        assert content[0]["text"] == "Static system prompt."
+        assert content[0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+        # The baseline block takes breakpoint 3; agent.md and the frozen
+        # skills manifest both ride in it.
+        assert "agentmd" in content[1]["text"]
+        assert f"<skills>\n{SKILLS_MANIFEST}\n</skills>" in content[1]["text"]
+        assert content[1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+
+        # The turn row rides as the last block of the last user message and
+        # takes breakpoint 4: it is history, so the next call carries the
+        # boundary it writes.
+        blocks = captured["req"].messages[-1].content
+        assert len(blocks) == 2
+        assert blocks[0]["text"] == "What moved today?"
+        assert "prompt_cache_breakpoint" not in blocks[0]
+        assert blocks[-1]["text"].startswith(ENVELOPE_OPEN)
+        assert blocks[-1]["text"].endswith(ENVELOPE_CLOSE)
+        assert "12:00 PM UTC, Monday, April 5, 2027" in blocks[-1]["text"]
+        assert blocks[-1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+
+        # AnthropicPromptCachingMiddleware must have no-opped for ChatOpenAI
+        for block in content:
+            assert "cache_control" not in block
+
+    @pytest.mark.asyncio
+    async def test_a_call_with_nothing_new_is_handed_over_untouched(self):
+        """No rows and no call updates: the tail leaves the messages alone."""
         captured: dict = {}
         chain = _build_chain(captured)
         model = _make_openai_model(prompt_cache_options={"mode": "implicit"})
 
         await chain(_make_model_request("Static system prompt.", model))
 
-        content = captured["req"].system_message.content
-        assert isinstance(content, list)
-        assert len(content) == 4
-
-        assert "prompt_cache_breakpoint" not in content[0]
-        assert "skills_manifest" in content[1]["text"]
-        assert content[1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
-        assert "prompt_cache_breakpoint" not in content[2]
-        assert "prompt_cache_breakpoint" not in content[3]
-
-        # AnthropicPromptCachingMiddleware must have no-opped for ChatOpenAI
-        for block in content:
-            assert "cache_control" not in block
+        messages = captured["req"].messages
+        assert len(messages) == 1
+        assert messages[0].content == "What moved today?"
 
     @pytest.mark.asyncio
     async def test_noop_without_prompt_cache_options(self):
@@ -144,9 +216,14 @@ class TestOpenAIPromptCacheBreakpoint:
         chain = _build_chain(captured)
         model = _make_openai_model(prompt_cache_options=None)
 
-        await chain(_make_model_request("Static system prompt.", model))
+        await chain(
+            _make_model_request("Static system prompt.", model, await _turn_rows())
+        )
 
         for block in captured["req"].system_message.content:
+            assert "prompt_cache_breakpoint" not in block
+        # Untagged model: nothing in the merged user message is marked either.
+        for block in captured["req"].messages[-1].content:
             assert "prompt_cache_breakpoint" not in block
 
     @pytest.mark.asyncio
@@ -159,9 +236,14 @@ class TestOpenAIPromptCacheBreakpoint:
             openai_api_base="https://proxy.example.com/v1",
         )
 
-        await chain(_make_model_request("Static system prompt.", model))
+        await chain(
+            _make_model_request("Static system prompt.", model, await _turn_rows())
+        )
 
         for block in captured["req"].system_message.content:
+            assert "prompt_cache_breakpoint" not in block
+        # Untagged model: nothing in the merged user message is marked either.
+        for block in captured["req"].messages[-1].content:
             assert "prompt_cache_breakpoint" not in block
 
     @pytest.mark.asyncio
@@ -176,6 +258,7 @@ class TestOpenAIPromptCacheBreakpoint:
         await chain(_make_model_request("Static system prompt.", model))
 
         content = captured["req"].system_message.content
+        assert content[0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
         assert content[1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
 
     @pytest.mark.asyncio
@@ -186,9 +269,14 @@ class TestOpenAIPromptCacheBreakpoint:
         chain = _build_chain(captured)
         model = _make_openai_model(prompt_cache_options={"mode": "implicit"})
 
-        await chain(_make_model_request("Static system prompt.", model))
+        await chain(
+            _make_model_request("Static system prompt.", model, await _turn_rows())
+        )
 
         for block in captured["req"].system_message.content:
+            assert "prompt_cache_breakpoint" not in block
+        # Untagged model: nothing in the merged user message is marked either.
+        for block in captured["req"].messages[-1].content:
             assert "prompt_cache_breakpoint" not in block
 
     @pytest.mark.asyncio

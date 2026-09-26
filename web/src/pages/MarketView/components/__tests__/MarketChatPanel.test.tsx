@@ -1,5 +1,5 @@
 import { render, screen, fireEvent, act } from '@testing-library/react';
-import { MemoryRouter, Routes, Route } from 'react-router-dom';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -60,7 +60,6 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     messageError: null,
     threadId: h.threadId,
     threadModels: {},
-    lastThreadModel: null,
     handleSendMessage: h.handleSendMessage,
     stopWorkflow: h.stopWorkflow,
     getSubagentHistory: vi.fn(),
@@ -149,18 +148,39 @@ const baseProps: PanelProps = {
   onShuffleQueries: vi.fn(),
 };
 
-function renderPanel(override: Partial<PanelProps> = {}) {
+function Probe() {
+  return <div data-testid="search">{useLocation().search}</div>;
+}
+
+function renderPanel(override: Partial<PanelProps> = {}, entry = '/market') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const page = (props: Partial<PanelProps>) => (
+    <>
+      <MarketChatPanel {...baseProps} {...props} />
+      <Probe />
+    </>
+  );
+  const view = render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={['/market']}>
+      <MemoryRouter initialEntries={[entry]}>
         <Routes>
-          <Route path="/market" element={<MarketChatPanel {...baseProps} {...override} />} />
+          <Route path="/market" element={page(override)} />
           <Route path="/chat/t/:threadId" element={<div data-testid="chat-page" />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  const rerender = (next: Partial<PanelProps>) => view.rerender(
+    <QueryClientProvider client={qc}>
+      <MemoryRouter initialEntries={[entry]}>
+        <Routes>
+          <Route path="/market" element={page(next)} />
+          <Route path="/chat/t/:threadId" element={<div data-testid="chat-page" />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { ...view, rerender };
 }
 
 describe('MarketChatPanel', () => {
@@ -337,10 +357,32 @@ describe('MarketChatPanel', () => {
     expect(onReturnToChat).toHaveBeenCalledTimes(1);
   });
 
+  it('drops a forwarded ?thread when the symbol switches to a fresh chat', () => {
+    // The panel opens on the URL's thread, and a reload would open it again:
+    // once the symbol moves to one with no saved thread, the URL has to agree
+    // with the fresh chat on screen or the reload binds the old conversation
+    // to the new symbol.
+    h.threadId = '__default__';
+    const view = renderPanel({}, '/market?thread=thread-xyz');
+    expect(screen.getByTestId('search').textContent).toBe('?thread=thread-xyz');
+    view.rerender({ symbol: 'MSFT' });
+    expect(screen.getByTestId('search').textContent).toBe('');
+    expect(localStorage.getItem('marketview_thread_id_ws-1_MSFT')).toBeNull();
+  });
+
   it('shows no continue button on a fresh chat with no return path', () => {
     h.threadId = '__default__';
     renderPanel();
     expect(screen.queryByText('Open in Chat')).not.toBeInTheDocument();
     expect(screen.queryByText('Return to Chat')).not.toBeInTheDocument();
+  });
+
+  it('opens the gone dialog for a tool row whose record the transcript no longer holds', () => {
+    // The click used to be swallowed when the lookup missed, which reads as a
+    // dead row; the dialog itself already says the call is gone.
+    renderPanel();
+    const open = ml.actions!.onToolCallDetailClick as (toolCallId: string) => void;
+    act(() => open('tc-missing'));
+    expect(screen.getByText(/no longer in the chat/i)).toBeInTheDocument();
   });
 });

@@ -1,19 +1,102 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Share2, Copy, Check, Link2, Globe, Lock } from 'lucide-react';
+import { Share2, Copy, Check, Link2, Lock, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { toast } from '@/components/ui/use-toast';
+import { createDateFormatter } from '@/lib/format';
+import { useCopyShareLink } from '@/hooks/useCopyShareLink';
+import { useSharedLinks, useShareLinkMutations } from '@/hooks/useShareLink';
 import { getThreadShareStatus, updateThreadSharing } from '../utils/api';
-import type { ThreadShareStatus, ThreadSharePermissions } from '../../../types/api';
+import { shareConflictIn } from '../utils/api/shareLinks';
+import type { ShareLink, ThreadShareStatus, ThreadSharePermissions } from '../../../types/api';
 
 interface ShareButtonProps {
   threadId: string;
   initialIsShared?: boolean;
+  /** The workspace whose shared files the popover lists; null hides the list. */
+  workspaceId?: string | null;
+}
+
+const sharedOn = createDateFormatter({ month: 'short', day: 'numeric' });
+
+function sharedLinkName(link: ShareLink): string {
+  return link.title || link.path?.split('/').pop() || link.code;
+}
+
+/** Every file link the workspace has made public, each with Copy and Stop. */
+function SharedInWorkspace({ workspaceId }: { workspaceId: string }) {
+  const { t } = useTranslation();
+  const { data: links } = useSharedLinks(workspaceId);
+  const { patch } = useShareLinkMutations(workspaceId);
+  const { copy, copiedCode } = useCopyShareLink();
+
+  if (!links?.length) return null;
+
+  const stopSharing = (link: ShareLink) => {
+    patch.mutate({ code: link.code, patch: { shared: false } }, {
+      onError: (err) => {
+        if (shareConflictIn(err) === 'link_changed') {
+          toast({ description: t('shareLink.linkChanged') });
+          return;
+        }
+        console.error('[ShareButton] Stop sharing failed:', err);
+        toast({ description: t('shareLink.shareFailed'), variant: 'destructive' });
+      },
+    });
+  };
+
+  return (
+    <div className="pt-3 mt-3 border-t space-y-2" style={{ borderColor: 'var(--color-border-muted)' }}>
+      <div className="flex items-center justify-between">
+        <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('share.sharedInWorkspace')}
+        </p>
+        <span className="text-xs tabular-nums" style={{ color: 'var(--color-text-quaternary)' }}>{links.length}</span>
+      </div>
+      <ul className="max-h-48 overflow-y-auto space-y-1">
+        {links.map((link) => (
+          <li key={link.code} className="flex items-center gap-2 min-w-0">
+            <FileText className="h-3.5 w-3.5 flex-shrink-0" style={{ color: 'var(--color-icon-muted)' }} />
+            <div className="flex-1 min-w-0">
+              <p className="text-xs truncate" style={{ color: 'var(--color-text-primary)' }} title={link.path ?? undefined}>
+                {sharedLinkName(link)}
+              </p>
+              {link.shared_at && (
+                <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
+                  {t('share.sharedOn', { date: sharedOn(new Date(link.shared_at)) })}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => void copy(link.code)}
+              className="p-1 rounded-md flex-shrink-0"
+              style={{ color: copiedCode === link.code ? 'var(--color-success)' : 'var(--color-text-secondary)' }}
+              title={t('share.copyLink')}
+              aria-label={t('share.copyLink')}
+            >
+              {copiedCode === link.code ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+            </button>
+            <button
+              type="button"
+              onClick={() => stopSharing(link)}
+              disabled={patch.isPending}
+              className="text-xs px-1.5 py-0.5 rounded-md flex-shrink-0 disabled:opacity-50 hover:underline"
+              style={{ color: 'var(--color-text-secondary)' }}
+            >
+              {t('share.stop')}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
 }
 
 /**
  * ShareButton -- Toggle public sharing for a thread, with permission controls.
  * Shows a popover with share toggle, URL copy, and permission checkboxes.
  */
-export default function ShareButton({ threadId, initialIsShared = false }: ShareButtonProps) {
+export default function ShareButton({ threadId, initialIsShared = false, workspaceId = null }: ShareButtonProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -133,7 +216,7 @@ export default function ShareButton({ threadId, initialIsShared = false }: Share
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   {isShared ? (
-                    <Globe className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
+                    <Link2 className="h-4 w-4" style={{ color: 'var(--color-accent-primary)' }} />
                   ) : (
                     <Lock className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
                   )}
@@ -163,13 +246,12 @@ export default function ShareButton({ threadId, initialIsShared = false }: Share
                   {/* Share URL */}
                   <div className="flex items-center gap-2">
                     <div
-                      className="flex-1 flex items-center gap-2 px-3 py-1.5 rounded-md text-xs truncate"
+                      className="flex-1 flex items-center px-3 py-1.5 rounded-md text-xs truncate"
                       style={{
                         backgroundColor: 'var(--color-bg-input)',
                         color: 'var(--color-text-secondary)',
                       }}
                     >
-                      <Link2 className="h-3.5 w-3.5 flex-shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
                       <span className="truncate">
                         {window.location.origin}{shareState.share_url}
                       </span>
@@ -225,6 +307,7 @@ export default function ShareButton({ threadId, initialIsShared = false }: Share
                   </p>
                 </>
               )}
+              {workspaceId && <SharedInWorkspace workspaceId={workspaceId} />}
             </div>
           )}
         </div>

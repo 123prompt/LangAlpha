@@ -10,6 +10,7 @@ import { Select } from '@/components/ui/select';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import Markdown from './Markdown';
 import { stripLineNumbers } from './toolDisplayConfig';
+import { LARGE_TOOL_RESULTS_PREFIX } from './filePanel/fileMeta';
 import { PRINT_PAGE_STYLE } from './printPageStyle';
 import { renderToPdf } from '@/lib/shellPdf';
 import './ExportPreviewModal.css';
@@ -140,7 +141,7 @@ export default function ExportPreviewModal({
     readFileFullFn(workspaceId, fileName)
       .then((res) => {
         if (signal.aborted) return;
-        const raw = fileName.startsWith('/large_tool_results/')
+        const raw = fileName.startsWith(LARGE_TOOL_RESULTS_PREFIX)
           ? stripLineNumbers(res.content) ?? res.content
           : res.content;
         setFullContent(raw);

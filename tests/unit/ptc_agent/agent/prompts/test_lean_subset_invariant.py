@@ -54,7 +54,9 @@ def _render_pair(surface: str) -> tuple[str, str]:
     """Return (detailed, lean) for a surface name."""
     loader = init_loader()
     if surface == "ptc":
-        kwargs = dict(tool_summary="STUB", subagent_summary="STUB", crawl_enabled=True)
+        # No tool_summary: the main agent's roster lives in the baseline now,
+        # so the shipped render is the one that points at <mcp-servers>.
+        kwargs = dict(subagent_summary="STUB", crawl_enabled=True)
         return (
             loader.get_system_prompt(**guidance_template_vars("detailed"), **kwargs),
             loader.get_system_prompt(**guidance_template_vars("lean"), **kwargs),

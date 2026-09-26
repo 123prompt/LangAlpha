@@ -1,16 +1,35 @@
 import type { AxiosResponse } from 'axios';
 import { api } from '@/api/client';
+import type {
+  Automation,
+  AutomationExecution,
+  AutomationPayload,
+  AutomationRun,
+  AutomationUpdatePayload,
+} from '@/types/automation';
 
-export const listAutomations = (params: Record<string, unknown>): Promise<AxiosResponse> =>
+export interface AutomationList {
+  automations: Automation[];
+  total: number;
+}
+
+export interface ExecutionList {
+  executions: AutomationExecution[];
+  total: number;
+}
+
+export interface RunFeedPage {
+  executions: AutomationRun[];
+  total: number;
+}
+
+export const listAutomations = (params: Record<string, unknown>): Promise<AxiosResponse<AutomationList>> =>
   api.get('/api/v1/automations', { params });
 
-export const getAutomation = (id: string): Promise<AxiosResponse> =>
-  api.get(`/api/v1/automations/${id}`);
-
-export const createAutomation = (data: Record<string, unknown>): Promise<AxiosResponse> =>
+export const createAutomation = (data: AutomationPayload): Promise<AxiosResponse<Automation>> =>
   api.post('/api/v1/automations', data);
 
-export const updateAutomation = (id: string, data: Record<string, unknown>): Promise<AxiosResponse> =>
+export const updateAutomation = (id: string, data: AutomationUpdatePayload): Promise<AxiosResponse<Automation>> =>
   api.patch(`/api/v1/automations/${id}`, data);
 
 export const deleteAutomation = (id: string): Promise<AxiosResponse> =>
@@ -25,8 +44,14 @@ export const resumeAutomation = (id: string): Promise<AxiosResponse> =>
 export const triggerAutomation = (id: string): Promise<AxiosResponse> =>
   api.post(`/api/v1/automations/${id}/trigger`);
 
-export const listExecutions = (id: string, params: Record<string, unknown>): Promise<AxiosResponse> =>
+export const listExecutions = (id: string, params: Record<string, unknown>): Promise<AxiosResponse<ExecutionList>> =>
   api.get(`/api/v1/automations/${id}/executions`, { params });
 
-export const listWorkspaces = (params: Record<string, unknown>): Promise<AxiosResponse> =>
-  api.get('/api/v1/workspaces', { params });
+/** Every automation's runs, newest first: the feed. `thread_id` and
+ *  `status` narrow it, e.g. to what waits on one thread. */
+export const listRecentRuns = (params: Record<string, unknown>): Promise<AxiosResponse<RunFeedPage>> =>
+  api.get('/api/v1/automations/executions', { params });
+
+/** Skip a run waiting for the turn in its thread to end. */
+export const skipRun = (automationId: string, executionId: string): Promise<AxiosResponse> =>
+  api.post(`/api/v1/automations/${automationId}/executions/${executionId}/skip`);

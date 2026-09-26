@@ -4,7 +4,7 @@
  * row is a real component — hooks can live per row (title fade, per-thread
  * liveness), and the panel keeps only tree-level state and handlers.
  */
-import React, { useCallback } from 'react';
+import React, { memo, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useSortable } from '@dnd-kit/sortable';
@@ -260,7 +260,8 @@ export interface ThreadTreeRowProps {
   onArchiveThread?: (wsId: string, threadId: string) => void;
 }
 
-export function ThreadTreeRow({
+
+function ThreadTreeRowImpl({
   wsId,
   thread,
   isCurrentThread,
@@ -410,7 +411,7 @@ export interface WorkspaceTreeRowProps {
   agents?: SidebarAgentRow[];
   activeAgentId?: string | null;
   /** The shared change-spec / always-on / duplicate / delete flows. */
-  wsActions: WorkspaceActions;
+  wsActions: Omit<WorkspaceActions, 'dialogs'>;
   rename: {
     active: boolean;
     value: string;
@@ -434,7 +435,7 @@ export interface WorkspaceTreeRowProps {
   onArchiveThread?: (wsId: string, threadId: string) => void;
 }
 
-export function WorkspaceTreeRow({
+function WorkspaceTreeRowImpl({
   ws,
   isExpanded,
   isCurrent,
@@ -564,8 +565,6 @@ export function WorkspaceTreeRow({
                           workspace={ws}
                           onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
                           onRename={rename.enabled ? () => rename.onStart(wsId, ws.name || '') : undefined}
-                          onUpgrade={wsActions.openUpgrade}
-                          onToggleAlwaysOn={wsActions.toggleAlwaysOn}
                           onDuplicate={wsActions.openDuplicate}
                           onDelete={wsActions.openDelete}
                         />
@@ -685,3 +684,12 @@ export function WorkspaceDragChip({ ws, expanded }: { ws: NavWorkspace; expanded
     </div>
   );
 }
+
+// Memoized: the sidebar is a child of the chat view, which commits on every
+// streamed token and again when the thread list and workspace files refetch
+// at turn end. Without this, every row rebuilt its elements on each of those
+// commits, and the one at turn end landed as a 30ms frame in the middle of
+// the fold closing. Every prop is a primitive, a cache-shared record, or a
+// callback the panel holds stable, so unchanged rows now cost nothing.
+export const ThreadTreeRow = memo(ThreadTreeRowImpl);
+export const WorkspaceTreeRow = memo(WorkspaceTreeRowImpl);

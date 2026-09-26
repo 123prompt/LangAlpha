@@ -5,6 +5,7 @@ import type {
   ToolCallData,
   ToolCallResultData,
   TodoItem,
+  OrderProposal,
   ProvenanceSourceType,
 } from './sse';
 import type { ErrorLinkSpec } from '@/utils/rateLimitError';
@@ -21,6 +22,8 @@ export interface TextSegment {
   type: 'text';
   content: string;
   order: number;
+  /** OpenAI Responses text-block phase, carried through but not yet rendered. */
+  phase?: 'commentary' | 'final_answer';
 }
 
 export interface ToolCallSegment {
@@ -167,8 +170,12 @@ export interface ReasoningProcess {
   isReasoning: boolean;
   reasoningComplete: boolean;
   order: number;
-  reasoningTitle?: string | null;
   _completedAt?: number;
+  /** Wall clock at the start signal, for the live "thinking for" header. */
+  _startedAt?: number;
+  /** How long the model thought, from the server's complete signal when it
+   *  carries one, else measured here. Absent when neither side knew. */
+  elapsedMs?: number;
 }
 
 export interface ToolCallProcess {
@@ -324,6 +331,19 @@ export interface ToolApprovalState {
    */
   actionIndex: number;
   actionCount: number;
+  /** The tool call this card answers, when the interrupt named one. It is what
+   *  joins the card to the result the call later produces. */
+  toolCallId?: string;
+  /**
+   * The order attempt this card answers. Its presence is what makes the card
+   * keyed: the resume names this id instead of trusting the slot, and a reload
+   * settles the card from the id rather than from its position, so a batch
+   * cannot hand one order the verdict the user gave another.
+   */
+  attemptId?: string;
+  /** The order this call would place, for the summary the card draws above the
+   *  raw arguments. Null, or absent, for a call that places none. */
+  order?: OrderProposal | null;
   /** The reason typed on Reject, if any. */
   reason?: string | null;
 }
@@ -468,6 +488,11 @@ export interface AssistantMessage {
    *  tool-argument chunk (`nextArrivalSeq`). The streaming indicator reads it
    *  to tell arriving text from a pause. */
   arrivalSeq?: number;
+  /** Server settlement instant supplied by historical replay. */
+  completedAt?: number;
+  /** Local observation of completion, stop, or failure. Not set on transport
+   * loss or a paused turn; replay's completedAt takes precedence. */
+  completionObservedAt?: number;
 }
 
 export type NotificationVariant = 'info' | 'success' | 'warning';

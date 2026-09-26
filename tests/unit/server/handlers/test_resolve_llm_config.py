@@ -418,9 +418,11 @@ class TestReasoningEffort:
                 base_config, "user-1", None, False, reasoning_effort="high"
             )
         # Should use per-request "high", not pref "low"
-        mock_create.assert_called_once()
-        call_kwargs = mock_create.call_args
-        assert call_kwargs.kwargs.get("reasoning_effort") == "high" or call_kwargs[1].get("reasoning_effort") == "high"
+        # The fetch role builds its own client for the flash model; only the
+        # main model's call carries the turn's level.
+        main_calls = [c for c in mock_create.call_args_list if c.args[0] == "system-default-model"]
+        assert len(main_calls) == 1
+        assert main_calls[0].kwargs.get("reasoning_effort") == "high"
 
     @pytest.mark.asyncio
     async def test_user_pref_reasoning(self, base_config):
@@ -442,9 +444,11 @@ class TestReasoningEffort:
             config = await resolve_llm_config(
                 base_config, "user-1", None, False, reasoning_effort=None
             )
-        mock_create.assert_called_once()
-        call_kwargs = mock_create.call_args
-        assert call_kwargs.kwargs.get("reasoning_effort") == "low" or call_kwargs[1].get("reasoning_effort") == "low"
+        # The fetch role builds its own client for the flash model; only the
+        # main model's call carries the turn's level.
+        main_calls = [c for c in mock_create.call_args_list if c.args[0] == "system-default-model"]
+        assert len(main_calls) == 1
+        assert main_calls[0].kwargs.get("reasoning_effort") == "low"
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +846,13 @@ class TestCustomModelFallback:
             config = await resolve_llm_config(base_config, "user-1", None, True)
 
         # Custom fallback dropped silently; no crash from create_llm().
-        assert not getattr(config, "fallback_llm_clients", None)
+        assert config.fallback_llm_clients == []
+        assert config.fallback_llm_names == []
+        from ptc_agent.agent.middleware.model_resilience import build_fallback_pairs
+
+        with patch("src.llms.get_llm_by_type") as factory:
+            assert build_fallback_pairs(config) == []
+            factory.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -870,8 +880,10 @@ class TestFastMode:
                 base_config, "user-1", None, False, fast_mode=True
             )
         # OAuth resolver should be called with service_tier="priority"
-        call_kwargs = mock_oauth.call_args
-        assert call_kwargs.kwargs.get("service_tier") == "priority"
+        # Roles resolve after the main model and never take a service tier,
+        # so the tier is asserted on the main model's own call.
+        main_call = next(c for c in mock_oauth.call_args_list if c.args[1] == "system-default-model")
+        assert main_call.kwargs.get("service_tier") == "priority"
 
     @pytest.mark.asyncio
     async def test_fast_mode_from_preference(self, base_config):
@@ -895,8 +907,10 @@ class TestFastMode:
             await resolve_llm_config(
                 base_config, "user-1", None, False
             )
-        call_kwargs = mock_oauth.call_args
-        assert call_kwargs.kwargs.get("service_tier") == "priority"
+        # Roles resolve after the main model and never take a service tier,
+        # so the tier is asserted on the main model's own call.
+        main_call = next(c for c in mock_oauth.call_args_list if c.args[1] == "system-default-model")
+        assert main_call.kwargs.get("service_tier") == "priority"
 
 
 class TestTuningReachesEveryClient:
@@ -1075,7 +1089,13 @@ class TestResolveOneFallbackGuard:
         # The fallback should be skipped, not crash the whole request
         assert config.llm.name == "system-default-model"
         # No fallback clients resolved (the one model failed)
-        assert not getattr(config, "fallback_llm_clients", None)
+        assert config.fallback_llm_clients == []
+        assert config.fallback_llm_names == []
+        from ptc_agent.agent.middleware.model_resilience import build_fallback_pairs
+
+        with patch("src.llms.get_llm_by_type") as factory:
+            assert build_fallback_pairs(config) == []
+            factory.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mixed_fallback_valid_and_invalid(self, base_config):
@@ -1214,7 +1234,8 @@ class TestClassifyModelDedup:
     @pytest.mark.asyncio
     async def test_classify_only_distinct_models(self, base_config):
         """resolve_llm_config only classifies the distinct models in play: the
-        main model and each fallback. The pref cache keeps every classify O(1)
+        main model, each fallback, and the flash model a blank fetch role
+        resolves to. The pref cache keeps every classify O(1)
         and free of extra DB reads, so the set of names is the invariant we care
         about (the per-name count is an implementation detail of the STEP-0
         prefetch + per-model primitive resolution).
@@ -1249,9 +1270,108 @@ class TestClassifyModelDedup:
         ):
             await resolve_llm_config(base_config, "user-1", None, True)
 
-        # No model outside {main, fallbacks} is ever classified.
+        # No model outside {main, fetch role, fallbacks} is ever classified.
         called_names = {call.args[1] for call in classify_mock.await_args_list}
-        assert called_names == {"system-default-model", "fb-a", "fb-b"}
+        assert called_names == {"system-default-model", "system-flash-model", "fb-a", "fb-b"}
+
+
+# ---------------------------------------------------------------------------
+# Blank fetch follows the user's flash model, on the user's own credential
+# ---------------------------------------------------------------------------
+
+
+class TestBlankFetchFollowsFlash:
+    """A blank fetch means the flash model, and it has to run on the user's own
+    credential. OAuth only resolves ``-oauth`` manifest entries, so these fakes
+    return a client for those names alone, as the real resolver does.
+    """
+
+    @staticmethod
+    async def _resolve(pref, mode="ptc", config=None):
+        from src.server.services.llm.config import resolve_llm_config
+
+        mock_mc = _mock_model_config(
+            system_models={
+                "system-default-model", "system-flash-model",
+                "main-oauth", "flash-oauth",
+            }
+        )
+
+        async def _oauth(user_id, model_name, *args, **kwargs):
+            if not model_name.endswith("-oauth"):
+                return None
+            client = MagicMock(name=f"oauth:{model_name}")
+            client.model_copy.return_value = MagicMock(name=f"copy-of-oauth:{model_name}")
+            return client
+
+        with (
+            patch(f"{USER_MODELS}.get_model_preference", new_callable=AsyncMock, return_value=pref),
+            patch(f"{CLIENTS}.resolve_oauth_llm_client", side_effect=_oauth),
+            patch("src.llms.llm.LLM.get_model_config", return_value=mock_mc),
+        ):
+            return await resolve_llm_config(
+                config or _make_config(), "user-1", None, False, mode=mode
+            )
+
+    @pytest.mark.asyncio
+    async def test_ptc_turn_takes_the_users_flash(self):
+        config = await self._resolve(
+            {"preferred_model": "main-oauth", "preferred_flash_model": "flash-oauth"}
+        )
+
+        assert config.llm.name == "main-oauth"
+        assert config.llm.flash == "flash-oauth"
+        assert config.subsidiary_llm_clients["fetch"]._extract_mock_name() == "oauth:flash-oauth"
+
+    @pytest.mark.asyncio
+    async def test_flash_without_oauth_falls_back_to_main_client(self):
+        """The deployment's flash is a bare name no OAuth account can serve, so
+        the fetch role takes a copy of the user's main client instead of
+        leaving web_fetch on a server key.
+        """
+        config = await self._resolve({"preferred_model": "main-oauth"})
+
+        assert config.llm.flash == "system-flash-model"
+        assert config.subsidiary_llm_clients["fetch"] is config.llm_client.model_copy.return_value
+
+    @pytest.mark.asyncio
+    async def test_blank_yaml_fetch_follows_the_users_flash(self):
+        """Through the real loader: ``fetch: ""`` in agent_config.yaml must not
+        pin the deployment's flash, or the user's flash never reaches the role.
+        """
+        from ptc_agent.config.loaders import load_from_dict
+
+        base = load_from_dict({
+            "llm": {
+                "name": "system-default-model", "flash": "system-flash-model",
+                "compaction": "", "fetch": "",
+            },
+            "daytona": {
+                "base_url": "https://test.daytona.io/api",
+                "auto_stop_interval": 3600,
+                "auto_archive_interval": 86400,
+                "auto_delete_interval": 604800,
+                "python_version": "3.12",
+            },
+            "mcp": {"servers": [], "tool_discovery_enabled": True},
+            "logging": {"level": "INFO", "file": "logs/test.log"},
+            "filesystem": {"allowed_directories": ["/home/workspace"]},
+        })
+        config = await self._resolve(
+            {"preferred_model": "main-oauth", "preferred_flash_model": "flash-oauth"},
+            config=base,
+        )
+
+        assert config.llm.fetch_name == "flash-oauth"
+        assert config.llm.compaction_name == "flash-oauth"
+        assert config.subsidiary_llm_clients["fetch"]._extract_mock_name() == "oauth:flash-oauth"
+        assert config.subsidiary_llm_clients["compaction"]._extract_mock_name() == "oauth:flash-oauth"
+
+    @pytest.mark.asyncio
+    async def test_platform_user_keeps_the_name_path(self):
+        config = await self._resolve({"preferred_flash_model": "system-flash-model"})
+
+        assert "fetch" not in config.subsidiary_llm_clients
 
 
 # ---------------------------------------------------------------------------

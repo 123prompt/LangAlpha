@@ -24,6 +24,8 @@ Usage:
 import logging
 import os
 from pathlib import Path
+from collections.abc import Callable
+from typing import Any
 
 import yaml
 
@@ -84,10 +86,12 @@ def get_blob_transfer_mode(sandbox_provider: str | None) -> str:
             f"Unknown storage.blob_transfer {mode!r}; using auto"
         )
         mode = "auto"
-    if mode != "auto":
-        return mode
+    # Checked before an explicit mode: OSS cannot sign a SHA-256-bound upload,
+    # so "direct" there would size scans for a path every push falls off.
     if STORAGE_PROVIDER in ("none", "oss"):
         return "relay"
+    if mode != "auto":
+        return mode
     return "direct" if sandbox_provider == "daytona" else "relay"
 
 
@@ -139,7 +143,14 @@ if STORAGE_PROVIDER == "none":
     def get_public_url(key: str) -> str:
         return ""
 
-    def get_signed_url(key: str, expires_in: int = 3600) -> str | None:
+    def get_signed_url(
+        key: str,
+        expires_in: int = 3600,
+        *,
+        content_disposition: str | None = None,
+        content_type: str | None = None,
+        for_browser: bool = False,
+    ) -> str | None:
         return None
 
     def get_signed_upload_url(
@@ -200,6 +211,9 @@ elif STORAGE_PROVIDER == "oss":
 else:
     # All S3-compatible providers: "s3", "r2", "cos", or any custom value
     from src.utils.storage.s3_compatible import (
+        abort_multipart_upload,
+        complete_multipart_upload,
+        create_signed_multipart_upload,
         get_signed_upload_url,
         delete_object,
         does_object_exist,
@@ -207,7 +221,9 @@ else:
         get_bytes_range,
         get_public_url,
         get_signed_url,
+        has_multipart_cleanup_rule,
         sanitize_storage_key,
+        sha256_object,
         upload_base64,
         upload_bytes,
         upload_chart,
@@ -218,7 +234,43 @@ else:
     _PROVIDER_NAME = f"S3-compatible ({STORAGE_PROVIDER})"
 
 
+if STORAGE_PROVIDER in ("none", "oss"):
+    # Multipart splits a presigned upload, and neither of these providers has
+    # one to split: OSS signs Content-MD5 rather than SHA-256, so a
+    # content-addressed key could not trust a direct write. A caller reaches
+    # the relay path on the missing signature before it ever asks for parts,
+    # so these answer once for both rather than being restated per provider.
+
+    def create_signed_multipart_upload(
+        key: str,
+        *,
+        content_length: int,
+        content_type: str,
+        expires_in: int = 900,
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        return None
+
+    def complete_multipart_upload(
+        key: str, upload_id: str, parts: list[tuple[int, str]]
+    ) -> bool:
+        return False
+
+    def abort_multipart_upload(key: str, upload_id: str) -> bool:
+        return False
+
+    def has_multipart_cleanup_rule() -> bool | None:
+        return None
+
+    def sha256_object(
+        key: str, deadline_for: Callable[[int], float] | None = None
+    ) -> str | None:
+        return None
+
+
 __all__ = [
+    "abort_multipart_upload",
+    "complete_multipart_upload",
+    "create_signed_multipart_upload",
     "delete_object",
     "does_object_exist",
     "get_bytes",
@@ -229,8 +281,10 @@ __all__ = [
     "get_blob_transfer_mode",
     "get_signed_upload_url",
     "get_signed_url",
+    "has_multipart_cleanup_rule",
     "is_storage_enabled",
     "sanitize_storage_key",
+    "sha256_object",
     "upload_base64",
     "upload_bytes",
     "upload_chart",

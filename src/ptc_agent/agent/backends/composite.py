@@ -8,6 +8,7 @@ from typing import Any, Protocol, Sequence
 
 import structlog
 
+from ptc_agent.agent.backends.results import EditTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 
 logger = structlog.get_logger(__name__)
@@ -36,7 +37,7 @@ class FilesystemRoute(Protocol):
         new_string: str,
         *,
         replace_all: bool = False,
-    ) -> dict[str, Any]: ...
+    ) -> EditTextResult: ...
 
     async def aglob_paths(self, pattern: str, path: str = ".") -> list[str]: ...
 
@@ -63,10 +64,10 @@ class CompositeFilesystemBackend:
 
         Asked of every route rather than a fixed tier list, so a new mount is
         covered the moment it is registered. Both directions have to be
-        checked, because the sandbox normalizer preserves `..`: the head
-        before each `..` catches a path leaving a mount, and the collapsed
-        target catches one walking back in, which would otherwise route to
-        the sandbox FS and shadow the store's copy for good.
+        checked: the head before each `..` catches a path leaving a mount,
+        which the collapse the sandbox normalizer now does would otherwise
+        hide, and the collapsed target catches one walking back in, which
+        would route to the sandbox FS and shadow the store's copy for good.
         """
         segments = path.split("/")
         if ".." not in segments:
@@ -149,7 +150,7 @@ class CompositeFilesystemBackend:
         new_string: str,
         *,
         replace_all: bool = False,
-    ) -> dict[str, Any]:
+    ) -> EditTextResult:
         normalized = self.normalize_path(file_path)
         route = self._route_for(normalized)
         if route is not None:

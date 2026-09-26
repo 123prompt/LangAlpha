@@ -116,6 +116,9 @@ def _stuck_provider(state: RuntimeState):
         async def get(self, sandbox_id, **kwargs):
             return _Runtime()
 
+        async def prepare_reconnect(self, runtime, *, tier=None):
+            pass
+
         def is_transient_error(self, exc):  # consulted by the retry wrapper
             return False
 

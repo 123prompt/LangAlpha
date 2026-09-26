@@ -203,7 +203,7 @@ class TestLeanIsSubsetOfDetailed:
 
     def test_lean_prompt_is_shorter(self):
         loader = init_loader()
-        kwargs = dict(tool_summary="", subagent_summary="")
+        kwargs = dict(subagent_summary="")
         detailed = loader.get_system_prompt(**guidance_template_vars("detailed"), **kwargs)
         lean = loader.get_system_prompt(**guidance_template_vars("lean"), **kwargs)
         assert len(lean) < len(detailed)
@@ -211,7 +211,7 @@ class TestLeanIsSubsetOfDetailed:
     def test_default_render_is_detailed(self):
         """A render that forgets to pass the flag must not silently go lean."""
         loader = init_loader()
-        kwargs = dict(tool_summary="", subagent_summary="")
+        kwargs = dict(subagent_summary="")
         assert loader.get_system_prompt(**kwargs) == loader.get_system_prompt(
             **guidance_template_vars("detailed"), **kwargs
         )

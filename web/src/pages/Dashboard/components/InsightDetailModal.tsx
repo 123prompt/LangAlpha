@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import TopicBadge from './TopicBadge';
 import { getInsightDetail } from '../utils/api';
+import { useBackdropDismiss } from '@/hooks/useDialogA11y';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { Loader } from '@/components/ui/loader';
@@ -310,6 +311,7 @@ function InsightDetailModal({ marketInsightId, onClose }: InsightDetailModalProp
   const [loading, setLoading] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
   const isMobile = useIsMobile();
+  const backdrop = useBackdropDismiss<HTMLDivElement>(onClose);
 
   const handleAttach = () => {
     if (!detail || !marketInsightId) return;
@@ -391,15 +393,14 @@ function InsightDetailModal({ marketInsightId, onClose }: InsightDetailModalProp
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          onClick={onClose}
-          className="fixed inset-0 z-50 flex items-center justify-center p-8"
+          {...backdrop}
+          className="fixed inset-0 z-[1010] flex items-center justify-center p-8"
           style={{ backgroundColor: 'var(--color-bg-overlay, rgba(0,0,0,0.6))', backdropFilter: 'blur(4px)' }}
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.95, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            onClick={(e) => e.stopPropagation()}
             className="w-full max-w-4xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col relative border"
             style={{
               backgroundColor: 'var(--color-bg-elevated)',

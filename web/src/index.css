@@ -6,6 +6,7 @@
 @import './styles/tokens.css';
 @import './styles/animations.css';
 @import './styles/chrome.css';
+@import './styles/dotGrid.css';
 
 @tailwind base;
 @tailwind components;

@@ -82,7 +82,7 @@ export interface UseAllModelsResult {
 export function useAllModels(): UseAllModelsResult {
   const { models: modelsData, isLoading: modelsLoading } = useModels();
   const { preferences, isLoading: prefsLoading } = usePreferences();
-  const rawPlatform = usePlatformModels();
+  const { platform: rawPlatform, isLoading: platformLoading } = usePlatformModels();
   const { providers: configuredProviders, isLoading: configuredLoading } = useConfiguredProviders();
 
   const customModels = useMemo<CustomModelEntry[]>(() => {
@@ -185,6 +185,6 @@ export function useAllModels(): UseAllModelsResult {
     compactionProfiles,
     searchProviders,
     rawApiResponse: modelsData ? (modelsData as Record<string, unknown>) : null,
-    isLoading: modelsLoading || prefsLoading || configuredLoading,
+    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading,
   };
 }

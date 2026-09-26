@@ -4,11 +4,13 @@
  * and streaming updates.
  */
 
+import { finalizeAssistantMessage } from '../session/stream/finalizeMessage';
 import type React from 'react';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { deviceTimezone } from '@/lib/deviceTimezone';
 import { useUser } from '@/hooks/useUser';
 import { sendChatMessageStream, sendRetryStream, getWorkflowStatus, sendHitlResponse, fetchThreadTurns, cancelWorkflow } from '../utils/api';
 import { useLocalRunPublisher } from '@/lib/threadLifecycle/useLocalRunPublisher';
@@ -30,12 +32,14 @@ import { bumpThreadNavOrder } from './useNavigationData';
 import { ensureThreadId } from '../session/threadCreation';
 export { removeStoredThreadId } from './utils/threadStorage';
 import { createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, type AttachmentMeta } from './utils/messageHelpers';
-import type { AssistantMessage, UserMessage } from '@/types/chat';
+import type { HitlResponseBody, HitlResumeEntry } from '@/types/api';
+import type { AssistantMessage, ToolApprovalPosition, UserMessage } from '@/types/chat';
 import type { PreviewData } from './utils/types';
 import { createRecentlySentTracker } from './utils/recentlySentTracker';
 import { createRequestKeyTracker } from './utils/requestKey';
 import { handleReasoningSignal, handleTextContent } from './utils/streamEventHandlers';
 import { useMarketWatch } from './useMarketWatch';
+import { refreshComputersAfterTurn } from './useComputers';
 // Chart-annotation live bridge: writes agent-drawn annotations into the
 // shared MarketView store so the desktop MarketView chat panel (which uses
 // this engine for both flash and PTC) renders them live. Harmless on the
@@ -48,8 +52,8 @@ import type {
   HistoryInterruptInfo, StreamProcessorRefs,
   ModelStatus, FallbackSuggestion,
 } from '../session/types';
-import { PROPOSAL_INTERRUPT_TYPES, SECRETARY_ACTION_TYPES, setCardStatus } from '../session/interrupts/buckets';
-import { beginResume, restoreCreditPausePending, type CreditPauseResumeRefs } from '../session/interrupts/creditPauseResume';
+import { PROPOSAL_INTERRUPT_TYPES, SECRETARY_ACTION_TYPES, setCardFields, setCardStatus } from '../session/interrupts/buckets';
+import { createAnswerBoard, type AnswerBoard } from '../session/interrupts/answerBoard';
 export type { ModelStatus, FallbackSuggestion } from '../session/types';
 import type { ChatSessionRuntime } from '../session/runtime';
 import { projectSubagentHistory } from '../session/subagents/projectHistory';
@@ -91,7 +95,7 @@ export function useChatMessages(
   // User locale/timezone — prefer saved preference, fall back to browser detection
   const { user } = useUser();
   const userLocale = user?.locale || navigator.language || 'en-US';
-  const userTimezone = user?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York';
+  const userTimezone = user?.timezone || deviceTimezone();
 
   // State
   const [messages, setMessages] = useState<MessageRecord[]>([]);
@@ -263,12 +267,6 @@ export function useChatMessages(
   // Track all LLM models used in this thread (ordered, deduplicated)
   const [threadModels, setThreadModels] = useState<string[]>([]);
 
-  // Track the model used by the most recent query in this thread (overwritten,
-  // not deduplicated) so re-opening a history thread defaults to the last-used
-  // model rather than the first. Distinct from threadModels because dedup there
-  // makes its tail unreliable when a thread switches models back and forth.
-  const [lastThreadModel, setLastThreadModel] = useState<string | null>(null);
-
   // Track if streaming is in progress to prevent history loading during streaming
   const isStreamingRef = useRef(false);
 
@@ -291,6 +289,15 @@ export function useChatMessages(
   // Batch parallel interrupt responses: track all interrupt IDs in current batch
   // and collect individual responses until all are answered, then resume at once.
   const pendingInterruptIdsRef = useRef(new Set<string>());
+  // The one owner of a turn's HITL decisions: card status, batch readiness, the
+  // `hitl_response` map and the rollback of a refused resume all come from here.
+  const answerBoard = useRef<AnswerBoard>(
+    createAnswerBoard({
+      pendingIds: pendingInterruptIdsRef,
+      sessionEpoch: sessionEpochRef,
+      setMessages,
+    }),
+  ).current;
   // Thread-scoped set of interrupt_ids that already have a rendered card. An
   // unanswered interrupt is re-raised by LangGraph with the SAME interrupt_id on
   // every resume; each re-raise arrives on a later turn's bubble, so the per-map
@@ -299,7 +306,6 @@ export function useChatMessages(
   // cleared only on thread switch / fresh history load. Shared by replay + live
   // so a live re-raise after a history load dedupes against replayed cards too.
   const renderedInterruptIdsRef = useRef(new Set<string>());
-  const collectedHitlResponsesRef = useRef<Record<string, { decisions: Array<{ type: string; message?: string }> }>>({});
 
   // Track approved PTC agent proposals waiting for thread_id backfill from tool_call_result.
   // Set by handleApprovePTCAgent, consumed by tool_call_result handler in the stream processor.
@@ -520,7 +526,6 @@ export function useChatMessages(
     setMessageError,
     setFallbackSuggestion,
     setThreadModels,
-    setLastThreadModel,
     setTokenUsage,
     setReloadTrigger,
     setHasActiveSubagents,
@@ -657,7 +662,6 @@ export function useChatMessages(
       if (isThreadSwitch) {
         setMessages([]);
         setThreadModels([]);
-        setLastThreadModel(null);
         setFallbackSuggestion(null);
         // A mid-retry pill belongs to the thread we're leaving; without this
         // it would render over thread B until B's next content event.
@@ -685,12 +689,10 @@ export function useChatMessages(
         // replay repopulates this from its persisted interrupt events.
         renderedInterruptIdsRef.current.clear();
         // So does the answer board. Left behind, thread A's unanswered id keeps
-        // failing B's `every(id => collected[id])` batch gate, so B's own
-        // interrupt is collected but never resumed: the card holds a disabled
-        // spinner until a full reload. Its only other clears sit on paths a
-        // thread switch does not take.
-        pendingInterruptIdsRef.current.clear();
-        collectedHitlResponsesRef.current = {};
+        // failing B's batch gate, so B's own interrupt is collected but never
+        // resumed: the card holds a disabled spinner until a full reload. Its
+        // only other clears sit on paths a thread switch does not take.
+        answerBoard.clear();
         // And the two state slots the board arms. Their only other clears sit
         // on answering or rejecting, which a thread switch also does not take,
         // so thread A's leftovers act on B: a live `pendingInterrupt` disables
@@ -703,6 +705,9 @@ export function useChatMessages(
         setPendingRejection(null);
       }
     }
+    // answerBoard is created once and never replaced, so it is omitted the way
+    // a ref would be; re-running this on a stable identity is not the point.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, initialThreadId]);
 
   /**
@@ -895,32 +900,21 @@ export function useChatMessages(
         await reconnectToStream({ activeTasks: status.active_tasks || [], runId: status.run_id ?? null, resetCursor: true, snapshotAtMs });
         unresolvedHistoryInterruptRef.current = [];
       } else if (historyHasUnresolvedInterruptRef.current && !status.can_reconnect) {
-        // Workflow genuinely paused → make interrupt(s) interactive.
-        //
-        // A tool approval is the one family with no answer path: nothing
-        // raises one any more and the approve/reject handlers are gone, so an
-        // unanswered one from history is a record to render, never a slot to
-        // fill. Arming it would disable the composer against a card with no
-        // controls, and a reload would only repeat that. Filtered here rather
-        // than where replay queues the entry: that list is also what the
-        // resolvers settle by id and what the reconnect branch strips, and
-        // both still need to find the card. The live projection keeps the
-        // same rule for a stream that still carries one (fromLiveEvent).
+        // Workflow genuinely paused → make interrupt(s) interactive
+        // An approval arms only where its verdict has somewhere to land. Order
+        // governance is the one middleware that consumes one and it reads its
+        // decisions by attempt id, so an approval naming no attempt would take
+        // a click that resumes the graph with the verdict unread and let the
+        // call run anyway. Arming it is worse than leaving it inert.
         const intInfos = unresolvedHistoryInterruptRef.current.filter(
-          (info) => info.type !== 'tool_approval',
+          (info) => info.type !== 'tool_approval' || info.target?.kind === 'attempt',
         );
         if (intInfos.length > 0) {
           const intInfo = intInfos[0]; // Use first for setPendingInterrupt (single-slot state)
           console.log('[Reconnect] Workflow paused, making', intInfos.length, 'interrupt(s) interactive:', intInfos.map((p) => p.type));
 
-          // Populate batching refs so answer/skip handlers can collect and batch-resume
-          pendingInterruptIdsRef.current.clear();
-          collectedHitlResponsesRef.current = {};
-          for (const info of intInfos) {
-            if (info.interruptId) {
-              pendingInterruptIdsRef.current.add(info.interruptId);
-            }
-          }
+          // Arm the board so answer/skip handlers can collect and batch-resume
+          answerBoard.arm(intInfos.map((info) => info.interruptId));
 
           if (intInfo.type === 'ask_user_question') {
             setPendingInterrupt({
@@ -932,6 +926,7 @@ export function useChatMessages(
           } else if (
             PROPOSAL_INTERRUPT_TYPES.has(intInfo.type)
             || intInfo.type === 'credit_pause'
+            || intInfo.type === 'tool_approval'
           ) {
             // Every proposal-shaped card restores the same single-slot state,
             // and the type it wants is the one the entry already carries, so a
@@ -1138,7 +1133,7 @@ export function useChatMessages(
         for (const [id, val] of Object.entries(aMsg.toolCallProcesses || {})) {
           tp[id] = val.isInProgress ? { ...val, isInProgress: false, isComplete: true } : val;
         }
-        return { ...aMsg, isStreaming: false, stopped: true, toolCallProcesses: tp };
+        return { ...finalizeAssistantMessage(aMsg, 'stopped'), toolCallProcesses: tp };
       }),
     );
 
@@ -1158,12 +1153,16 @@ export function useChatMessages(
           const rp = (msgs[i].reasoningProcesses as Record<string, Record<string, unknown>>) || {};
           if (rp[reasoningId]) {
             const next = { ...rp };
+            const completedAt = Date.now();
+            const startedAt = next[reasoningId]._startedAt as number | undefined;
             next[reasoningId] = {
               ...next[reasoningId],
               isReasoning: false,
               reasoningComplete: true,
-              reasoningTitle: null,
-              _completedAt: Date.now(),
+              _completedAt: completedAt,
+              // The main transcript's close stamps a duration on the same click.
+              elapsedMs: (next[reasoningId].elapsedMs as number | undefined)
+                ?? (startedAt ? completedAt - startedAt : undefined),
             };
             msgs[i] = { ...msgs[i], reasoningProcesses: next };
             break;
@@ -1515,10 +1514,7 @@ export function useChatMessages(
         const finalId = currentMessageRef.current || demotedAssistantId;
         if (finalId) {
           setMessages((prev) =>
-            updateMessage(prev, finalId, (msg) => ({
-              ...msg,
-              isStreaming: false,
-            }))
+            updateMessage(prev, finalId, (msg) => finalizeAssistantMessage(msg, demotedInterruptedRef.current ? 'paused' : 'completed'))
           );
           if (!demotedInterruptedRef.current) {
             cleanupAfterStreamEnd(finalId);
@@ -1538,10 +1534,8 @@ export function useChatMessages(
         const finalAssistantId = demotedAssistantId;
         setMessages((prev) =>
           updateMessage(prev, finalAssistantId, (msg) => ({
-            ...msg,
+            ...finalizeAssistantMessage(msg, 'failed'),
             content: msg.content || 'Failed to send message. Please try again.',
-            isStreaming: false,
-            error: true,
           }))
         );
         setMessageError((err as Error).message || 'Failed to send message');
@@ -1658,7 +1652,6 @@ export function useChatMessages(
     // Track model used in this send
     if (model) {
       setThreadModels(prev => prev.includes(model) ? prev : [...prev, model]);
-      setLastThreadModel(model);
     }
 
     // Add user message after history messages
@@ -1803,10 +1796,7 @@ export function useChatMessages(
       {
         const finalId = currentMessageRef.current || assistantMessageId;
         setMessages((prev) =>
-          updateMessage(prev,finalId, (msg) => ({
-            ...msg,
-            isStreaming: false,
-          }))
+          updateMessage(prev, finalId, (msg) => finalizeAssistantMessage(msg, wasInterruptedRef.current ? 'paused' : 'completed'))
         );
         markTranscriptPersisted();
       }
@@ -1865,10 +1855,8 @@ export function useChatMessages(
               setMessageError((err as Error).message || 'Failed to send message');
               setMessages((prev) =>
                 updateMessage(prev, assistantMessageId, (msg) => ({
-                  ...msg,
+                  ...finalizeAssistantMessage(msg, 'failed'),
                   content: msg.content || 'Failed to send message. Please try again.',
-                  isStreaming: false,
-                  error: true,
                 }))
               );
             }
@@ -1896,10 +1884,7 @@ export function useChatMessages(
             // Mark message as complete (use live ref in case steering_delivered switched it)
             const finalId = currentMessageRef.current || assistantMessageId;
             setMessages((prev) =>
-              updateMessage(prev,finalId, (msg) => ({
-                ...msg,
-                isStreaming: false,
-              }))
+              updateMessage(prev, finalId, (msg) => finalizeAssistantMessage(msg, wasInterruptedRef.current ? 'paused' : 'completed'))
             );
 
             cleanupAfterStreamEnd(finalId);
@@ -1937,31 +1922,19 @@ export function useChatMessages(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isCompacting]);
 
-  /** The credit pause this resume is answering, so the stream can settle its
-   *  status. Held in a ref because the settle happens in stream callbacks. */
-  const resumingCreditPauseRef = useRef<string | null>(null);
-  const creditPauseRefs = useRef<CreditPauseResumeRefs>({
-    pauseId: resumingCreditPauseRef,
-    pendingInterruptIds: pendingInterruptIdsRef,
-    collectedHitlResponses: collectedHitlResponsesRef,
-    sessionEpoch: sessionEpochRef,
-    setMessages,
-  }).current;
-
   /**
    * Resumes an interrupted turn with an HITL response (approve or reject).
    * Follows the same pattern as handleSendMessage but sends messages: [] with hitl_response.
    */
-  const resumeWithHitlResponse = useCallback(async (hitlResponse: Record<string, { decisions: Array<{ type: string; message?: string }> }>, planMode: boolean = false) => {
+  const resumeWithHitlResponse = useCallback(async (hitlResponse: HitlResponseBody, planMode: boolean = false) => {
     // Ahead of beginResume, so the settler's fence captures this run's own
     // epoch rather than the previous one (which it would already fail).
     sessionEpochRef.current += 1;
-    const settleResume = beginResume(creditPauseRefs);
+    const settleResume = answerBoard.beginResume(Object.keys(hitlResponse));
     let admitted = false;
 
     setPendingInterrupt(null);
-    pendingInterruptIdsRef.current.clear();
-    collectedHitlResponsesRef.current = {};
+    answerBoard.clear();
 
     // Create assistant message placeholder
     const assistantMessageId = `assistant-hitl-${Date.now()}`;
@@ -2055,10 +2028,7 @@ export function useChatMessages(
       {
         const finalId = currentMessageRef.current || assistantMessageId;
         setMessages((prev) =>
-          updateMessage(prev,finalId, (msg) => ({
-            ...msg,
-            isStreaming: false,
-          }))
+          updateMessage(prev, finalId, (msg) => finalizeAssistantMessage(msg, wasInterruptedRef.current ? 'paused' : 'completed'))
         );
         markTranscriptPersisted();
       }
@@ -2092,20 +2062,15 @@ export function useChatMessages(
         const platformUrl = (import.meta.env.VITE_PLATFORM_URL as string | undefined) || '/account';
         setMessageError(buildRateLimitError(info, platformUrl));
         setMessages((prev) =>
-          updateMessage(prev,assistantMessageId, (msg) => ({
-            ...msg,
-            isStreaming: false,
-          }))
+          updateMessage(prev, assistantMessageId, (msg) => finalizeAssistantMessage(msg, wasInterruptedRef.current ? 'paused' : 'completed'))
         );
       } else {
         console.error('[HITL] Error resuming turn:', err);
         setMessageError((err as Error).message || 'Failed to resume this turn');
         setMessages((prev) =>
-          updateMessage(prev,assistantMessageId, (msg) => ({
-            ...msg,
+          updateMessage(prev, assistantMessageId, (msg) => ({
+            ...finalizeAssistantMessage(msg, 'failed'),
             content: msg.content || 'Failed to resume this turn. Please try again.',
-            isStreaming: false,
-            error: true,
           }))
         );
       }
@@ -2135,23 +2100,10 @@ export function useChatMessages(
     const { interruptId, planApprovalId, planMode } = pendingInterrupt;
     const approvalId = planApprovalId!;
 
-    // Flip the plan card to "approved" wherever it lives (mirrors
-    // resolveProposal): a deduped re-raise can point pendingInterrupt at a
-    // hidden resume bubble, so a single-bubble write could miss the visible card.
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.role !== 'assistant') return m;
-        const msg = m as AssistantMessage;
-        if (!msg.planApprovals?.[approvalId]) return m;
-        return {
-          ...msg,
-          planApprovals: {
-            ...msg.planApprovals,
-            [approvalId]: { ...msg.planApprovals[approvalId], status: 'approved' },
-          },
-        };
-      })
-    );
+    // Flip the plan card wherever it lives: a deduped re-raise can point
+    // pendingInterrupt at a hidden resume bubble, so a single-bubble write
+    // could miss the visible card.
+    setMessages((prev) => setCardStatus(prev, 'planApprovals', approvalId, 'approved'));
 
     const hitlResponse = {
       [interruptId!]: { decisions: [{ type: 'approve' }] },
@@ -2164,21 +2116,8 @@ export function useChatMessages(
     const { interruptId, planApprovalId, planMode } = pendingInterrupt;
     const approvalId = planApprovalId!;
 
-    // Flip the plan card to "rejected" wherever it lives (see approve above).
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.role !== 'assistant') return m;
-        const msg = m as AssistantMessage;
-        if (!msg.planApprovals?.[approvalId]) return m;
-        return {
-          ...msg,
-          planApprovals: {
-            ...msg.planApprovals,
-            [approvalId]: { ...msg.planApprovals[approvalId], status: 'rejected' },
-          },
-        };
-      })
-    );
+    // Flip the plan card wherever it lives (see approve above).
+    setMessages((prev) => setCardStatus(prev, 'planApprovals', approvalId, 'rejected'));
 
     // Store interruptId + planMode so next handleSendMessage routes as rejection feedback
     setPendingRejection({ interruptId: interruptId!, planMode: planMode! });
@@ -2187,51 +2126,28 @@ export function useChatMessages(
 
   // Shared HITL collect-then-batch-resume. Parallel interrupts must be answered
   // together (one batched resume), so each handler records its own interrupt_id's
-  // decision here, and we resume only once EVERY pending interrupt has a collected
-  // response. Reading pendingInterrupt (a single slot N dispatches overwrite)
+  // decision on the board, and we resume only once EVERY armed interrupt has an
+  // answer. Reading pendingInterrupt (a single slot N dispatches overwrite)
   // instead would answer the wrong interrupt and leave the others to re-interrupt.
+  // Returns whether a resume actually went out, which a caller that
+  // optimistically flipped its card has to know, or the card sits in an
+  // in-flight state no stream will ever settle.
   // planMode defaults to false; question handlers pass currentPlanModeRef.current.
   const collectHitlResponseAndMaybeResume = useCallback((
     interruptId: string,
-    response: { decisions: Array<{ type: string; message?: string }> },
+    response: HitlResumeEntry,
     planMode: boolean = false,
   ) => {
-    collectedHitlResponsesRef.current[interruptId] = response;
-    const pending = pendingInterruptIdsRef.current;
-    const collected = collectedHitlResponsesRef.current;
-    // Returns whether a resume actually went out. A turn can hold several
-    // interrupts and this batches them, so one answer is often not enough;
-    // a caller that optimistically flipped its card has to know that, or the
-    // card sits in an in-flight state no stream will ever settle.
-    if (pending.size > 0 && [...pending].every((id) => collected[id])) {
-      resumeWithHitlResponse({ ...collected }, planMode);
-      return true;
-    }
-    return false;
-  }, [resumeWithHitlResponse]);
+    const batch = answerBoard.answer(interruptId, response);
+    if (batch) resumeWithHitlResponse(batch, planMode);
+    return !!batch;
+  }, [resumeWithHitlResponse, answerBoard]);
 
   const handleAnswerQuestion = useCallback((answer: string, questionId: string, interruptId: string) => {
     if (!questionId || !interruptId) return;
 
     // Optimistically mark the card as answered
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.role !== 'assistant') return m;
-        const msg = m as AssistantMessage;
-        if (!msg.userQuestions?.[questionId]) return m;
-        return {
-          ...msg,
-          userQuestions: {
-            ...msg.userQuestions,
-            [questionId]: {
-              ...msg.userQuestions[questionId],
-              status: 'answered',
-              answer,
-            },
-          },
-        };
-      })
-    );
+    setMessages((prev) => setCardFields(prev, 'userQuestions', questionId, { status: 'answered', answer }));
 
     // Collect this response for batching (parallel interrupts need all responses at once)
     collectHitlResponseAndMaybeResume(
@@ -2245,23 +2161,7 @@ export function useChatMessages(
     if (!questionId || !interruptId) return;
 
     // Mark the card as skipped
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.role !== 'assistant') return m;
-        const msg = m as AssistantMessage;
-        if (!msg.userQuestions?.[questionId]) return m;
-        return {
-          ...msg,
-          userQuestions: {
-            ...msg.userQuestions,
-            [questionId]: {
-              ...msg.userQuestions[questionId],
-              status: 'skipped',
-            },
-          },
-        };
-      })
-    );
+    setMessages((prev) => setCardStatus(prev, 'userQuestions', questionId, 'skipped'));
 
     // Collect this response for batching (parallel interrupts need all responses at once)
     collectHitlResponseAndMaybeResume(
@@ -2375,21 +2275,43 @@ export function useChatMessages(
   // (single-slot pendingInterrupt would misroute after a reload).
   const handleResumeCreditPause = useCallback((pauseId: string, interruptId: string) => {
     if (!pauseId || !interruptId) return;
-    resumingCreditPauseRef.current = pauseId;
-    resolveProposal('creditPauses', pauseId, 'resuming');
+    answerBoard.armCreditPause(pauseId);
     const resumed = collectHitlResponseAndMaybeResume(
       interruptId,
       { decisions: [{ type: 'approve' }] },
     );
-    if (!resumed) {
-      // Another interrupt in this turn is still unanswered, so nothing was
-      // sent and no stream will settle this card. Put it back rather than
-      // leave a disabled spinner the user can only clear by reloading — and
-      // keep the reference, because the batch this answer joined dispatches
-      // later and its settler is what moves the card to `resumed`.
-      restoreCreditPausePending(creditPauseRefs);
-    }
-  }, [collectHitlResponseAndMaybeResume, resolveProposal, creditPauseRefs]);
+    // Another interrupt in this turn is still unanswered, so nothing was sent
+    // and no stream will settle this card. Put it back rather than leave a
+    // disabled spinner the user can only clear by reloading.
+    if (!resumed) answerBoard.restoreCreditPause();
+  }, [collectHitlResponseAndMaybeResume, answerBoard]);
+
+  // Direct MCP tool approvals answer from the card itself: the card carries its
+  // own interrupt id, so several stopped calls in one turn each collect their
+  // decision and the batch resumes once the last one is answered.
+  const settleToolApproval = useCallback((
+    approvalId: string,
+    interruptId: string,
+    position: ToolApprovalPosition,
+    click: { approved: boolean; message?: string },
+    attemptId?: string,
+  ) => {
+    if (!approvalId || !interruptId) return;
+    const entry = answerBoard.decideToolCall(approvalId, interruptId, position, click, attemptId);
+    if (entry) collectHitlResponseAndMaybeResume(interruptId, entry);
+  }, [collectHitlResponseAndMaybeResume, answerBoard]);
+
+  const handleApproveToolCall = useCallback((
+    approvalId: string, interruptId: string, position: ToolApprovalPosition, attemptId?: string,
+  ) => {
+    settleToolApproval(approvalId, interruptId, position, { approved: true }, attemptId);
+  }, [settleToolApproval]);
+
+  const handleRejectToolCall = useCallback((
+    approvalId: string, interruptId: string, position: ToolApprovalPosition, message?: string, attemptId?: string,
+  ) => {
+    settleToolApproval(approvalId, interruptId, position, { approved: false, message }, attemptId);
+  }, [settleToolApproval]);
 
   const insertNotification = useCallback(
     (text: string, variant: 'info' | 'success' | 'warning' = 'info', detail?: string) => {
@@ -2575,10 +2497,7 @@ export function useChatMessages(
 
       const finalId = currentMessageRef.current || assistantMessageId;
       setMessages((prev) =>
-        updateMessage(prev,finalId, (msg) => ({
-          ...msg,
-          isStreaming: false,
-        }))
+        updateMessage(prev, finalId, (msg) => finalizeAssistantMessage(msg, wasInterruptedRef.current ? 'paused' : 'completed'))
       );
       markTranscriptPersisted();
     } catch (err: unknown) {
@@ -2594,11 +2513,9 @@ export function useChatMessages(
       console.error('[streamFromCheckpoint] Error:', err);
       setMessageError((err as Error).message || 'Failed to process request');
       setMessages((prev) =>
-        updateMessage(prev,assistantMessageId, (msg) => ({
-          ...msg,
+        updateMessage(prev, assistantMessageId, (msg) => ({
+          ...finalizeAssistantMessage(msg, 'failed'),
           content: msg.content || 'Failed to process request. Please try again.',
-          isStreaming: false,
-          error: true,
         }))
       );
     } finally {
@@ -2608,10 +2525,10 @@ export function useChatMessages(
       if (!wasDisconnected && !wasInterruptedRef.current && !wasStoppedRef.current) {
         const finalId = currentMessageRef.current || assistantMessageId;
         setMessages((prev) =>
-          updateMessage(prev,finalId, (msg) => ({
-            ...msg,
-            isStreaming: false,
-          }))
+          // Literal, not the ref: the guard above already read it, and React
+          // runs this updater later, so a ternary here would answer from a
+          // different moment than the branch it is standing in.
+          updateMessage(prev, finalId, (msg) => finalizeAssistantMessage(msg, 'completed'))
         );
         cleanupAfterStreamEnd(finalId);
       }
@@ -2770,6 +2687,7 @@ export function useChatMessages(
     markTranscriptPersisted,
     clearModelStatus,
     finalizePendingTodos,
+    refreshComputerAfterTurn: agentMode === 'ptc' ? () => refreshComputersAfterTurn(queryClient) : null,
     reportBackWatch,
   };
 
@@ -2777,7 +2695,6 @@ export function useChatMessages(
     messages,
     threadId,
     threadModels,
-    lastThreadModel,
     isLoading,
     marketWatch,
     hasActiveSubagents,
@@ -2792,6 +2709,9 @@ export function useChatMessages(
     fallbackSuggestion,
     clearFallbackSuggestion,
     reconnectIfStaleRun: reportBackWatch.reconnectIfStaleRun,
+    // The run this view is streaming or last streamed, so the host can tell
+    // its own run apart from one the user feed reports starting elsewhere.
+    currentRunIdRef,
     messageError,
     returnedSteering,
     clearReturnedSteering: () => setReturnedSteering(null),
@@ -2813,6 +2733,8 @@ export function useChatMessages(
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
     handleResumeCreditPause,
+    handleApproveToolCall,
+    handleRejectToolCall,
     tokenUsage,
     isShared,
     insertNotification,

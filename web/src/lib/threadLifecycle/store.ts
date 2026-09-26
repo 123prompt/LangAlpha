@@ -498,6 +498,12 @@ export function isThreadRunning(threadId: string): boolean {
   return state.running.has(threadId);
 }
 
+/** The newest run the user feed has reported for the thread, this tab's own
+ *  stream aside: how a view learns that a run started somewhere else. */
+export function useThreadFeedRunId(threadId: string): string | null {
+  return useSyncExternalStore(subscribe, () => state.threads.get(threadId)?.feed?.runId ?? null);
+}
+
 /** True while the thread's latest run is interrupted (waiting for input). */
 export function useThreadNeedsInput(threadId: string): boolean {
   return useSyncExternalStore(subscribe, () => state.needsInput.has(threadId));

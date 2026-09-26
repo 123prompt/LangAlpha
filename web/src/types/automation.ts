@@ -1,4 +1,4 @@
-/** Automation types — automation CRUD and execution records */
+/** Automation types: the wire shapes of `/api/v1/automations*` (src/server/models/automation.py). */
 
 export interface DeliveryConfig {
   methods: string[];
@@ -20,50 +20,124 @@ export interface PriceTriggerConfig {
   };
 }
 
-export interface Automation {
-  id: string;
-  name: string;
-  description?: string;
-  schedule?: string;
-  workspace_id?: string;
-  status: 'active' | 'paused' | 'error';
-  prompt?: string;
-  config?: Record<string, unknown>;
-  trigger_type?: 'cron' | 'once' | 'price';
-  trigger_config?: PriceTriggerConfig;
-  created_at?: string;
-  updated_at?: string;
-  last_run_at?: string | null;
-  next_run_at?: string | null;
-  delivery_config?: DeliveryConfig;
-  [key: string]: unknown;
-}
+/** `executing` is a price automation mid-run; cron and once automations stay
+ *  `active` while they run, and only their execution row says `running`. */
+export type AutomationStatus = 'active' | 'paused' | 'completed' | 'disabled' | 'executing';
 
-export interface AutomationExecution {
-  id: string;
-  automation_id: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  started_at?: string;
-  completed_at?: string | null;
-  result?: unknown;
+/** `waiting` is a firing held until the turn running in its thread ends;
+ *  `skipped` is one that never ran, and is not a failure. */
+export type ExecutionStatus = 'pending' | 'waiting' | 'running' | 'completed' | 'failed' | 'timeout' | 'skipped';
+
+/** Why a run was skipped: the reader chose to, its thread stayed busy (or an
+ *  earlier firing was already waiting), or the server stopped mid-wait. */
+export type SkipReason = 'user' | 'thread_busy' | 'interrupted';
+
+/** A failed run's cause, where the reader can act on it: a usage limit
+ *  refused the firing or paused its run (`error_message` is then the quota
+ *  service's own words), or the model provider rejected the user's own key. */
+export type FailureReason = 'usage_limit' | 'provider_auth';
+
+/** Why the server switched an automation off. Cleared by a resume. */
+export type DisableReason = 'provider_auth' | 'max_failures';
+
+export type TriggerType = 'cron' | 'once' | 'price';
+
+export interface DeliveryAttempt {
+  method: string;
+  success: boolean;
   error?: string | null;
-  [key: string]: unknown;
 }
 
-export interface AutomationCreatePayload {
+/** One run as every endpoint that carries it describes it: the list row's
+ *  newest execution, an automation's history, and the cross-automation feed. */
+export interface RunSummary {
+  automation_execution_id: string;
+  status: ExecutionStatus;
+  conversation_thread_id: string | null;
+  scheduled_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error_message: string | null;
+  skip_reason: SkipReason | null;
+  failure_reason: FailureReason | null;
+}
+
+/** The newest execution of an automation, carried on each list row. */
+export interface AutomationLastExecution extends RunSummary {
+  /** The start of the run's final answer, as plain text. */
+  excerpt: string | null;
+}
+
+export interface Automation {
+  automation_id: string;
+  user_id: string;
+  name: string;
+  description: string | null;
+
+  trigger_type: TriggerType;
+  cron_expression: string | null;
+  timezone: string;
+  trigger_config: PriceTriggerConfig | null;
+
+  next_run_at: string | null;
+  last_run_at: string | null;
+
+  agent_mode: 'flash' | 'ptc';
+  instruction: string;
+  workspace_id: string | null;
+  llm_model: string | null;
+
+  thread_strategy: 'new' | 'continue';
+  conversation_thread_id: string | null;
+
+  status: AutomationStatus;
+  max_failures: number;
+  failure_count: number;
+  disable_reason?: DisableReason | null;
+
+  delivery_config: DeliveryConfig | null;
+  metadata?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+
+  last_execution: AutomationLastExecution | null;
+}
+
+/** The settings the form writes: every field on a create, and the whole set
+ *  again on an edit, which the server applies as a patch. */
+export interface AutomationPayload {
   name: string;
   description?: string;
-  schedule?: string;
+  trigger_type: TriggerType;
+  cron_expression?: string;
+  timezone: string;
+  trigger_config?: PriceTriggerConfig;
+  next_run_at?: string;
+  agent_mode: Automation['agent_mode'];
+  instruction: string;
   workspace_id?: string;
-  prompt?: string;
-  config?: Record<string, unknown>;
+  thread_strategy: Automation['thread_strategy'];
+  max_failures: number;
+  delivery_config: DeliveryConfig;
 }
 
-export interface AutomationUpdatePayload {
-  name?: string;
-  description?: string;
-  schedule?: string;
-  workspace_id?: string;
-  prompt?: string;
-  config?: Record<string, unknown>;
+/** What an edit sends, applied by the server as a patch: only the fields
+ *  the edit changed need to be there. An automation keeps its kind of
+ *  trigger for life, so there is no `trigger_type`. */
+export type AutomationUpdatePayload = Partial<Omit<AutomationPayload, 'trigger_type'>>;
+
+export interface AutomationExecution extends RunSummary {
+  automation_id: string;
+  delivery_result: DeliveryAttempt[] | null;
+  created_at: string;
+}
+
+/** One entry of the cross-automation run feed. */
+export interface AutomationRun extends AutomationExecution {
+  automation_name: string;
+  agent_mode: Automation['agent_mode'];
+  trigger_type: TriggerType;
+  workspace_id: string | null;
+  /** The start of the run's final answer, when the run produced one. */
+  excerpt: string | null;
 }

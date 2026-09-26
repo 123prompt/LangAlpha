@@ -575,8 +575,8 @@ def role_registry(config, enabled_subagents, subagent_defs, model_pref) -> list[
         )
 
     roles = [
-        _role("compaction", config.llm.compaction),
-        _role("fetch", config.llm.fetch),
+        _role("compaction", config.llm.compaction_name),
+        _role("fetch", config.llm.fetch_name),
     ]
     for name in enabled_subagents:
         defn = subagent_defs.get(name)
@@ -775,6 +775,8 @@ async def _resolve_fallback_clients(
     """
     fallback_models = config.llm.fallback or []
     if not fallback_models:
+        config.fallback_llm_clients = []
+        config.fallback_llm_names = []
         return
 
     async def _resolve_one(model_name: str):
@@ -825,13 +827,14 @@ async def _resolve_fallback_clients(
         # else: SYSTEM with no client (shouldn't happen with platform fallback
         # on) — guard by skipping.
 
-    if merged_fallbacks:
-        config.fallback_llm_clients = merged_fallbacks
-        config.fallback_llm_names = merged_fallback_names
-        if byok_count:
-            logger.debug(
-                f"[CHAT] Resolved {byok_count}/{len(fallback_models)} fallback models via OAuth/BYOK"
-            )
+    # Empty is authoritative too: every candidate may have been rejected.
+    # Leaving None would let agent construction retry the original names.
+    config.fallback_llm_clients = merged_fallbacks
+    config.fallback_llm_names = merged_fallback_names
+    if byok_count:
+        logger.debug(
+            f"[CHAT] Resolved {byok_count}/{len(fallback_models)} fallback models via OAuth/BYOK"
+        )
 
 
 async def resolve_clients(

@@ -19,6 +19,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from src.server.database import conversation as qr_db
+from src.server.database import order_attempts as oa_db
 from src.server.database import pool
 from src.server.database.runs import subagent_runs as sr_db
 from src.server.database.runs.outbox import (
@@ -158,6 +159,10 @@ async def start_run(
     try:
         async with _lifecycle_connection(conn) as conn:
             async with conn.transaction():
+                from src.server.database.workspace import lock_run_workspace
+
+                await lock_run_workspace(conn, thread_id)
+
                 # Fast-path dedup probe. The unique index below is the
                 # race-safe backstop; this just avoids burning a turn_index
                 # (and, on a fork, re-truncating rows the first transmit's
@@ -201,6 +206,14 @@ async def start_run(
                         raise sr_db.TaskRunSlotBusyError(
                             thread_id, str(live_task["task_id"]), live_task
                         )
+                    # An order still waiting for a verdict or a call hangs off
+                    # a response row about to be deleted, and nothing settles
+                    # it once the row is gone. After the guards, so a refused
+                    # fork refuses no order; before the truncation, whose rows
+                    # it selects; in this transaction, so a rollback undoes it.
+                    await oa_db.refuse_attempts_on_fork(
+                        thread_id, fork.from_turn, conn=conn
+                    )
                     deleted = await qr_db.truncate_thread_from_turn(
                         thread_id,
                         fork.from_turn,
@@ -605,23 +618,61 @@ async def workspace_has_active_run(workspace_id: str) -> bool:
             return bool((await cur.fetchone())[0])
 
 
-async def get_latest_attempt(thread_id: str) -> Optional[Dict[str, Any]]:
+async def computer_has_active_run(computer_id: str) -> bool:
+    """Any live root run on any workspace bound to the computer.
+
+    The machine-scoped twin of ``workspace_has_active_run``, and a join rather
+    than a counter column because a torn-down computer takes every project on it
+    with it: the answer has to come from the runs themselves, not from a number
+    a crashed worker could have left behind. At one workspace per computer the
+    two functions return the same thing.
+    """
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM conversation_responses r
+                    JOIN conversation_threads t
+                      ON t.conversation_thread_id = r.conversation_thread_id
+                    JOIN workspaces w ON w.workspace_id = t.workspace_id
+                    WHERE w.computer_id = %s AND r.status = 'in_progress'
+                )
+                """,
+                (computer_id,),
+            )
+            return bool((await cur.fetchone())[0])
+
+
+async def get_latest_attempt(
+    thread_id: str, *, before_turn: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
     """The thread's most recent attempt row — /retry's validation target.
 
     Ordered by ``run_seq`` — the one monotonic run ordering. turn_index is
     reused by retries and lowered by branch rewinds, so it cannot define
     "latest" (two coexisting definitions of latest is a drift bug).
+
+    ``before_turn`` narrows the search to attempts of earlier turns: a fork
+    from turn N discards N and everything after it, so its predecessor is the
+    latest attempt that will survive, not the latest attempt there is.
     """
+    clauses = ["conversation_thread_id = %s"]
+    params: list[Any] = [thread_id]
+    if before_turn is not None:
+        clauses.append("turn_index < %s")
+        params.append(before_turn)
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 SELECT * FROM conversation_responses
-                WHERE conversation_thread_id = %s
+                WHERE {" AND ".join(clauses)}
                 ORDER BY run_seq DESC
                 LIMIT 1
                 """,
-                (thread_id,),
+                tuple(params),
             )
             row = await cur.fetchone()
             return dict(row) if row else None

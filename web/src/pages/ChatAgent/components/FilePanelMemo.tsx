@@ -105,9 +105,9 @@ export function useAddToMemo({
     try {
       // For text mimes, route through /files/read (unlimited) so the bytes we
       // upload are exactly what the detail view will later display. Going via
-      // /files/download would skip vault-secret redaction and preserve a
-      // trailing newline that /files/read strips — making future stale checks
-      // false-positive even when the file hasn't changed.
+      // /files/download would preserve a trailing newline that /files/read
+      // strips, making future stale checks false-positive even when the file
+      // hasn't changed.
       let file: File;
       if (mime === 'application/pdf') {
         const buf = await downloadFileAsArrayBufferFn(workspaceId, filePath);

@@ -1,64 +1,111 @@
-"""Unauthenticated path-style workspace file serving (`/api/v1/wsfiles/...`)."""
+"""Path-style workspace file serving (`/api/v1/wsfiles/g/<grant>/...`)."""
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query
 
 from src.config.env import PDF_RENDER_INTERNAL_BASE
+from src.server.services.file_grants import (
+    FileGrantError,
+    grant_prefix,
+    mint_file_grant,
+    verify_file_grant,
+)
 from src.server.utils.error_sanitization import single_line
 from src.server.utils.http_headers import content_disposition
 from fastapi.responses import Response
 
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.services.workspace_manager import WorkspaceManager
+from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.persistence.resolve import resolve_file_bytes_or_none
-from src.server.utils.secret_redactor import get_redactor, get_vault_secrets_for_redaction
+from src.server.utils.secret_redactor import (
+    get_redactor,
+    get_vault_secrets_for_redaction,
+)
 from src.utils.mime import resolve_content_type
 
+from ._containment import (
+    contained_absolute_path,
+    contained_relative_path,
+    FileTooLargeToServe,
+    read_contained_sandbox_file,
+)
 from ._shared import (
     _is_text_content_type,
     _is_utf8,
-    _get_work_dir,
     _is_flash_workspace,
     _is_serve_blocked_path,
-    _normalize_requested_path,
     _record_fs_bytes,
     _to_client_path,
+    work_dir_for,
 )
+
+# What a path has to clear to leave the workspace on this route. A share token
+# narrowed to one subtree hands in a stricter one; see ``share_access``.
+VisibilityGate = Callable[[str], bool]
+
+
+def _default_visible(client_path: str) -> bool:
+    return not _is_serve_blocked_path(client_path)
+
 
 logger = logging.getLogger(__name__)
 
 
+def _served_work_dir(workspace: dict[str, Any], workspace_id: str) -> str:
+    """The serve root, or this route's 404 for a workspace that names no folder.
+
+    The URL is the only credential here, so every failed check answers the
+    same way and none of them says which one failed. A row bound to a computer
+    with no folder name is a workspace whose files cannot be placed, and the
+    computer root is not a fallback: it holds the siblings.
+    """
+    try:
+        return work_dir_for(workspace)
+    except WorkspaceLayoutUnavailable as e:
+        logger.warning(
+            f"Refusing file access to workspace {workspace_id}: {single_line(str(e))}"
+        )
+        raise HTTPException(status_code=404, detail="Not found") from None
+
 
 # ---------------------------------------------------------------------------
-# Unauthenticated path-style file serving (`/api/v1/wsfiles/...`)
+# Path-style file serving (`/api/v1/wsfiles/g/<grant>/...`)
 # ---------------------------------------------------------------------------
 #
 # Gives `.html` deliverables true served semantics: a document served at
-# `/wsfiles/{ws}/work/task/report.html` can reference `charts/foo.png` and the
-# browser resolves it relatively to `/wsfiles/{ws}/work/task/charts/foo.png`.
-# The workspace UUID (128-bit) is the access credential, mirroring the
-# `preview_redirect_router` posture: uniform 404 for missing/unauthorized,
-# and never wake a stopped sandbox (denial-of-wallet protection).
+# `/wsfiles/g/<grant>/work/task/report.html` can reference `charts/foo.png`
+# and the browser resolves it relatively under the same prefix. The grant is
+# the credential: signed for the owner, expiring, and minted only by an
+# authenticated route (``services/file_grants``). Uniform 404 for a bad grant,
+# a missing file and an unauthorized path alike, and never wake a stopped
+# sandbox (denial-of-wallet protection).
 #
-# This is an internal serving mechanism, NOT a sharing primitive — the
-# workspace UUID grants read access to every file in the workspace.
-# User-facing sharing goes through permission-scoped thread-share tokens.
+# This is the owner's own viewer mechanism, NOT a sharing primitive: a grant
+# opens the whole workspace. User-facing sharing goes through share links and
+# permission-scoped thread-share tokens.
 
 wsfiles_router = APIRouter(prefix="/api/v1", tags=["Workspace File Serving"])
 
 # Short private cache: HTML reports and their assets are effectively immutable
 # for a turn, so up to 60s of staleness on reload (until the next agent update
 # is picked up) is an acceptable trade for far fewer sandbox/DB reads. The
-# workspace UUID is a bearer credential, so we never allow shared/public caches
-# to retain the bytes.
+# grant is a bearer credential, so we never allow shared/public caches to
+# retain the bytes.
 _WSFILES_CACHE_CONTROL = "private, max-age=60"
+
+# The renderer fetches the document and its subresources with no credential
+# of its own, so the prefix it is handed carries one that outlives the render
+# by a few minutes and nothing else.
+_PDF_GRANT_TTL_SECONDS = 5 * 60
 
 # Content-Security-Policy for served reports. Two jobs:
 #   1. The `sandbox` directive forces an opaque origin even though the iframe
@@ -94,11 +141,13 @@ _WSFILES_CSP = (
     "form-action 'none'"
 )
 
-# Viewer-embed script spliced after <head> when `?inject=theme` is set. Two
+# Viewer-embed script spliced after <head> when `?inject=theme` is set. Three
 # jobs: (1) theme sync — listens for `widget:themeUpdate` postMessages and
 # applies the `--color-*` custom properties to :root via a dedicated style
 # element (payload matches the inline-widget protocol the parent speaks,
-# useHtmlSandbox.pushTheme); (2) link routing — a plain <a href> would
+# useHtmlSandbox.pushTheme); (2) anchor scrolling on `widget:scrollTo`, so a
+# reference clicked twice lands twice (useHtmlSandbox.scrollToAnchor);
+# (3) link routing, a plain <a href> would
 # navigate the sandboxed IFRAME itself (where the target has no cookies and
 # bot checks break), so external links open via window.open(..., 'noopener')
 # while same-host links keep in-frame navigation (multi-file reports).
@@ -111,9 +160,16 @@ _THEME_INJECTION = (
     "(document.head||document.documentElement).appendChild(s);}"
     "s.textContent=':root{\\n'+css+'\\n}';}"
     "window.addEventListener('message',function(e){"
-    "var d=e&&e.data;"
-    "if(!d||d.type!=='widget:themeUpdate'||!d.css)return;"
-    "apply(d.css);});"
+    "var d=e&&e.data;if(!d)return;"
+    "if(d.type==='widget:themeUpdate'&&d.css){apply(d.css);return;}"
+    # A reference to the section the URL already names moves neither `src` nor
+    # `location.hash`, so the browser has nothing to navigate to and the click
+    # reads as dead. Scrolling on request rather than on the fragment changing
+    # is what makes the second click land. Looked up by id and by name, the two
+    # things a fragment matches; no selector parsing, so any anchor text is safe.
+    "if(d.type==='widget:scrollTo'&&d.id){"
+    "var el=document.getElementById(d.id)||document.getElementsByName(d.id)[0];"
+    "if(el&&el.scrollIntoView)el.scrollIntoView();}});"
     "document.addEventListener('click',function(e){"
     "if(e.defaultPrevented)return;"
     "var a=e.target&&e.target.closest?e.target.closest('a[href]'):null;"
@@ -162,7 +218,10 @@ def _has_traversal(path: str) -> bool:
 
 
 async def _db_fallback_bytes(
-    workspace: dict[str, Any], workspace_id: str, normalized_path: str, extension_mime: str
+    workspace: dict[str, Any],
+    workspace_id: str,
+    normalized_path: str,
+    extension_mime: str,
 ) -> tuple[bytes, str] | None:
     """Read a file's bytes from the persisted DB record (no sandbox I/O)."""
     file_record = await FilePersistenceService.get_file_content(
@@ -184,49 +243,98 @@ async def _db_fallback_bytes(
     return content, extension_mime
 
 
+def warm_sandbox(workspace: dict[str, Any], workspace_id: str) -> Any | None:
+    """A sandbox handle only from a session this worker already holds.
+
+    Resolved in one shot so the handle is fenced against the row's binding: a
+    session bound to a replaced sandbox must read as "not warm" here. Going
+    through the acquisition path instead would retire that handle and
+    re-attach, which is correct for an authenticated caller and exactly wrong
+    for the share and wsfiles routes, since it starts or provisions a sandbox
+    from a URL-only request. A stale 'running' row whose sandbox auto-stopped
+    has no warm session either.
+    """
+    if workspace.get("status") != "running":
+        return None
+    session = WorkspaceManager.get_instance().get_session_if_ready(
+        workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
+    )
+    return getattr(session, "sandbox", None) if session else None
+
+
+async def warm_sandbox_bytes(
+    sandbox: Any,
+    normalized_path: str,
+    *,
+    work_dir: str,
+    visible: VisibilityGate,
+) -> tuple[str, bytes] | None:
+    """The canonical client path and the bytes behind it, or None.
+
+    Canonicalises before reading and judges the canonical path: a symlink under
+    the workspace is otherwise a free pass through both the lexical validator
+    and whatever the caller's visibility gate hides.
+    """
+    # The workspace folder, never the sandbox's own fold: the handle is the
+    # computer's and folds against its root, which holds every sibling too.
+    candidate = contained_absolute_path(normalized_path, work_dir)
+    if candidate is None or not sandbox.validate_path(candidate):
+        return None
+    try:
+        resolved = await read_contained_sandbox_file(
+            sandbox, candidate, work_dir=work_dir
+        )
+    except FileTooLargeToServe as too_large:
+        # Judged like any other read before the caller falls back to the
+        # persisted copy, which may still hold what a symlink replaced.
+        if not visible(_to_client_path(sandbox, too_large.canonical, work_dir)):
+            return None
+        raise
+    if resolved is None:
+        return None
+    canonical, content = resolved
+    client_path = _to_client_path(sandbox, canonical, work_dir)
+    if not visible(client_path):
+        return None
+    return client_path, content
+
+
 async def _resolve_serve_bytes(
-    workspace: dict[str, Any], workspace_id: str, normalized_path: str
+    workspace: dict[str, Any],
+    workspace_id: str,
+    normalized_path: str,
+    *,
+    work_dir: str,
+    visible: VisibilityGate = _default_visible,
 ) -> tuple[bytes, str] | None:
     """Resolve raw bytes + content type for a file, sandbox-first with DB fallback.
 
     Returns ``(content, content_type)`` or ``None`` when the file is missing.
-    Live bytes are read only from a session this worker already holds *and*
-    that still matches the row's binding; anything else — a replaced sandbox, a
-    stale ``running`` row whose sandbox auto-stopped, a cold worker — falls back
-    to the persisted DB record. This keeps the unauthenticated route from ever
-    waking or recovering a sandbox (denial-of-wallet) from a UUID-only request.
+    This is the one ordering every route that serves a workspace file uses:
+    live bytes from an already-warm, binding-matched session, and the persisted
+    record otherwise. Two routes answering the same token with different bytes
+    is the defect the single rule removes.
     """
     extension_mime = _guess_content_type(normalized_path)
 
-    # Live read only from an already-warm sandbox, resolved in one shot so the
-    # handle is fenced against the row's binding: a session bound to a replaced
-    # sandbox must read as "not warm" here. Going through the acquisition path
-    # instead would retire that handle and re-attach — which is correct for an
-    # authenticated caller and exactly wrong for this route, since it starts or
-    # provisions a sandbox from a UUID-only request. A stale 'running' row whose
-    # sandbox auto-stopped has no warm session either → DB fallback.
-    status = workspace.get("status")
-    session = (
-        WorkspaceManager.get_instance().get_session_if_ready(
-            workspace_id, expected_sandbox_id=workspace.get("sandbox_id")
-        )
-        if status == "running"
-        else None
-    )
-    sandbox = getattr(session, "sandbox", None) if session else None
+    sandbox = warm_sandbox(workspace, workspace_id)
     if sandbox is None:
         return await _db_fallback_bytes(
             workspace, workspace_id, normalized_path, extension_mime
         )
-    candidate, error = sandbox.validate_and_normalize_path(normalized_path)
-    if error:
-        return None
     try:
-        content = await sandbox.adownload_file_bytes(candidate)
+        resolved = await warm_sandbox_bytes(
+            sandbox, normalized_path, work_dir=work_dir, visible=visible
+        )
+    except FileTooLargeToServe:
+        return await _db_fallback_bytes(
+            workspace, workspace_id, normalized_path, extension_mime
+        )
     except RuntimeError as e:
         # Deliberate residual: an unreachable sandbox is indistinguishable from a
-        # missing file on this route. It is unauthenticated, so distinguishing
-        # them (503 vs 404) would confirm that a guessed workspace UUID is real.
+        # missing file on this route. The URL is the only credential, so
+        # distinguishing them (503 vs 404) would confirm that a guessed
+        # credential resolved to a real workspace.
         # Fall back to the persisted copy first so the common case still serves.
         # Warning, not debug: the response deliberately hides the cause, which
         # makes this line the only place it survives.
@@ -237,12 +345,9 @@ async def _resolve_serve_bytes(
         return await _db_fallback_bytes(
             workspace, workspace_id, normalized_path, extension_mime
         )
-    if content is None:
+    if resolved is None:
         return None
-    client_path = _to_client_path(sandbox, candidate)
-    if _is_serve_blocked_path(client_path):
-        return None
-    return content, extension_mime
+    return resolved[1], extension_mime
 
 
 async def serve_workspace_file(
@@ -251,6 +356,7 @@ async def serve_workspace_file(
     *,
     inject_theme: bool,
     workspace: dict[str, Any] | None = None,
+    visible: VisibilityGate | None = None,
 ) -> Response:
     """Serve one workspace file inline with a sandboxed CSP and optional theming.
 
@@ -259,13 +365,18 @@ async def serve_workspace_file(
     bodies, and emits the sandboxed, egress-capped ``_WSFILES_CSP`` on every
     response. When ``inject_theme`` is set and the body is HTML, a small
     theme-sync ``<script>`` is spliced after ``<head>``; otherwise the bytes
-    are served faithfully. Missing/unknown/traversal inputs all raise a uniform
-    404 so the endpoint never reveals which check failed.
+    are served faithfully. Missing, unknown, traversal and escaping inputs all
+    raise a uniform 404 so the endpoint never reveals which check failed, and a
+    404 rather than a 403 so a denial never confirms that a path exists.
 
-    ``workspace`` may be passed pre-resolved (e.g. by a share-token route) to
-    reuse this core with a different credential resolver; otherwise the
-    workspace is looked up by UUID.
+    ``workspace`` may be passed pre-resolved (e.g. by a share route) to reuse
+    this core with a different credential resolver; otherwise the workspace is
+    looked up by the id the caller's credential named. ``visible`` is that
+    route's own reach: a share token scoped to one subtree or a share link
+    frozen to a file list narrows it, and the gate runs again on whatever path
+    the sandbox read actually resolved to.
     """
+    visible = visible or _default_visible
     if _has_traversal(path):
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -273,18 +384,18 @@ async def serve_workspace_file(
         try:
             workspace = await db_get_workspace(workspace_id)
         except Exception:
-            raise HTTPException(
-                status_code=404, detail="Not found"
-            ) from None
+            raise HTTPException(status_code=404, detail="Not found") from None
     if not workspace or _is_flash_workspace(workspace):
         raise HTTPException(status_code=404, detail="Not found")
 
-    work_dir = _get_work_dir()
-    normalized_path = _normalize_requested_path(path, work_dir)
-    if not normalized_path or _is_serve_blocked_path(normalized_path):
+    work_dir = _served_work_dir(workspace, workspace_id)
+    normalized_path = contained_relative_path(path, work_dir)
+    if normalized_path is None or not visible(normalized_path):
         raise HTTPException(status_code=404, detail="Not found")
 
-    resolved = await _resolve_serve_bytes(workspace, workspace_id, normalized_path)
+    resolved = await _resolve_serve_bytes(
+        workspace, workspace_id, normalized_path, work_dir=work_dir, visible=visible
+    )
     if resolved is None:
         raise HTTPException(status_code=404, detail="Not found")
     content, content_type = resolved
@@ -330,15 +441,26 @@ async def render_workspace_file_pdf(
     scale: float | None = None,
     page_numbers: bool = False,
     branding: bool = True,
+    visible: VisibilityGate | None = None,
+    serve_base: str | None = None,
 ) -> Response:
     """Render a workspace HTML file to PDF via headless Chromium.
 
     Pre-validates the file exists and is HTML (same uniform 404 posture as the
     inline serve, so chromium never spins on garbage), then renders the byte-
-    faithful internal wsfiles URL (no theme injection) under an SSRF-gated
+    faithful loopback wsfiles URL (no theme injection) under an SSRF-gated
     browser. Renderer failures map to 501/504/500 — intentionally NOT 404,
     since the file exists and only the converter failed.
+
+    ``serve_base`` is the route prefix the document and every subresource it
+    pulls are fetched under, and it is the whole authorization story for those
+    subresources: the browser fetches them with no token of its own, so
+    whatever the prefix admits is what the PDF can contain. The default is a
+    grant that outlives the render by minutes; a caller whose reach is
+    narrower than the workspace passes the prefix of a route that re-checks
+    each request rather than a deeper string to match against.
     """
+    visible = visible or _default_visible
     if _has_traversal(path):
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -350,13 +472,15 @@ async def render_workspace_file_pdf(
     if not workspace or _is_flash_workspace(workspace):
         raise HTTPException(status_code=404, detail="Not found")
 
-    work_dir = _get_work_dir()
-    normalized_path = _normalize_requested_path(path, work_dir)
-    if not normalized_path or _is_serve_blocked_path(normalized_path):
+    work_dir = _served_work_dir(workspace, workspace_id)
+    normalized_path = contained_relative_path(path, work_dir)
+    if normalized_path is None or not visible(normalized_path):
         raise HTTPException(status_code=404, detail="Not found")
 
     # Cheap pre-validation: resolve bytes + content type and require HTML.
-    resolved = await _resolve_serve_bytes(workspace, workspace_id, normalized_path)
+    resolved = await _resolve_serve_bytes(
+        workspace, workspace_id, normalized_path, work_dir=work_dir, visible=visible
+    )
     if resolved is None:
         raise HTTPException(status_code=404, detail="Not found")
     _content, content_type = resolved
@@ -366,16 +490,19 @@ async def render_workspace_file_pdf(
     from src.server.services import pdf_render
 
     base = PDF_RENDER_INTERNAL_BASE.rstrip("/")
+    if serve_base is None:
+        grant = await mint_file_grant(workspace_id, ttl=_PDF_GRANT_TTL_SECONDS)
+        serve_base = grant_prefix(grant)
+    if not serve_base.startswith(base):
+        serve_base = f"{base}/{serve_base.lstrip('/')}"
     # Percent-encode the path (UTF-8) so metacharacters (#, ?, space) and
     # non-ASCII (CJK) survive into headless Chromium; keep `/` so the path
-    # structure stays intact. The wsfiles endpoint decodes it back to unicode.
-    encoded_path = quote(normalized_path, safe="/")
-    internal_url = f"{base}/api/v1/wsfiles/{workspace_id}/{encoded_path}"
-    serve_prefix = f"{base}/api/v1/wsfiles/{workspace_id}/"
+    # structure stays intact. The serving endpoint decodes it back to unicode.
+    internal_url = f"{serve_base}{quote(normalized_path, safe='/')}"
     try:
         pdf_bytes = await pdf_render.render_workspace_pdf(
             internal_url,
-            workspace_serve_prefix=serve_prefix,
+            workspace_serve_prefix=serve_base,
             scale=scale,
             page_numbers=page_numbers,
             branding=branding,
@@ -399,12 +526,16 @@ async def render_workspace_file_pdf(
     return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 
-@wsfiles_router.get("/wsfiles/{workspace_id}/{path:path}")
+@wsfiles_router.get("/wsfiles/g/{grant}/{path:path}")
 async def serve_workspace_file_endpoint(
-    workspace_id: str,
+    grant: str,
     path: str,
-    inject: str | None = Query(None, description="Set to 'theme' to splice theme-sync into HTML."),
-    format: str | None = Query(None, description="Set to 'pdf' to render HTML as a PDF."),
+    inject: str | None = Query(
+        None, description="Set to 'theme' to splice theme-sync into HTML."
+    ),
+    format: str | None = Query(
+        None, description="Set to 'pdf' to render HTML as a PDF."
+    ),
     scale: float | None = Query(
         None, ge=0.5, le=2.0, description="PDF only: render scale (0.5–2.0)."
     ),
@@ -415,19 +546,27 @@ async def serve_workspace_file_endpoint(
         True, description="PDF only: stamp 'LangAlpha · <date>' in the footer."
     ),
 ) -> Response:
-    """Serve a workspace file by path with sandboxed CSP (unauthenticated).
+    """Serve a workspace file by path with sandboxed CSP.
 
-    Workspace UUID is the credential; uniform 404 for unknown workspace,
-    missing file, or traversal. ``?inject=theme`` adds theme-sync to HTML only.
-    ``?format=pdf`` renders HTML files to PDF server-side; other values serve
-    normally. ``scale``, ``page_numbers``, and ``branding`` apply only with
-    ``format=pdf``.
+    The grant is the credential; uniform 404 for a bad or expired grant, an
+    unknown workspace, a missing file, or traversal. ``?inject=theme`` adds
+    theme-sync to HTML only. ``?format=pdf`` renders HTML files to PDF
+    server-side; other values serve normally. ``scale``, ``page_numbers``,
+    and ``branding`` apply only with ``format=pdf``.
     """
+    try:
+        workspace_id = await verify_file_grant(grant)
+    except FileGrantError as e:
+        logger.info(f"Refusing wsfiles request: {single_line(str(e))}")
+        raise HTTPException(status_code=404, detail="Not found") from None
     if format == "pdf":
         return await render_workspace_file_pdf(
-            workspace_id, path, scale=scale, page_numbers=page_numbers, branding=branding
+            workspace_id,
+            path,
+            scale=scale,
+            page_numbers=page_numbers,
+            branding=branding,
         )
     return await serve_workspace_file(
         workspace_id, path, inject_theme=(inject == "theme")
     )
-

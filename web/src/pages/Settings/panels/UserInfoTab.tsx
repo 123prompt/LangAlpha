@@ -14,24 +14,22 @@ import { queryKeys } from '@/lib/queryKeys';
 import { useTheme } from '@/contexts/ThemeContext';
 import { FONT_SCALES, getFontScale, setFontScale, type FontScale } from '@/lib/fontScale';
 import { turnEndScrollPatch, readTurnEndScroll, type TurnEndScroll } from '@/lib/turnEndScroll';
+import {
+  readStreamingMode,
+  readTurnDisplay,
+  streamingModePatch,
+  turnDisplayPatch,
+  type StreamingMode,
+  type TurnDisplay,
+} from '@/lib/transcriptDisplay';
 import { useTranslation } from 'react-i18next';
 import { useToast } from '@/components/ui/use-toast';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
 import { useDebouncedSave } from '@/hooks/useDebouncedSave';
 import { isSupported, setLocaleCookie } from '@/lib/locale';
+import TimezonePicker from '@/components/TimezonePicker';
+import { deviceTimezone } from '@/lib/deviceTimezone';
 import type { Preferences } from './types';
-
-interface TimezoneOption {
-  value: string;
-  label: string;
-}
-
-interface TimezoneGroup {
-  group: string;
-  options: TimezoneOption[];
-}
-
-type TimezoneEntry = TimezoneOption | TimezoneGroup;
 
 /** User-info tab: avatar, name/timezone/locale with debounced auto-save,
  * theme preference, voice-input toggle, and logout. */
@@ -47,6 +45,8 @@ export function UserInfoTab() {
   const themeLabelId = useId();
   const fontSizeLabelId = useId();
   const turnEndLabelId = useId();
+  const turnDisplayLabelId = useId();
+  const streamingModeLabelId = useId();
   const { t, i18n } = useTranslation();
 
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
@@ -58,45 +58,6 @@ export function UserInfoTab() {
   const [error, setError] = useState<string | null>(null);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
 
-  const timezones: TimezoneEntry[] = [
-    { value: '', label: t('settings.selectTimezone') },
-    {
-      group: 'Americas', options: [
-        { value: 'America/New_York', label: 'Eastern Time (America/New_York)' },
-        { value: 'America/Chicago', label: 'Central Time (America/Chicago)' },
-        { value: 'America/Denver', label: 'Mountain Time (America/Denver)' },
-        { value: 'America/Los_Angeles', label: 'Pacific Time (America/Los_Angeles)' },
-        { value: 'America/Toronto', label: 'Eastern - Canada (America/Toronto)' },
-        { value: 'America/Sao_Paulo', label: 'Brasília Time (America/Sao_Paulo)' },
-      ]
-    },
-    {
-      group: 'Europe', options: [
-        { value: 'Europe/London', label: 'GMT (Europe/London)' },
-        { value: 'Europe/Paris', label: 'CET (Europe/Paris)' },
-        { value: 'Europe/Berlin', label: 'CET (Europe/Berlin)' },
-      ]
-    },
-    {
-      group: 'Asia', options: [
-        { value: 'Asia/Shanghai', label: 'China Standard Time (Asia/Shanghai)' },
-        { value: 'Asia/Tokyo', label: 'Japan Standard Time (Asia/Tokyo)' },
-        { value: 'Asia/Hong_Kong', label: 'Hong Kong Time (Asia/Hong_Kong)' },
-        { value: 'Asia/Singapore', label: 'Singapore Time (Asia/Singapore)' },
-        { value: 'Asia/Kolkata', label: 'India Standard Time (Asia/Kolkata)' },
-      ]
-    },
-    {
-      group: 'Oceania', options: [
-        { value: 'Australia/Sydney', label: 'Australian Eastern (Australia/Sydney)' },
-      ]
-    },
-    {
-      group: 'Other', options: [
-        { value: 'UTC', label: 'UTC' },
-      ]
-    },
-  ];
 
   const locales = [
     { value: '', label: t('settings.selectLocale') },
@@ -210,6 +171,34 @@ export function UserInfoTab() {
     }
   };
 
+  const turnDisplay = readTurnDisplay(prefsData);
+  const handleTurnDisplayChange = async (next: TurnDisplay) => {
+    if (next === turnDisplay) return;
+    try {
+      await updatePrefsMutation.mutateAsync(turnDisplayPatch(next));
+    } catch {
+      toast({
+        variant: 'destructive',
+        title: t('common.error'),
+        description: t('settings.failedToSaveSettings'),
+      });
+    }
+  };
+
+  const streamingMode = readStreamingMode(prefsData);
+  const handleStreamingModeChange = async (next: StreamingMode) => {
+    if (next === streamingMode) return;
+    try {
+      await updatePrefsMutation.mutateAsync(streamingModePatch(next));
+    } catch {
+      toast({
+        variant: 'destructive',
+        title: t('common.error'),
+        description: t('settings.failedToSaveSettings'),
+      });
+    }
+  };
+
   const handleLogoutConfirm = () => {
     logout();
     setShowLogoutConfirm(false);
@@ -287,22 +276,16 @@ export function UserInfoTab() {
 
       <div>
         <label className="block text-[0.8125rem] font-medium mb-1.5" style={{ color: 'var(--color-text-primary)' }}>{t('settings.timezone')}</label>
-        <Select
+        <TimezonePicker
           value={timezone}
-          onChange={(e) => handleTimezoneChange(e.target.value)}
-        >
-          {timezones.map((item, i) => (
-            'value' in item ? (
-              <option key={i} value={item.value}>{item.label}</option>
-            ) : (
-              <optgroup key={i} label={item.group}>
-                {item.options.map((opt, j) => (
-                  <option key={`${i}-${j}`} value={opt.value}>{opt.label}</option>
-                ))}
-              </optgroup>
-            )
-          ))}
-        </Select>
+          onChange={handleTimezoneChange}
+          home={deviceTimezone()}
+          homeLabel={t('timezone.thisDevice')}
+          placeholder={t('settings.selectTimezone')}
+          className="w-full"
+          // The card fill the name and language fields beside it take.
+          triggerClassName="bg-[color:var(--color-bg-card)]"
+        />
       </div>
 
       <div>
@@ -376,6 +359,44 @@ export function UserInfoTab() {
             { value: 'reply_start', label: t('settings.turnEndScrollReplyStart') },
           ]}
         />
+      </div>
+
+      {/* Whether reasoning is shown as it streams */}
+      <div className="settings-row flex-wrap">
+        <div className="flex-1 basis-64 space-y-0.5">
+          <label id={turnDisplayLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.turnDisplay')}</label>
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.turnDisplayDesc')}</p>
+        </div>
+        <div className="flex shrink-0">
+          <SegmentedControl
+            labelledBy={turnDisplayLabelId}
+            value={turnDisplay}
+            onChange={(v) => { void handleTurnDisplayChange(v); }}
+            options={[
+              { value: 'lean', label: t('settings.turnDisplayLean') },
+              { value: 'verbose', label: t('settings.turnDisplayVerbose') },
+            ]}
+          />
+        </div>
+      </div>
+
+      {/* How response text appears while it streams */}
+      <div className="settings-row flex-wrap">
+        <div className="flex-1 basis-64 space-y-0.5">
+          <label id={streamingModeLabelId} className="text-[0.8125rem] font-medium" style={{ color: 'var(--color-text-primary)' }}>{t('settings.streamingMode')}</label>
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('settings.streamingModeDesc')}</p>
+        </div>
+        <div className="flex shrink-0">
+          <SegmentedControl
+            labelledBy={streamingModeLabelId}
+            value={streamingMode}
+            onChange={(v) => { void handleStreamingModeChange(v); }}
+            options={[
+              { value: 'token', label: t('settings.streamingModeToken') },
+              { value: 'paragraph', label: t('settings.streamingModeParagraph') },
+            ]}
+          />
+        </div>
       </div>
       </div>
 

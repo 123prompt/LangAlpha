@@ -135,6 +135,15 @@ def _base_path_defn(tools: list[str] | None = None) -> SubagentDefinition:
     )
 
 
+class TestSubagentPromptTimeRules:
+    """A subagent reads its own turn stamp, so its prompt states how to read one."""
+
+    def test_the_prompt_states_the_time_rules(self):
+        prompt = _compiler(config=_config()).compile(_base_path_defn())["system_prompt"]
+        assert "<time_rules>" in prompt
+        assert "Each turn opens with a stamp" in prompt
+
+
 class TestSubagentPromptFeatureGating:
     """The prompt must mirror the tool binding: a tool_guide tier the subagent
     cannot call would drive calls to a tool that is not bound. watch_market is

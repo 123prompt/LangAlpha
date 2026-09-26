@@ -12,10 +12,15 @@ def sql_literals(statuses: tuple) -> str:
     """
     return ", ".join(f"'{s}'" for s in statuses)
 
+# ``usage_settled_at`` rides along because it is the settle instant itself, and
+# replay pairs it with the query timestamp to say how long a turn took. Readers
+# that go through ``_SETTLED_ATTEMPTS`` directly get it from the ``*``; one that
+# projects this list would otherwise be left with the start-plus-duration
+# estimate, which measures from before the row existed.
 _RESPONSE_COLUMNS = (
     "conversation_response_id, conversation_thread_id, turn_index, status, "
     "interrupt_reason, metadata, warnings, errors, execution_time, created_at, "
-    "sse_events, attempt_no, retry_of_run_id"
+    "usage_settled_at, sse_events, attempt_no, retry_of_run_id"
 )
 
 # 1.6: retries append attempt rows at the SAME turn_index, and the live run is

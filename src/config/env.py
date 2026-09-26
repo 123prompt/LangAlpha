@@ -42,6 +42,11 @@ GINLIX_DATA_ENABLED: bool = bool(GINLIX_DATA_URL)
 # Public base URL of this server (used in agent-generated URLs like preview links)
 SERVER_BASE_URL: str = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
 
+# Where the web app is served, for links the agent hands to a person
+# (``/a/<code>``). Defaults to the API origin, which is where the app lives
+# unless the frontend is served from its own host.
+PUBLIC_APP_URL: str = (os.getenv("PUBLIC_APP_URL", "") or SERVER_BASE_URL).rstrip("/")
+
 # Where this deployment serves its OAuth client metadata document (CIMD). An
 # authorization server advertising client_id_metadata_document_supported fetches
 # this URL and treats it as the client_id, so there is no registration call and

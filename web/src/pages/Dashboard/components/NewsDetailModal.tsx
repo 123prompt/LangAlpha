@@ -7,6 +7,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import i18n from '@/i18n';
 import { useTranslation } from 'react-i18next';
 import { getNewsArticle } from '../utils/api';
+import { useBackdropDismiss } from '@/hooks/useDialogA11y';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { Loader } from '@/components/ui/loader';
@@ -175,6 +176,7 @@ function NewsBody({
   onAttach?: () => void;
 }) {
   const { t: trans } = useTranslation();
+  const sentimentBackdrop = useBackdropDismiss<HTMLDivElement>(() => setExpandedSentiment(null));
   const safeFallbackUrl = safeHttpUrl(fallbackUrl);
   const safeArticleUrl = safeHttpUrl(article?.article_url);
   if (loading && !article) {
@@ -470,7 +472,7 @@ function NewsBody({
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
                       exit={{ opacity: 0 }}
-                      onClick={() => setExpandedSentiment(null)}
+                      {...sentimentBackdrop}
                       className="fixed inset-0 z-[60] flex items-center justify-center p-4"
                       style={{ backgroundColor: 'rgba(0,0,0,0.5)', backdropFilter: 'blur(4px)' }}
                     >
@@ -478,7 +480,6 @@ function NewsBody({
                         initial={{ opacity: 0, scale: 0.95, y: 20 }}
                         animate={{ opacity: 1, scale: 1, y: 0 }}
                         exit={{ opacity: 0, scale: 0.95, y: 20 }}
-                        onClick={(e) => e.stopPropagation()}
                         className="w-full max-w-lg rounded-2xl border p-6 shadow-2xl"
                         style={{
                           backgroundColor: 'var(--color-bg-elevated)',
@@ -540,6 +541,7 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
   const [fetchFailed, setFetchFailed] = useState(false);
   const [expandedSentiment, setExpandedSentiment] = useState<number | null>(null);
   const isMobile = useIsMobile();
+  const backdrop = useBackdropDismiss<HTMLDivElement>(onClose);
 
   // Read the latest fallback at fetch time without re-running the effect when
   // the parent hands us a fresh object for the same newsId.
@@ -603,11 +605,22 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
   useEffect(() => {
     if (!newsId) return;
     const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      // The same guard the dialog hook uses. An Escape that abandons an IME
+      // candidate, or one a layer inside has already handled, is not a
+      // dismissal, and this listener is on the window so it hears both.
+      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+      // Innermost layer first. With a sentiment card open, Escape was aimed at
+      // the card, and closing the article behind it would throw away what the
+      // reader was reading to dismiss something the size of a tooltip.
+      if (expandedSentiment !== null) {
+        setExpandedSentiment(null);
+        return;
+      }
+      onClose();
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, [newsId, onClose]);
+  }, [newsId, onClose, expandedSentiment]);
 
   const body = (
     <NewsBody
@@ -645,15 +658,14 @@ function NewsDetailModal({ newsId, onClose, fallbackUrl, fallback }: NewsDetailM
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          onClick={onClose}
-          className="fixed inset-0 z-50 flex items-center justify-center p-8"
+          {...backdrop}
+          className="fixed inset-0 z-[1010] flex items-center justify-center p-8"
           style={{ backgroundColor: 'var(--color-bg-overlay, rgba(0,0,0,0.6))', backdropFilter: 'blur(4px)' }}
         >
           <motion.div
             initial={{ opacity: 0, scale: 0.95, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.95, y: 20 }}
-            onClick={(e) => e.stopPropagation()}
             className="w-full max-w-5xl max-h-[90vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col relative border"
             style={{
               backgroundColor: 'var(--color-bg-elevated)',

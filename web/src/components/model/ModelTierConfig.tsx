@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils"
 import { ModelSelector } from "./ModelSelector"
 import type { ProviderModelsData } from "./types"
 import type { ModelAccess } from "@/types/platform"
+import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
 
 export interface ModelTierConfigProps {
   /** Available models grouped by provider */
@@ -21,6 +22,8 @@ export interface ModelTierConfigProps {
   showExplainer?: boolean
   /** Optional access map: model name → access type for badge display */
   modelAccess?: Record<string, ModelAccess>
+  /** Optional model metadata, for display names */
+  metadata?: Record<string, ModelMetadataEntry>
 }
 
 // ---------------------------------------------------------------------------
@@ -36,6 +39,7 @@ export function ModelTierConfig({
   onFlashModelChange,
   showExplainer = false,
   modelAccess,
+  metadata,
 }: ModelTierConfigProps) {
   const [explainerOpen, setExplainerOpen] = useState(true)
 
@@ -188,6 +192,7 @@ export function ModelTierConfig({
         placeholder="Select primary model..."
         required
         modelAccess={modelAccess}
+        metadata={metadata}
       />
 
       {/* Flash Model selector */}
@@ -201,6 +206,7 @@ export function ModelTierConfig({
         placeholder="Select flash model..."
         required
         modelAccess={modelAccess}
+        metadata={metadata}
       />
 
     </div>

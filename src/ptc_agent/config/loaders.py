@@ -34,7 +34,11 @@ from ptc_agent.config.agent import (
     SubagentConfig,
     SubagentsConfig,
 )
-from ptc_agent.config.core import CoreConfig, create_default_security_config
+from ptc_agent.config.core import (
+    CoreConfig,
+    create_default_security_config,
+    default_sandbox_skills_base,
+)
 from ptc_agent.config.utils import (
     configure_structlog,
     create_filesystem_config,
@@ -255,17 +259,13 @@ def load_from_dict(
         llm_name = llm_data.get("name", "")
         if not llm_name:
             raise ValueError("llm.name is required in agent_config.yaml when llm is a dict")
-        # Blank compaction/fetch inherit the flash model, so leaving them empty
-        # in agent_config.yaml means "reuse flash for these cheaper roles".
-        # `... or None` folds "" to None when flash is itself unset, so the
-        # downstream fall-back-to-main path (resolve_compaction_client) still
-        # engages instead of resolving an empty model name.
-        flash_model = llm_data.get("flash") or None
+        # Blank compaction/fetch stay None so they follow flash on read
+        # (LLMConfig.compaction_name / fetch_name), including a user's flash.
         llm_config = LLMConfig(
             name=llm_name,
             flash=llm_data.get("flash"),
-            compaction=llm_data.get("compaction") or flash_model,
-            fetch=llm_data.get("fetch") or flash_model,
+            compaction=llm_data.get("compaction") or None,
+            fetch=llm_data.get("fetch") or None,
             fallback=llm_data.get("fallback"),
         )
     elif llm_data is not None:
@@ -322,7 +322,8 @@ def load_from_dict(
         enabled=skills_data.get("enabled", True),
         user_skills_dir=skills_data.get("user_skills_dir", "~/.ptc-agent/skills"),
         sandbox_skills_base=skills_data.get(
-            "sandbox_skills_base", f"{filesystem_config.working_directory}/.agents/skills"
+            "sandbox_skills_base",
+            default_sandbox_skills_base(filesystem_config.working_directory),
         ),
     )
 

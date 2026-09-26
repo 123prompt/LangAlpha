@@ -6,6 +6,7 @@ into. Restore and every serving route come through here.
 
 import logging
 
+from src.server.database.blob_keys import INLINE_MAX_BYTES
 from src.server.database.workspace_file_blobs import (
     BlobError,
     fetch_blob,
@@ -13,6 +14,17 @@ from src.server.database.workspace_file_blobs import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The most a serving route will hold in memory for one file. Past it the
+# route refuses rather than buffering: a file this large with its own object
+# downloads through a signed link, and one without could only be inline,
+# which is capped at the same size. Restore reads through
+# ``resolve_file_bytes`` directly and is not bound by this.
+SERVE_MAX_BYTES = INLINE_MAX_BYTES
+
+
+def too_large_to_serve(file_record: dict) -> bool:
+    return int(file_record.get("file_size") or 0) > SERVE_MAX_BYTES
 
 
 class FileBytesUnavailable(Exception):
@@ -79,6 +91,8 @@ async def resolve_file_bytes_or_none(
     exist. The uniform answer is a security property — it lives here, in one
     named policy, rather than as a rule each route is trusted to remember.
     """
+    if too_large_to_serve(file_record):
+        return None
     try:
         return await resolve_file_bytes(file_record, user_id=user_id)
     except FileBytesUnavailable as e:

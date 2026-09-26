@@ -19,6 +19,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
+from ptc_agent.core.project_context import ProjectContext
+
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     ModelRequest,
@@ -57,7 +59,11 @@ def image_storage_key(thread_id: str, sha_hex: str, basename: str) -> str:
 
 
 async def capture_sandbox_images(
-    sandbox: Any, paths: set[str], thread_id: str = ""
+    sandbox: Any,
+    paths: set[str],
+    thread_id: str = "",
+    *,
+    project: ProjectContext | None = None,
 ) -> dict[str, str]:
     """Download sandbox image paths, upload content-addressed, return path→URL.
 
@@ -73,7 +79,12 @@ async def capture_sandbox_images(
 
     async def _capture_one(path: str) -> tuple[str, str] | None:
         try:
-            content = await sandbox.adownload_file_bytes(sandbox.normalize_path(path))
+            normalized = (
+                sandbox.normalize_path(path, project=project)
+                if project is not None
+                else sandbox.normalize_path(path)
+            )
+            content = await sandbox.adownload_file_bytes(normalized)
             if not content:
                 return None
             basename = path.rsplit("/", 1)[-1]

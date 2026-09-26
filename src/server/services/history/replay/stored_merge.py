@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from ptc_agent.agent.middleware.large_result_eviction import TOO_LARGE_TOOL_MSG
@@ -253,12 +254,19 @@ def _merge_stored_payloads(
     _restore_evicted_results(turn_items, stored)
 
     projected_ordinals, projected_lane_counts = _message_lane_ordinals(turn_items)
-    stored_ordinals, _ = _message_lane_ordinals(stored)
-    committed_stored_ids = (
-        _misaligned_committed_ids(turn_items, stored, resurrect_lanes)
-        if resurrect_lanes
-        else set()
+    stored_ordinals, stored_lane_counts = _message_lane_ordinals(stored)
+    # A lane whose stored count disagrees with the checkpoint holds a phantom
+    # partial or lost output, so its ordinals do not line up across the streams
+    # and its messages are paired by content instead.
+    shifted_lanes = {
+        lane for lane, count in stored_lane_counts.items()
+        if count != projected_lane_counts.get(lane, 0)
+    }
+    paired_lanes = set(resurrect_lanes) | shifted_lanes
+    committed_pairs = (
+        _pair_committed_messages(turn_items, stored, paired_lanes) if paired_lanes else {}
     )
+    committed_stored_ids = set(committed_pairs)
 
     index_by_key: dict[tuple, int] = {}
     for idx, item in enumerate(turn_items):
@@ -267,6 +275,17 @@ def _merge_stored_payloads(
             # Last occurrence wins so an anchor covers its whole message group
             # (e.g. both reasoning-signal items share one key).
             index_by_key[key] = idx
+
+    def duration_key(data: dict[str, Any]) -> tuple | None:
+        lane = _lane(data.get("agent"))
+        if lane not in shifted_lanes:
+            return _anchor_key("message_chunk", data, stored_ordinals)
+        twin = committed_pairs.get(data.get("id"))
+        if twin is None:
+            return None  # a phantom attempt: its thinking is not the row's
+        return ("message_chunk", lane, projected_ordinals[twin], "reasoning_signal")
+
+    _carry_reasoning_durations(turn_items, stored, index_by_key, duration_key)
 
     last_lane_index: dict[str, int] = {}
     for idx, item in enumerate(turn_items):
@@ -302,6 +321,46 @@ def _merge_stored_payloads(
         merged.append(item)
         merged.extend(inserts_after.get(idx, ()))
     return merged
+
+
+def _carry_reasoning_durations(
+    turn_items: list[dict[str, Any]],
+    stored: list[dict[str, Any]],
+    index_by_key: dict[tuple, int],
+    key_of: Callable[[dict[str, Any]], tuple | None],
+) -> None:
+    """Carry stored reasoning ``elapsed_ms`` onto the projected close.
+
+    How long the model thought is measured on the live stream and exists
+    nowhere in the checkpoint, so the projected close would replay without
+    it. The anchor key names the message group; its last occurrence is the
+    close, because the projector emits start before complete.
+
+    The total is a sum because the two sides count differently. A message
+    with interleaved thinking streams one close per block, while
+    ``split_content_blocks`` joins those blocks into a single reasoning
+    row, so one projected close stands for all of them. Taking any one
+    block's time would report a fraction of the thinking the row shows.
+    """
+    totals: dict[tuple, int] = {}
+    for event in stored:
+        data = event["data"]
+        if (
+            event["event"] != "message_chunk"
+            or data.get("content_type") != "reasoning_signal"
+            or data.get("content") != "complete"
+            or not isinstance(data.get("elapsed_ms"), int)
+        ):
+            continue
+        key = key_of(data)
+        if key is None or key not in index_by_key:
+            continue
+        totals[key] = totals.get(key, 0) + data["elapsed_ms"]
+
+    for key, elapsed_ms in totals.items():
+        target = turn_items[index_by_key[key]]["data"]
+        if target.get("content_type") == "reasoning_signal" and target.get("content") == "complete":
+            target["elapsed_ms"] = elapsed_ms
 
 
 def _is_lost_transcript_row(
@@ -343,12 +402,12 @@ def _is_lost_transcript_row(
     return False
 
 
-def _misaligned_committed_ids(
+def _pair_committed_messages(
     turn_items: list[dict[str, Any]],
     stored: list[dict[str, Any]],
-    resurrect_lanes: set[str] | frozenset[str],
-) -> set[str]:
-    """Stored message ids that are a checkpointed message's shifted copy.
+    lanes: set[str] | frozenset[str],
+) -> dict[str, str]:
+    """Stored message id -> the checkpointed message it is a copy of.
 
     A phantom partial (a model attempt that failed before an in-run retry)
     shifts a lane's stored ordinals, so a committed message's stored copy
@@ -360,9 +419,9 @@ def _misaligned_committed_ids(
     break toward the earliest stored message, so the copy is the first
     occurrence and later repeats resurrect.
     """
-    projected = _lane_message_signatures(turn_items, resurrect_lanes)
-    committed: set[str] = set()
-    for lane, stored_msgs in _lane_message_signatures(stored, resurrect_lanes).items():
+    projected = _lane_message_signatures(turn_items, lanes)
+    committed: dict[str, str] = {}
+    for lane, stored_msgs in _lane_message_signatures(stored, lanes).items():
         lane_projected = projected.get(lane, [])
         if not lane_projected:
             continue
@@ -381,7 +440,7 @@ def _misaligned_committed_ids(
                 stored_msgs[i][1] == lane_projected[j][1]
                 and 1 + dp[i + 1][j + 1] == dp[i][j]
             ):
-                committed.add(stored_msgs[i][0])
+                committed[stored_msgs[i][0]] = lane_projected[j][0]
                 i += 1
                 j += 1
             elif dp[i + 1][j] >= dp[i][j + 1]:

@@ -33,6 +33,7 @@ from ptc_agent.agent.middleware.skills.registry import (
     get_skill,
     get_skill_registry,
     list_skills,
+    resolve_disabled_skills,
 )
 from ptc_agent.agent.middleware.skills.middleware import (
     SkillsMiddleware,
@@ -59,4 +60,5 @@ __all__ = [
     "get_sandbox_skill_names",
     "list_skills",
     "load_skill_content",
+    "resolve_disabled_skills",
 ]

@@ -23,7 +23,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 PTC = "src.server.handlers.chat.ptc_run"
 
 
@@ -88,7 +87,9 @@ def _make_workspace_manager(
     reconnect callback is never invoked (new sandbox, no pre-existing
     state to observe).
     """
-    wm = MagicMock()
+    from src.server.services.workspace_manager import WorkspaceManager
+
+    wm = MagicMock(spec=WorkspaceManager)
     wm.has_ready_session = MagicMock(return_value=has_ready)
 
     async def _session_with_callback(
@@ -106,7 +107,12 @@ def _make_workspace_manager(
     return wm
 
 
-async def _run_to_sentinel(request, workspace_manager):
+async def _run_to_sentinel(request, workspace_manager, stamps=None):
+    """``stamps``, when given, gets each event's delay from the first pull.
+
+    Timing the events rather than the whole call keeps the lazy app import
+    and the error-path teardown after the sentinel out of the measurement:
+    both depend on state earlier tests leave behind, not on this path."""
     from src.server.handlers.chat.ptc_run import astream_ptc_workflow
 
     sentinel_registry_store = MagicMock()
@@ -128,14 +134,17 @@ async def _run_to_sentinel(request, workspace_manager):
             new_callable=AsyncMock,
             return_value=(True, None),
         ),
-        patch(f"{PTC}._resolve_timezone", return_value="UTC"),
+        patch(
+            f"{PTC}.get_user_profile_for_prompt",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
         patch(f"{PTC}.init_tracking", return_value=(MagicMock(), MagicMock())),
         patch(f"{PTC}.apply_fetch_override"),
         patch(f"{PTC}.WorkspaceManager") as mock_wm_cls,
         patch(f"{PTC}._fire_and_forget"),
         patch(f"{PTC}.update_workspace_activity"),
         patch(f"{PTC}.BackgroundRegistryStore") as mock_reg_store_cls,
-        patch(f"{PTC}.ExecutionTracker"),
     ):
         mock_setup.agent_config = MagicMock()
         mock_wm_cls.get_instance.return_value = workspace_manager
@@ -155,9 +164,13 @@ async def _run_to_sentinel(request, workspace_manager):
         )
 
         collected: list[str] = []
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         try:
             async for event in gen:
                 collected.append(event)
+                if stamps is not None:
+                    stamps.append(loop.time() - started)
         except Exception:
             pass
         finally:
@@ -243,6 +256,26 @@ async def test_recovery_path_callback_never_fires_no_refinement(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_warm_sibling_acquisition_does_not_wait_for_state_callback():
+    req = _make_request()
+    wm = _make_workspace_manager(
+        has_ready=False,
+        observed_state=None,
+        session_delay_s=0.001,
+    )
+
+    stamps: list[float] = []
+    lines = await _run_to_sentinel(req, wm, stamps)
+
+    # Ready arrives on the session, not after the 5 s state-callback wait.
+    assert stamps[-1] < 1.0
+    assert _parse_ws_status_events(lines) == [
+        {"status": "starting", "workspace_id": "ws-1"},
+        {"status": "ready", "workspace_id": "ws-1"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_warm_path_emits_zero_events():
     """has_ready_session=True → no workspace_status events at all."""
     req = _make_request()
@@ -256,7 +289,8 @@ async def test_warm_path_emits_zero_events():
     # cached session, but no callback should flow through because the
     # generator doesn't supply one on the warm branch.
     warm_calls = [
-        c for c in wm.get_session_for_workspace.await_args_list
+        c
+        for c in wm.get_session_for_workspace.await_args_list
         if c.kwargs.get("on_state_observed") is not None
     ]
     assert warm_calls == [], "warm path must not pass on_state_observed"

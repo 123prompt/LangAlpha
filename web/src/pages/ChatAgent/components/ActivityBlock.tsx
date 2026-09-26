@@ -1,983 +1,139 @@
-import React, { useState, useRef, useMemo, useEffect, useId, memo } from 'react';
-import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
-import { Brain, ChevronDown, Wrench, X as XIcon } from 'lucide-react';
-import type { LucideIcon } from 'lucide-react';
-import {
-  getDisplayName,
-  getToolIcon,
-  getPreparingText,
-  getCompletedSummary,
-  getActiveLabel,
-  getCompletedRowTitle,
-  categorizeTool,
-  type ToolCategory,
-} from './toolDisplayConfig';
-import { classifyAgentPath, isUserProfileReadmePath } from '../utils/agentPaths';
-import { ToolIcon } from './ToolIcon';
-import { TextShimmer } from '@/components/ui/text-shimmer';
-import { DotLoader } from '@/components/ui/dot-loader';
-import { useAnimatedText } from '@/components/ui/animated-text';
-import Markdown from './Markdown';
-import {
-  INLINE_ARTIFACT_TOOLS,
-  INLINE_ARTIFACT_MAP,
-} from './charts/InlineArtifactCards';
+import React, { memo, useEffect, useId, useMemo, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import { ChevronDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import './ActivityBlock.css';
+import { INLINE_ARTIFACT_MAP, isInlineArtifactReady, openCardTarget } from './charts/InlineArtifactCards';
+import { isUserProfileReadmePath } from '../utils/agentPaths';
+import { announceAnchoredToggle } from '../utils/anchoredToggle';
+import { summarizeCompletedItems } from './messageList/activitySummary';
+import { type ActivityItem, type PreparingToolCallData, isRunning } from './messageList/activityTypes';
+import { filePathOf, groupFileToolRuns } from './messageList/groupFileToolRuns';
+import { FileToolGroupRow } from './messageList/FileToolGroupRow';
+import { ReasoningRow } from './messageList/ReasoningRow';
+import { ToolCallRow, PreparingTimelineRow } from './messageList/ToolCallRow';
+import { PreparingToolCallRow, ToolCallLiveRow } from './messageList/InlineActivityRows';
 import { LiveRow } from './messageList/LiveRow';
-import { SPRING_SNAPPY, EXIT_TWEEN } from './messageList/liveZoneTiming';
-
-/** Tool names where clicking should open the file in the FilePanel */
-const FILE_NAV_TOOLS = new Set(['Read', 'Write']);
-
-function getFilePathFromArgs(args: Record<string, unknown> | undefined): string | null {
-  if (!args) return null;
-  return (args.file_path || args.filePath || args.path || args.filename || null) as string | null;
-}
-
-/**
- * The agent occasionally reads `.agents/user/profile/README.md` to recall the
- * JSON schema for portfolio/watchlist/preference. That's plumbing chatter — it
- * doesn't represent meaningful work to a human reader and the README itself
- * has no user-facing surface to open. Hide these rows from the timeline (and
- * from the accordion summary fingerprint/counts) so the chat stays focused
- * on actual data operations.
- */
-function shouldHideTimelineItem(item: ActivityItem): boolean {
-  if (item.type !== 'tool_call') return false;
-  if (item.toolName !== 'Read') return false;
-  const fp = getFilePathFromArgs(item.toolCall?.args);
-  return fp ? isUserProfileReadmePath(fp) : false;
-}
-
-/** One spring for every fold and chevron in the block. Near critical damping on
-    purpose: an underdamped spring closing a panel to height 0 swings negative
-    (clamped, so the fold looks finished), then comes back through zero a third
-    of a second later and shifts everything below by a pixel before it settles. */
-const SPRING_FOLD = { type: 'spring' as const, stiffness: 260, damping: 30 };
-// Derived from EXIT_TWEEN so the live zone's top gap closes with its last row.
-const LIVE_ZONE_MARGIN_MS = EXIT_TWEEN.duration * 1000;
-
-type LiveState = 'active' | 'completing' | 'completed' | 'failed';
-
-interface ToolCallData {
-  args?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
-interface ToolCallResultData {
-  content?: unknown;
-  artifact?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
-interface ActivityItem {
-  id?: string;
-  toolCallId?: string;
-  type: 'reasoning' | 'tool_call';
-  toolName?: string;
-  toolCall?: ToolCallData;
-  toolCallResult?: ToolCallResultData;
-  isComplete?: boolean;
-  /** Set in MessageList from `proc.isFailed`. Persists across the live→completed
-   *  transition so the accordion timeline can render a failure indicator. */
-  isFailed?: boolean;
-  _recentlyCompleted?: boolean;
-  _liveState?: LiveState;
-  /** Intermediate chart-annotation draw — render as an ordinary row, never a
-   *  card (the latest draw per chart owns the card; set in MessageList). */
-  _annotationStep?: boolean;
-  content?: string;
-  reasoningTitle?: string;
-  [key: string]: unknown;
-}
-
-interface PreparingToolCallData {
-  toolName?: string;
-  argsLength: number;
-  [key: string]: unknown;
-}
+import { SettlingLabel } from './messageList/SettlingLabel';
+import { SPRING_FOLD, EXIT_TWEEN } from './messageList/liveZoneTiming';
+import { useActivityRowKeys } from './messageList/useActivityRowKeys';
+import type { ChartTabSpec } from './filePanel/types';
+import './ActivityBlock.css';
 
 interface ActivityBlockProps {
   items: ActivityItem[];
   preparingToolCall?: PreparingToolCallData | null;
   isStreaming: boolean;
-  /** First block of the message: the accordion sits against the bubble's top padding. */
-  isFirst: boolean;
+  /** Inline is the compatibility layout for a transcript without a turn fold. */
+  presentation?: 'inline' | 'folded' | 'expanded';
+  liveReasoningOpen?: boolean;
   onToolCallClick?: (item: ActivityItem) => void;
   onOpenFile?: (path: string, workspaceId?: string) => void;
+  onOpenChart?: (spec: ChartTabSpec) => void;
 }
 
-/**
- * ActivityBlock -- unified component for completed + live activity items.
- *
- * Items move from the live zone to the accordion zone in the same React render,
- * eliminating the visible gap that separate components caused between
- * fade-out and reappear across render cycles.
- */
-const ActivityBlock = memo(function ActivityBlock({ items, preparingToolCall, isStreaming, isFirst, onToolCallClick, onOpenFile }: ActivityBlockProps): React.ReactElement | null {
+const ActivityBlock = memo(function ActivityBlock({
+  items, preparingToolCall, isStreaming, presentation = 'inline', liveReasoningOpen = false,
+  onToolCallClick, onOpenFile, onOpenChart,
+}: ActivityBlockProps): React.ReactElement | null {
   const { t } = useTranslation();
-  const [isExpanded, setIsExpanded] = useState(false);
-  const reduceMotion = useReducedMotion();
-  const prevCompletedIdsRef = useRef<Set<string | undefined>>(new Set());
-  // Stable per-instance id pair for the toggle button + the timeline panel it
-  // controls — assistive tech needs both `aria-expanded`/`aria-controls` and
-  // a labelled region to announce the accordion correctly.
-  const reactId = useId();
-  const summaryButtonId = `activity-summary-${reactId}`;
-  const timelinePanelId = `activity-timeline-${reactId}`;
+  const inline = presentation === 'inline';
+  const [expanded, setExpanded] = useState(presentation === 'expanded');
+  useEffect(() => { setExpanded(presentation === 'expanded'); }, [presentation]);
+  const id = useId();
+  const summaryId = `activity-summary-${id}`;
+  const panelId = `activity-timeline-${id}`;
 
-  // Memoize partition of items into zones
-  const { completedItems, liveItems, inlineChartItems } = useMemo(() => {
-    const completed: ActivityItem[] = [];
-    const live: ActivityItem[] = [];
-    const inlineCharts: ActivityItem[] = [];
-
+  const { timeline, charts } = useMemo(() => {
+    const timeline: ActivityItem[] = [];
+    const charts: ActivityItem[] = [];
     for (const item of items) {
-      // Drop README schema-doc reads at the partition layer so they're invisible
-      // to every downstream consumer (live row, accordion summary, category
-      // counts, new-item animation tracker) — no need for per-site guards.
-      if (shouldHideTimelineItem(item)) continue;
-      if (item._liveState === 'completed') {
-        if (
-          item.type === 'tool_call' &&
-          INLINE_ARTIFACT_TOOLS.has(item.toolName || '') &&
-          item.toolCallResult?.artifact &&
-          !item._annotationStep
-        ) {
-          inlineCharts.push(item);
-        } else {
-          completed.push(item);
+      if (item.type === 'tool_call') {
+        const path = filePathOf(item);
+        if (item.toolName === 'Read' && path && isUserProfileReadmePath(path)) continue;
+        if (item._liveState === 'completed' && !item._annotationStep
+          && isInlineArtifactReady(item.toolName, item.toolCallResult?.artifact)) {
+          charts.push(item);
+          continue;
         }
-      } else {
-        live.push(item);
       }
+      timeline.push(item);
     }
-    return { completedItems: completed, liveItems: live, inlineChartItems: inlineCharts };
+    return { timeline, charts };
   }, [items]);
+  const completed = useMemo(() => timeline.filter((item) => item._liveState === 'completed'), [timeline]);
+  const hasLive = timeline.some((item) => item._liveState !== 'completed');
+  const bareReasoning = !inline && completed.length > 0 && !hasLive && !preparingToolCall
+    && completed.every((item) => item.type === 'reasoning');
+  const showCompleted = expanded || bareReasoning;
+  const showSummary = completed.length > 0 && !bareReasoning;
+  const summary = useMemo(() => summarizeCompletedItems(completed, t, { expanded }), [completed, expanded, t]);
+  const keys = useActivityRowKeys(timeline, !!preparingToolCall);
 
-  // Detect newly completed items for entrance animation. Memoized so a long
-  // turn with many completed rows doesn't re-walk the array every SSE chunk.
-  const currentCompletedIds = useMemo(
-    () => new Set(completedItems.map(i => i.id || i.toolCallId)),
-    [completedItems],
-  );
-  const newlyCompletedIds = useMemo(() => {
-    const out = new Set<string | undefined>();
-    if (!isStreaming) return out;
-    for (const id of currentCompletedIds) {
-      if (!prevCompletedIdsRef.current.has(id)) out.add(id);
+  // One list owns both live and settled rows. Opening the accordion changes
+  // visibility, never the live rows' parent, keys, or reasoning policy.
+  const runs = groupFileToolRuns(timeline);
+  const rows: Array<{ key: string; content: React.ReactNode; live: boolean }> = [];
+  for (const run of runs) {
+    const item = run[0];
+    const live = run.some((entry) => entry._liveState !== 'completed');
+    if (!live && !showCompleted) continue;
+    let content: React.ReactNode;
+    if (inline && live && item.type === 'tool_call') {
+      content = <ToolCallLiveRow tc={item} liveState={item._liveState} />;
+    } else if (item.type === 'reasoning') {
+      content = <ReasoningRow item={item} isStreaming={isRunning(item)}
+        defaultExpanded={isRunning(item) ? liveReasoningOpen : inline} />;
+    } else if (item.toolName === 'Read' || item.toolName === 'Write' || item.toolName === 'Edit') {
+      content = <FileToolGroupRow items={run.filter((entry) => entry.type === 'tool_call')}
+        onOpenFile={onOpenFile} onToolCallClick={onToolCallClick} isStreaming={run.some(isRunning)} />;
+    } else {
+      content = <ToolCallRow item={item} running={isRunning(item)} onClick={() => onToolCallClick?.(item)} />;
     }
-    return out;
-  }, [currentCompletedIds, isStreaming]);
-  useEffect(() => {
-    // Ref mutation belongs in an effect, not render \u2014 strict-mode double
-    // render would otherwise over-advance the prev set.
-    prevCompletedIdsRef.current = currentCompletedIds;
-  }, [currentCompletedIds]);
-
-  // Content-aware accordion header \u2014 group completed items by category and
-  // emit `<count> <label>` fragments. Computed BEFORE any early-return so
-  // hook order stays stable.
-  //
-  // Fingerprint includes the file_path arg per item so the breakdown
-  // re-walks when an item's args arrive late (a common SSE pattern: row
-  // created with empty args, file_path patched in a later chunk). The
-  // earlier `[length, lastId]` key silently froze the category counts.
-  const summaryFingerprint = useMemo(() => completedItems
-    .map((i) => {
-      const args = i.toolCall?.args as Record<string, unknown> | undefined;
-      const fp = (args?.file_path || args?.filePath || '') as string;
-      return `${i.id || i.toolCallId || ''}:${i.type}:${i.toolName || ''}:${fp}`;
-    })
-    .join('|'), [completedItems]);
-  // Slot = what we emit in the header. `memory` and `profile` each collapse
-  // read+write into a single fragment whose verb flips on any write (each is
-  // conceptually one surface — the user's memory, the user's profile data).
-  // `fileRead`/`fileEdit` and `memo`/`memoWrite` stay separate — distinct
-  // file/memo paths shouldn't collide under one label, and any memo
-  // modification is surfaced distinctly so a future regression letting the
-  // agent mutate a memo is visible.
-  type SummarySlot = 'skill' | 'memory' | 'memo' | 'memoWrite' | 'profile' | 'code' | 'web' | 'search' | 'fileRead' | 'fileEdit' | 'reasoning' | 'generic';
-  const summaryFragments = useMemo<{ slot: SummarySlot; count: number; modified?: boolean }[]>(() => {
-    const counts = new Map<ToolCategory | 'reasoning', number>();
-    for (const item of completedItems) {
-      const key: ToolCategory | 'reasoning' = item.type === 'reasoning'
-        ? 'reasoning'
-        : categorizeTool(item.toolName || '', item.toolCall);
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-    const memReads = counts.get('memoryRead') ?? 0;
-    const memWrites = counts.get('memoryWrite') ?? 0;
-    const memTotal = memReads + memWrites;
-    const profileReads = counts.get('profileRead') ?? 0;
-    const profileWrites = counts.get('profileWrite') ?? 0;
-    const profileTotal = profileReads + profileWrites;
-    const order: SummarySlot[] = ['skill', 'memory', 'memo', 'memoWrite', 'profile', 'code', 'web', 'search', 'fileRead', 'fileEdit', 'reasoning', 'generic'];
-    const out: { slot: SummarySlot; count: number; modified?: boolean }[] = [];
-    for (const slot of order) {
-      if (slot === 'memory') {
-        if (memTotal > 0) out.push({ slot, count: memTotal, modified: memWrites > 0 });
-      } else if (slot === 'profile') {
-        if (profileTotal > 0) out.push({ slot, count: profileTotal, modified: profileWrites > 0 });
-      } else if (counts.has(slot as ToolCategory | 'reasoning')) {
-        out.push({ slot, count: counts.get(slot as ToolCategory | 'reasoning')! });
-      }
-    }
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [summaryFingerprint]);
-
-  const hasInlineCharts = inlineChartItems.length > 0;
-  const hasCompleted = completedItems.length > 0;
-  const hasLive = liveItems.length > 0;
-  const hasPreparingTools = !!preparingToolCall;
-
-  if (!hasInlineCharts && !hasCompleted && !hasLive && !hasPreparingTools) return null;
-
-  let summaryLabel: string | undefined;
-  if (summaryFragments.length > 0 && summaryFragments.some((f) => f.slot !== 'reasoning' && f.slot !== 'generic')) {
-    // When folded, cap the breakdown at 3 fragments + "…" so the header stays
-    // scannable on turns with many tool categories. Expanding the accordion
-    // reveals the full breakdown alongside the per-step rows.
-    // High-signal fragments (memory writes, memo writes) get priority:
-    // they're information the user specifically needs to see and shouldn't
-    // drop into the "and more …" tail when 4+ categories are present.
-    // We hoist them to the front of the visible slice while preserving the
-    // relative order of everything else.
-    const FOLDED_MAX = 3;
-    const isPriority = (f: { slot: SummarySlot; modified?: boolean }) =>
-      f.slot === 'memoWrite'
-      || (f.slot === 'memory' && f.modified === true)
-      || (f.slot === 'profile' && f.modified === true);
-    const priority = summaryFragments.filter(isPriority);
-    const rest = summaryFragments.filter((f) => !isPriority(f));
-    const ordered = [...priority, ...rest];
-    const overflowing = !isExpanded && ordered.length > FOLDED_MAX;
-    const visible = overflowing ? ordered.slice(0, FOLDED_MAX) : ordered;
-    const labels = visible
-      .map((f) => {
-        if (f.slot === 'reasoning') return t('toolArtifact.nReasoning', { count: f.count });
-        if (f.slot === 'skill') return t('toolArtifact.categoryCount.skill', { count: f.count });
-        if (f.slot === 'memory') {
-          // No count for memory — any write/edit overrules pure-read framing.
-          return t(f.modified ? 'toolArtifact.categoryCount.memoryUpdated' : 'toolArtifact.categoryCount.memoryRead');
-        }
-        if (f.slot === 'profile') {
-          // Same single-surface framing as memory — verb flips on any write.
-          return t(f.modified ? 'toolArtifact.categoryCount.profileUpdated' : 'toolArtifact.categoryCount.profileRead');
-        }
-        if (f.slot === 'fileRead') return t('toolArtifact.categoryCount.fileRead', { count: f.count });
-        if (f.slot === 'fileEdit') return t('toolArtifact.categoryCount.fileEdit', { count: f.count });
-        if (f.slot === 'memo') return t('toolArtifact.categoryCount.memo', { count: f.count });
-        if (f.slot === 'memoWrite') return t('toolArtifact.categoryCount.memoWrite', { count: f.count });
-        if (f.slot === 'code') return t('toolArtifact.categoryCount.code', { count: f.count });
-        if (f.slot === 'web') return t('toolArtifact.categoryCount.web', { count: f.count });
-        if (f.slot === 'search') return t('toolArtifact.categoryCount.search', { count: f.count });
-        return t('toolArtifact.categoryCount.generic', { count: f.count });
-      });
-    summaryLabel = labels.join(' \u00b7 ');
-    if (overflowing) summaryLabel = `${summaryLabel} ${t('toolArtifact.andMore')}`;
-  } else if (completedItems.length > 0) {
-    summaryLabel = t('toolArtifact.nStepsCompleted', { count: completedItems.length });
+    rows.push({ key: keys.forItem(item), content, live });
   }
-  // Capitalize first character only \u2014 leave the rest untouched so embedded
-  // proper nouns / casing stay intact. Applies to both the fragment-based label
-  // and the fallback "completed N steps" label.
-  if (summaryLabel && summaryLabel.length > 0) {
-    summaryLabel = summaryLabel.charAt(0).toUpperCase() + summaryLabel.slice(1);
+  if (preparingToolCall) {
+    rows.push({ key: keys.preparing, live: true, content: inline
+      ? <PreparingToolCallRow tc={preparingToolCall} />
+      : <PreparingTimelineRow tc={preparingToolCall} /> });
   }
 
-  return (
-    <div className="mb-1">
-      {/* Inline chart cards -- always visible, above accordion */}
-      {hasInlineCharts && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: hasCompleted || hasLive || hasPreparingTools ? 6 : 0 }}>
-          {inlineChartItems.map((item, idx) => {
-            const artifact = item.toolCallResult!.artifact!;
-            const ChartComponent = INLINE_ARTIFACT_MAP[artifact.type as string];
-            if (!ChartComponent) return null;
-            return (
-              <div key={`chart-${item.id || idx}`}>
-                <ChartComponent
-                  artifact={artifact}
-                  onClick={() => onToolCallClick?.(item)}
-                />
-              </div>
-            );
-          })}
-        </div>
-      )}
-
-      {/* Accordion zone (top) -- completed items, animates in smoothly */}
-      <AnimatePresence initial={false}>
-        {hasCompleted && (
-          <motion.div
-            key="accordion-zone"
-            /* The fold animates its height, so it has to clip -- and its only
-               child is a summary button flush against every edge, whose ring
-               the clip then eats. clips-focus-ring turns it inward. */
-            className="clips-focus-ring"
-            /* The pull-up against the bubble's top padding rides the same
-               keyframes as the height: applied as a class it lands whole on
-               the frame the zone mounts at height 0, an 8 px hop. It is
-               only owed at the top of the bubble: lower down, or under an
-               inline card, it would eat the gap to whatever sits above. */
-            initial={{ opacity: 0, height: 0, marginTop: 0 }}
-            animate={{ opacity: 1, height: 'auto', marginTop: isFirst && !hasInlineCharts ? '-0.5rem' : 0 }}
-            transition={SPRING_FOLD}
-            style={{ overflow: 'hidden' }}
-          >
-            <button
-              id={summaryButtonId}
-              type="button"
-              aria-expanded={isExpanded}
-              aria-controls={timelinePanelId}
-              onClick={() => setIsExpanded(!isExpanded)}
-              className="inline-flex items-center gap-2 text-left bg-transparent border-0 p-0 cursor-pointer transition-colors hover:text-foreground"
-              style={{
-                paddingTop: '5px',
-                paddingBottom: '5px',
-                fontSize: '0.8125rem',
-                color: 'var(--Labels-Tertiary)',
-              }}
-            >
-              <span className="truncate">{summaryLabel}</span>
-              <motion.div
-                animate={{ rotate: isExpanded ? 90 : 0 }}
-                transition={SPRING_FOLD}
-                className="flex-shrink-0"
-                style={{ opacity: 0.6 }}
-              >
-                <ChevronDown className="h-3.5 w-3.5 -rotate-90" />
-              </motion.div>
-            </button>
-
-            <AnimatePresence initial={false}>
-              {isExpanded && (
-                <motion.div
-                  key="accordion-body"
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  transition={SPRING_FOLD}
-                  style={{ overflow: 'hidden' }}
-                >
-                  <div
-                    id={timelinePanelId}
-                    role="region"
-                    aria-labelledby={summaryButtonId}
-                  >
-                  <ol className="timeline mt-1">
-                    {completedItems.map((item, idx) => {
-                      const itemId = item.id || item.toolCallId;
-                      const isNew = newlyCompletedIds.has(itemId);
-                      const itemKey = item.type === 'reasoning' ? `r-${itemId || idx}` : `t-${itemId || idx}`;
-
-                      const content = renderCompletedItem(item, idx, onToolCallClick, onOpenFile);
-                      if (!content) return null;
-
-                      if (isNew) {
-                        return (
-                          <motion.li
-                            key={itemKey}
-                            initial={{ opacity: 0, height: 0 }}
-                            animate={{ opacity: 1, height: 'auto' }}
-                            transition={SPRING_FOLD}
-                            style={{ overflow: 'hidden', listStyle: 'none' }}
-                          >
-                            {content}
-                          </motion.li>
-                        );
-                      }
-
-                      return <li key={itemKey} style={{ listStyle: 'none' }}>{content}</li>;
-                    })}
-                  </ol>
-                  </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Live zone (bottom) -- active/completing items + preparing.
-          A plain block that stays mounted: the rows animate their own height
-          in and out, so the container never carries one. An animated
-          container exit is a trap here -- the next tool call routinely lands
-          mid-collapse, and framer-motion restores a re-entering element by
-          animating the exit keys back to their remembered values, leaving an
-          inline pixel height that no later render clears. The gap from the
-          accordion collapses with the last row via a CSS transition. */}
-      <div
-        data-testid="activity-live-zone"
-        style={{
-          // The former mt-2 / -mt-1, kept in rem so it still tracks --app-font-scale.
-          marginTop: hasLive || hasPreparingTools ? (hasCompleted ? '0.5rem' : '-0.25rem') : 0,
-          // The rows leave instantly under reduced motion; the gap goes with them.
-          transition: reduceMotion ? 'none' : `margin-top ${LIVE_ZONE_MARGIN_MS}ms ease-in`,
-        }}
-      >
-        {/* Live items in chronological order */}
-        <AnimatePresence initial={false}>
-          {liveItems.map(item => {
-            if (item.type === 'reasoning') {
-              const { title: extractedTitle, body: extractedBody } = extractLeadingBoldHeader(item.content || '');
-              const effectiveTitle = item.reasoningTitle || extractedTitle;
-              const liveBody = extractedTitle ? extractedBody : item.content;
-              return (
-                <LiveRow
-                  key={`live-r-${item.id}`}
-                  opacity={item._liveState === 'completing' ? 0.7 : 1}
-                  className="px-3 py-2"
-                >
-                  <div
-                    className="flex items-center gap-2 mb-1"
-                    style={{ fontSize: '0.8125rem', color: 'var(--Labels-Secondary)' }}
-                  >
-                    <Brain className="h-4 w-4 flex-shrink-0" />
-                    {item._liveState === 'active' ? (
-                      <TextShimmer
-                        as="span"
-                        className="font-medium truncate text-[0.8125rem] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)]"
-                        duration={1.5}
-                      >
-                        {effectiveTitle || t('toolArtifact.reasoningPending')}
-                      </TextShimmer>
-                    ) : (
-                      <span className="font-medium truncate">{effectiveTitle || t('toolArtifact.reasoningComplete')}</span>
-                    )}
-                  </div>
-
-                  {liveBody && (
-                    <AnimatedReasoningContent
-                      content={liveBody}
-                      isStreaming={item._liveState === 'active'}
-                    />
-                  )}
-                </LiveRow>
-              );
-            }
-            if (item.type === 'tool_call') {
-              return (
-                <LiveRow key={`live-t-${item.id || item.toolCallId}`}>
-                  <ToolCallLiveRow tc={item} liveState={item._liveState} />
-                </LiveRow>
-              );
-            }
-            return null;
-          })}
-        </AnimatePresence>
-
-        {/* Preparing tool call -- always at the bottom */}
-        <AnimatePresence initial={false}>
-          {hasPreparingTools && (
-            <LiveRow key="preparing">
-              <PreparingToolCallRow tc={preparingToolCall!} />
-            </LiveRow>
-          )}
-        </AnimatePresence>
-      </div>
-    </div>
-  );
-});
-
-function renderCompletedItem(
-  item: ActivityItem,
-  idx: number,
-  onToolCallClick?: (item: ActivityItem) => void,
-  onOpenFile?: (path: string, workspaceId?: string) => void,
-): React.ReactElement | null {
-  if (item.type === 'reasoning') {
-    return <ReasoningRow item={item} />;
-  }
-  if (item.type === 'tool_call') {
-    const toolName = item.toolName || '';
-
-    if (toolName === 'Edit') {
-      return <EditToolRow item={item} onOpenFile={onOpenFile} />;
-    }
-
-    if (FILE_NAV_TOOLS.has(toolName)) {
-      const filePath = getFilePathFromArgs(item.toolCall?.args);
-      return (
-        <ToolCallRow
-          item={item}
-          onClick={() => {
-            if (filePath && onOpenFile) {
-              onOpenFile(filePath);
-            } else {
-              onToolCallClick?.(item);
-            }
-          }}
-        />
-      );
-    }
-
-    return (
-      <ToolCallRow
-        item={item}
-        onClick={() => onToolCallClick?.(item)}
-      />
-    );
-  }
-  return null;
-}
-
-interface AnimatedReasoningContentProps {
-  content: string;
-  isStreaming: boolean;
-}
-
-/** Module scope, not a literal: a fresh object would defeat Markdown's memo on every tick. */
-const REASONING_STYLE = { opacity: 0.8 };
-
-function AnimatedReasoningContent({ content, isStreaming }: AnimatedReasoningContentProps): React.ReactElement {
-  const displayText = useAnimatedText(content || '', { enabled: isStreaming });
-  return (
-    <Markdown
-      variant="compact"
-      content={displayText}
-      className="text-xs"
-      style={REASONING_STYLE}
-    />
-  );
-}
-
-interface ToolCallLiveRowProps {
-  tc: ActivityItem;
-  liveState?: LiveState;
-}
-
-/** Live tool call row -- monochrome state visuals.
- *
- * Active state:    2px left rule (.nrow.state-active::before) + label shimmer
- *                  + gentle icon pulse.
- * Completing state: no badge — row dims via opacity 0.7 and the title flips
- *                  to past tense. (We deliberately dropped the green ✓ to
- *                  avoid the SaaS-default badge look.)
- * Failed state:    gray ✕ badge overlaid on the tool icon + past-tense title.
- */
-const ToolCallLiveRow = memo(function ToolCallLiveRow({ tc, liveState }: ToolCallLiveRowProps): React.ReactElement {
-  const { t } = useTranslation();
-  const toolName = tc.toolName || '';
-  const args = tc.toolCall?.args;
-  const isInProgress = liveState === 'active' && !tc.isComplete && !tc._recentlyCompleted;
-  // Only `state-active` has a CSS treatment (left-rule shimmer in
-  // ActivityBlock.css). Completing and failed states get their visual cue
-  // from the inline icon badges below; keeping unused class hooks would
-  // mislead the next CSS author.
-  const stateClass = isInProgress ? 'state-active' : '';
-
-  const activeLabel = isInProgress ? getActiveLabel(toolName, tc.toolCall, t) : null;
-  const artifact = tc.toolCallResult?.artifact;
-  const completedTitle = !isInProgress
-    ? getCompletedRowTitle(toolName, tc.toolCall, t, artifact)
-    : null;
-  const summary = !isInProgress ? getCompletedSummary(toolName, tc.toolCall, t) : null;
-
-  return (
-    <motion.div
-      className={`nrow ${stateClass} flex items-center gap-2 pl-3 pr-3 py-1.5`}
-      animate={{ opacity: isInProgress ? 1 : 0.7, y: isInProgress ? 0 : 1 }}
-      transition={{ duration: 0.25, ease: 'easeOut' }}
-      style={{ fontSize: '0.8125rem', color: 'var(--Labels-Secondary)' }}
-    >
-      <div className="relative flex-shrink-0 flex items-center justify-center h-5 w-5">
-        <motion.span
-          animate={isInProgress ? { opacity: [0.85, 1, 0.85] } : { opacity: 1 }}
-          transition={isInProgress ? { duration: 1.5, repeat: Infinity, ease: 'easeInOut' } : { duration: 0.2 }}
-          style={{ display: 'inline-flex' }}
-        >
-          <ToolIcon toolName={toolName} args={args} artifact={artifact} className="h-4 w-4" />
-        </motion.span>
-        <AnimatePresence>
-          {liveState === 'failed' && (
-            <motion.span
-              key="fail"
-              className="nrow-badge"
-              initial={{ scale: 0, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              transition={SPRING_SNAPPY}
-              aria-label={t('toolArtifact.a11y.toolCallFailed')}
-            >
-              <XIcon className="h-3 w-3" />
-            </motion.span>
-          )}
-        </AnimatePresence>
-      </div>
-      {isInProgress ? (
-        <TextShimmer
-          as="span"
-          className="font-medium text-[0.8125rem] [--base-color:var(--Labels-Secondary)] [--base-gradient-color:var(--color-text-primary)] truncate"
-          duration={1.5}
-        >
-          {activeLabel || ''}
-        </TextShimmer>
-      ) : (
-        <>
-          <span className="font-medium flex-shrink-0 whitespace-nowrap">{completedTitle}</span>
-          {summary
-            ? <span className="truncate min-w-0" style={{ opacity: 0.55 }}>&mdash; {summary}</span>
-            : <span style={{ opacity: 0.55 }}>{t('toolArtifact.done')}</span>}
-        </>
-      )}
-    </motion.div>
-  );
-});
-
-interface PreparingToolCallRowProps {
-  tc: PreparingToolCallData;
-}
-
-/** Preparing row -- shown while tool_call_chunks are still streaming.
- *  No left rule; just DotLoader + icon + label. Args aren't yet available
- *  to classify, so we fall back to the generic display name. */
-function PreparingToolCallRow({ tc }: PreparingToolCallRowProps): React.ReactElement {
-  const { t } = useTranslation();
-  const toolName = tc.toolName || '';
-  const displayName = toolName ? getDisplayName(toolName, t) : t('toolArtifact.toolCall');
-  const IconComponent: LucideIcon = toolName ? getToolIcon(toolName) : Wrench;
-  const prepText = getPreparingText(toolName, tc.argsLength, t);
-
-  return (
-    <div
-      className="nrow flex items-center gap-2 pl-3 pr-3"
-      style={{
-        fontSize: '0.8125rem',
-        color: 'var(--Labels-Secondary)',
-        padding: '6px 12px',
-        opacity: 0.85,
-      }}
-    >
-      <DotLoader
-        className="flex-shrink-0 gap-px"
-        dotClassName="bg-foreground/15 [&.active]:bg-foreground size-[1.5px]"
-      />
-      <span className="flex-shrink-0 flex items-center justify-center h-5 w-5">
-        <IconComponent className="h-4 w-4" />
-      </span>
-      <span className="font-medium">{displayName}</span>
-      <span style={{ opacity: 0.55 }}>{prepText}</span>
-    </div>
-  );
-}
-
-/* --- Accordion sub-components --- */
-
-interface ReasoningRowProps {
-  item: ActivityItem;
-}
-
-/** Extract a leading `**subtitle**` line from reasoning content so we can
- * promote it into the row title and strip it from the body.
- *
- * Conservative on purpose — leaves content alone unless we see the o1-style
- * "header line, blank line, body" pattern:
- *   - bold appears at the very start (after optional whitespace)
- *   - bold spans a single line, no inner newlines or asterisks
- *   - bold is short enough to read as a heading (≤ 80 chars after trim)
- *   - bold is followed by ≥ 1 newline AND a non-empty body
- *
- * If any check fails, returns { title: null, body: original } and the row
- * keeps the generic "Reasoning" label. */
-// Exported for unit testing alongside the components below; the only export
-// in this file other than the default `ActivityBlock`. The HMR fast-refresh
-// rule complains about mixed exports, but extracting this 8-line pure helper
-// to its own module is more churn than it's worth.
-// eslint-disable-next-line react-refresh/only-export-components
-export function extractLeadingBoldHeader(content: string): { title: string | null; body: string } {
-  if (!content) return { title: null, body: content };
-  const match = content.match(/^\s*\*\*([^*\n]+?)\*\*\s*\n+([\s\S]+)$/);
-  if (!match) return { title: null, body: content };
-  const candidate = match[1].trim();
-  const body = match[2];
-  if (!candidate || candidate.length > 80 || !body.trim()) {
-    return { title: null, body: content };
-  }
-  return { title: candidate, body };
-}
-
-const ReasoningRow = memo(function ReasoningRow({ item }: ReasoningRowProps): React.ReactElement {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(true);
-  const { title: extractedTitle, body: extractedBody } = useMemo(
-    () => extractLeadingBoldHeader(item.content || ''),
-    [item.content],
-  );
-  const effectiveTitle = item.reasoningTitle || extractedTitle;
-  const title = effectiveTitle || t('toolArtifact.reasoning');
-  const displayContent = extractedTitle ? extractedBody : item.content;
-  const hasContent = !!displayContent;
-
-  return (
-    <div className="titem">
-      <div className="titem-icon">
-        <Brain className="h-4 w-4" />
-      </div>
-      <div className="titem-body">
-        <button
-          type="button"
-          onClick={() => hasContent && setExpanded(!expanded)}
-          className={`titem-line text-left bg-transparent border-0 p-0 ${hasContent ? 'cursor-pointer' : 'cursor-default'}`}
-          style={{ color: 'inherit' }}
-        >
-          <span className="titem-title truncate">{title}</span>
-          {hasContent && (
-            <motion.div
-              animate={{ rotate: expanded ? 90 : 0 }}
-              transition={SPRING_FOLD}
-              className="flex-shrink-0 inline-flex items-center"
-              style={{ opacity: 0.6, alignSelf: 'center' }}
-            >
-              <ChevronDown className="h-3 w-3 -rotate-90" />
-            </motion.div>
-          )}
+  if (timeline.length === 0 && charts.length === 0 && !preparingToolCall) return null;
+  return <div>
+    {charts.map((item) => {
+      if (item.type !== 'tool_call') return null;
+      const artifact = item.toolCallResult?.artifact;
+      const Chart = artifact && INLINE_ARTIFACT_MAP[artifact.type as string];
+      return Chart ? <div key={item.id} className="mb-1.5"><Chart artifact={artifact} onClick={() => openCardTarget(artifact, onOpenChart, () => onToolCallClick?.(item))} /></div> : null;
+    })}
+    <AnimatePresence initial={false}>
+      {showSummary && <motion.div key="summary" className="clips-focus-ring"
+        initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }}
+        exit={{ opacity: 0, height: 0 }} transition={EXIT_TWEEN} style={{ overflow: 'hidden' }}>
+        <button id={summaryId} type="button" aria-expanded={expanded} aria-controls={panelId}
+          onClick={(e) => { announceAnchoredToggle(e.currentTarget); setExpanded(!expanded); }}
+          className="inline-flex items-center gap-2 text-left bg-transparent border-0 p-0 cursor-pointer transition-colors hover:text-foreground"
+          style={{ paddingTop: '5px', paddingBottom: '5px', fontSize: '0.8125rem', color: 'var(--Labels-Tertiary)' }}>
+          <SettlingLabel text={summary ?? ''} />
+          <motion.span animate={{ rotate: expanded ? 90 : 0 }} transition={SPRING_FOLD} className="flex-shrink-0" style={{ opacity: 0.6 }}>
+            <ChevronDown className="h-3.5 w-3.5 -rotate-90" />
+          </motion.span>
         </button>
-        <AnimatePresence initial={false}>
-          {expanded && displayContent && (
-            <motion.div
-              key="reasoning-content"
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={SPRING_FOLD}
-              style={{ overflow: 'hidden' }}
-            >
-              <div className="titem-reasoning-card">
-                <Markdown
-                  variant="compact"
-                  content={displayContent}
-                />
-              </div>
-            </motion.div>
-          )}
+      </motion.div>}
+    </AnimatePresence>
+    <div id={panelId} role="region" aria-labelledby={showSummary ? summaryId : undefined}>
+      <div role="list" className="timeline live-zone" data-testid="activity-live-zone">
+        <AnimatePresence initial={isStreaming}>
+          {/* Segment spacing owns the outside gap. Only a summary above the
+              timeline needs an inset; standalone rows already have padding. */}
+          {rows.map((row, index) => <LiveRow key={row.key}
+            gap={index === 0 && showSummary ? '8px' : '0px'}
+            gapBottom="0px">
+            <div role="listitem" data-activity-state={row.live ? 'live' : 'settled'}>{row.content}</div>
+          </LiveRow>)}
         </AnimatePresence>
       </div>
     </div>
-  );
-});
-
-interface ToolCallRowProps {
-  item: ActivityItem;
-  onClick?: () => void;
-}
-
-/** Gray ✕ overlay marking a completed-but-failed tool call in the accordion
- * timeline. Reuses `.nrow-badge` from the live zone for visual parity. */
-function FailedIconBadge({ label }: { label: string }): React.ReactElement {
-  return (
-    <span className="nrow-badge" aria-label={label}>
-      <XIcon className="h-3 w-3" />
-    </span>
-  );
-}
-
-const ToolCallRow = memo(function ToolCallRow({ item, onClick }: ToolCallRowProps): React.ReactElement {
-  const { t } = useTranslation();
-  const toolName = item.toolName || '';
-  const args = item.toolCall?.args;
-  const artifact = item.toolCallResult?.artifact;
-  const title = getCompletedRowTitle(toolName, item.toolCall, t, artifact);
-  const summary = getCompletedSummary(toolName, item.toolCall, t);
-  const isFailed = item.isFailed === true;
-  const failedLabel = t('toolArtifact.a11y.toolCallFailed');
-
-  // Decide the destination tab label for the pill tooltip.
-  const cat = categorizeTool(toolName, item.toolCall);
-  const isMemory = cat === 'memoryRead' || cat === 'memoryWrite';
-  const tabLabel = isMemory
-    ? t('rightPanel.tabs.memory')
-    : cat === 'memo' || cat === 'memoWrite'
-      ? t('rightPanel.tabs.memo')
-      : t('rightPanel.tabs.files');
-
-  // No pill → the row title becomes the click target so the affordance isn't
-  // lost (e.g., memory/memo index rows where the verb already names the file).
-  const openInTabLabel = t('toolArtifact.a11y.openInTab', { tab: tabLabel });
-  const titleNode = summary ? (
-    <span className="titem-title">{title}</span>
-  ) : (
-    <button
-      type="button"
-      onClick={onClick}
-      className="titem-title titem-title-button"
-      title={openInTabLabel}
-      aria-label={openInTabLabel}
-    >
-      {title}
-    </button>
-  );
-
-  return (
-    <div className={`titem${isFailed ? ' failed' : ''}`}>
-      <div className="titem-icon" title={isFailed ? failedLabel : undefined}>
-        <ToolIcon toolName={toolName} args={args} artifact={artifact} className="h-4 w-4" style={{ color: 'var(--Labels-Secondary)' }} />
-        {isFailed && <FailedIconBadge label={failedLabel} />}
-      </div>
-      <div className="titem-body">
-        <div className="titem-line">
-          {titleNode}
-          {summary && (
-            <span className="titem-pill-wrap">
-              <button
-                type="button"
-                onClick={onClick}
-                className="obj"
-                title={t('toolArtifact.a11y.openInTab', { tab: tabLabel })}
-              >
-                {summary}
-              </button>
-            </span>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-});
-
-interface EditToolRowProps {
-  item: ActivityItem;
-  onOpenFile?: (path: string, workspaceId?: string) => void;
-}
-
-const EditToolRow = memo(function EditToolRow({ item, onOpenFile }: EditToolRowProps): React.ReactElement {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  const args = (item.toolCall?.args || {}) as Record<string, unknown>;
-  const title = getCompletedRowTitle(item.toolName || 'Edit', item.toolCall, t);
-  const IconComponent = getToolIcon(item.toolName || 'Edit', args);
-  const isFailed = item.isFailed === true;
-  const failedLabel = t('toolArtifact.a11y.toolCallFailed');
-
-  const filePath = getFilePathFromArgs(args);
-  const fileName = filePath ? filePath.split('/').pop() : '';
-  const oldStr = (args.old_string || args.oldString || '') as string;
-  const newStr = (args.new_string || args.newString || '') as string;
-  const hasDiff = !!(oldStr || newStr);
-  // For user-profile paths the row title already names the entity
-  // ("Updated portfolio") — appending `portfolio.json` as a pill is redundant
-  // noise. Skip the filename fallback in that case; the title-as-button
-  // branch below preserves click-to-open.
-  const info = filePath ? classifyAgentPath(filePath) : null;
-  const fallbackName = info?.kind === 'user-profile' ? '' : fileName;
-  const summary = getCompletedSummary(item.toolName || 'Edit', item.toolCall, t) || fallbackName;
-
-  // Match the destination tab label to the actual classification of the
-  // path so the tooltip doesn't lie when the click routes to Memory.
-  const editCat = categorizeTool(item.toolName || 'Edit', item.toolCall);
-  const editTabLabel =
-    editCat === 'memoryWrite' || editCat === 'memoryRead'
-      ? t('rightPanel.tabs.memory')
-      : editCat === 'memo' || editCat === 'memoWrite'
-        ? t('rightPanel.tabs.memo')
-        : t('rightPanel.tabs.files');
-
-  // When there's no pill, fold the click affordance into the title so the
-  // user can still open the file. Mirrors ToolCallRow's no-summary branch.
-  const editOpenInTabLabel = t('toolArtifact.a11y.openInTab', { tab: editTabLabel });
-  const titleNode = summary ? (
-    <span className="titem-title">{title}</span>
-  ) : (
-    <button
-      type="button"
-      onClick={() => filePath && onOpenFile?.(filePath)}
-      className="titem-title titem-title-button"
-      title={editOpenInTabLabel}
-      aria-label={editOpenInTabLabel}
-    >
-      {title}
-    </button>
-  );
-
-  return (
-    <div className={`titem${isFailed ? ' failed' : ''}`}>
-      <div className="titem-icon" title={isFailed ? failedLabel : undefined}>
-        <IconComponent className="h-4 w-4" />
-        {isFailed && <FailedIconBadge label={failedLabel} />}
-      </div>
-      <div className="titem-body">
-        <div className="titem-line">
-          {titleNode}
-          {summary && (
-            <span className="titem-pill-wrap">
-              <button
-                type="button"
-                onClick={() => filePath && onOpenFile?.(filePath)}
-                className="obj"
-                title={t('toolArtifact.a11y.openInTab', { tab: editTabLabel })}
-              >
-                {summary}
-              </button>
-            </span>
-          )}
-          {hasDiff && (
-            <button
-              type="button"
-              onClick={() => setExpanded(!expanded)}
-              className="titem-trail bg-transparent border-0 p-0 cursor-pointer"
-              style={{ color: 'inherit' }}
-              aria-label={expanded ? t('toolArtifact.a11y.collapseDiff') : t('toolArtifact.a11y.expandDiff')}
-            >
-              <motion.div
-                animate={{ rotate: expanded ? 90 : 0 }}
-                transition={SPRING_FOLD}
-              >
-                <ChevronDown className="h-3 w-3 -rotate-90" style={{ opacity: 0.5 }} />
-              </motion.div>
-            </button>
-          )}
-        </div>
-
-        <AnimatePresence initial={false}>
-          {expanded && hasDiff && (
-            <motion.div
-              key="diff-content"
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={SPRING_FOLD}
-              style={{ overflow: 'hidden' }}
-            >
-              <div className="mt-2 rounded overflow-hidden" style={{ fontSize: '0.75rem', border: '1px solid var(--color-border-muted)' }}>
-                {oldStr && (
-                  <div style={{ backgroundColor: 'var(--color-loss-soft)' }}>
-                    {oldStr.split('\n').map((line, i) => (
-                      <div key={`old-${i}`} className="flex" style={{ minHeight: '20px' }}>
-                        <span
-                          className="flex-shrink-0 select-none text-right px-2"
-                          style={{ color: 'var(--color-loss-muted)', width: '20px', userSelect: 'none' }}
-                        >&minus;</span>
-                        <pre className="flex-1 font-mono whitespace-pre-wrap break-all m-0 pr-2" style={{ color: 'var(--color-loss)' }}>
-                          {line}
-                        </pre>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {newStr && (
-                  <div style={{ backgroundColor: 'var(--color-profit-soft)' }}>
-                    {newStr.split('\n').map((line, i) => (
-                      <div key={`new-${i}`} className="flex" style={{ minHeight: '20px' }}>
-                        <span
-                          className="flex-shrink-0 select-none text-right px-2"
-                          style={{ color: 'var(--color-profit-muted)', width: '20px', userSelect: 'none' }}
-                        >+</span>
-                        <pre className="flex-1 font-mono whitespace-pre-wrap break-all m-0 pr-2" style={{ color: 'var(--color-profit)' }}>
-                          {line}
-                        </pre>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-    </div>
-  );
+  </div>;
 });
 
 export default ActivityBlock;

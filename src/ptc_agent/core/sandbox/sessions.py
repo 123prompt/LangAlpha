@@ -7,6 +7,7 @@ semantics are unchanged.
 
 import asyncio
 import shlex
+import uuid
 from typing import Any
 
 import structlog
@@ -66,7 +67,13 @@ async def get_preview_link(sandbox: "PTCSandbox", port: int) -> PreviewInfo:
     return result
 
 
-async def start_preview_server(sandbox: "PTCSandbox", command: str, port: int) -> str:
+async def start_preview_server(
+    sandbox: "PTCSandbox",
+    command: str,
+    port: int,
+    *,
+    owner: str | None = None,
+) -> str:
     """Start a command in a dedicated per-port session for preview URL serving.
 
         Each port gets its own Daytona session so blocking server commands
@@ -79,10 +86,15 @@ async def start_preview_server(sandbox: "PTCSandbox", command: str, port: int) -
     await sandbox._wait_ready()
     assert sandbox.runtime is not None
 
-    session_id = f"preview-{port}"
+    session_id = f"preview-{port}-{uuid.uuid4().hex[:12]}"
 
     # Tear down stale session for this port if one exists
     if port in sandbox._preview_sessions:
+        prior_owner = sandbox._preview_owners.get(port)
+        if owner is not None and prior_owner is not None and prior_owner != owner:
+            raise RuntimeError(
+                f"Port {port} is already in use on this computer. Choose another port."
+            )
         old_sid, _old_cmd = sandbox._preview_sessions[port]
         try:
             await sandbox._runtime_call(
@@ -93,6 +105,7 @@ async def start_preview_server(sandbox: "PTCSandbox", command: str, port: int) -
         except Exception:
             logger.debug("Stale preview session cleanup failed", port=port)
         del sandbox._preview_sessions[port]
+        sandbox._preview_owners.pop(port, None)
 
     try:
         await sandbox._runtime_call(
@@ -133,6 +146,8 @@ async def start_preview_server(sandbox: "PTCSandbox", command: str, port: int) -
         total_timeout=30,
     )
     sandbox._preview_sessions[port] = (session_id, result.cmd_id)
+    if owner is not None:
+        sandbox._preview_owners[port] = owner
     logger.info(
         "Preview server started",
         cmd_id=result.cmd_id,
@@ -174,41 +189,29 @@ async def start_and_get_preview_url(
     *,
     expires_in: int = 3600,
     startup_timeout: float = 10.0,
+    owner: str | None = None,
 ) -> PreviewInfo:
-    """Start a server command in background and return a signed preview URL.
-
-        Combines start_preview_server + port readiness poll + get_preview_url.
-        If the port is already reachable through the Daytona proxy the server
-        start is skipped entirely, making this method safe to call repeatedly.
-
-        Polls for up to ``startup_timeout`` seconds to confirm the port is
-        actually listening before generating the URL.  If the port never
-        becomes reachable the URL is still returned — the frontend
-        health-check polling handles dead-server detection.
-
-        If the server command fails (e.g. port already in use), the preview
-        URL is still generated — the existing server keeps serving.
-        """
+    """Ports belong to the computer; callers must choose an unused one."""
     await sandbox._wait_ready()
     assert sandbox.runtime is not None
 
     if port not in sandbox._preview_locks:
         sandbox._preview_locks[port] = asyncio.Lock()
     async with sandbox._preview_locks[port]:
-        # Quick probe: is the server already reachable through the proxy?
-        # This catches the common case where the server is already running
-        # and avoids an unnecessary (destructive) session teardown + restart.
-        # We check the proxy — not an in-sandbox /dev/tcp — because a server
-        # binding to 127.0.0.1 would pass the in-sandbox check but return 502
-        # through the proxy.
-        if await sandbox._is_preview_reachable(port):
-            logger.info("Preview already reachable via proxy, skipping server start", port=port)
-            return await sandbox.get_preview_url(port, expires_in=expires_in)
-
-        try:
-            await sandbox.start_preview_server(command, port)
-        except Exception as e:
-            logger.warning("Failed to start preview server", command=command, error=str(e))
+        occupied = await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            f"bash -c '(echo > /dev/tcp/localhost/{port}) >/dev/null 2>&1'",
+            timeout=5,
+            retry_policy=RetryPolicy.SAFE,
+        )
+        if occupied.exit_code == 0:
+            if owner is None or sandbox._preview_owners.get(port) != owner:
+                raise RuntimeError(
+                    f"Port {port} is already in use on this computer. Choose another port."
+                )
+            if await sandbox._is_preview_reachable(port):
+                return await sandbox.get_preview_url(port, expires_in)
+        await sandbox.start_preview_server(command, port, owner=owner)
 
         # Poll until the port is listening.
         # Uses bash built-in /dev/tcp (no external tools like nc needed) via
@@ -238,6 +241,12 @@ async def start_and_get_preview_url(
                 exc_info=True,
             )
 
+        logs = await sandbox.get_preview_server_logs(port)
+        if not logs.get("success") or logs.get("exit_code") is not None:
+            raise RuntimeError(
+                f"Preview command on port {port} failed. "
+                + str(logs.get("stderr") or logs.get("stdout") or "Check the server command.")
+            )
         return await sandbox.get_preview_url(port, expires_in=expires_in)
 
 
@@ -498,4 +507,5 @@ async def stop_preview_server(sandbox: "PTCSandbox", port: int) -> bool:
     except Exception:
         logger.debug("Failed to delete preview session", session_id=session_id)
     sandbox._preview_sessions.pop(port, None)
+    sandbox._preview_owners.pop(port, None)
     return True

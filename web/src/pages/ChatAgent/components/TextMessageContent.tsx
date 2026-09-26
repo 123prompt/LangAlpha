@@ -1,9 +1,12 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import Markdown from './Markdown';
 import { useAnimatedText } from '@/components/ui/animated-text';
+import { visibleParagraphPrefix } from '@/lib/paragraphGate';
+import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import { parseErrorMessage, type ParsedError } from '../utils/parseErrorMessage';
+import type { OpenFileHandler } from '../utils/fileLocation';
 import { UPSTREAM_HINT_I18N_KEY, type StructuredError } from '@/utils/rateLimitError';
 
 interface TextMessageContentProps {
@@ -14,7 +17,10 @@ interface TextMessageContentProps {
    *  internal errors render at the chat-input banner, not inline), use the
    *  structured fields instead of re-parsing the raw message text. */
   structuredError?: StructuredError;
-  onOpenFile?: (path: string, workspaceId?: string) => void;
+  onOpenFile?: OpenFileHandler;
+  /** Whether everything that has arrived is on screen. The typewriter trails
+   *  the stream, so what follows this block can wait for it to catch up. */
+  onRevealed?: (done: boolean) => void;
 }
 
 /**
@@ -23,8 +29,30 @@ interface TextMessageContentProps {
  * Renders text content from message_chunk events with content_type: text.
  * Supports markdown formatting including bold, italic, lists, code blocks, etc.
  */
-function TextMessageContent({ content, isStreaming, hasError, structuredError, onOpenFile }: TextMessageContentProps): React.ReactElement | null {
-  const displayText = useAnimatedText(content || '', { enabled: isStreaming });
+function TextMessageContent({ content, isStreaming, hasError, structuredError, onOpenFile, onRevealed }: TextMessageContentProps): React.ReactElement | null {
+  const { streamingMode } = useTranscriptDisplay();
+  // Paragraph mode holds the sentence being written, so the typewriter has
+  // nothing left to animate: a paragraph lands whole or not at all.
+  const gated = streamingMode === 'paragraph' && isStreaming;
+  const text = content || '';
+  // Whatever this bubble has already painted stays painted. The gate is a
+  // floor on what to show, never a reason to take words back: switching the
+  // delivery preference mid-reply used to drop the text between the last
+  // blank line and the caret, and a reply with no blank line yet vanished
+  // whole. The mark is per stream, so a regenerate starts from nothing.
+  const shownLenRef = useRef(0);
+  if (!isStreaming) shownLenRef.current = 0;
+  const target = gated ? visibleParagraphPrefix(text) : text;
+  const visibleLen = Math.max(target.length, Math.min(shownLenRef.current, text.length));
+  shownLenRef.current = visibleLen;
+  const visible = text.slice(0, visibleLen);
+  const displayText = useAnimatedText(visible, { enabled: isStreaming && !gated });
+  // Measured against everything that has ARRIVED, not against what the gate
+  // chose to release. What follows this block waits on this flag, so comparing
+  // against the released prefix called a held-back paragraph "shown" and let an
+  // activity block overtake the prose it belongs under.
+  const revealed = !content || hasError || displayText === text;
+  useEffect(() => { onRevealed?.(revealed); }, [onRevealed, revealed]);
 
   if (!content) {
     return null;
@@ -36,6 +64,12 @@ function TextMessageContent({ content, isStreaming, hasError, structuredError, o
     }
     const parsed = parseErrorMessage(content);
     return <ErrorDisplay parsed={parsed} />;
+  }
+
+  // Nothing has crossed a paragraph boundary yet. Render nothing rather than an
+  // empty Markdown root, which would take the block's vertical rhythm with it.
+  if (gated && !visible) {
+    return null;
   }
 
   return (

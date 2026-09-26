@@ -13,3 +13,6 @@ export const MIN_LIVE_EXPOSURE_MS = 1800;
 export const SPRING_SNAPPY = { type: 'spring' as const, stiffness: 200, damping: 28 };
 /** Quick tween for live rows clearing out, exits should not draw the eye. */
 export const EXIT_TWEEN = { duration: 0.18, ease: 'easeIn' as const };
+
+/** Turn and activity disclosures share a critically damped spring. */
+export const SPRING_FOLD = { type: 'spring' as const, stiffness: 260, damping: 30 };

@@ -39,7 +39,6 @@ function buildRuntime() {
     setMessageError: vi.fn(),
     setFallbackSuggestion: vi.fn(),
     setThreadModels: vi.fn(),
-    setLastThreadModel: vi.fn(),
     setTokenUsage: vi.fn(),
     setReloadTrigger: vi.fn(),
     setThreadId: vi.fn(),

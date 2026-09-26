@@ -65,4 +65,15 @@ export function apiErrorStatus(err: unknown): number | null {
   return typeof status === 'number' ? status : null;
 }
 
+/** A 4xx: the request itself was refused, so asking again gets the same answer. */
+export function isClientError(err: unknown): boolean {
+  const status = apiErrorStatus(err);
+  return status !== null && status >= 400 && status < 500;
+}
+
+/** React Query `retry`: twice for a server or network failure, never for a 4xx. */
+export function retryUnlessClientError(failureCount: number, err: unknown): boolean {
+  return failureCount < 2 && !isClientError(err);
+}
+
 // --- Workspaces ---

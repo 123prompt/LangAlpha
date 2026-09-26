@@ -14,7 +14,6 @@ Protocol details (discovered from @mariozechner/pi-ai 0.58.0):
 - Extra authorize param: code=true
 """
 
-import asyncio
 import base64
 import hashlib
 import logging
@@ -28,6 +27,12 @@ from src.server.database.oauth_tokens import (
     get_oauth_tokens,
     invalidate_oauth_active_cache,
     upsert_oauth_tokens,
+)
+from src.server.services.oauth_refresh_wait import (
+    REFRESH_BUFFER,
+    REFRESH_LOCK_TTL_MS,
+    await_refreshed_tokens,
+    token_expiry,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,12 +224,9 @@ async def get_valid_token(user_id: str) -> dict | None:
         return None
 
     now = datetime.now(timezone.utc)
-    expires_at = tokens["expires_at"]
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
 
     # Token still valid (with 5-min buffer)
-    if expires_at > now + timedelta(minutes=5):
+    if token_expiry(tokens) > now + REFRESH_BUFFER:
         return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
 
     # Need to refresh — acquire Redis lock
@@ -232,16 +234,16 @@ async def get_valid_token(user_id: str) -> dict | None:
 
     cache = get_cache_client()
     lock_key = f"oauth:refresh:{user_id}:{CLAUDE_PROVIDER}"
-
-    if cache.enabled and cache.client:
-        acquired = await cache.client.set(lock_key, "1", nx=True, ex=35)
-        if not acquired:
-            # Another request is refreshing — wait briefly and re-read
-            await asyncio.sleep(1)
-            tokens = await get_oauth_tokens(user_id, CLAUDE_PROVIDER)
-            if tokens:
-                return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
-            return None
+    # Released only by its owner, so a refresh that outlives the lock cannot
+    # free the next holder's. None (Redis unavailable) refreshes uncoordinated.
+    lock_token = secrets.token_hex(16)
+    acquired = await cache.acquire_lock(lock_key, lock_token, REFRESH_LOCK_TTL_MS)
+    if acquired is False:
+        # Another request is refreshing: use what it stores.
+        tokens = await await_refreshed_tokens(user_id, CLAUDE_PROVIDER)
+        if tokens:
+            return {"access_token": tokens["access_token"], "plan_type": tokens.get("plan_type")}
+        return None
 
     try:
         new = await refresh_tokens(tokens["refresh_token"])
@@ -270,8 +272,5 @@ async def get_valid_token(user_id: str) -> dict | None:
         logger.error(f"[claude_oauth] Token refresh failed for user_id={user_id}: {e}")
         return None
     finally:
-        if cache.enabled and cache.client:
-            try:
-                await cache.client.delete(lock_key)
-            except Exception:
-                pass
+        if acquired:
+            await cache.release_lock(lock_key, lock_token)

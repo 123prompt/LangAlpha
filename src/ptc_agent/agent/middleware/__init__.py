@@ -85,6 +85,14 @@ from .large_result_eviction import (
     LargeResultEvictionMiddleware,
 )
 
+# Runtime context: the per-thread baseline block plus the tail envelope carried
+# on every model call. Imported ahead of market_watch, which contributes a
+# per-call row to the envelope.
+from .runtime_context import (
+    BaselineContextMiddleware,
+    TailEnvelopeMiddleware,
+)
+
 # Market watch middleware (live price injection for watched tickers)
 from .market_watch import (
     MarketWatchMiddleware,
@@ -93,26 +101,6 @@ from .market_watch import (
 # Steering middleware
 from .steering import (
     SteeringMiddleware,
-)
-
-# Workspace context middleware (agent.md injection)
-from .workspace_context import (
-    WorkspaceContextMiddleware,
-)
-
-# Memory context middleware (memory.md injection from LangGraph BaseStore)
-from .memory_context import (
-    MemoryContextMiddleware,
-)
-
-# Memo awareness middleware (tiny <memo-index count=N/> block from BaseStore)
-from .memo_awareness import (
-    MemoAwarenessMiddleware,
-)
-
-# Runtime context middleware (time + user profile, after cache breakpoint)
-from .runtime_context import (
-    RuntimeContextMiddleware,
 )
 
 # OpenAI prompt-cache breakpoint middleware (GPT-5.6+ explicit caching)
@@ -185,14 +173,9 @@ __all__ = [
     "SteeringMiddleware",
     # Subagent steering
     "SubagentSteeringMiddleware",
-    # Workspace context
-    "WorkspaceContextMiddleware",
-    # Memory context
-    "MemoryContextMiddleware",
-    # Memo awareness
-    "MemoAwarenessMiddleware",
     # Runtime context
-    "RuntimeContextMiddleware",
+    "BaselineContextMiddleware",
+    "TailEnvelopeMiddleware",
     # OpenAI prompt caching
     "OpenAIPromptCachingMiddleware",
     # Cross-provider reasoning sanitizer

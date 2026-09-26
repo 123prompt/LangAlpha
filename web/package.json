@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "packageManager": "pnpm@10.18.1",
+  "packageManager": "pnpm@12.6.0",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build && node scripts/check-critical-path.mjs",
@@ -19,6 +19,7 @@
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
+    "@internationalized/date": "^3.12.0",
     "@monaco-editor/react": "^4.7.0",
     "@radix-ui/react-context-menu": "^2.2.16",
     "@radix-ui/react-dialog": "^1.1.15",
@@ -38,8 +39,11 @@
     "html2canvas": "^1.4.1",
     "i18next": "^25.8.13",
     "katex": "^0.16.32",
-    "lightweight-charts": "^4.1.3",
+    "lightweight-charts": "^5.2.1",
     "lucide-react": "^0.562.0",
+    "mdast-util-from-markdown": "^2.0.3",
+    "mdast-util-math": "^3.0.0",
+    "micromark-extension-math": "^3.1.0",
     "pagedjs": "^0.4.3",
     "pdfjs-dist": "5.4.296",
     "react": "^19.2.4",
@@ -89,17 +93,5 @@
     "typescript": "^5.9.3",
     "vite": "^7.3.1",
     "vitest": "^3.2.4"
-  },
-  "pnpm": {
-    "overrides": {
-      "minimatch": "^10.2.1",
-      "dompurify": "^3.3.2"
-    },
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ],
-    "patchedDependencies": {
-      "exceljs@4.4.0": "patches/exceljs@4.4.0.patch"
-    }
   }
 }

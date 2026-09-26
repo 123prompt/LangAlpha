@@ -38,6 +38,7 @@ from src.config.settings import get_compaction_timeout
 from src.llms.content_utils import format_llm_content
 from src.llms.token_counter import extract_token_usage
 from ptc_agent.config.agent import CompactionConfig
+from ptc_agent.core.paths import WorkspaceLayout
 from src.llms import get_llm_by_type, maybe_disable_streaming
 
 from ptc_agent.agent.state import ensure_message_ids
@@ -88,13 +89,40 @@ def _build_summary_request(
     from langchain_core.messages import get_buffer_string
     from src.llms.api_call import create_messages
 
-    history = get_buffer_string(trimmed_messages)
+    history = get_buffer_string(_summarizable(trimmed_messages))
     user_prompt = f"{_COMPACTION_USER_NUDGE}\n\n<messages>\n{history}\n</messages>"
 
     return create_messages(
         system_prompt=summary_prompt,
         user_prompt=user_prompt,
     )
+
+
+def _summarizable(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """History as the summarizer should read it: harness rows are not the user.
+
+    A runtime-context row is persisted as a ``HumanMessage`` because that is
+    the one role every provider accepts anywhere, but ``get_buffer_string``
+    would render it as ``Human:`` and the summarizer would take a time stamp
+    or a file diff for a request. Turn anchors are dropped, since the block
+    they annotate is rebuilt at compaction, and change rows are relabelled as
+    ``System:`` so what they say survives without being attributed to anyone.
+    """
+    from langchain_core.messages import SystemMessage
+
+    from ptc_agent.agent.middleware.runtime_context.durable import (
+        runtime_update_from_message,
+    )
+    from ptc_agent.agent.middleware.runtime_context.turn import TURN_ROW_KIND
+
+    out: list[AnyMessage] = []
+    for message in messages:
+        update = runtime_update_from_message(message)
+        if update is None:
+            out.append(message)
+        elif update.kind != TURN_ROW_KIND:
+            out.append(SystemMessage(content=update.text))
+    return out
 
 
 class CompactionMiddleware(AgentMiddleware):
@@ -815,7 +843,7 @@ class CompactionMiddleware(AgentMiddleware):
         # Compute thread_dir so truncation markers can reference the offload path
         thread_dir = None
         if self._backend is not None:
-            thread_dir = f".agents/threads/{get_thread_id()}"
+            thread_dir = WorkspaceLayout.thread_subdir(get_thread_id())
 
         return truncate_message_args(
             messages,

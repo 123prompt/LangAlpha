@@ -2,15 +2,6 @@ import { render, screen, fireEvent } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// Stub the heavy chart surface — it owns websockets, React Query and the real
-// lightweight-charts canvas, all tested in MarketView. Here we only care that
-// the card mounts it with the right props once the modal opens.
-vi.mock('@/pages/MarketView/components/MarketChartSurface', () => ({
-  MarketChartSurface: (props: { symbol: string; timeframe?: string; workspaceId?: string | null }) => (
-    <div data-testid="surface">{`${props.symbol}:${props.timeframe}:${props.workspaceId ?? ''}`}</div>
-  ),
-}));
-
 // Stub the OHLC fetch hook so the resting card's preview chart has bars without
 // hitting React Query / the network. Two ascending bars → an "up" green trend.
 vi.mock('@/pages/MarketView/hooks/useStockBars', () => ({
@@ -26,8 +17,9 @@ vi.mock('@/pages/MarketView/hooks/useStockBars', () => ({
 
 import { WorkspaceProvider } from '../../../contexts/WorkspaceContext';
 import { ChartSurfaceContext, type ChartSurface } from '../../../contexts/ChartSurfaceContext';
-import { chartAnnotationStore } from '@/pages/MarketView/stores/chartAnnotationStore';
+import { chartAnnotationStore, makeChartId } from '@/pages/MarketView/stores/chartAnnotationStore';
 import { InlineChartAnnotationCard } from '../InlineChartAnnotationCard';
+import { MessageActionsProvider } from '../../messageList/MessageActionsContext';
 
 const ARTIFACT = {
   type: 'chart_annotation',
@@ -55,19 +47,23 @@ function LocationDisplay(): React.ReactElement {
 function renderCard(
   artifact: Record<string, unknown>,
   surface: Partial<ChartSurface> = {},
+  onOpenChart?: (spec: { symbol: string; timeframe?: string }) => void,
+  workspaceId: string | null = 'ws-ctx',
 ) {
   const value: ChartSurface = { chartPresent: false, ...surface };
   return render(
     <MemoryRouter initialEntries={['/chat/t/thread-123']}>
-      <WorkspaceProvider workspaceId="ws-ctx" downloadFile={null}>
+      <WorkspaceProvider workspaceId={workspaceId} downloadFile={null}>
         <ChartSurfaceContext.Provider value={value}>
-          <Routes>
-            <Route
-              path="/chat/t/:threadId"
-              element={<InlineChartAnnotationCard artifact={artifact} />}
-            />
-            <Route path="/market" element={<LocationDisplay />} />
-          </Routes>
+          <MessageActionsProvider actions={onOpenChart ? { onOpenChart } : {}}>
+            <Routes>
+              <Route
+                path="/chat/t/:threadId"
+                element={<InlineChartAnnotationCard artifact={artifact} />}
+              />
+              <Route path="/market" element={<LocationDisplay />} />
+            </Routes>
+          </MessageActionsProvider>
         </ChartSurfaceContext.Provider>
       </WorkspaceProvider>
     </MemoryRouter>,
@@ -80,7 +76,7 @@ describe('InlineChartAnnotationCard', () => {
     chartAnnotationStore._resetForTesting();
   });
 
-  it('renders the spotlight preview card, with the heavy surface deferred until opened', () => {
+  it('renders the spotlight preview card', () => {
     renderCard(ARTIFACT);
 
     expect(screen.getByText('NVDA')).toBeInTheDocument();
@@ -89,34 +85,67 @@ describe('InlineChartAnnotationCard', () => {
     expect(screen.getByRole('button', { name: /2 annotations/ })).toBeInTheDocument();
     expect(screen.getByText('Resistance')).toBeInTheDocument();
     expect(screen.getByText('Open annotated chart')).toBeInTheDocument();
-    // The resting preview is a lightweight inline SVG of the price + overlays;
-    // the full lightweight-charts surface only mounts after the modal opens.
-    expect(screen.queryByTestId('surface')).not.toBeInTheDocument();
   });
 
-  it('opens the modal with the chart surface, scoped to symbol/timeframe/workspace', async () => {
-    renderCard(ARTIFACT);
+  it('opens the chart tab in the panel, scoped to symbol and timeframe', () => {
+    const onOpenChart = vi.fn();
+    renderCard({ ...ARTIFACT, timeframe: '1hour' }, {}, onOpenChart);
     fireEvent.click(screen.getByRole('button'));
 
-    // Surface is lazy-loaded, so it resolves a tick after the modal opens.
-    expect(await screen.findByTestId('surface')).toHaveTextContent('NVDA:1day:ws-art');
+    // The artifact's workspace rides along: the tab draws that workspace's annotations, not the panel's.
+    expect(onOpenChart).toHaveBeenCalledWith({ symbol: 'NVDA', timeframe: '1hour', workspaceId: 'ws-art' });
+    // Nothing navigated away: the chart is a tab beside the chat.
+    expect(screen.queryByTestId('loc')).not.toBeInTheDocument();
+  });
+
+  // Clearing the chart only hides the drawing; asking for it from the card
+  // brings it back, as the MarketView chip does.
+  it('re-shows a drawing the user cleared from the chart', () => {
+    const chartId = makeChartId('NVDA', '1day');
+    chartAnnotationStore.clearDisplay('ws-art', chartId);
+    renderCard(ARTIFACT, {}, vi.fn());
+    fireEvent.click(screen.getByRole('button'));
+    expect(chartAnnotationStore.isDisplayCleared('ws-art', chartId)).toBe(false);
   });
 
   // The spotlight card is a role="button" — it must be keyboard-operable, not
-  // just mouse-clickable. Enter and Space both open the modal.
-  it.each(['Enter', ' '])('opens the modal via the %s key (keyboard a11y)', async (key) => {
-    renderCard(ARTIFACT);
+  // just mouse-clickable. Enter and Space both open the chart.
+  it.each(['Enter', ' '])('opens the chart via the %s key (keyboard a11y)', (key) => {
+    const onOpenChart = vi.fn();
+    renderCard(ARTIFACT, {}, onOpenChart);
     const card = screen.getByRole('button');
     expect(card).toHaveAttribute('tabindex', '0');
 
     fireEvent.keyDown(card, { key });
-    expect(await screen.findByTestId('surface')).toHaveTextContent('NVDA:1day:ws-art');
+    expect(onOpenChart).toHaveBeenCalledWith({ symbol: 'NVDA', timeframe: '1day', workspaceId: 'ws-art' });
   });
 
-  it('opens MarketView from the modal carrying symbol, ptc mode, workspace, thread, returnTo', async () => {
+  // A share mounts the transcript with no workspace, and the chart it opens
+  // carries no drawing, so the card offers the chart and promises no more.
+  it('offers a plain chart, not an annotated one, on a share', () => {
+    const onOpenChart = vi.fn();
+    renderCard(ARTIFACT, {}, onOpenChart, null);
+
+    expect(screen.getByText('Open chart')).toBeInTheDocument();
+    expect(screen.queryByText('Open annotated chart')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'NVDA 1day, 2 annotations. Open chart.' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button'));
+    expect(onOpenChart).toHaveBeenCalledWith({ symbol: 'NVDA', timeframe: '1day', workspaceId: 'ws-art' });
+  });
+
+  it('opens the tab on the panel workspace when the artifact names none', () => {
+    const onOpenChart = vi.fn();
+    const { workspace_id: _omitted, ...bare } = ARTIFACT;
+    renderCard(bare, {}, onOpenChart);
+    fireEvent.click(screen.getByRole('button'));
+
+    expect(onOpenChart).toHaveBeenCalledWith({ symbol: 'NVDA', timeframe: '1day', workspaceId: 'ws-ctx' });
+  });
+
+  it('falls back to MarketView, carrying symbol, ptc mode, workspace, thread, returnTo, when no panel can open it', async () => {
     renderCard(ARTIFACT);
-    fireEvent.click(screen.getByRole('button')); // stage 1 -> modal
-    fireEvent.click(await screen.findByText('Open in MarketView'));
+    fireEvent.click(screen.getByRole('button'));
 
     const loc = await screen.findByTestId('loc');
     const url = loc.textContent || '';
@@ -129,26 +158,21 @@ describe('InlineChartAnnotationCard', () => {
     expect(params.get('returnTo')).toBe('/chat/t/thread-123');
   });
 
-  it('uses the artifact timeframe for the bubble, the surface, and the MarketView URL', async () => {
-    const hourly = { ...ARTIFACT, timeframe: '1hour' };
-    renderCard(hourly);
+  it('uses the artifact timeframe for the bubble and the MarketView URL', async () => {
+    renderCard({ ...ARTIFACT, timeframe: '1hour' });
 
     // The pill shows the short label; the full timeframe rides the accessible name.
     expect(screen.getByText('1H')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /1hour/ })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button')); // open modal
-    expect(await screen.findByTestId('surface')).toHaveTextContent('NVDA:1hour:ws-art');
-
-    // Opening MarketView carries the timeframe so it lands on the right view.
-    fireEvent.click(await screen.findByText('Open in MarketView'));
+    fireEvent.click(screen.getByRole('button'));
     const loc = await screen.findByTestId('loc');
     const url = loc.textContent || '';
     const params = new URLSearchParams(url.slice(url.indexOf('?')));
     expect(params.get('tf')).toBe('1hour');
   });
 
-  it('collapses to a chip (no chart, no modal) when a chart is present', () => {
+  it('collapses to a chip (no chart) when a chart is present', () => {
     renderCard(ARTIFACT, { chartPresent: true });
 
     expect(screen.getByText(/on chart/i)).toBeInTheDocument();

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { queryKeys } from '../lib/queryKeys';
+import { FAIL_FAST_OFFLINE } from '../lib/network';
 import {
   deleteSkill,
   deleteWorkspaceSkill,
@@ -122,6 +123,7 @@ export function useDeleteWorkspaceSkill() {
 export function useUploadSkill() {
   const queryClient = useQueryClient();
   return useMutation({
+    ...FAIL_FAST_OFFLINE,
     mutationFn: ({
       file,
       onProgress,
@@ -183,6 +185,7 @@ export function useDeleteSkill() {
 export function useUploadWorkspaceSkill(workspaceId: string) {
   const queryClient = useQueryClient();
   return useMutation({
+    ...FAIL_FAST_OFFLINE,
     mutationFn: ({
       file,
       onProgress,

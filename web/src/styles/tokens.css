@@ -33,11 +33,14 @@ html {
      the reading face for long-form surfaces (conversation, file content).
      Apply via body default + the .font-content utility. */
   /* One shared CJK companion (Noto Sans SC, unicode-range sliced by Google
-     Fonts) sits after the Latin faces in both roles: Latin glyphs never reach
-     it, CJK renders identically on every OS instead of PingFang/YaHei. */
+     Fonts) sits after the Latin faces in every role: Latin glyphs never reach
+     it, CJK renders identically on every OS instead of PingFang/YaHei. Mono
+     needs it too, since kickers and readouts set translated copy in it. In
+     each it goes ahead of the system faces, which can reach the OS's own CJK
+     face through the system's fallback before a later family is tried. */
   --font-ui: 'Sora', 'Geist', 'Noto Sans SC', -apple-system, system-ui, sans-serif;
   --font-content: 'Geist', 'Noto Sans SC', -apple-system, system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', 'Menlo', ui-monospace, SFMono-Regular, monospace;
+  --font-mono: 'JetBrains Mono', 'Menlo', 'Noto Sans SC', ui-monospace, SFMono-Regular, monospace;
 
   --sidebar-width: 80px;
   --bottom-tab-height: 78px;
@@ -81,6 +84,13 @@ html {
   --color-bg-hover: rgba(255, 255, 255, 0.05);
   --color-bg-subtle: rgba(255, 255, 255, 0.03);
   --color-bg-chart-placeholder: #FFFFFF;
+  /* Spreadsheet grid (ExcelViewer, CsvViewer). Deliberately theme-invariant,
+     like a printed page: a workbook's own fills and font colours were chosen
+     against a white sheet, and only on one do they read as their author saw
+     them. The surface around the grid carries the theme instead. Every other
+     grid shade is mixed from this pair in ExcelViewer.css. */
+  --color-sheet-paper: #FFFFFF;
+  --color-sheet-ink: #1F1F1E;
   --color-bg-overlay: rgba(0, 0, 0, 0.6);
   --color-bg-overlay-strong: rgba(0, 0, 0, 0.8);
 
@@ -263,6 +273,9 @@ html {
   --color-bg-hover: rgba(0, 0, 0, 0.04);
   --color-bg-subtle: rgba(0, 0, 0, 0.02);
   --color-bg-chart-placeholder: #FFFFFF;
+  /* Spreadsheet grid: the same printed page as dark (see the role note in :root). */
+  --color-sheet-paper: #FFFFFF;
+  --color-sheet-ink: #1F1F1E;
   --color-bg-overlay: rgba(0, 0, 0, 0.25);
   --color-bg-overlay-strong: rgba(0, 0, 0, 0.45);
 
@@ -458,7 +471,8 @@ html {
      own. An outline on the field alone cuts across the container's border and
      leaves whatever else lives in there outside the indicator: the icon on a
      search pill, the chips already entered on a token field. Mark the container
-     and it rings on the field's behalf.
+     and it rings on the field's behalf. Such a container carries
+     `owns-its-edge` too, its sibling opt-out for the focused-field edge below.
 
      Scoped to a direct-child input so a button sharing the container -- a clear
      affordance, a chip's remove -- still rings itself instead of lighting the
@@ -573,6 +587,41 @@ html {
      `outline-none` compiles to this and not to `outline: none`. */
   :root[data-pointer-focus] :focus-visible {
     outline-color: transparent;
+  }
+}
+
+/* Focused text fields.
+
+   The layer above answers one question: does a keyboard ring draw. This
+   answers a different one: does a field the pointer just clicked look
+   focused. It does, by its edge and nothing else -- the accent border that
+   marks the about-to-act moment everywhere else, plus a one-pixel halo of
+   the soft accent so that edge reads on a dark card. No outline and no
+   pointer gate: a field the mouse focused is about to receive typing.
+
+   Unlayered and !important on purpose. Fields set their resting border as
+   an inline style across the app, and inline beats every stylesheet rule
+   except an important one; sweeping the border onto a class would give
+   every field a second place its edge is decided. Only the edge, only
+   while focused, never on a field flagged invalid, and never on a control
+   with no text entry (checkbox, radio, range, file, color), whose focus is
+   the ring's job.
+
+   Every other exception is opt-out by one class a box puts on itself,
+   `owns-its-edge`, so the next edge-owning box declares itself where it is
+   built instead of coming back to edit this selector. It must: the halo is
+   a shadow, and a shadow draws on a borderless field too, as a faint
+   rectangle inside a box already lit. The block below hands that box the
+   edge on its field's behalf, the way `.rings-within` hands it the ring. */
+:where(input, textarea, select):focus:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="submit"], [type="button"], [aria-invalid="true"], .owns-its-edge, .owns-its-edge *) {
+  border-color: var(--color-accent-primary) !important;
+  box-shadow: 0 0 0 1px var(--color-accent-soft) !important;
+}
+
+@supports selector(:has(*)) {
+  .owns-its-edge:has(> :where(input, textarea):focus) {
+    border-color: var(--color-accent-primary) !important;
+    box-shadow: 0 0 0 1px var(--color-accent-soft) !important;
   }
 }
 

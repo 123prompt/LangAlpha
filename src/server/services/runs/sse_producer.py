@@ -10,6 +10,7 @@ import copy
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple, cast
 
@@ -22,8 +23,8 @@ from src.server.utils.content_normalizer import (
     is_thinking_status_signal,
 )
 from src.server.utils.pg_sanitize import finite_json_dumps
+from src.server.utils.text_phase import TextPhaseTracker
 from src.llms.content_utils import extract_reasoning_summary_index
-from src.utils.tracking import ExecutionTracker
 from src.config import settings as app_settings
 from src.config.settings import (
     get_workflow_timeout,
@@ -248,6 +249,31 @@ def find_resilience_trace(exc: BaseException) -> Optional[Dict[str, Any]]:
     return None
 
 
+def model_call_failure(
+    exc: BaseException, credential_source: Any
+) -> Dict[str, Any]:
+    """Ledger metadata for a run that failed on its model call; ``{}`` when
+    the failure was anything else.
+
+    The resilience trace is the signal, not the provider SDK prefix
+    ``classify_stream_exception`` matches: the middleware attaches it only to
+    a model call's exception, while an httpx 401 from a tool or data API
+    would pass for a rejected model key. The primary's status is the one its
+    credential earned, and that credential is the run's own.
+    """
+    trace = find_resilience_trace(exc)
+    attempted = trace.get("attempted_models") if trace else None
+    if not (isinstance(attempted, list) and attempted and isinstance(attempted[0], dict)):
+        return {}
+    status = attempted[0].get("status_code")
+    if not isinstance(status, int):
+        return {}
+    return {
+        "error_status_code": status,
+        "error_credential_owned": user_owns_credential(credential_source),
+    }
+
+
 def classify_stream_exception(exc: BaseException) -> Dict[str, Any]:
     """Classify a chat-stream exception as ``upstream`` or ``internal``.
 
@@ -320,7 +346,7 @@ class StreamEventAccumulator:
         if prev_data.get("content_type") == "reasoning_signal":
             return False
 
-        merge_keys = ("thread_id", "agent", "id", "role", "content_type")
+        merge_keys = ("thread_id", "agent", "id", "role", "content_type", "phase")
         if any(prev_data.get(k) != incoming.get(k) for k in merge_keys):
             return False
 
@@ -421,11 +447,18 @@ class RunSSEProducer:
 
         # Track reasoning status per agent for lifecycle management
         self.reasoning_active: Set[str] = set()
+        # Monotonic clock at each agent's open reasoning block, so its closing
+        # signal can carry how long the model thought. Stored frames replay
+        # verbatim, so the duration survives a reload without a schema change.
+        self._reasoning_started_at: Dict[str, float] = {}
 
         # Track reasoning block index per agent to detect block transitions
         # When index changes (e.g., 0→1), a separator (\n\n) is needed between blocks
         self._reasoning_block_index: dict[str, int] = {}
         self._reasoning_separator_pending: Set[str] = set()
+
+        # The OpenAI Responses `phase` of streamed text, per agent and message.
+        self._text_phase = TextPhaseTracker()
 
         # Track function_call state for Response API (per agent)
         # Response API sends name/call_id only in first chunk, need to persist across chunks
@@ -548,7 +581,7 @@ class RunSSEProducer:
         timeout_warning_sent = False
         timeout_warning_threshold = 0.9  # Send warning at 90% of timeout
 
-        # Set tool tracking ContextVar (like ExecutionTracker pattern)
+        # Set tool tracking ContextVar
         # This must be done BEFORE graph.astream() so nodes inherit the ContextVar
         if self.tool_tracker:
             from src.tools.decorators import _tool_usage_context
@@ -898,8 +931,7 @@ class RunSSEProducer:
                     continue
 
                 # Task content (text/reasoning/tool frames) is owned by the
-                # per-task channel; it also stays out of the main turn's
-                # ExecutionTracker — task messages live in the task's own
+                # per-task channel; task messages live in the task's own
                 # checkpoint namespace, not the turn transcript.
                 if task_lane:
                     continue
@@ -938,15 +970,6 @@ class RunSSEProducer:
                         logger.debug(
                             f"[RAW_REASONING] agent={agent_name} reasoning_content={reasoning_raw}"
                         )
-
-                # Track message for persistence (if tracking is active)
-                # Only track complete messages (AIMessage, ToolMessage), not chunks.
-                # Compaction chunks are internal — don't persist them as turns.
-                if isinstance(message_chunk, (AIMessage, ToolMessage)) and not is_compaction_chunk:
-                    ExecutionTracker.update_context(
-                        agent_name=agent_name,
-                        messages=message_chunk
-                    )
 
                 # Process the message chunk
                 async for event in self._process_message_chunk(
@@ -1151,11 +1174,13 @@ class RunSSEProducer:
             # Value is a string description (plan description)
             action_requests = [{"description": interrupt_value}]
 
+        kind = interrupt_value.get("kind") if isinstance(interrupt_value, dict) else None
         return self._format_sse_event(
             "interrupt",
             {
                 "thread_id": self.thread_id,
                 "interrupt_id": interrupt_obj.id,
+                **({"kind": kind} if isinstance(kind, str) else {}),
                 "action_requests": action_requests,
                 "role": "assistant",
                 "finish_reason": "interrupt",
@@ -1417,6 +1442,10 @@ class RunSSEProducer:
             if prev_idx is not None and reasoning_idx != prev_idx:
                 self._reasoning_separator_pending.add(agent_name)
 
+        # Resolve before normalization: the frame that announces the phase has
+        # empty text and is dropped below, so the table must be filled first.
+        text_phase = self._text_phase.resolve(agent_name, message_id, message_chunk.content)
+
         # Normalize main content - extract text and get content type
         text_content, content_type = normalize_text_content(message_chunk.content)
 
@@ -1465,6 +1494,8 @@ class RunSSEProducer:
 
             event_stream_message["content"] = text_content
             event_stream_message["content_type"] = content_type  # "text" or "reasoning"
+            if content_type == "text" and text_phase:
+                event_stream_message["phase"] = text_phase
 
             # Handle reasoning content lifecycle
             if content_type == "reasoning":
@@ -1529,6 +1560,8 @@ class RunSSEProducer:
                 f"normalized={finish_reason} has_tool_state={has_tool_call_state} "
                 f"response_metadata={message_chunk.response_metadata}"
             )
+
+            self._text_phase.finish(agent_name)
 
             # If finishing while reasoning is active, emit completion signal
             if agent_name in self.reasoning_active:
@@ -1781,19 +1814,27 @@ class RunSSEProducer:
         *,
         is_compaction: bool = False,
     ) -> str:
-        """Format a reasoning lifecycle signal event."""
+        """Format a reasoning lifecycle signal event.
+
+        A ``complete`` carries ``elapsed_ms`` since the matching ``start``; a
+        close with no recorded open (a stop that synthesizes one) carries none.
+        """
         event_type = "compaction_chunk" if is_compaction else "message_chunk"
-        return self._format_sse_event(
-            event_type,
-            {
-                "thread_id": self.thread_id,
-                "agent": agent_name,
-                "id": message_id,
-                "role": "assistant",
-                "content": signal_type,
-                "content_type": "reasoning_signal",
-            },
-        )
+        data: Dict[str, Any] = {
+            "thread_id": self.thread_id,
+            "agent": agent_name,
+            "id": message_id,
+            "role": "assistant",
+            "content": signal_type,
+            "content_type": "reasoning_signal",
+        }
+        if signal_type == "start":
+            self._reasoning_started_at[agent_name] = time.monotonic()
+        elif signal_type == "complete":
+            started = self._reasoning_started_at.pop(agent_name, None)
+            if started is not None:
+                data["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+        return self._format_sse_event(event_type, data)
 
     def _format_sse_event(self, event_type: str, data: dict[str, Any], *, accumulate: bool = True) -> str:
         """

@@ -1,0 +1,138 @@
+# Platform contract: the surface a turn arrives on
+
+A chat turn may declare the surface it came from, and the delivery rules that surface accepts.
+langalpha turns the declaration into one line of runtime context, written into the conversation
+when the turn opens, and pairs it in the same row with a paragraph saying what that surface
+promises. This document is that contract as the calling client sees it.
+
+Who owns what: the client posting the turn owns the surface vocabulary, every per-message
+payload it sends, and the delivery rules for any surface it renders itself. For chat channels
+that client is the gateway holding the channel webhook. langalpha owns the grammar, the
+transport of the rules, and the rules for the two surfaces it renders itself (`web` and
+`market_view`). langalpha builds no channel-specific content of its own: it never formats for a
+channel's message API, never splits a reply into a channel's chunks, and never addresses a
+channel by name in output, and it carries no wording of its own about what a channel accepts.
+It reads the pointer and states the rules for that row.
+
+## `platform`
+
+`platform`, optional, on `POST /api/v1/threads/{id}/messages` (`ChatRequest`) and on
+`POST /api/v1/threads` (`ThreadCreateRequest`).
+
+Grammar: `^[a-z_]+(:[A-Z0-9][A-Z0-9.-]*)?$`, at most 50 characters.
+
+- The surface name is lowercase letters and underscores.
+- An optional `:<SYMBOL>` suffix scopes the surface to one ticker. The symbol starts with a
+  letter or a digit: digit-first tickers are ordinary (`0700.HK`, `600519.SH`, `002851.SZ`),
+  so the suffix does not require a leading letter.
+
+Examples: `web`, `market_view:AAPL`, `market_view:002851.SZ`, `telegram`.
+
+An absent `platform` renders no surface pointer at all. That is the right value when nothing
+about the turn's origin should steer delivery, and it is what a system-initiated thread sends.
+
+## `surface_rules`
+
+`surface_rules`, optional, on `POST /api/v1/threads/{id}/messages` (`ChatRequest`). A plain
+string, at most 2000 characters; whitespace is stripped and an empty string is the same as
+sending nothing. It is honoured on the same trust an `X-Dispatch: background` dispatch needs:
+a request that presents the service token, or any request on an `oss` stack that has no
+`INTERNAL_SERVICE_TOKEN` configured, where there is no caller to tell apart. On any other
+request the field is dropped before the turn starts, since the text is carried on the
+operator role where the provider has one.
+
+This is where a client states what its own surface accepts. langalpha renders two surfaces
+itself and ships a paragraph for each of them (below); for every other surface the client that
+draws the reply is the one that knows the shape its transport takes, so it writes the paragraph
+and sends it here. Whatever arrives is carried to the model verbatim, with no wrapper and no
+label, and it replaces langalpha's built-in line rather than joining it: on any surface, the
+client that renders the answer is the authority on it.
+
+Send it on every request. langalpha decides when the model actually reads it, on the same "only
+when they are news" rule as the pointer, and a change of text counts as news: the first turn
+after a gateway rewords its rules restates them. That comparison is why the field is sent every
+time rather than once.
+
+A worked example of the shape a gateway might send:
+
+```json
+{
+  "platform": "slack",
+  "surface_rules": "Surface slack: the channel renders a subset of markdown, truncates long messages, and has no widget surface. Reply in plain text or the channel's limited markdown, a few short paragraphs, one message per answer. Wide tables, code blocks and long reports go into a file deliverable; send the summary and the link, not the body."
+}
+```
+
+## The surfaces langalpha renders
+
+| Surface | What it promises the model |
+|---|---|
+| `web` | Full markdown, no length cap. Widgets, charts, HTML reports and file deliverables are all available. The default surface and the only one with no constraints. |
+| `market_view:<SYMBOL>` | The user is looking at that symbol's chart and asking about what is in front of them. Anything they selected on the chart arrives with their message, and annotations the agent draws on that chart are visible to them on it. Facts, not a format: the shape of the answer is left to the model. |
+
+Every other surface renders whatever the client sent in `surface_rules`, and nothing at all when
+it sent none. `telegram`, `slack`, `discord` and `feishu` are still names langalpha recognizes,
+so they pass the grammar and render in the pointer, but the wording for them belongs to the
+gateway.
+
+Two more sets of rules ride in the same row and are not surfaces; neither is sent in
+`platform`:
+
+- **origin `automation`**: full markdown and the full deliverable set, plus the rule that
+  nobody is waiting and no question can be answered, so the model states its assumptions
+  rather than asking.
+- **subagent run**: a role flag set inside langalpha, never by a client. The report is
+  addressed to the parent agent rather than to a person.
+
+## `origin`
+
+`origin` is orthogonal to `platform`: `platform` is which surface, `origin` is who started the
+thread. It is an object, `{"type": "agent" | "automation" | "system", "id": "<optional>"}`,
+recorded once at thread creation and ignored for existing threads. An absent `origin` means
+user-initiated, which is the common case and is never written. The label is advisory: it is
+client-supplied, it is not authenticated, and no access decision reads it.
+
+## The pointer is re-read every turn
+
+The surface pointer is current state, not a property of the thread. It is rendered from the
+turn's own `platform` value once, at the turn boundary, into the row that turn writes into
+history, so a thread asked in the web app and followed up from a chat channel carries `web` on
+one turn and the channel on the next, with no thread edit in between. Each row keeps its place
+in time and describes the turn it was written for.
+
+The rules themselves ride in that row too, and only when they are news. langalpha compares the
+rules this turn needs against the last ones the model can still see on the wire, and writes the
+paragraph when they differ: the thread's first turn, a turn that changed surface, a turn whose
+`surface_rules` text changed, the first turn after a compaction dropped the row that stated
+them, and every subagent run, which starts with no history of its own. A thread that stays in
+the web app therefore states the web rules once and never repeats them.
+
+A consequence for the caller: send `platform` and `surface_rules` on every message, not only on
+the first. A turn that omits either does not inherit the previous turn's value.
+
+## Adding a surface
+
+One step, on the client: start sending the new name in `platform` and its rules in
+`surface_rules`. It takes effect on the next turn, with no langalpha release in between. A name
+langalpha does not recognize still renders in the pointer, because the client ships on its own
+schedule and an unfamiliar name is version skew, not a bad turn; langalpha logs it once per
+process at debug level, since the thing that hides is a typo.
+
+Adding the name to `KNOWN_SURFACES` in
+`src/ptc_agent/agent/middleware/runtime_context/surface.py` is optional and only silences that
+log line. It does not give the surface any rules.
+
+A surface that sends no `surface_rules` leaves the model with nothing to steer on, so it falls
+back to its default behavior, which is the `web` shape. A surface whose whole point is a
+constraint (short replies, no widgets) therefore needs its paragraph before the traffic
+matters.
+
+## Where this lives in the code
+
+| Piece | File |
+|---|---|
+| Fields and grammar | `src/server/models/chat.py` (`ChatRequest`), `src/server/models/conversation.py` (`ThreadCreateRequest`) |
+| Per-turn resolution | `src/server/handlers/chat/request_prep.py` (`TurnRuntimeContext`) |
+| Grammar and known set | `src/ptc_agent/agent/middleware/runtime_context/surface.py` |
+| Pointer rendering | `runtime_context/turn.py` (`TurnContextMiddleware`), `templates/envelope/turn.md.j2` |
+| Built-in rules prose, and where caller rules land | `templates/envelope/surface_rules.md.j2` |
+| When the rules ride | `runtime_context/turn.py` (`rules_key`, `_rules_already_stated`) |

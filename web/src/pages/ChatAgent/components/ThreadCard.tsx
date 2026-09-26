@@ -1,9 +1,10 @@
 import React from 'react';
-import { Trash2, Edit2, Globe, Archive, ArchiveRestore } from 'lucide-react';
+import { Trash2, Edit2, Link2, Archive, ArchiveRestore } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useTitleFade } from '@/hooks/useTitleFade';
 import { useThreadFlags } from '@/lib/threadLifecycle/store';
+import { cn } from '@/lib/utils';
 
 interface ThreadCardProps {
   thread: Record<string, unknown>;
@@ -85,8 +86,19 @@ function ThreadCard({ thread, onClick, onDelete, onRename, onArchive, onUnarchiv
 
       {/* Thread title and info */}
       <div className="flex-1 min-w-0">
-        <h3 className={`text-sm font-normal truncate${titleFading ? ' animate-fade-in' : ''}`} style={{ color: 'var(--color-text-primary)' }}>
-          {cardTitle}
+        <h3 className={cn('flex items-center gap-1.5 text-sm font-normal', titleFading && 'animate-fade-in')} style={{ color: 'var(--color-text-primary)' }}>
+          <span className="truncate min-w-0">{cardTitle}</span>
+          {!!thread.is_shared && (
+            <span
+              role="img"
+              aria-label={t('share.anyoneWithLink')}
+              title={t('share.anyoneWithLink')}
+              className="inline-flex flex-shrink-0"
+              style={{ color: 'var(--color-accent-primary)' }}
+            >
+              <Link2 className="h-3.5 w-3.5" aria-hidden />
+            </span>
+          )}
         </h3>
         {!!thread.updated_at && (
           <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -94,14 +106,6 @@ function ThreadCard({ thread, onClick, onDelete, onRename, onArchive, onUnarchiv
           </p>
         )}
       </div>
-
-      {/* Shared indicator */}
-      {!!thread.is_shared && (
-        <Globe
-          className="h-3.5 w-3.5 flex-shrink-0"
-          style={{ color: 'var(--color-accent-primary)' }}
-        />
-      )}
 
       {/* Action icons - Show on hover */}
       {(onRename || onDelete || onArchive || onUnarchive) && (

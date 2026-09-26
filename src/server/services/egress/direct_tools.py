@@ -23,7 +23,7 @@ import json
 import logging
 import re
 import warnings
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -32,15 +32,33 @@ from typing import TYPE_CHECKING, Any, Mapping
 from langchain_core.tools import BaseTool
 
 from ptc_agent.agent.middleware.direct_mcp import METADATA_KEY
+from ptc_agent.agent.middleware.order_governance import execution_token
 from src.config.env import EGRESS_RELAY_LOOPBACK_URL, EGRESS_RELAY_SECRET
-from src.server.database.mcp_oauth import SERVABLE, get_connection
-from src.server.services.brokerage_capabilities import denied_tools, vendor_for_url
+from src.server.database.mcp_oauth import SERVABLE, ConnectionStatus, get_connection
+from src.server.services.brokerage_capabilities import (
+    denied_tools,
+    order_tool,
+    vendor_for_url,
+)
 from src.server.services.egress import folded_contains
-from src.server.services.egress.relay_jwt import CALLER_HOST, mint_relay_jwt
-from src.server.services.mcp_tool_split import DirectServerTools
+from src.server.services.egress.execution_token import EXECUTION_HEADER
+from src.server.services.egress.relay_jwt import (
+    CALLER_HOST,
+    identity_claim,
+    mint_relay_jwt,
+)
+from src.server.services.mcp_tool_split import DirectServerTools, DirectTool
+from src.server.services.tool_binding import (
+    inputs_from_row,
+    order_payload,
+    order_policy,
+    resolve_plan,
+)
 
 if TYPE_CHECKING:
     from ptc_agent.core.session import Session
+    from src.server.services.computer_manager._types import WorkspaceToolView
+    from src.server.services.egress.order_ledger import OrderAttemptLedger
 
 logger = logging.getLogger(__name__)
 
@@ -94,37 +112,111 @@ MAX_DIRECT_TOOLS = 64
 MAX_DIRECT_SCHEMA_CHARS = 120_000
 
 
+@dataclass
+class _Budget:
+    """What a turn has left to spend on direct tool definitions."""
+
+    tools: int = 0
+    chars: int = 0
+
+    def take(self, tool: DirectTool) -> bool:
+        if self.tools >= MAX_DIRECT_TOOLS:
+            return False
+        size = len(json.dumps(tool.schema, ensure_ascii=False, default=str))
+        if self.chars + size > MAX_DIRECT_SCHEMA_CHARS:
+            return False
+        self.tools += 1
+        self.chars += size
+        return True
+
+
 def admit_within_budget(
     by_server: Mapping[str, Any],
-) -> tuple[dict[str, list[dict]], list[tuple[str, str]]]:
-    """Split each server's schemas into the ones a turn can afford, and the rest.
+) -> tuple[dict[str, list[DirectTool]], list[tuple[str, DirectTool]]]:
+    """Split each server's tools into the ones a turn can afford, and the rest.
 
-    Taken one per server in rotation rather than server by server, so a broker
+    Order tools are seated first, at every server, because losing one to a
+    quote tool the user also bound direct is not a smaller toolset but a
+    brokerage whose reads work and whose orders are gone. Everything else is
+    taken one per server in rotation rather than server by server, so a broker
     publishing eighty tools cannot spend the whole budget before a second
     connection is reached at all: every server keeps a usable share, and a user
     who wants more of one narrows the others on the Plugins page.
     """
-    queues = {name: list(entry.schemas or ()) for name, entry in by_server.items()}
-    admitted: dict[str, list[dict]] = {name: [] for name in queues}
-    dropped: list[tuple[str, str]] = []
-    tools = 0
-    chars = 0
+    queues = {name: list(entry.tools or ()) for name, entry in by_server.items()}
+    admitted: dict[str, list[DirectTool]] = {name: [] for name in queues}
+    dropped: list[tuple[str, DirectTool]] = []
+    budget = _Budget()
+
+    for name in queues:
+        rest: list[DirectTool] = []
+        for tool in queues[name]:
+            if tool.resolved.order is None:
+                rest.append(tool)
+            elif budget.take(tool):
+                admitted[name].append(tool)
+            else:
+                dropped.append((name, tool))
+        queues[name] = rest
+
     while any(queues.values()):
         for name, queue in queues.items():
             if not queue:
                 continue
-            schema = queue.pop(0)
-            if tools >= MAX_DIRECT_TOOLS:
-                dropped.append((name, str(schema.get("name") or "")))
-                continue
-            size = len(json.dumps(schema, ensure_ascii=False, default=str))
-            if chars + size > MAX_DIRECT_SCHEMA_CHARS:
-                dropped.append((name, str(schema.get("name") or "")))
-                continue
-            admitted[name].append(schema)
-            tools += 1
-            chars += size
+            tool = queue.pop(0)
+            if budget.take(tool):
+                admitted[name].append(tool)
+            else:
+                dropped.append((name, tool))
     return admitted, dropped
+
+
+def relay_http_client(**kwargs: Any) -> Any:
+    """The MCP client's HTTP client, carrying the order grant when there is one.
+
+    The grant is per call and the session is per turn, so it cannot be a header
+    on the transport: it is read from a contextvar at send time. The MCP client
+    runs each POST inside the context of whoever sent the message, which is
+    what makes a value set around one ``await`` visible to the task that dials.
+
+    Built by the SDK's own factory: a bare ``AsyncClient`` would drop the read
+    timeout to five seconds and cut every slow vendor call.
+    """
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    async def attach_grant(request: Any) -> None:
+        token = execution_token.get()
+        if token:
+            request.headers[EXECUTION_HEADER] = token
+
+    # ``follow_redirects`` is what the factory already does and not one of its
+    # parameters, so the transport passing it explicitly has to be dropped.
+    kwargs.pop("follow_redirects", None)
+    client = create_mcp_http_client(**{k: v for k, v in kwargs.items() if v is not None})
+    client.event_hooks.setdefault("request", []).append(attach_grant)
+    return client
+
+
+def relay_mcp_client(grant_id: str, *, token: str) -> Any:
+    """One MCP client dialling the host's own relay on loopback for one grant.
+
+    The only construction of it, because everything that makes a host-side call
+    a host-side call is here: the loopback address, the grant in the path, the
+    relay JWT, and the HTTP client that attaches an execution grant when the
+    caller holds one. A second copy would be a second answer to "does this call
+    carry the order token".
+    """
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    base = EGRESS_RELAY_LOOPBACK_URL.rstrip("/")
+    return Client(
+        StreamableHttpTransport(
+            url=f"{base}/v1/egress/{grant_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            httpx_client_factory=relay_http_client,
+        )
+    )
 
 
 # How long a turn waits for one relay session before giving up on opening it
@@ -141,9 +233,11 @@ class DirectMCPBinding:
     """The tools bound for one turn, the clients behind them, and the policy.
 
     ``check`` is the port ``DirectMcpPolicyMiddleware`` calls per tool call. It
-    reads the connection row again rather than the set bound at turn start:
-    consent withdrawn on the Plugins page mid-turn, or a connection that went
-    to ``needs_reauth``, refuses the next call instead of the next turn.
+    reads the server's own row again rather than the set bound at turn start:
+    consent withdrawn on the Plugins page mid-turn, a connection that went to
+    ``needs_reauth``, a row or its plugin switched off, a tool moved back to
+    the sandbox, or an order gate switched on, refuses the next call instead
+    of the next turn.
     """
 
     user_id: str | None = None
@@ -153,19 +247,101 @@ class DirectMCPBinding:
     def add_server(self, name: str, client: Any) -> None:
         self._clients.append((name, client))
 
-    async def check(self, server: str, tool: str) -> str | None:
+    async def check(
+        self, server: str, tool: str, approval: bool = False
+    ) -> str | None:
         if not self.user_id:
             return "no user is attached to this turn"
         connection = await get_connection(self.user_id, server)
-        if connection is None:
-            return f"{server} is no longer connected"
-        if connection.status not in SERVABLE:
+        # A revoked record is history, not a claim on the row: the user
+        # disconnected, and the row's own headers may authenticate it now.
+        if connection is not None and connection.status is ConnectionStatus.REVOKED:
+            connection = None
+        if connection is not None and connection.status not in SERVABLE:
             return f"{server} needs to be reconnected before it can be used"
-        vendor = vendor_for_url(connection.server_url)
-        denied = denied_tools(vendor, connection.granted_capabilities or ())
+        from src.server.database.mcp_servers import get_catalog_server
+
+        try:
+            row = await get_catalog_server(self.user_id, server)
+        except Exception:
+            # Fails closed, because the alternative is judging the call against
+            # a row nobody could read: the consent, the binding and the gate all
+            # come off this one read.
+            logger.warning(
+                "[DIRECT_MCP] %r/%r: catalog re-read failed",
+                server,
+                tool,
+                exc_info=True,
+            )
+            return f"{server} could not be read just now; send this again"
+        identity = self._identity(connection, row)
+        if identity is None:
+            return f"{server} is switched off or no longer connected"
+        vendor, granted = identity
+        denied = denied_tools(vendor, granted)
         if denied and folded_contains(denied, tool):
             return f"the connection to {server} does not permit {tool}"
+        # Resolved the way the binder resolved it, so a tool the user moved
+        # back to the sandbox mid-turn stops being callable here. The relay's
+        # own direct-only gate cannot catch this one: it refuses a sandbox
+        # caller reaching a direct tool, and this call arrives as the host.
+        plan = resolve_plan(vendor, granted, inputs_from_row(row))
+        if not folded_contains(plan.direct, tool):
+            return (
+                f"{tool} is no longer bound directly; "
+                "send this again to reach it from the sandbox"
+            )
+        # The interrupt is wired from the stamp made at turn start, so a switch
+        # to asking about orders would otherwise not reach a tool already bound:
+        # the call would run ungated for the rest of the turn. Refusing sends
+        # the user back through a turn whose tools carry the current answer.
+        if not approval and self._now_needs_approval(tool, vendor, row):
+            return (
+                f"{tool} now needs your approval on every call; "
+                "send this again so it can ask you first"
+            )
         return None
+
+    def _identity(
+        self, connection: Any, row: Mapping[str, Any] | None
+    ) -> tuple[str | None, Sequence[str]] | None:
+        """Whose rules judge this call and what was consented to, or None when
+        the server is gone or out of delivery.
+
+        A connection answers both, and its own address outranks the row's:
+        consent was given for what the token was issued for. A
+        header-authenticated row answers with its own address and consent to
+        nothing, which is what denies a curated vendor's whole curation to a
+        row that never went through a consent screen.
+        """
+        # The row governs either credential kind: a live token says nothing
+        # about a server the user has taken out of delivery. A plugin's disable
+        # leaves its rows' own flag alone, and the plugin's is what takes them
+        # out of delivery -- the relay reads both the same way.
+        if row is None or not row.get("enabled") or row.get("plugin_enabled") is False:
+            return None
+        if connection is not None:
+            return (
+                vendor_for_url(connection.server_url),
+                connection.granted_capabilities or (),
+            )
+        return vendor_for_url(row.get("url")), ()
+
+    def _now_needs_approval(
+        self, tool: str, vendor: str | None, row: Mapping[str, Any] | None
+    ) -> bool:
+        """Whether the row gates this tool right now, not at turn start.
+
+        The order map answers first because it answers alone: a tool that
+        mutates no order is gated by nothing a row can say, so the row's
+        switches are read only for one that does.
+        """
+        if order_tool(vendor, tool) is None:
+            return False
+        policy = order_policy(
+            vendor, tool, order_approval=inputs_from_row(row).order_approval
+        )
+        return policy is not None and policy.approval
 
     async def drive(self, stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
         """Run ``stream`` with every relay session open around it.
@@ -211,7 +387,8 @@ async def prepare_direct_mcp_tools(
     *,
     user_id: str | None,
     workspace_id: str,
-    sandbox_id: str,
+    sandbox_id: str | None = None,
+    computer_id: str | None = None,
     grants: Mapping[str, str],
     by_server: Mapping[str, DirectServerTools],
 ) -> DirectMCPBinding:
@@ -220,8 +397,6 @@ async def prepare_direct_mcp_tools(
     if not by_server or not grants or not EGRESS_RELAY_SECRET or not user_id:
         return binding
 
-    from fastmcp import Client
-    from fastmcp.client.transports import StreamableHttpTransport
     from mcp.types import Tool
 
     with warnings.catch_warnings():
@@ -233,9 +408,9 @@ async def prepare_direct_mcp_tools(
         user_id=user_id,
         workspace_id=workspace_id,
         sandbox_id=sandbox_id,
+        computer_id=computer_id,
         caller=CALLER_HOST,
     )
-    base = EGRESS_RELAY_LOOPBACK_URL.rstrip("/")
 
     # Only a granted server can be reached, so only a granted server may spend
     # the budget: one that lost its grant would otherwise displace tools from a
@@ -250,22 +425,34 @@ async def prepare_direct_mcp_tools(
             MAX_DIRECT_TOOLS,
             MAX_DIRECT_SCHEMA_CHARS,
             len(dropped),
-            ", ".join(f"{s}/{t}" for s, t in dropped[:20]),
+            ", ".join(f"{s}/{t.name}" for s, t in dropped[:20]),
         )
+    # An order tool that could not be seated even with priority means the whole
+    # server stays unbound: a brokerage whose reads answer and whose orders
+    # quietly are not there reads as working, and the model would compose an
+    # order out of the tools that remain.
+    starved: dict[str, list[str]] = {}
+    for server, tool in dropped:
+        if tool.resolved.order is not None:
+            starved.setdefault(server, []).append(tool.name)
+    for server, order_tools in starved.items():
+        logger.warning(
+            "[DIRECT_MCP] %r: order tools over budget (%s); none of its tools "
+            "are bound directly this turn",
+            server,
+            ", ".join(sorted(order_tools)),
+        )
+        affordable[server] = []
 
     for server, entry in by_server.items():
         grant_id = grants.get(server)
-        schemas = affordable.get(server) or ()
-        if not grant_id or not schemas:
+        affordable_tools = affordable.get(server) or ()
+        if not grant_id or not affordable_tools:
             continue
-        client = Client(
-            StreamableHttpTransport(
-                url=f"{base}/v1/egress/{grant_id}",
-                headers={"Authorization": f"Bearer {minted.token}"},
-            )
-        )
+        client = relay_mcp_client(grant_id, token=minted.token)
         bound = 0
-        for schema in schemas:
+        for direct in affordable_tools:
+            schema = direct.schema
             try:
                 tool = Tool(
                     name=schema["name"],
@@ -284,16 +471,26 @@ async def prepare_direct_mcp_tools(
                 )
                 continue
             lc_tool.name = direct_tool_name(server, tool.name)
+            # Everything but the vendor comes off the resolution the plan
+            # already made, so the composite, the relay and this stamp cannot
+            # disagree about what a call is or which calls stop.
             lc_tool.metadata = {
                 **(lc_tool.metadata or {}),
                 METADATA_KEY: {
                     "server": server,
                     "tool": tool.name,
+                    # The brokerage whose rules this call is judged by, from
+                    # the address the grant was issued for. The server name is
+                    # the user's to choose, so it says nothing about a vendor.
+                    "vendor": entry.vendor,
+                    # What this call does to an order, or null when it does
+                    # nothing to one. Read by the surface that renders the
+                    # call and by whatever governs it.
+                    "order": order_payload(direct.resolved.order),
                     # A `both` tool keeps its sandbox wrapper, so the prompt
                     # must not tell the model this one is call-only.
-                    "sandboxed": not folded_contains(
-                        entry.sandbox_excluded, tool.name
-                    ),
+                    "sandboxed": direct.sandboxed,
+                    "approval": direct.resolved.approval,
                 },
             }
             binding.tools.append(lc_tool)
@@ -309,18 +506,70 @@ async def prepare_direct_mcp_tools(
     return binding
 
 
+async def direct_tools_for_turn(
+    binding: Awaitable[DirectMCPBinding],
+    *,
+    user_id: str | None,
+    workspace_id: str,
+    thread_id: str,
+    run_id: str,
+    turn_index: int,
+) -> tuple[DirectMCPBinding, "OrderAttemptLedger | None"]:
+    """This turn's direct toolset, and the ledger its orders are written to.
+
+    A binder that fails costs the turn its direct tools and not the turn: on
+    PTC the rest of the toolset is still reachable through the sandbox, and on
+    Flash the agent still answers. The ledger carries ids only, because every
+    transition it makes is a guarded statement against the row: the worker that
+    ends up holding the tool call is never assumed to be the one that proposed
+    it.
+    """
+    from src.server.services.egress.order_ledger import OrderAttemptLedger
+
+    try:
+        bound = await binding
+    except Exception:
+        logger.warning("[DIRECT_MCP] binding failed; running without", exc_info=True)
+        bound = DirectMCPBinding(user_id=user_id)
+    if not user_id:
+        return bound, None
+    return bound, OrderAttemptLedger(
+        user_id=user_id,
+        workspace_id=workspace_id,
+        thread_id=thread_id,
+        run_id=run_id,
+        turn_index=turn_index,
+    )
+
+
 async def bind_direct_mcp_tools(
-    session: "Session", *, user_id: str | None
+    session: "Session",
+    *,
+    user_id: str | None,
+    workspace_id: str,
+    view: "WorkspaceToolView | None" = None,
 ) -> DirectMCPBinding:
-    """The PTC shape: the session carries the split and the grants."""
-    by_server = session.direct_mcp_tools
-    egress = session.egress_binding
+    """The PTC shape: the split and the grants come from the project's frozen
+    view when the caller holds one.
+
+    The project comes from the caller, never from the session: one session
+    serves every project on its machine, so its own labels name whichever
+    project built it and a turn on any sibling would mint a token claiming
+    that one. The same goes for the split: the session's copy is whichever
+    sibling resolved last, so a turn reads the view frozen for its project.
+    """
+    by_server = view.direct_mcp_tools if view is not None else session.direct_mcp_tools
+    egress = view.egress_binding if view is not None else session.egress_binding
     if not by_server or egress is None:
         return DirectMCPBinding(user_id=user_id)
     return await prepare_direct_mcp_tools(
         user_id=user_id,
-        workspace_id=session.conversation_id,
-        sandbox_id=getattr(session.sandbox, "sandbox_id", None) or "",
+        workspace_id=workspace_id,
+        # Absent, not "": the host path runs for a Flash turn and for a session
+        # whose sandbox is not provisioned, and the validator refuses an empty
+        # identity claim.
+        sandbox_id=identity_claim(getattr(session.sandbox, "sandbox_id", None)),
+        computer_id=identity_claim(getattr(session, "computer_id", None)),
         grants=egress.grants,
         by_server=by_server,
     )

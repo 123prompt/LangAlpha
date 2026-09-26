@@ -1,19 +1,14 @@
 import { Search, HelpCircle, Mail, LayoutGrid, Pencil } from 'lucide-react';
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { searchStocks } from '@/lib/marketUtils';
+import type { StockSearchHit } from '@/lib/marketUtils';
+import { useSymbolSearch } from '@/hooks/useSymbolSearch';
 import { useNavigate } from 'react-router-dom';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { buildMarketViewUrl } from '@/pages/MarketView/utils/marketRoute';
 import './DashboardHeader.css';
 
-interface StockResult {
-  symbol: string;
-  name?: string;
-  [key: string]: unknown;
-}
-
 interface DashboardHeaderProps {
-  onStockSearch?: (symbol: string, stock: StockResult | null) => void;
   onScrollToTop?: () => void;
   /** When provided (desktop only), show the Classic/Custom segmented toggle and the Edit button in Custom mode. */
   layoutToggle?: {
@@ -24,7 +19,7 @@ interface DashboardHeaderProps {
   };
 }
 
-const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScrollToTop, layoutToggle }) => {
+const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onScrollToTop, layoutToggle }) => {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const { t } = useTranslation();
@@ -34,8 +29,7 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
 
   // Search state
   const [searchValue, setSearchValue] = useState('');
-  const [searchResults, setSearchResults] = useState<StockResult[]>([]);
-  const [searchLoading, setSearchLoading] = useState(false);
+  const { hits: searchResults, loading: searchLoading } = useSymbolSearch(searchValue, 12);
   const [showDropdown, setShowDropdown] = useState(false);
   const [searchFocused, setSearchFocused] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -66,33 +60,6 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [showHelpPopover]);
 
-  // Stock search with debounce (300ms)
-  useEffect(() => {
-    const query = searchValue.trim();
-    if (!query || query.length < 1) {
-      setSearchResults([]);
-      setSearchLoading(false);
-      setShowDropdown(false);
-      return;
-    }
-
-    const timeoutId = setTimeout(async () => {
-      setSearchLoading(true);
-      setShowDropdown(true);
-      try {
-        const result = await searchStocks(query, 12);
-        setSearchResults((result.results || []) as StockResult[]);
-      } catch (error) {
-        console.error('Stock search failed:', error);
-        setSearchResults([]);
-      } finally {
-        setSearchLoading(false);
-      }
-    }, 300);
-
-    return () => clearTimeout(timeoutId);
-  }, [searchValue]);
-
   // Close search dropdown on outside click
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -104,23 +71,24 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  const handleSelectStock = (stock: StockResult) => {
-    if (stock?.symbol) {
-      const symbol = stock.symbol.trim().toUpperCase();
-      setSearchValue(symbol);
-      setShowDropdown(false);
-      if (onStockSearch) {
-        onStockSearch(symbol, stock);
-      } else {
-        navigate(`/market?symbol=${encodeURIComponent(symbol)}`);
-      }
-    }
+  const openSymbol = (symbol: string) => {
+    setSearchValue(symbol);
+    setShowDropdown(false);
+    navigate(buildMarketViewUrl({ symbol }));
+  };
+
+  const handleSelectStock = (stock: StockSearchHit) => {
+    openSymbol(stock.symbol.trim().toUpperCase());
   };
 
   const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const q = searchValue.trim();
     if (!q) return;
+    // Nothing is taken while a search is resting or in flight: the rows on
+    // screen may still answer the query that was typed over, and the raw text
+    // may yet resolve to a hit of its own. The same rule as SymbolSearch.
+    if (searchLoading) return;
 
     // Default to the first search result when available
     if (searchResults.length > 0) {
@@ -128,14 +96,7 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
       return;
     }
 
-    const symbol = q.toUpperCase();
-    setSearchValue(symbol);
-    setShowDropdown(false);
-    if (onStockSearch) {
-      onStockSearch(symbol, null);
-    } else {
-      navigate(`/market?symbol=${encodeURIComponent(symbol)}`);
-    }
+    openSymbol(q.toUpperCase());
   };
 
   return (
@@ -164,7 +125,7 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
           <div className="dashboard-search-wrapper" ref={dropdownRef}>
             <form
               onSubmit={handleSubmit}
-              className="dashboard-search-form relative group flex items-center gap-2 h-10 px-3 rounded-xl border transition-all"
+              className="dashboard-search-form owns-its-edge relative group flex items-center gap-2 h-10 px-3 rounded-xl border transition-all"
               style={{
                 backgroundColor: 'var(--color-bg-input)',
                 borderColor: searchFocused ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
@@ -180,7 +141,7 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
                 type="text"
                 placeholder={t('dashboard.searchPlaceholder')}
                 value={searchValue}
-                onChange={(e) => setSearchValue(e.target.value)}
+                onChange={(e) => { setSearchValue(e.target.value); setShowDropdown(e.target.value.trim() !== ''); }}
                 onFocus={() => {
                   setSearchFocused(true);
                   if (searchValue.trim()) setShowDropdown(true);
@@ -209,7 +170,7 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
             </form>
             {showDropdown && searchValue.trim() && (
               <div className="dashboard-search-dropdown">
-                {searchLoading ? (
+                {searchLoading && searchResults.length === 0 ? (
                   <div className="dashboard-search-dropdown-item dashboard-search-dropdown-loading">
                     {t('dashboard.searching')}
                   </div>
@@ -218,7 +179,7 @@ const DashboardHeader: React.FC<DashboardHeaderProps> = ({ onStockSearch, onScro
                     {t('dashboard.noResults')}
                   </div>
                 ) : (
-                  searchResults.slice(0, 12).map((stock, index) => (
+                  searchResults.map((stock, index) => (
                     <button
                       key={`${stock.symbol}-${index}`}
                       type="button"

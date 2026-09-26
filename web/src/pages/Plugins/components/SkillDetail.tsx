@@ -4,9 +4,9 @@ import { Loader } from '@/components/ui/loader';
 import {
   EnabledToggle,
   TagBadge,
-} from '@/pages/ChatAgent/components/mcp/McpPrimitives';
+} from '@/components/mcp/McpPrimitives';
 import { useSkillContent } from '@/hooks/useSkills';
-import { createDateFormatter } from '@/lib/format';
+import { createDateFormatter, formatBytes } from '@/lib/format';
 import type { SkillInfo } from '@/pages/ChatAgent/utils/api';
 import {
   DetailField,
@@ -23,11 +23,6 @@ import { PluginOriginBadge, PluginSuppressedBadge } from './PluginBadges';
  */
 
 const formatDate = createDateFormatter({ dateStyle: 'medium' });
-
-function formatSize(bytes: number): string {
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-}
 
 export function SkillDetail({
   skill,
@@ -95,7 +90,7 @@ export function SkillDetail({
       }
     >
       {skill.description && (
-        <p className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
+        <p className="text-sm leading-relaxed" style={{ color: 'var(--color-text-secondary)' }}>
           {skill.description}
         </p>
       )}
@@ -114,7 +109,7 @@ export function SkillDetail({
           </p>
         ) : (
           <pre
-            className="text-[0.6875rem] leading-relaxed whitespace-pre-wrap break-words rounded-md p-3.5 max-h-96 overflow-y-auto"
+            className="text-xs leading-relaxed whitespace-pre-wrap break-words rounded-md p-3.5 max-h-96 overflow-y-auto"
             style={{
               color: 'var(--color-text-secondary)',
               backgroundColor: 'var(--color-bg-card)',
@@ -143,7 +138,7 @@ export function SkillDetail({
           <DetailField label={t('plugins.detail.origin')}>{originLabel}</DetailField>
           {skill.size_bytes > 0 && (
             <DetailField label={t('plugins.detail.size')}>
-              {formatSize(skill.size_bytes)}
+              {formatBytes(skill.size_bytes)}
             </DetailField>
           )}
           {skill.updated_at && (

@@ -7,23 +7,16 @@ This module creates a PTC agent that:
 - Supports sub-agent delegation for specialized tasks
 """
 
-from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 import structlog
 from langchain.agents import create_agent
 
-from ptc_agent.agent.backends import (
-    CompositeFilesystemBackend,
-    NamespaceFactory,
-    RequestScopedStoreCache,
-    SandboxBackend,
-    StoreBackend,
-    WorkflowsBackend,
-    prebuilt_workflow_backend,
-    workflow_namespace,
-)
+from ptc_agent.agent.backends import SandboxBackend
+from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.agent.middleware import SubAgentMiddleware
 from ptc_agent.agent.state import DeltaAgentState
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
@@ -56,34 +49,29 @@ from ptc_agent.agent.middleware import (
     MarketWatchMiddleware,
     SteeringMiddleware,
     SubagentSteeringMiddleware,
-    WorkspaceContextMiddleware,
-    # memory.md injection from the LangGraph store
-    MemoryContextMiddleware,
-    # injects <memo-index count=N path=.../>
-    MemoAwarenessMiddleware,
     ReasoningCompatibilityMiddleware,
 )
 from ptc_agent.agent.middleware.direct_mcp import (
-    DirectMcpPolicyMiddleware,
     DirectToolSet,
+    direct_tool_middleware,
     direct_tool_summary,
 )
-from ptc_agent.core.paths import (
-    MEMO_INDEX_FILENAME,
-    MEMO_USER_DIR,
-    MEMORY_INDEX_FILENAME,
-    MEMORY_USER_DIR,
-    MEMORY_WORKSPACE_DIR,
-    USER_PROFILE_DATA_DIR,
-    WORKFLOW_DIR,
+from ptc_agent.agent.middleware.order_governance import OrderLedger
+from ptc_agent.agent.context_stack import build_context_middleware
+from ptc_agent.agent.filesystem_routes import (
+    build_filesystem_backend,
+    resolve_identity_gates,
 )
 from ptc_agent.agent.middleware.background_subagent.workflow.prebuilt import (
     get_prebuilt_workflows,
 )
-from ptc_agent.agent.backends.user_data import UserDataBackend
 from ptc_agent.agent.middleware.image_capture import ImageCaptureMiddleware
 from ptc_agent.agent.middleware.openai_prompt_caching import OpenAIPromptCachingMiddleware
-from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
+from ptc_agent.agent.middleware.runtime_context import (
+    TailEnvelopeMiddleware,
+    TurnContext,
+    TurnContextMiddleware,
+)
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
@@ -97,6 +85,7 @@ from ptc_agent.agent.prompts import (
     format_subagent_summary,
     get_loader,
     guidance_template_vars,
+    workspace_path_vars,
 )
 from ptc_agent.agent.subagents import (
     SubagentCompiler,
@@ -149,57 +138,6 @@ logger = structlog.get_logger(__name__)
 DEFAULT_MAX_CONCURRENT_TASK_UNITS = 3
 
 
-@dataclass(frozen=True)
-class _IdentityGates:
-    """Which identity-derived surfaces a build gets.
-
-    Memory, memo and the workflow store are opt-in on identity: without a user
-    id they are disabled entirely rather than falling back to a shared
-    namespace that would cross-pollinate unauthenticated sessions.
-    """
-
-    user_memory: bool
-    workspace_memory: bool
-    memo: bool
-    user_data: bool
-    workflow: bool
-    workflow_fs: bool
-    workflow_tool: bool
-
-    @property
-    def memory(self) -> bool:
-        return self.user_memory or self.workspace_memory
-
-
-def _resolve_identity_gates(
-    *,
-    store: Any | None,
-    user_id: str | None,
-    workspace_id: str | None,
-    disable_subagents: bool,
-) -> _IdentityGates:
-    from src.config.settings import get_workflow_orchestration_config
-
-    workflow = get_workflow_orchestration_config().enabled
-    identified = store is not None and bool(user_id)
-    return _IdentityGates(
-        user_memory=identified,
-        workspace_memory=identified and bool(workspace_id),
-        memo=identified,
-        # Independent of `store`: the user-profile data backend (portfolio +
-        # watchlist + preferences) talks to the application DB tables, not the
-        # LangGraph store.
-        user_data=bool(user_id),
-        workflow=workflow,
-        workflow_fs=workflow and identified,
-        # RunWorkflow dispatches subagents, so it drops with the recursion
-        # gate. The skill that advertises it is gated on the same flag —
-        # advertising a skill whose tool this build never registers strands
-        # the agent.
-        workflow_tool=workflow and not disable_subagents,
-    )
-
-
 class PTCAgent:
     """Agent that uses Programmatic Tool Calling (PTC) pattern for MCP tool execution.
 
@@ -216,7 +154,6 @@ class PTCAgent:
 
     def _build_system_prompt(
         self,
-        tool_summary: str,
         subagent_summary: str,
         guidance: str,
         plan_mode: bool = False,
@@ -225,17 +162,24 @@ class PTCAgent:
         memo_enabled: bool = True,
         crawl_enabled: bool = False,
         direct_tool_summary: str = "",
+        workspace: WorkspaceLayout | None = None,
+        legacy_layout: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
         ``guidance`` shapes the cached prefix, so the prefix varies by (model,
         guidance) rather than (model), which only splits when a user pins the
-        level themselves.
+        level themselves. The workspace folder varies it too, but a thread
+        lives in one workspace, so a thread still reuses its own prefix.
         """
         loader = get_loader()
         return loader.get_system_prompt(
             **guidance_template_vars(guidance),
-            tool_summary=tool_summary,
+            **workspace_path_vars(
+                workspace,
+                root=self.config.filesystem.working_directory,
+                legacy_layout=legacy_layout,
+            ),
             subagent_summary=subagent_summary,
             max_concurrent_task_units=DEFAULT_MAX_CONCURRENT_TASK_UNITS,
             ask_user_enabled=True,
@@ -243,7 +187,6 @@ class PTCAgent:
             include_examples=True,
             include_anti_patterns=True,
             thread_id=thread_id or "",
-            working_directory=self.config.filesystem.working_directory,
             memory_enabled=memory_enabled,
             memo_enabled=memo_enabled,
             market_watch_enabled=self.config.feature_enabled("market_watch"),
@@ -254,174 +197,6 @@ class PTCAgent:
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
         return build_tool_summary_from_registry(
             mcp_registry, mode=self.config.mcp.tool_exposure_mode
-        )
-
-    def _build_filesystem_backend(
-        self,
-        *,
-        backend: Any,
-        gates: _IdentityGates,
-        store: Any | None,
-        user_id: str | None,
-        workspace_id: str | None,
-    ) -> tuple[Any, list[Any]]:
-        """Mount the store-backed routes over the sandbox filesystem.
-
-        Returns the backend the filesystem tools should see, and the middleware
-        that injects those routes' content after the prompt-cache breakpoint
-        (memory.md, the memo count block) — one list because they share that
-        position.
-        """
-        if not (gates.memory or gates.memo or gates.user_data or gates.workflow):
-            return backend, []
-
-        # One cache per agent (≈ per request). Shared by every memory/memo
-        # backend route + the two read-side middlewares so that across the
-        # K model calls in a turn we pay 1 set of store reads, not K.
-        # Agent-side writes invalidate the affected key so reads in later
-        # rounds within the same turn see the fresh value.
-        store_cache: RequestScopedStoreCache | None = (
-            RequestScopedStoreCache()
-            if (gates.memory or gates.memo or gates.workflow_fs)
-            else None
-        )
-        sandbox_root = backend.root_dir.rstrip("/")
-
-        # INVARIANT: these closures capture identity at agent-creation time
-        # (``user_id`` is bound once per call). Safe only because one PTCAgent
-        # is built per request — if an orchestrator ever reuses agent instances
-        # across requests, memory will cross-pollinate between users. Resolve
-        # identity at call time (e.g. via `langgraph.runtime.get_runtime()`)
-        # before introducing reuse.
-        routes: list[Any] = []
-        user_namespace_factory: NamespaceFactory | None = None
-        workspace_namespace_factory: NamespaceFactory | None = None
-        memo_namespace_factory: NamespaceFactory | None = None
-
-        if gates.user_memory:
-
-            def _user_namespace() -> tuple[str, ...]:
-                return (user_id, "memory")
-
-            user_namespace_factory = _user_namespace
-            routes.append(
-                StoreBackend(
-                    store=store,
-                    namespace_factory=_user_namespace,
-                    root_prefix=f"{sandbox_root}/{MEMORY_USER_DIR}/",
-                    sandbox_backend=backend,
-                    cache=store_cache,
-                )
-            )
-
-        if gates.workspace_memory:
-
-            def _workspace_namespace() -> tuple[str, ...]:
-                return (user_id, "workspaces", workspace_id, "memory")
-
-            workspace_namespace_factory = _workspace_namespace
-            routes.append(
-                StoreBackend(
-                    store=store,
-                    namespace_factory=_workspace_namespace,
-                    root_prefix=f"{sandbox_root}/{MEMORY_WORKSPACE_DIR}/",
-                    sandbox_backend=backend,
-                    cache=store_cache,
-                )
-            )
-
-        if gates.memo:
-
-            def _memo_namespace() -> tuple[str, ...]:
-                # Plural: avoid string-prefix collision with the
-                # ``(user_id, "memory")`` tier in AsyncPostgresStore,
-                # whose asearch is ``LIKE 'user_id.memo%'``.
-                return (user_id, "memos")
-
-            memo_namespace_factory = _memo_namespace
-            routes.append(
-                StoreBackend(
-                    store=store,
-                    namespace_factory=_memo_namespace,
-                    root_prefix=f"{sandbox_root}/{MEMO_USER_DIR}/",
-                    sandbox_backend=backend,
-                    read_only=True,
-                    read_only_error=(
-                        "Memo is user-managed. Ask the user to edit or "
-                        "upload via the memo panel."
-                    ),
-                    cache=store_cache,
-                )
-            )
-
-        if gates.workflow:
-            workflow_root = f"{sandbox_root}/{WORKFLOW_DIR}/"
-            prebuilt_route = prebuilt_workflow_backend(
-                files=get_prebuilt_workflows().files(),
-                root_prefix=workflow_root,
-                sandbox_backend=backend,
-            )
-            if gates.workflow_fs:
-
-                def _workflow_namespace() -> tuple[str, ...]:
-                    return workflow_namespace(user_id)
-
-                routes.append(
-                    WorkflowsBackend(
-                        store_backend=StoreBackend(
-                            store=store,
-                            namespace_factory=_workflow_namespace,
-                            root_prefix=workflow_root,
-                            sandbox_backend=backend,
-                            cache=store_cache,
-                        ),
-                        prebuilt_backend=prebuilt_route,
-                    )
-                )
-            else:
-                routes.append(prebuilt_route)
-
-        if gates.user_data:
-            routes.append(
-                UserDataBackend(
-                    user_id=user_id,
-                    sandbox_backend=backend,
-                    root_prefix=f"{sandbox_root}/{USER_PROFILE_DATA_DIR}/",
-                )
-            )
-
-        if not routes:
-            return backend, []
-
-        dynamic_context_middleware: list[Any] = []
-        if gates.memory:
-            dynamic_context_middleware = [
-                MemoryContextMiddleware(
-                    store=store,
-                    user_namespace_factory=user_namespace_factory,
-                    workspace_namespace_factory=workspace_namespace_factory,
-                    user_display_path=f"{MEMORY_USER_DIR}/{MEMORY_INDEX_FILENAME}",
-                    workspace_display_path=f"{MEMORY_WORKSPACE_DIR}/{MEMORY_INDEX_FILENAME}",
-                    index_key=MEMORY_INDEX_FILENAME,
-                    cache=store_cache,
-                )
-            ]
-        if gates.memo and memo_namespace_factory is not None:
-            # Memo's count block injects after the cache breakpoint
-            # alongside memory.md, hence the shared list.
-            dynamic_context_middleware.append(
-                MemoAwarenessMiddleware(
-                    store=store,
-                    user_namespace_factory=memo_namespace_factory,
-                    display_path=f"{MEMO_USER_DIR}/",
-                    index_key=MEMO_INDEX_FILENAME,
-                    cache=store_cache,
-                )
-            )
-
-        return (
-            CompositeFilesystemBackend(sandbox=backend, routes=routes),
-            dynamic_context_middleware,
         )
 
     def create_agent(
@@ -440,8 +215,8 @@ class PTCAgent:
         user_profile: dict | None = None,
         plan_mode: bool = False,
         thread_id: str | None = None,
-        workspace_name: str = "",
-        workspace_description: str = "",
+        workspace_name: str | None = None,
+        workspace_description: str | None = None,
         on_agent_md_write: Any | None = None,
         store: Any | None = None,
         on_signed_url: Any | None = None,
@@ -451,6 +226,9 @@ class PTCAgent:
         tool_summary: str | None = None,
         disable_subagents: bool = False,
         direct_mcp: DirectToolSet | None = None,
+        order_ledger: OrderLedger | None = None,
+        turn_context: TurnContext | None = None,
+        project: ProjectContext | None = None,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -467,7 +245,15 @@ class PTCAgent:
             user_id: First component of memory-namespace tuples. When ``None``,
                 memory is disabled entirely rather than falling back to a shared
                 namespace that would cross-pollinate unauthenticated sessions.
-            on_agent_md_write: Invalidates the Session's agent.md cache on write.
+            on_agent_md_write: Invalidates the Session's agent.md cache on write
+                and records the write's last-writer stamp.
+            turn_context: What this turn knows about itself (when the previous
+                one ran, the surface it arrived on and that surface's delivery
+                rules, the zone its clock is stamped in), for the turn anchor
+                row. None for a context-free build such as thread maintenance.
+            project: The workspace folder this turn runs in. Passed rather
+                than read from the ambient context because the build happens
+                before the run's own task binds it.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
@@ -476,21 +262,29 @@ class PTCAgent:
 
         # Freeze current time for this request (refreshes on each new query)
         request_time = datetime.now(tz=UTC)
-        timezone_str = (user_profile or {}).get("timezone")
+        timezone_str = turn_context.timezone if turn_context else None
         current_time = format_current_time(request_time, timezone_str)
 
         # Compute short thread ID for thread-scoped storage
         short_thread_id = thread_id[:8] if thread_id else ""
 
-        backend = SandboxBackend(sandbox, operation_callback=operation_callback)
+        preview_owner = project.workspace_id if project else None
+        backend = SandboxBackend(
+            sandbox,
+            operation_callback=operation_callback,
+            preview_owner=preview_owner,
+        )
+        # The one workspace root this build uses, read off the live computer
+        # root plus the turn's folder rather than the config default.
+        workspace_layout = sandbox.workspace(project)
 
         # Memory is opt-in: disabled entirely when identity is missing rather
         # than falling back to a shared namespace that would cross-pollinate
-        # unauthenticated sessions.
-        workspace_id_for_memory = (
-            getattr(session, "conversation_id", None) if session else None
-        )
-        gates = _resolve_identity_gates(
+        # unauthenticated sessions. The workspace comes from the project: the
+        # session is per computer and several workspaces share it, so its own
+        # id names whichever one acquired it first.
+        workspace_id_for_memory = project.workspace_id if project else None
+        gates = resolve_identity_gates(
             store=store,
             user_id=user_id,
             workspace_id=workspace_id_for_memory,
@@ -503,19 +297,18 @@ class PTCAgent:
                 workspace_id_present=bool(workspace_id_for_memory),
             )
 
-        filesystem_backend, dynamic_context_middleware = (
-            self._build_filesystem_backend(
-                backend=backend,
-                gates=gates,
-                store=store,
-                user_id=user_id,
-                workspace_id=workspace_id_for_memory,
-            )
+        filesystem_backend, baseline_store_sources = build_filesystem_backend(
+            backend=backend,
+            gates=gates,
+            store=store,
+            user_id=user_id,
+            workspace_id=workspace_id_for_memory,
+            layout=workspace_layout,
         )
 
         # Create the execute_code tool for MCP invocation
         execute_code_tool = create_execute_code_tool(
-            backend, mcp_registry, thread_id=short_thread_id
+            backend, mcp_registry, thread_id=short_thread_id, session=session
         )
 
         # Create the Bash tool for shell command execution
@@ -523,7 +316,7 @@ class PTCAgent:
         bash_output_tool = create_bash_output_tool(backend)
 
         # Create the preview URL tool for sandbox service previews
-        workspace_id = getattr(session, "conversation_id", "") if session else ""
+        workspace_id = project.workspace_id if project else ""
         preview_url_tool = create_preview_url_tool(backend, workspace_id=workspace_id, on_signed_url=on_signed_url)
 
         # Create the show widget tool for inline HTML visualizations
@@ -610,7 +403,11 @@ class PTCAgent:
         shared_middleware.append(
             FileOperationMiddleware(
                 on_agent_md_write=on_agent_md_write,
-                work_dir=self.config.filesystem.working_directory,
+                # The workspace root: the hook fires on ``agent.md``, which
+                # lives in the folder, and a path measured from the computer
+                # root keeps the folder name in front of it.
+                work_dir=workspace_layout.workspace,
+                thread_id=thread_id,
             )
         )
         # Shared placement gives subagents provenance coverage too. The leak
@@ -648,7 +445,13 @@ class PTCAgent:
         if not gates.workflow_tool:
             skill_registry.pop("run-workflow", None)
 
-        skill_loader_middleware = SkillsMiddleware(
+        # One per stack rather than one shared instance, because the two stacks
+        # differ in a single answer: where the manifest goes. The main agent
+        # has a baseline to freeze it into; a subagent does not, so its copy
+        # keeps appending the manifest per call. Everything else about them,
+        # the registry included, is the same object.
+        skills_middleware = partial(
+            SkillsMiddleware,
             skill_registry=skill_registry,
             mode="ptc",
             backend=backend,
@@ -659,7 +462,8 @@ class PTCAgent:
             ],
             disabled_skills=self.config.disabled_skills,
         )
-        shared_middleware.append(skill_loader_middleware)
+        skill_loader_middleware = skills_middleware(inject_manifest=False)
+        subagent_skill_middleware = skills_middleware(inject_manifest=True)
         tools.extend(skill_loader_middleware.tools)
         tools.extend(skill_loader_middleware.get_all_skill_tools())
 
@@ -669,11 +473,11 @@ class PTCAgent:
         # Must be first: steering context must be visible before any other middleware.
         main_only_middleware.append(SteeringMiddleware())
 
-        # Consent is re-read per call here, so a tool the connection no longer
-        # covers is refused rather than reaching the vendor.
+        # Ahead of the plan interrupt: consent is re-read per call and an order
+        # is put to the user against a durable attempt, which is what execution
+        # then reads.
         direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
-        if direct_tools:
-            main_only_middleware.append(DirectMcpPolicyMiddleware(direct_mcp))
+        main_only_middleware.extend(direct_tool_middleware(direct_mcp, order_ledger))
 
         _bg_registry = background_registry or BackgroundTaskRegistry()
         event_capture_middleware = SubagentEventCaptureMiddleware(registry=_bg_registry)
@@ -690,8 +494,9 @@ class PTCAgent:
             tools.extend(background_middleware.tools)
 
         if HumanInTheLoopMiddleware is not None:
-            interrupt_config: Any = create_plan_mode_interrupt_config()
-            hitl_middleware = HumanInTheLoopMiddleware(interrupt_on=interrupt_config)
+            hitl_middleware = HumanInTheLoopMiddleware(
+                interrupt_on=create_plan_mode_interrupt_config()
+            )
             main_only_middleware.append(hitl_middleware)
 
             # Only add submit_plan tool when plan_mode is enabled
@@ -729,6 +534,7 @@ class PTCAgent:
             sandbox=sandbox,
             mcp_registry=mcp_registry,
             tool_sets=subagent_tool_sets,
+            default_model=turn.client,
             user_profile=user_profile,
             current_time=current_time,
             thread_id=short_thread_id,
@@ -744,6 +550,7 @@ class PTCAgent:
             skill_dirs=[
                 d for d, _ in self.config.skills.local_skill_dirs_with_sandbox()
             ],
+            project=project,
         )
         if disable_subagents:
             # Recursion gate: no subagents compiled, none advertised in the
@@ -759,23 +566,25 @@ class PTCAgent:
             if additional_subagents:
                 subagents.extend(additional_subagents)
 
-        # Prefer the session-cached summary (precomputed once per session in the
-        # WorkspaceManager) so the hot path never recomputes it — that's what
-        # keeps the prompt-cache prefix byte-stable per turn. Fall back to
+        # The roster the baseline freezes into <mcp-servers>. Prefer the
+        # session-cached summary (precomputed once per session in the
+        # WorkspaceManager) so the hot path never recomputes it; fall back to
         # computing from the registry for callers without a cached summary
-        # (tests, the SessionProvider path).
+        # (tests, the SessionProvider path). Resolved to a string here rather
+        # than read live at the turn boundary: a source that answers None
+        # marks the epoch incomplete, and a build with no session cache would
+        # then rebuild the block on every turn.
         if tool_summary is None:
             tool_summary = self._get_tool_summary(mcp_registry)
         subagent_summary = format_subagent_summary(subagents)
 
         eviction_dir = (
-            f".agents/threads/{short_thread_id}/large_tool_results"
+            WorkspaceLayout.thread_subdir(short_thread_id, "large_tool_results")
             if short_thread_id
-            else ".agents/large_tool_results"
+            else WorkspaceLayout.LARGE_TOOL_RESULTS_DIR
         )
 
         system_prompt = self._build_system_prompt(
-            tool_summary,
             subagent_summary,
             turn.guidance,
             plan_mode=plan_mode,
@@ -784,6 +593,8 @@ class PTCAgent:
             memo_enabled=gates.memo,
             crawl_enabled=bool(crawl_tools),
             direct_tool_summary=direct_tool_summary(direct_tools),
+            workspace=workspace_layout,
+            legacy_layout=bool(project is not None and project.layout_origin == 3),
         )
 
         logger.debug(
@@ -795,8 +606,8 @@ class PTCAgent:
 
         # --- Build final middleware stacks ---
         compaction_config = self.config.compaction.model_dump()
-        if self.config.llm and self.config.llm.compaction:
-            compaction_config["llm"] = self.config.llm.compaction
+        if self.config.llm and self.config.llm.compaction_name:
+            compaction_config["llm"] = self.config.llm.compaction_name
         client = resolve_compaction_client(self.config)
         if client is not None:
             compaction_config["_llm_client"] = client
@@ -836,10 +647,22 @@ class PTCAgent:
             m
             for m in [
                 SubagentSteeringMiddleware(registry=background_middleware.registry),
+                # The turn row a subagent can act on: when its turn opened,
+                # and that it is a child rather than the main agent. The user's
+                # context stays out, a subagent works from its brief. It writes
+                # into history at the turn boundary, so its position among the
+                # middlewares below does not matter. No clock is injected: this
+                # stack is built once per parent turn and run for every
+                # subagent, so the row reads the clock when its own turn opens.
+                TurnContextMiddleware(
+                    timezone=timezone_str or "UTC",
+                    is_subagent=True,
+                ),
                 LargeResultEvictionMiddleware(
                     backend=backend, eviction_dir=eviction_dir
                 ),
                 *shared_middleware,
+                subagent_skill_middleware,
                 image_capture,
                 compaction,
                 *model_resilience,
@@ -849,32 +672,41 @@ class PTCAgent:
                 OpenAIPromptCachingMiddleware(),
                 EmptyToolCallRetryMiddleware(),
                 PatchToolCallsMiddleware(),
+                # Innermost: carries the turn's rows in the shape this model
+                # accepts and pins the tail breakpoint on the last block.
+                TailEnvelopeMiddleware(
+                    now=request_time,
+                    guidance=turn.guidance,
+                    model_name=turn.name or None,
+                ),
                 ReasoningCompatibilityMiddleware(),
             ]
             if m is not None
         ]
 
-        # Workspace context middleware (agent.md injection — main agent only)
-        workspace_context_middleware: list[Any] = []
-        if session is not None:
-            workspace_context_middleware = [
-                WorkspaceContextMiddleware(
-                    session=session,
-                    name=workspace_name,
-                    description=workspace_description,
-                )
-            ]
-
-        # Positioned after the prompt-cache breakpoint (innermost) so dynamic
-        # content doesn't invalidate the cached prefix.
-        runtime_context_middleware: list[Any] = [
-            RuntimeContextMiddleware(
-                current_time=current_time,
-                user_profile=user_profile,
-                user_data_counts=user_data_counts,
-                sandbox_enabled=True,
-            )
-        ]
+        # The turn row, the per-thread baseline and the tail envelope, wired
+        # for the main agent: the baseline is agent.md, the memory indices, the
+        # memo pointer and the user's identity + steering, which a subagent
+        # never gets because it works from its brief, not from the user's
+        # workspace. Where each of the three has to sit is on ContextMiddleware.
+        context = build_context_middleware(
+            now=request_time,
+            guidance=turn.guidance,
+            model_name=turn.name or None,
+            turn_context=turn_context,
+            user_profile=user_profile,
+            sandbox_enabled=True,
+            session=session,
+            workspace_name=workspace_name,
+            workspace_description=workspace_description,
+            sources=baseline_store_sources,
+            blocks={
+                "mcp_servers": lambda _state: tool_summary,
+                "skills": lambda state: skill_loader_middleware.build_manifest(state)
+                or "",
+            },
+            user_data_counts=user_data_counts,
+        )
 
         # Compiled subagent graphs live on this middleware; the RunWorkflow
         # dispatcher below shares the same instances so direct dispatches get
@@ -930,10 +762,22 @@ class PTCAgent:
         #   - AnthropicPromptCachingMiddleware (cache_control) and
         #     OpenAIPromptCachingMiddleware (prompt_cache_breakpoint) each place
         #     their provider's breakpoint on the last system message block they
-        #     see (the static prompt + skills); each no-ops for other providers.
-        #   - WorkspaceContextMiddleware (agent.md) and RuntimeContextMiddleware
-        #     (time + profile) are innermost — they append AFTER the breakpoint,
-        #     so dynamic content doesn't invalidate the cached prefix.
+        #     see, which is the static prompt's own: the skills manifest and the
+        #     MCP roster ride in the baseline now. Each no-ops for other
+        #     providers.
+        #   - TurnContextMiddleware runs before BaselineContextMiddleware so
+        #     the turn row is written into history ahead of the change rows.
+        #   - BaselineContextMiddleware is innermost on the system message: it
+        #     appends the frozen per-thread baseline AFTER their breakpoint as
+        #     one block and pins breakpoint 3 on it, so the static prefix stays
+        #     shareable while the baseline caches per thread.
+        #   - TailEnvelopeMiddleware is innermost overall. It carries this
+        #     turn's rows, appends an envelope only when the call has a
+        #     market_watch stamp, and pins the tail cache breakpoint, so
+        #     nothing may be appended after it.
+        # On the wire that is: tools (bp1), static system (bp2), baseline block
+        # (bp3), messages ending in the turn's rows (bp4), the four Anthropic
+        # allows.
         deepagent_middleware = [
             m
             for m in [
@@ -942,6 +786,7 @@ class PTCAgent:
                 ),
                 subagent_task_middleware,
                 *shared_middleware,
+                skill_loader_middleware,
                 *main_only_middleware,
                 image_capture,
                 compaction,
@@ -950,11 +795,10 @@ class PTCAgent:
                 multimodal_read,
                 AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
                 OpenAIPromptCachingMiddleware(),
-                # Market watch (main agent only): appends the ephemeral
-                # <market-watch> price stamp. Inside model_resilience so it
-                # sees the post-fallback model — its provider-specific cache
-                # breakpoints (Anthropic cache_control / OpenAI
-                # prompt_cache_breakpoint) must never reach another provider.
+                # Market watch (main agent only): contributes the
+                # <market-watch> price stamp as a per-call row on the request,
+                # which the tail envelope renders. Must stay OUTSIDE
+                # TailEnvelopeMiddleware, which reads that key.
                 *(
                     [MarketWatchMiddleware()]
                     if self.config.feature_enabled("market_watch")
@@ -962,9 +806,9 @@ class PTCAgent:
                 ),
                 EmptyToolCallRetryMiddleware(),
                 PatchToolCallsMiddleware(),
-                *workspace_context_middleware,
-                *dynamic_context_middleware,
-                *runtime_context_middleware,
+                context.turn,
+                context.baseline,
+                context.tail,
                 ReasoningCompatibilityMiddleware(),
             ]
             if m is not None

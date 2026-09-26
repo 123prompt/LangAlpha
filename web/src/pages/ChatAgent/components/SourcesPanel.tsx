@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import {
@@ -23,11 +23,13 @@ import {
 } from '@/components/ui/dialog';
 import { provenanceDisplayKey, countDedupedSources, type ProvenanceRecord } from '@/types/chat';
 import type { ProvenanceSourceType } from '@/types/sse';
+import { formatBytes } from '@/lib/format';
 import { AnimatedTabs } from '@/components/ui/animated-tabs';
 import { workspaceRelativePath } from '@/pages/ChatAgent/utils/agentPaths';
 import { isTaskAgentId } from '@/pages/ChatAgent/utils/agentId';
 import { Favicon } from './Favicon';
 import './SourcesPanel.css';
+import { deckHeight, deckPeekLayers, deckSlot, useDeckCollapse, type DeckGeometry } from '@/components/ui/cardDeck';
 
 /** Source types that carry a URL/domain and render a {@link Favicon}. */
 const URL_SOURCE_TYPES = new Set<ProvenanceSourceType>(['web_search', 'web_fetch', 'sec_filing']);
@@ -47,14 +49,17 @@ const GROUP_ORDER: ProvenanceSourceType[] = [
   'memory_read',
 ];
 
-/** Deck geometry — spacing/fan motion kept in step with the widget-context deck
- *  (the chat-input snapshot deck). MAX_PEEK_LAYERS is intentionally shallower
- *  here: provenance decks can hold many results, so a collapsed deck only hints
- *  "there's more behind" with a couple of peek cards rather than a deep stack. */
-const CARD_HEIGHT = 52;
-const CARD_GAP = 6;
-const PEEK_STEP = 6;
-const MAX_PEEK_LAYERS = 2;
+/** Shallower than the widget-context deck on purpose: a provenance deck can
+ *  hold many results, so collapsed it only hints "there's more behind" with a
+ *  couple of peek cards rather than a deep stack. */
+const GEOMETRY: DeckGeometry = {
+  cardHeight: 52,
+  cardGap: 6,
+  peekStep: 6,
+  maxPeekLayers: 2,
+  peekScaleStep: 0.03,
+  minPeekScale: 0.85,
+};
 
 /** Shared card chrome (visuals only — positioning/height is set per use). Every
  *  card is filled with `--color-bg-card` so a leaf card and the front of a
@@ -139,13 +144,6 @@ function urlPath(url: string): string {
 function shortSha(sha?: string): string {
   if (!sha) return '';
   return sha.length > 12 ? sha.slice(0, 12) : sha;
-}
-
-function formatSize(bytes?: number): string {
-  if (bytes == null) return '';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function formatTimestamp(ts?: string): string {
@@ -593,7 +591,7 @@ function SourceRow({
         onClick={() => onOpenRecord(record)}
         aria-label={`${title} — ${t('chat.sources.viewDetails')}`}
         className={`group relative ${CARD_CHROME}`}
-        style={{ height: CARD_HEIGHT, boxShadow: '0 1px 2px rgba(20, 20, 23, 0.05)' }}
+        style={{ height: GEOMETRY.cardHeight, boxShadow: '0 1px 2px rgba(20, 20, 23, 0.05)' }}
       >
         <SourceCardBody
           record={record}
@@ -666,17 +664,19 @@ function SourceDeck({
   // A "list" deck (query/domain) labels each card by its own page; an entity
   // deck shares the front label across cards and subtitles by data-kind.
   const isEntity = variant === 'entity';
-  const rootRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useDeckCollapse({
+    open: fanned,
+    onCollapse,
+    // An opened detail view portals out of the deck; its clicks are still the
+    // deck's own.
+    ignoreWithin: '[role="dialog"]',
+  });
   const n = records.length;
-  const peekLayers = Math.min(n - 1, MAX_PEEK_LAYERS);
-  const stackHeight = fanned
-    ? n * (CARD_HEIGHT + CARD_GAP) - CARD_GAP
-    : CARD_HEIGHT + peekLayers * PEEK_STEP;
   // Collapsed, only render the front + a capped number of peek cards so a big
   // deck doesn't stack arbitrarily deep (the true count stays on the front
   // badge). Fanned, render every card. Capping the rendered set — not just the
   // stack height — keeps the deepest peek card flush with the stack's bottom.
-  const visible = fanned ? records : records.slice(0, peekLayers + 1);
+  const visible = fanned ? records : records.slice(0, deckPeekLayers(n, GEOMETRY) + 1);
   // The collapsed front card's count noun tracks the grouping (sources /
   // results / pages). It's deck-level — depends only on variant — so compute
   // it once here rather than per card in the map below.
@@ -687,51 +687,16 @@ function SourceDeck({
         ? 'chat.sources.pageCount'
         : 'chat.sources.sourceCount';
 
-  // Outside-click / Escape collapse while fanned, deferred one frame so the
-  // click that fanned the deck can't immediately re-collapse it. Clicks inside
-  // a Radix dialog (an opened detail view) are carved out.
-  useEffect(() => {
-    if (!fanned) return;
-    const onDown = (e: MouseEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (!target) return;
-      if (target.closest && target.closest('[role="dialog"]')) return;
-      if (!document.body.contains(target)) return;
-      if (rootRef.current && rootRef.current.contains(target)) return;
-      onCollapse();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCollapse();
-    };
-    let attached = false;
-    const raf = requestAnimationFrame(() => {
-      document.addEventListener('mousedown', onDown);
-      document.addEventListener('keydown', onKey);
-      attached = true;
-    });
-    return () => {
-      cancelAnimationFrame(raf);
-      if (attached) {
-        document.removeEventListener('mousedown', onDown);
-        document.removeEventListener('keydown', onKey);
-      }
-    };
-  }, [fanned, onCollapse]);
-
   return (
     <div
       ref={rootRef}
       className="source-deck-stack"
       data-testid="source-stack"
       data-fanned={fanned}
-      style={{ height: stackHeight }}
+      style={{ height: deckHeight(n, fanned, GEOMETRY) }}
     >
       {visible.map((r, i) => {
-        const top = fanned ? i * (CARD_HEIGHT + CARD_GAP) : 0;
-        const peekY = fanned ? 0 : i * PEEK_STEP;
-        const peekScale = fanned ? 1 : Math.max(1 - i * 0.03, 0.85);
-        const peekOpacity = fanned ? 1 : i === 0 ? 1 : Math.max(0.85 - (i - 1) * 0.2, 0.25);
-        const interactive = fanned || i === 0;
+        const { style, interactive } = deckSlot(i, n, fanned, GEOMETRY);
         const isTop = i === 0;
         const collapsedFront = !fanned && isTop;
         const kind = kindLabel(t, r.detail);
@@ -792,12 +757,8 @@ function SourceDeck({
             onClick={() => (fanned ? onOpenRecord(r) : onToggleFan())}
             className={`group source-deck-card absolute left-0 right-0 ${CARD_CHROME}`}
             style={{
-              top,
-              height: CARD_HEIGHT,
-              transform: `translateY(${peekY}px) scale(${peekScale})`,
-              opacity: peekOpacity,
-              zIndex: n - i,
-              pointerEvents: interactive ? 'auto' : 'none',
+              height: GEOMETRY.cardHeight,
+              ...style,
               boxShadow: fanned
                 ? '0 4px 12px rgba(20, 20, 23, 0.06), 0 1px 2px rgba(20, 20, 23, 0.04)'
                 : isTop
@@ -975,7 +936,7 @@ function FingerprintRows({ record }: { record: ProvenanceRecord }): React.ReactE
       mono: true,
       icon: <Fingerprint className="h-3 w-3 flex-shrink-0" style={TERTIARY} />,
     });
-  if (record.result_size != null) meta.push({ label: t('chat.sources.fingerprint.size'), value: formatSize(record.result_size), mono: true });
+  if (record.result_size != null) meta.push({ label: t('chat.sources.fingerprint.size'), value: formatBytes(record.result_size), mono: true });
 
   const argEntries = record.args ? Object.entries(record.args) : [];
 

@@ -24,12 +24,20 @@ from datetime import datetime, timezone
 
 import pytest
 
+from ptc_agent.core.paths import SandboxLayout
 from src.server.services.persistence import backup
 from src.server.services.persistence.transfer import ScanEntry, ScanResult
 
 WS = "ws-prune-gate"
 PATH = "reports/gone.txt"
 MTIME_NS = 1_700_000_000_000_000_000
+
+ROOT = "/workspace"
+DIR_NAME = "prune-ab12"
+# The folder the scan walks. It rides into the prune statement as
+# ``walked_dir_name``, which is what keeps a scan of the wrong directory from
+# reading a sibling's files as this workspace's deletions.
+LAYOUT = SandboxLayout.for_root(ROOT).for_workspace(DIR_NAME)
 
 
 CLOCK = datetime(2026, 9, 3, 12, 0, 0, tzinfo=timezone.utc)
@@ -59,7 +67,7 @@ def _scan(*entries: ScanEntry, errors=None) -> ScanResult:
 
 def _sandbox() -> MagicMock:
     sandbox = MagicMock()
-    sandbox.working_dir = "/workspace"
+    sandbox.working_dir = ROOT
     sandbox.adownload_file_bytes = AsyncMock(return_value=None)
     return sandbox
 
@@ -89,8 +97,12 @@ async def _sync_with_empty_sandbox(incomplete):
             "src.server.services.persistence.backup.delete_removed_files",
             new=AsyncMock(return_value=7),
         ) as deleter,
+        patch(
+            "src.server.services.persistence.backup.get_workspace_total_size",
+            new=AsyncMock(return_value=0),
+        ),
     ):
-        result = await backup.sync_to_db(WS, _sandbox())
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     return result, deleter
 
 
@@ -100,7 +112,7 @@ async def test_empty_listing_while_flagged_deletes_nothing():
     against it erases the entire manifest — the whole file list, not one row."""
     result, deleter = await _sync_with_empty_sandbox(True)
     deleter.assert_not_awaited()
-    assert result["deleted"] == 0
+    assert result.deleted == 0
 
 
 @pytest.mark.asyncio
@@ -108,7 +120,7 @@ async def test_empty_listing_when_not_flagged_still_prunes():
     """A user who really did delete everything must still see it reflected."""
     result, deleter = await _sync_with_empty_sandbox(False)
     deleter.assert_awaited_once()
-    assert result["deleted"] == 7
+    assert result.deleted == 7
 
 
 @pytest.mark.asyncio
@@ -161,7 +173,7 @@ async def _sync_with_one_unchanged_file(incomplete: bool):
             new=AsyncMock(return_value=1),
         ) as deleter,
     ):
-        result = await backup.sync_to_db(WS, _sandbox())
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     return result, deleter
 
 
@@ -169,8 +181,8 @@ async def _sync_with_one_unchanged_file(incomplete: bool):
 async def test_flagged_workspace_keeps_the_row_for_a_missing_file():
     result, deleter = await _sync_with_one_unchanged_file(True)
     deleter.assert_not_awaited()
-    assert result["deleted"] == 0
-    assert result["skipped"] == 1
+    assert result.deleted == 0
+    assert result.skipped == 1
 
 
 @pytest.mark.asyncio
@@ -178,7 +190,7 @@ async def test_unflagged_workspace_prunes_the_row_for_a_missing_file():
     result, deleter = await _sync_with_one_unchanged_file(False)
     deleter.assert_awaited_once()
     assert deleter.await_args.args[1] == {"keep.txt"}
-    assert result["deleted"] == 1
+    assert result.deleted == 1
 
 
 async def _sync_with_one_restamped_file(incomplete: bool, stamp_failure=None):
@@ -206,7 +218,7 @@ async def _sync_with_one_restamped_file(incomplete: bool, stamp_failure=None):
         patch("src.server.services.persistence.backup.bulk_update_file_stamps", new=AsyncMock(side_effect=stamp_failure)) as stamps,
         patch("src.server.services.persistence.backup.delete_removed_files", new=AsyncMock(return_value=0)),
     ):
-        result = await backup.sync_to_db(WS, _sandbox())
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     return result, stamps
 
 
@@ -216,7 +228,7 @@ async def test_a_stamp_write_that_fails_is_counted_as_an_error():
     stop reads the backup as clean and tears the sandbox down with the new
     mode unrecorded."""
     result, _ = await _sync_with_one_restamped_file(False, RuntimeError("db away"))
-    assert result["errors"] == 1
+    assert result.errors == 1
 
 
 @pytest.mark.asyncio
@@ -225,7 +237,7 @@ async def test_flagged_workspace_leaves_a_moved_stamp_unrecorded():
     stamp. Recording it makes the wrong mode the one the retry restores."""
     result, stamps = await _sync_with_one_restamped_file(True)
     stamps.assert_not_awaited()
-    assert result["skipped"] == 1
+    assert result.skipped == 1
 
 
 @pytest.mark.asyncio
@@ -249,7 +261,7 @@ async def _sync(listing: ScanResult, incomplete=False):
         patch("src.server.services.persistence.backup.get_workspace_total_size", new=AsyncMock(return_value=0)),
         patch("src.server.services.persistence.backup.delete_removed_files", new=AsyncMock(return_value=1)) as deleter,
     ):
-        result = await backup.sync_to_db(WS, _sandbox())
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     return result, deleter
 
 
@@ -260,7 +272,9 @@ async def test_prune_is_fenced_to_rows_untouched_since_the_scan_began():
     result, deleter = await _sync(_scan())
     deleter.assert_awaited_once()
     assert deleter.await_args.kwargs["untouched_since"] == CLOCK
-    assert result["deleted"] == 1
+    # And fenced to the folder this scan actually walked.
+    assert deleter.await_args.kwargs["walked_dir_name"] == DIR_NAME
+    assert result.deleted == 1
 
 
 @pytest.mark.asyncio
@@ -269,7 +283,7 @@ async def test_unreadable_root_does_not_wipe_the_manifest():
     same signature as an emptied workspace. It must keep every row."""
     result, deleter = await _sync(_scan(errors=[{"path": ".", "error": "EIO"}]))
     deleter.assert_not_awaited()
-    assert result["deleted"] == 0 and result["errors"] == 1
+    assert result.deleted == 0 and result.errors == 1
 
 
 @pytest.mark.asyncio
@@ -277,7 +291,7 @@ async def test_any_scan_read_error_withholds_pruning():
     entry = ScanEntry(path="reports", kind="dir", size=0, mtime_ns=MTIME_NS, mode=0o755, sha256=None, symlink_target=None, is_binary=None)
     result, deleter = await _sync(_scan(entry, errors=[{"path": "reports/q3", "error": "EACCES"}]))
     deleter.assert_not_awaited()
-    assert result["errors"] == 1
+    assert result.errors == 1
 
 
 @pytest.mark.asyncio
@@ -286,16 +300,18 @@ async def test_a_file_that_vanished_mid_scan_does_not_withhold_pruning():
     read: absent for the right reason. It is not data at risk either."""
     result, deleter = await _sync(_scan(errors=[{"path": "reports/q3", "error": "ENOENT", "errno": 2}]))
     deleter.assert_awaited_once()
-    assert result["errors"] == 0
+    assert result.errors == 0
 
 
 @pytest.mark.asyncio
 async def test_a_missing_root_still_withholds_pruning():
-    """ENOENT on the root is not a vanished file; it is the whole workspace
-    unreadable, and the empty listing it yields must not prune anything."""
+    """ENOENT on the root is a folder this sandbox never had, not a vanished
+    file: nothing there can be lost, so it is not an unsaved file, but the
+    empty listing it yields must not prune anything."""
     result, deleter = await _sync(_scan(errors=[{"path": ".", "error": "ENOENT", "errno": 2}]))
     deleter.assert_not_awaited()
-    assert result["deleted"] == 0 and result["errors"] == 1
+    assert result.deleted == 0 and result.errors == 0
+    assert result.root_missing is True and result.unsaved == []
 
 
 # --- a directory that stopped being one -------------------------------------
@@ -322,7 +338,7 @@ async def _sync_dir_turned_symlink(incomplete: bool):
         patch("src.server.services.persistence.backup.delete_file_rows", new=AsyncMock(return_value=1)) as rows_deleter,
         patch("src.server.services.persistence.backup.delete_removed_files", new=AsyncMock(return_value=1)) as deleter,
     ):
-        result = await backup.sync_to_db(WS, _sandbox())
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     return result, rows_deleter, deleter
 
 
@@ -335,7 +351,7 @@ async def test_a_flagged_workspace_still_drops_children_of_a_decayed_directory()
     deleter.assert_not_awaited()
     rows_deleter.assert_awaited_once()
     assert rows_deleter.await_args.args[1] == ["a/child"]
-    assert result["deleted"] == 1
+    assert result.deleted == 1
 
 
 @pytest.mark.asyncio
@@ -343,7 +359,7 @@ async def test_an_unflagged_workspace_counts_both_prunes():
     result, rows_deleter, deleter = await _sync_dir_turned_symlink(False)
     rows_deleter.assert_awaited_once()
     deleter.assert_awaited_once()
-    assert result["deleted"] == 2
+    assert result.deleted == 2
 
 
 async def _sync_legacy_child_under_new_symlink():
@@ -368,7 +384,7 @@ async def _sync_legacy_child_under_new_symlink():
         patch("src.server.services.persistence.backup.delete_file_rows", new=AsyncMock(return_value=2)) as rows_deleter,
         patch("src.server.services.persistence.backup.delete_removed_files", new=AsyncMock(return_value=1)) as deleter,
     ):
-        result = await backup.sync_to_db(WS, _sandbox())
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     return result, rows_deleter, deleter
 
 
@@ -377,4 +393,103 @@ async def test_children_with_no_parent_row_are_still_dropped_under_a_new_symlink
     result, rows_deleter, deleter = await _sync_legacy_child_under_new_symlink()
     deleter.assert_not_awaited()
     assert sorted(rows_deleter.await_args.args[1]) == ["a/child", "a/sub/deep"]
-    assert result["deleted"] == 2
+    assert result.deleted == 2
+
+
+# --- paths the manifest cannot key -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_path_too_long_to_record_is_unsaved_and_never_written():
+    """One such path used to fail the batch insert with "value too long for
+    type character varying(1024)", taking every other file in the pass down
+    and leaving a strict backup with no file to name."""
+    deep = "d/" * 600
+    listing = _scan(
+        ScanEntry("reports", "dir", 4096, MTIME_NS, 0o755, None, None, None),
+        ScanEntry(deep.rstrip("/"), "dir", 4096, MTIME_NS, 0o755, None, None, None),
+        ScanEntry(deep + "f.txt", "file", 3, MTIME_NS, 0o644, "f", None, None),
+    )
+    with (
+        patch("src.server.services.persistence.backup.PACK_CUTOFF", -1),
+        patch("src.server.services.persistence.backup.is_storage_enabled", return_value=False),
+        patch("src.server.services.persistence.backup.scan_workspace", new=AsyncMock(return_value=listing)),
+        patch("src.server.services.persistence.backup.files_restore_incomplete", new=AsyncMock(return_value=False)),
+        patch("src.server.services.persistence.backup.get_file_metadata_for_sync", new=AsyncMock(return_value={})),
+        patch("src.server.services.persistence.backup.get_workspace_total_size", new=AsyncMock(return_value=3)),
+        patch("src.server.services.persistence.backup.delete_removed_files", new=AsyncMock(return_value=0)),
+        patch("src.server.services.persistence.backup.bulk_upsert_files", new=AsyncMock(return_value=1)) as upsert,
+        patch("src.server.services.persistence.blobs.bulk_upsert_files", new=AsyncMock(return_value=0)),
+    ):
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
+
+    written = [row["file_path"] for call in upsert.await_args_list for row in call.args[1]]
+    assert written == ["reports"]
+    assert sorted((f.path, f.reason, f.size) for f in result.unsaved) == [
+        (deep.rstrip("/"), "path_too_long", None),
+        (deep + "f.txt", "path_too_long", 3),
+    ]
+    assert result.oversized == 2 and result.errors == 0
+
+
+@pytest.mark.asyncio
+async def test_a_path_over_the_byte_cutoff_keeps_the_row_it_already_has():
+    """The cutoff counts bytes and the column counts characters, so a
+    multibyte path can have a row from before the cutoff. Dropping it from
+    the listing must not read as a deletion and prune that row."""
+    wide = "文" * 700 + ".txt"
+    listing = _scan(
+        ScanEntry("keep.txt", "file", 10, MTIME_NS, 0o644, "x", None, None),
+        ScanEntry(wide, "file", 10, MTIME_NS, 0o644, "w", None, None),
+    )
+    with (
+        patch("src.server.services.persistence.backup.PACK_CUTOFF", -1),
+        patch("src.server.services.persistence.backup.is_storage_enabled", return_value=False),
+        patch("src.server.services.persistence.backup.scan_workspace", new=AsyncMock(return_value=listing)),
+        patch("src.server.services.persistence.backup.files_restore_incomplete", new=AsyncMock(return_value=False)),
+        patch("src.server.services.persistence.backup.get_file_metadata_for_sync", new=AsyncMock(return_value={})),
+        patch("src.server.services.persistence.backup.get_workspace_total_size", new=AsyncMock(return_value=10)),
+        patch("src.server.services.persistence.backup._persist_inline", new=AsyncMock(return_value=(1, []))),
+        patch("src.server.services.persistence.backup.delete_removed_files", new=AsyncMock(return_value=0)) as prune,
+    ):
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
+
+    assert wide in prune.await_args.args[1]
+    assert [(f.path, f.reason) for f in result.unsaved] == [(wide, "path_too_long")]
+
+
+def test_the_manifest_bound_counts_bytes_as_well_as_characters():
+    from src.server.database.workspace_file import path_fits_manifest
+
+    assert path_fits_manifest("a" * 1024)
+    assert not path_fits_manifest("a" * 1025)
+    # 700 CJK characters are well under 1024 but 2100 bytes of key.
+    assert not path_fits_manifest("文" * 700)
+
+
+@pytest.mark.asyncio
+async def test_a_directory_past_path_max_is_path_too_long_and_does_not_stop_the_prune():
+    """The sandbox cannot even open it (Linux ENAMETOOLONG). Reported as
+    unreadable, it told the user to check permissions and held every
+    deletion back, though nothing under it could ever have had a row."""
+    listing = _scan(
+        ScanEntry("keep.txt", "file", 10, MTIME_NS, 0o644, "x", None, None),
+        errors=[{"path": "deep/" + "a" * 4200, "error": "File name too long", "errno": 36}],
+    )
+    existing = {
+        "keep.txt": {"kind": "file", "file_size": 10, "mtime_ns": MTIME_NS, "content_hash": "x", "permissions": "0644"},
+        PATH: {"kind": "file", "file_size": 5, "mtime_ns": MTIME_NS, "content_hash": "y"},
+    }
+    with (
+        patch("src.server.services.persistence.backup.PACK_CUTOFF", -1),
+        patch("src.server.services.persistence.backup.scan_workspace", new=AsyncMock(return_value=listing)),
+        patch("src.server.services.persistence.backup.files_restore_incomplete", new=AsyncMock(return_value=False)),
+        patch("src.server.services.persistence.backup.workspace_owner", new=AsyncMock(return_value="user-prune")),
+        patch("src.server.services.persistence.backup.get_file_metadata_for_sync", new=AsyncMock(return_value=existing)),
+        patch("src.server.services.persistence.backup.get_workspace_total_size", new=AsyncMock(return_value=10)),
+        patch("src.server.services.persistence.backup.delete_removed_files", new=AsyncMock(return_value=1)) as deleter,
+    ):
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
+
+    assert [f.reason for f in result.unsaved] == ["path_too_long"]
+    deleter.assert_awaited_once()

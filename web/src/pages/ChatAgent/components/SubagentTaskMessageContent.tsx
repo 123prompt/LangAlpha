@@ -6,6 +6,7 @@ import { ErrorLink } from '@/components/ui/error-banner';
 import { CREDIT_STOP_ERROR_TYPE } from '@/types/sse';
 import { buildRateLimitError } from '@/utils/rateLimitError';
 import { type SubagentTokenUsage } from '../utils/tokenUsage';
+import type { ToolCallProcessRecord } from './ToolCallDetailView';
 import { useCreditPausePending } from './CreditPausePendingContext';
 import { useSubagentTelemetry } from './SubagentTelemetryContext';
 import TaskCardShell, { MONO_STACK } from './TaskCardShell';
@@ -114,14 +115,6 @@ export function SubagentStopNotice({ subagentId }: { subagentId: string | undefi
   );
 }
 
-export interface ToolCallProcess {
-  toolCallResult?: {
-    content?: unknown;
-    [key: string]: unknown;
-  };
-  [key: string]: unknown;
-}
-
 interface SubagentInfo {
   subagentId: string;
   description: string;
@@ -140,8 +133,10 @@ interface SubagentTaskMessageContentProps {
   action?: string;
   resumeTargetId?: string;
   onOpen?: (info: SubagentInfo) => void;
-  onDetailOpen?: (process: ToolCallProcess) => void;
-  toolCallProcess?: ToolCallProcess;
+  /** Opens the spawn's detail by its call id, which is this card's `subagentId`. */
+  onDetailOpen?: (toolCallId: string) => void;
+  /** The spawn's record; its presence is what offers the detail affordance. */
+  toolCallProcess?: ToolCallProcessRecord;
   /** Live tool-call count for this subagent — derived from card state at the call site. */
   toolCalls?: number;
   /** Live cumulative token usage for this subagent — derived from card state at the call site. */
@@ -209,8 +204,8 @@ function SubagentTaskMessageContent({
 
   const handleViewDetails = (e: React.MouseEvent<HTMLButtonElement>): void => {
     e.stopPropagation();
-    if (onDetailOpen && toolCallProcess) {
-      onDetailOpen(toolCallProcess);
+    if (onDetailOpen && toolCallProcess && subagentId) {
+      onDetailOpen(subagentId);
     }
   };
 

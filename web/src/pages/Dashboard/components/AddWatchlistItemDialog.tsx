@@ -6,14 +6,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../../../compo
 import { Input } from '../../../components/ui/input';
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { getStockPrices } from '../utils/api';
-import { searchStocks } from '@/lib/marketUtils';
-
-interface StockResult {
-  symbol: string;
-  name?: string;
-  exchangeShortName?: string;
-  stockExchange?: string;
-}
+import type { StockSearchHit } from '@/lib/marketUtils';
+import { useSymbolSearch } from '@/hooks/useSymbolSearch';
 
 interface WatchlistItemData {
   symbol: string;
@@ -48,9 +42,8 @@ function AddWatchlistItemDialog({
   const { t } = useTranslation();
   const [page, setPage] = useState<1 | 2>(1); // 1 = search, 2 = details
   const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<StockResult[]>([]);
-  const [searchLoading, setSearchLoading] = useState(false);
-  const [selectedStock, setSelectedStock] = useState<StockResult | null>(null);
+  const { hits: searchResults, loading: searchLoading } = useSymbolSearch(searchQuery, 50, { enabled: open && page === 1 });
+  const [selectedStock, setSelectedStock] = useState<StockSearchHit | null>(null);
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
   const [priceLoading, setPriceLoading] = useState(false);
 
@@ -58,35 +51,6 @@ function AddWatchlistItemDialog({
   const [notes, setNotes] = useState('');
   const [priceAbove, setPriceAbove] = useState('');
   const [priceBelow, setPriceBelow] = useState('');
-
-  // Debounced search
-  useEffect(() => {
-    if (!open || page !== 1) {
-      setSearchResults([]);
-      return;
-    }
-
-    const query = searchQuery.trim();
-    if (!query || query.length < 1) {
-      setSearchResults([]);
-      return;
-    }
-
-    const timeoutId = setTimeout(async () => {
-      setSearchLoading(true);
-      try {
-        const result = await searchStocks(query, 50);
-        setSearchResults((result.results || []) as StockResult[]);
-      } catch (error) {
-        console.error('Search failed:', error);
-        setSearchResults([]);
-      } finally {
-        setSearchLoading(false);
-      }
-    }, 300); // 300ms debounce
-
-    return () => clearTimeout(timeoutId);
-  }, [searchQuery, open, page]);
 
   // Fetch current price when stock is selected
   useEffect(() => {
@@ -116,7 +80,6 @@ function AddWatchlistItemDialog({
     if (!open) {
       setPage(1);
       setSearchQuery('');
-      setSearchResults([]);
       setSelectedStock(null);
       setCurrentPrice(null);
       setNotes('');
@@ -125,7 +88,7 @@ function AddWatchlistItemDialog({
     }
   }, [open]);
 
-  const handleStockSelect = (stock: StockResult) => {
+  const handleStockSelect = (stock: StockSearchHit) => {
     setSelectedStock(stock);
     setPage(2);
   };
@@ -192,7 +155,7 @@ function AddWatchlistItemDialog({
                 />
               </div>
               <ScrollArea className="mt-3 max-h-[50dvh] sm:max-h-[400px]">
-                {searchLoading ? (
+                {searchLoading && searchResults.length === 0 ? (
                   <div className="py-8 text-center text-sm" style={{ color: 'var(--color-text-secondary)' }}>
                     {t('dashboard.addWatchlistDialog.searching')}
                   </div>

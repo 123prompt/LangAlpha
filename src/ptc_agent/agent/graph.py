@@ -5,7 +5,9 @@ import logging
 from typing import Any, Protocol, runtime_checkable
 
 from ptc_agent.agent.agent import PTCAgent
+from ptc_agent.agent.middleware.runtime_context import TurnContext
 from ptc_agent.config import AgentConfig
+from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.session import Session
 
 logger = logging.getLogger(__name__)
@@ -25,25 +27,30 @@ def _user_profile_cache_key(user_id: str) -> str:
 
 
 async def fetch_user_data_counts(user_id: str | None) -> dict[str, Any] | None:
-    """Lightweight counts for the static `<user_profile>` block.
+    """Lightweight counts for the static `<user_profile>` block, plus the
+    watchlist symbols the preferred-market vote reads.
 
-    Three indexed queries in parallel. Failure is non-fatal — returns None and
+    Four indexed queries in parallel, read per turn rather than through the
+    cached profile: a watchlist edit invalidates no cache, and the market it
+    implies has to follow the edit. Failure is non-fatal: returns None and
     the awareness block omits the counts line.
     """
     if not user_id:
         return None
     try:
         from src.server.services import user_data_io as io
-        portfolio_count, watchlist_counts, prefs_set = await asyncio.gather(
+        portfolio_count, watchlist_counts, prefs_set, symbols = await asyncio.gather(
             io.count_portfolio_for_user(user_id),
             io.count_watchlist_for_user(user_id),
             io.exists_preferences_for_user(user_id),
+            io.list_watchlist_symbols_for_user(user_id),
         )
         wl_count, item_count = watchlist_counts
         return {
             "portfolio_count": int(portfolio_count),
             "watchlist_summary": f"{wl_count}:{item_count}",
             "prefs_set": bool(prefs_set),
+            "watchlist_symbols": list(symbols),
         }
     except Exception:
         logger.warning("user-data counts fetch failed; awareness block will omit counts", exc_info=True)
@@ -126,13 +133,18 @@ class SessionProvider(Protocol):
         ...
 
 
-async def _read_workspace_naming(workspace_id: str) -> tuple[str, str]:
+async def _read_workspace_naming(workspace_id: str) -> tuple[str | None, str | None]:
     """The workspace's name and description for the prompt's `<workspace>` block.
 
     Read once here rather than inside the model call, so the values are bound
-    when the turn's agent is built: the model never sees the name change under
-    it mid-answer, and a rename lands on the very next turn.
+    when the turn's agent is built and the model never sees the name change
+    under it mid-answer. The baseline freezes the pair per epoch; a rename
+    reaches the model as a `workspace_changed` row on the next turn. A read
+    that fails answers None, not an empty name: the baseline must not file a
+    row saying the workspace lost its name.
     """
+    if not workspace_id:
+        return None, None
     try:
         from src.server.database.workspace import get_workspace_name_and_description
 
@@ -140,7 +152,7 @@ async def _read_workspace_naming(workspace_id: str) -> tuple[str, str]:
         return (row.get("name") or "").strip(), (row.get("description") or "").strip()
     except Exception as e:
         logger.warning(f"Failed to read the name of workspace {workspace_id}: {e}")
-        return "", ""
+        return None, None
 
 
 async def build_ptc_graph(
@@ -211,6 +223,7 @@ async def build_ptc_graph_with_session(
     checkpointer: Any | None = None,
     background_registry: Any | None = None,
     user_id: str | None = None,
+    user_profile: dict[str, Any] | None = None,
     plan_mode: bool = False,
     thread_id: str | None = None,
     store: Any | None = None,
@@ -218,43 +231,66 @@ async def build_ptc_graph_with_session(
     namespace_owner: Any | None = None,
     disable_subagents: bool = False,
     direct_mcp: Any | None = None,
+    order_ledger: Any | None = None,
+    turn_context: TurnContext | None = None,
+    project: ProjectContext | None = None,
+    tool_view: Any | None = None,
 ) -> Any:
-    """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path)."""
-    workspace_id = session.conversation_id
+    """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
+
+    ``turn_context`` is what this turn knows about itself, for the turn anchor
+    row. It is optional because this builder also serves context-free callers
+    (thread maintenance) that have no turn. ``user_profile`` is the caller's
+    read of the profile, the one its ``turn_context`` zone came from, so the
+    identity block and the stamp never answer from two different reads.
+
+    ``project`` is the workspace folder the turn runs in. The build happens
+    before the run's task binds it, so it travels as an argument.
+
+    ``tool_view`` is the project's frozen registry and summary. The session's
+    own fields belong to whichever project on the machine resolved last.
+    """
+    mcp_registry = (
+        tool_view.mcp_registry if tool_view is not None else session.mcp_registry
+    )
+    tool_summary = (
+        tool_view.mcp_tool_summary
+        if tool_view is not None
+        else getattr(session, "mcp_tool_summary", None)
+    )
+    # From the project, never from the session: the session is cached per
+    # computer and several workspaces share it, so its own label names
+    # whichever workspace happened to acquire it first.
+    workspace_id = project.workspace_id if project else ""
     logger.debug(f"Building PTC graph with session for workspace: {workspace_id}")
 
-    if not session.sandbox or not session.mcp_registry:
+    if not session.sandbox or not mcp_registry:
         raise RuntimeError(
             f"Session for workspace {workspace_id} is not properly initialized"
         )
 
-    if user_id:
-        (
-            user_profile,
-            user_data_counts,
-            ptc_agent,
-            (workspace_name, workspace_description),
-        ) = await asyncio.gather(
-            get_user_profile_for_prompt(user_id),
-            fetch_user_data_counts(user_id),
-            asyncio.to_thread(PTCAgent, config),
-            _read_workspace_naming(workspace_id),
-        )
-        if user_profile:
-            logger.debug(f"Loaded user profile for {user_id}: {user_profile}")
-    else:
-        user_profile = None
-        user_data_counts = None
-        ptc_agent, (workspace_name, workspace_description) = await asyncio.gather(
-            asyncio.to_thread(PTCAgent, config),
-            _read_workspace_naming(workspace_id),
-        )
+    (
+        user_data_counts,
+        ptc_agent,
+        (workspace_name, workspace_description),
+    ) = await asyncio.gather(
+        fetch_user_data_counts(user_id),
+        asyncio.to_thread(PTCAgent, config),
+        _read_workspace_naming(workspace_id),
+    )
 
-    vault_secrets = getattr(session.sandbox, "vault_secrets", None)
+    if workspace_id:
+        from src.server.database.vault_secrets import get_effective_secrets
+
+        # Snapshot this project's credentials for this graph. The shared sandbox's
+        # mutable value may already belong to a sibling that acquired it later.
+        vault_secrets = await get_effective_secrets(workspace_id, user_id=user_id)
+    else:
+        vault_secrets = dict(getattr(session.sandbox, "vault_secrets", None) or {})
 
     inner_agent = ptc_agent.create_agent(
         sandbox=session.sandbox,
-        mcp_registry=session.mcp_registry,
+        mcp_registry=mcp_registry,
         subagent_names=subagent_names or config.subagents.enabled,
         disable_subagents=disable_subagents,
         operation_callback=operation_callback,
@@ -267,7 +303,7 @@ async def build_ptc_graph_with_session(
         thread_id=thread_id,
         workspace_name=workspace_name,
         workspace_description=workspace_description,
-        on_agent_md_write=session.invalidate_agent_md,
+        on_agent_md_write=session.note_agent_md_write,
         store=store,
         on_signed_url=on_signed_url,
         vault_secrets=vault_secrets,
@@ -276,8 +312,11 @@ async def build_ptc_graph_with_session(
         # Session-cached tool summary (precomputed once per session) so the per
         # turn create_agent never recomputes it — keeps the prompt-cache prefix
         # byte-stable. None → create_agent computes from the registry.
-        tool_summary=getattr(session, "mcp_tool_summary", None),
+        tool_summary=tool_summary,
         direct_mcp=direct_mcp,
+        order_ledger=order_ledger,
+        turn_context=turn_context,
+        project=project,
     )
 
     logger.debug(

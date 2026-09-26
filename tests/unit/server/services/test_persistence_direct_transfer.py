@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ptc_agent.core.paths import SandboxLayout
 from src.server.database.workspace_file import datetime_to_micros, micros_to_datetime
 from src.server.services.persistence import backup, blobs, resolve, restore
 from src.server.services.persistence._rows import (
@@ -25,6 +26,7 @@ from src.server.services.persistence._rows import (
     _ns_to_datetime,
     _row_base,
 )
+from src.server.services.persistence.sync_result import SyncResult, UnsavedFile
 from src.server.services.persistence.transfer import ScanEntry, ScanResult
 
 
@@ -60,6 +62,12 @@ NS = 1_700_000_000_123_456_789
 A = "a" * 64
 B = "b" * 64
 
+ROOT = "/workspace"
+DIR_NAME = "direct-ab12"
+# Every entry point names the folder it mirrors; a bare root would be a claim
+# over the siblings sharing this computer.
+LAYOUT = SandboxLayout.for_root(ROOT).for_workspace(DIR_NAME)
+
 
 def _entry(path, sha=A, size=3, mode=0o644, kind="file", target=None, is_binary=False, mtime_ns=NS):
     return ScanEntry(path, kind, size, mtime_ns, mode, sha if kind == "file" else None, target, is_binary)
@@ -71,7 +79,7 @@ def _scan(*entries):
 
 def _sandbox(provider="daytona"):
     sb = MagicMock()
-    sb.working_dir = "/workspace"
+    sb.working_dir = ROOT
     sb.config.sandbox.provider = provider
     sb.adownload_file_bytes = AsyncMock(return_value=b"abc")
     return sb
@@ -83,13 +91,18 @@ CLOCK = datetime(2026, 9, 3, 12, 0, 0, tzinfo=timezone.utc)
 @pytest.fixture
 def db():
     """Every database and store seam, so each test states only what differs."""
+    _upsert = AsyncMock(side_effect=lambda ws, rows, conn=None: len(rows))
     with (
         patch.object(backup, "manifest_clock", new=AsyncMock(return_value=CLOCK)),
         patch.object(backup, "get_file_metadata_for_sync", new=AsyncMock(return_value={})) as meta,
         patch.object(backup, "files_restore_incomplete", new=AsyncMock(return_value=False)),
         patch.object(backup, "delete_removed_files", new=AsyncMock(return_value=0)) as deleter,
         patch.object(backup, "get_workspace_total_size", new=AsyncMock(return_value=0)),
-        patch.object(backup, "bulk_upsert_files", new=AsyncMock(side_effect=lambda ws, rows, conn=None: len(rows))) as upsert,
+        # The inline path writes its own batches from blobs; both names are
+        # the same seam, so a test asserts on the rows, not on which module
+        # carried them.
+        patch.object(backup, "bulk_upsert_files", new=_upsert) as upsert,
+        patch.object(blobs, "bulk_upsert_files", new=_upsert),
         patch.object(backup, "bulk_update_file_stamps", new=AsyncMock()) as mtimes,
         patch.object(backup, "is_storage_enabled", return_value=True),
         patch.object(backup, "workspace_owner", new=AsyncMock(return_value=USER)),
@@ -110,7 +123,11 @@ def db():
 
 
 def _rows(db):
-    return {r["file_path"]: r for r in db["upsert"].await_args.args[1]}
+    return {
+        r["file_path"]: r
+        for call in db["upsert"].await_args_list
+        for r in call.args[1]
+    }
 
 
 # --- timestamps ------------------------------------------------------------
@@ -132,7 +149,7 @@ async def test_new_files_go_direct_and_register_only_what_the_store_took(db):
     db["scan"].return_value = _scan(_entry("a.txt", A), _entry("b.bin", B, size=5, is_binary=True), _entry("dup.txt", A))
     db["push"].return_value = {A: {"status": "ok", "http": 200}, B: {"status": "ok", "http": 200}}
 
-    result = await backup.sync_to_db(WS, _sandbox())
+    result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
 
     # One presign and one push item per distinct digest, never per path.
     assert db["presign"].call_count == 2
@@ -147,7 +164,7 @@ async def test_new_files_go_direct_and_register_only_what_the_store_took(db):
     assert rows["b.bin"]["is_binary"] is True and rows["a.txt"]["is_binary"] is False
     assert rows["a.txt"]["permissions"] == "0644"
     assert rows["a.txt"]["sandbox_modified_at"] == micros_to_datetime(NS // 1000)
-    assert result == {"synced": 3, "skipped": 0, "deleted": 0, "errors": 0, "oversized": 0, "total_size": 0}
+    assert result == SyncResult(synced=3, pruned=True)
 
 
 @pytest.mark.asyncio
@@ -156,7 +173,7 @@ async def test_registered_digest_skips_upload_entirely(db):
     db["scan"].return_value = _scan(_entry("a.txt", A))
     db["registered"].return_value = {A}
 
-    await backup.sync_to_db(WS, _sandbox())
+    await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
 
     db["presign"].assert_not_called()
     db["push"].assert_not_awaited()
@@ -170,11 +187,12 @@ async def test_store_rejection_withholds_the_row_and_counts_an_error(db):
     db["scan"].return_value = _scan(_entry("a.txt", A), _entry("b.txt", B))
     db["push"].return_value = {A: {"status": "failed", "http": 403}, B: {"status": "changed", "http": 400}}
 
-    result = await backup.sync_to_db(WS, _sandbox())
+    result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
 
     db["store"].assert_not_awaited()  # no relay after a rejection
     db["upsert"].assert_not_awaited()
-    assert result["errors"] == 2 and result["synced"] == 0
+    assert result.errors == 2 and result.synced == 0
+    assert {(f.path, f.reason) for f in result.unsaved} == {("a.txt", "failed"), ("b.txt", "changed")}
     db["deleter"].assert_awaited_once()
     assert db["deleter"].await_args.args[1] == {"a.txt", "b.txt"}  # paths still active: never pruned
 
@@ -188,12 +206,12 @@ async def test_unreachable_store_falls_back_to_relay_in_the_same_pass(db):
 
     with patch.object(blobs.hashlib, "sha256") as sha:
         sha.return_value.hexdigest.return_value = A
-        result = await backup.sync_to_db(WS, sb)
+        result = await backup.sync_to_db(WS, sb, layout=LAYOUT)
 
-    sb.adownload_file_bytes.assert_awaited_once_with("/workspace/a.txt")
+    sb.adownload_file_bytes.assert_awaited_once_with(f"{LAYOUT.workspace}/a.txt")
     db["store"].assert_awaited_once_with(USER, A, b"\x00" * 3)
     assert _rows(db)["a.txt"]["blob_sha256"] == A
-    assert result["errors"] == 0
+    assert result.errors == 0
 
 
 @pytest.mark.asyncio
@@ -206,7 +224,7 @@ async def test_relay_mode_and_unpresignable_store_never_push(db):
         sb = _sandbox(setup.get("provider", "daytona"))
         with patch.object(blobs.hashlib, "sha256") as sha:
             sha.return_value.hexdigest.return_value = A
-            await backup.sync_to_db(WS, sb)
+            await backup.sync_to_db(WS, sb, layout=LAYOUT)
         db["push"].assert_not_awaited()
         db["store"].assert_awaited_once()
 
@@ -222,13 +240,13 @@ async def test_unchanged_pointer_row_with_new_mode_is_refreshed_without_bytes(db
                   "blob_sha256": A, "is_binary": False, "mime_type": "text/plain"},
     }
 
-    result = await backup.sync_to_db(WS, _sandbox())
+    result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
 
     db["registered"].assert_not_awaited()
     db["push"].assert_not_awaited()
     row = _rows(db)["a.txt"]
     assert row["permissions"] == "0600" and row["blob_sha256"] == A
-    assert result["skipped"] == 1 and result["synced"] == 1
+    assert result.skipped == 1 and result.synced == 1
 
 
 @pytest.mark.asyncio
@@ -240,7 +258,7 @@ async def test_unchanged_inline_row_only_gets_its_mtime_refreshed(db):
                   "blob_sha256": None},
     }
 
-    await backup.sync_to_db(WS, _sandbox())
+    await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
 
     db["upsert"].assert_not_awaited()
     db["mtimes"].assert_awaited_once()
@@ -260,7 +278,7 @@ async def test_unchanged_inline_row_persists_a_mode_only_change(db):
                   "blob_sha256": None},
     }
 
-    await backup.sync_to_db(WS, _sandbox())
+    await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
 
     db["upsert"].assert_not_awaited()
     (path, when, perms), = db["mtimes"].await_args.args[1]
@@ -303,10 +321,10 @@ async def test_same_microsecond_stamp_is_a_pure_skip(db):
         "a.txt": {"kind": "file", "file_size": 3, "content_hash": A, "mtime_ns": NS, "permissions": "0644",
                   "blob_sha256": A},
     }
-    result = await backup.sync_to_db(WS, _sandbox())
+    result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     db["upsert"].assert_not_awaited()
     db["mtimes"].assert_not_awaited()
-    assert result["skipped"] == 1
+    assert result.skipped == 1
 
 
 @pytest.mark.asyncio
@@ -315,7 +333,7 @@ async def test_directories_and_symlinks_become_rows_without_content(db):
         _entry("empty", kind="dir", mode=0o755),
         _entry("link", kind="symlink", mode=0, target="../t.txt"),
     )
-    await backup.sync_to_db(WS, _sandbox())
+    await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
     db["registered"].assert_not_awaited()
     rows = _rows(db)
     assert rows["empty"]["kind"] == "dir" and rows["empty"]["permissions"] == "0755"
@@ -328,8 +346,36 @@ async def test_directories_and_symlinks_become_rows_without_content(db):
 async def test_scan_read_errors_count_against_a_strict_backup(db):
     db["scan"].return_value = ScanResult([_entry("ok.txt", A)], [], [{"path": "bad", "error": "EACCES"}], 1, 0)
     db["push"].return_value = {A: {"status": "ok"}}
-    result = await backup.sync_to_db(WS, _sandbox())
-    assert result["errors"] == 1 and result["synced"] == 1
+    result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
+    assert result.errors == 1 and result.synced == 1
+    assert result.unsaved == [UnsavedFile("bad", "unreadable")]
+
+
+@pytest.mark.asyncio
+async def test_a_file_over_the_path_cap_is_unsaved_but_not_an_error(db):
+    """Every later sync refuses it the same way, so it is reported apart from
+    the failures a retry can clear, together with the cap that refused it."""
+    db["scan"].return_value = ScanResult([_entry("ok.txt", A)], [{"path": "big.bin", "size": 300}], [], 1, 0)
+    db["push"].return_value = {A: {"status": "ok"}}
+    with patch.object(backup, "scan_cap_bytes", return_value=100):
+        result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
+    assert result.unsaved == [UnsavedFile("big.bin", "too_large", 300)]
+    assert (result.oversized, result.errors, result.max_file_bytes) == (1, 0, 100)
+
+
+@pytest.mark.asyncio
+async def test_a_folder_this_sandbox_never_had_is_not_an_unsaved_file(db):
+    """A sibling that has not rejoined a recreated machine has no folder there.
+    Nothing on the sandbox can be lost, so a strict backup must not abort on
+    it, and nothing was seen, so no mirror row may be pruned on its account."""
+    import errno
+
+    db["scan"].return_value = ScanResult(
+        [], [], [{"path": ".", "errno": errno.ENOENT, "error": "ENOENT"}], 0, 0
+    )
+    result = await backup.sync_to_db(WS, _sandbox(), layout=LAYOUT)
+    assert result.root_missing is True and result.unsaved == []
+    db["deleter"].assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -338,11 +384,24 @@ async def test_storage_off_keeps_bytes_inline(db):
     sb = _sandbox()
     sb.adownload_file_bytes = AsyncMock(side_effect=[b"text", b"\x00\x01"])
     with patch.object(backup, "is_storage_enabled", return_value=False):
-        await backup.sync_to_db(WS, sb)
+        await backup.sync_to_db(WS, sb, layout=LAYOUT)
     db["registered"].assert_not_awaited()
     rows = _rows(db)
     assert rows["a.txt"]["content_text"] == "text" and rows["a.txt"]["blob_sha256"] is None
     assert rows["b.bin"]["content_binary"] == b"\x00\x01" and rows["b.bin"]["is_binary"] is True
+
+
+@pytest.mark.asyncio
+async def test_storage_off_says_why_a_file_went_unsaved(db):
+    """A download that finds nothing means the file left after the scan, which
+    the next pass settles; one that raises is a failure."""
+    db["scan"].return_value = _scan(_entry("gone.txt", A), _entry("broken.txt", B))
+    sb = _sandbox()
+    sb.adownload_file_bytes = AsyncMock(side_effect=[None, OSError("read failed")])
+    with patch.object(backup, "is_storage_enabled", return_value=False):
+        result = await backup.sync_to_db(WS, sb, layout=LAYOUT)
+    assert {(f.path, f.reason) for f in result.unsaved} == {("gone.txt", "changed"), ("broken.txt", "failed")}
+    assert result.synced == 0
 
 
 @pytest.mark.asyncio
@@ -359,7 +418,7 @@ async def test_a_late_nul_is_stored_whole_with_no_store_to_fall_back_on(db):
     sb = _sandbox()
     sb.adownload_file_bytes = AsyncMock(return_value=content)
     with patch.object(backup, "is_storage_enabled", return_value=False):
-        await backup.sync_to_db(WS, sb)
+        await backup.sync_to_db(WS, sb, layout=LAYOUT)
     row = _rows(db)["log.txt"]
     assert row["is_binary"] is True
     assert row["content_text"] is None and row["content_binary"] == content
@@ -406,7 +465,7 @@ async def test_restore_pulls_pointer_rows_and_structure_in_one_runtime_call(rest
     sb.acreate_directories = AsyncMock(return_value=True)
     sb.aupload_file_bytes = AsyncMock(return_value=True)
 
-    result = await restore.restore_to_sandbox(WS, sb)
+    result = await restore.restore_to_sandbox(WS, sb, layout=LAYOUT)
 
     first = restore_db["pull"].await_args_list[0]
     by_path = {i["path"]: i for i in first.args[1]}
@@ -415,19 +474,21 @@ async def test_restore_pulls_pointer_rows_and_structure_in_one_runtime_call(rest
     assert by_path["a.txt"]["mtime_ns"] == (NS // 1000) * 1000
     assert by_path["d"]["url"] is None and by_path["l"]["symlink_target"] == "a.txt"
     # A relay pass follows, so the first op leaves the directories open.
-    assert first.kwargs == {"defer_dir_modes": True}
+    assert first.kwargs == {"defer_dir_modes": True, "layout": LAYOUT}
     # The legacy inline row went through the server to a staging name; the
     # placement op verifies and moves it, and closes the directory after it.
     uploads = [c.args[0] for c in sb.aupload_file_bytes.await_args_list]
-    assert "/workspace/old.txt" not in uploads
-    (staged,) = [p for p in uploads if p.startswith("/workspace/.wsfiles-relay-")]
+    assert f"{LAYOUT.workspace}/old.txt" not in uploads
+    (staged,) = [
+        p for p in uploads if p.startswith(f"{LAYOUT.workspace}/.wsfiles-relay-")
+    ]
     placement = restore_db["pull"].await_args_list[1].args[1]
     old = restore._pull_item(_row("old.txt", text="inline"), url=None)
     # Size and digest describe the bytes relayed, not the row: this fixture's
     # own file_size is stale, the shape a row written before file_size came
     # from the content itself is in.
     old.update({
-        "file": staged.removeprefix("/workspace/"),
+        "file": staged.removeprefix(f"{LAYOUT.workspace}/"),
         "sha256": hashlib.sha256(b"inline").hexdigest(),
         "size": len(b"inline"),
     })
@@ -448,12 +509,12 @@ async def test_restore_unreachable_store_relays_and_a_mismatch_is_an_error(resto
     sb.acreate_directories = AsyncMock(return_value=True)
     sb.aupload_file_bytes = AsyncMock(return_value=True)
     with patch.object(resolve, "fetch_blob", new=AsyncMock(return_value=b"abc")) as fetch:
-        result = await restore.restore_to_sandbox(WS, sb)
+        result = await restore.restore_to_sandbox(WS, sb, layout=LAYOUT)
     assert fetch.await_count == 2
     assert result == {"restored": 2, "errors": 0}
 
     restore_db["pull"].side_effect = [{"a.txt": {"status": "mismatch"}, "b.txt": {"status": "ok"}}]
-    result = await restore.restore_to_sandbox(WS, sb)
+    result = await restore.restore_to_sandbox(WS, sb, layout=LAYOUT)
     assert result == {"restored": 1, "errors": 1}
     assert restore_db["flag"].await_args.args == (WS, True)
 
@@ -466,7 +527,7 @@ async def test_restore_relay_mode_never_presigns(restore_db):
     sb.acreate_directories = AsyncMock(return_value=True)
     sb.aupload_file_bytes = AsyncMock(return_value=True)
     with patch.object(resolve, "fetch_blob", new=AsyncMock(return_value=b"abc")):
-        result = await restore.restore_to_sandbox(WS, sb)
+        result = await restore.restore_to_sandbox(WS, sb, layout=LAYOUT)
     restore_db["sign"].assert_not_called()
     assert result == {"restored": 1, "errors": 0}
 
@@ -540,3 +601,138 @@ async def test_transfer_op_without_a_result_line_is_a_runtime_error():
     sandbox = _exec_sandbox(("Traceback: boom\n", 1))
     with pytest.raises(transfer.TransferRuntimeError):
         await transfer.run_transfer_op(sandbox, "scan", {"root": "/home/workspace"}, timeout_s=30)
+
+
+# --- multipart assembly -------------------------------------------------------
+
+_SHA = "a" * 64
+
+
+def _multipart_result(sent_sha256, parts=(1, 2, 3)):
+    result = {"status": "ok", "etags": [[n, f"etag-{n}"] for n in parts]}
+    if sent_sha256 is not None:
+        result["sent_sha256"] = sent_sha256
+    return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "status"),
+    [
+        (_multipart_result(_SHA), "ok"),
+        # Parts are signed for length only: same-sized different bytes would
+        # otherwise land under this digest's key.
+        (_multipart_result("b" * 64), "changed"),
+        (_multipart_result(None), "failed"),
+        (_multipart_result(_SHA, parts=(1, 3)), "failed"),
+    ],
+    ids=["digest-matches", "sent-other-bytes", "no-sent-digest", "missing-part"],
+)
+async def test_multipart_assembles_only_the_digests_own_bytes(result, status):
+    with (
+        patch.object(blobs, "complete_multipart_upload", return_value=True) as complete,
+        patch.object(blobs, "abort_multipart_upload", return_value=True) as abort,
+        patch.object(blobs, "sha256_object", return_value=_SHA),
+    ):
+        settled = await blobs._settle_multipart(
+            USER, {_SHA: ("upload-1", 3)}, {_SHA: result}
+        )
+    assert settled[_SHA]["status"] == status
+    assert complete.called is (status == "ok")
+    assert abort.called is (status != "ok")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("held", "deleted", "error"),
+    [
+        ("b" * 64, True, "assembled object does not match its digest"),
+        (None, False, "assembled object could not be read back"),
+    ],
+    ids=["forged-digest", "unreadable"],
+)
+async def test_an_assembled_object_counts_only_once_its_bytes_hash_to_the_digest(held, deleted, error):
+    """The runtime's sent_sha256 is its own word; the store holds the truth."""
+    with (
+        patch.object(blobs, "complete_multipart_upload", return_value=True),
+        patch.object(blobs, "abort_multipart_upload", return_value=True),
+        patch.object(blobs, "sha256_object", return_value=held),
+        patch.object(blobs, "delete_object", return_value=True) as delete,
+    ):
+        settled = await blobs._settle_multipart(
+            USER, {_SHA: ("upload-1", 3)}, {_SHA: _multipart_result(_SHA)}
+        )
+    assert settled[_SHA]["status"] == "failed"
+    assert settled[_SHA]["error"] == error
+    assert delete.called is deleted
+
+
+@pytest.mark.asyncio
+async def test_a_file_too_large_for_one_put_is_withheld_when_the_store_will_not_split_it():
+    huge = ScanEntry("data/huge.bin", "file", blobs.SINGLE_PUT_MAX_BYTES + 1, 1, 0o644, "c" * 64, None, True)
+    small = ScanEntry("data/small.bin", "file", 10, 1, 0o644, "d" * 64, None, True)
+    with (
+        patch.object(blobs, "get_signed_upload_url", return_value=("https://store/x", {})),
+        patch.object(blobs, "create_signed_multipart_upload", return_value=None),
+    ):
+        items, uploads, withheld = await blobs._sign_push_items(
+            USER, WS, {"c" * 64: huge, "d" * 64: small}, expires=60, unlink_after=False
+        )
+    assert [i["sha256"] for i in items] == ["d" * 64]
+    assert uploads == {}
+    assert withheld["c" * 64]["status"] == "failed"
+
+
+def test_a_row_of_unknown_size_is_pulled_as_unknown_not_as_empty():
+    """Zero would admit it free of the runtime's byte budget and then fail its
+    real bytes as a size mismatch; unknown is charged whole and checked by digest."""
+    row = {"file_path": "old.bin", "kind": "file", "blob_sha256": "e" * 64, "file_size": None}
+    assert restore._pull_item(row, url="https://store/x")["size"] is None
+    assert restore._pull_item({**row, "file_size": 0}, url=None)["size"] == 0
+
+
+class TestLiveDownloadLink:
+    """The link is an optimization over the download route, which streams any
+    size, so a file the export cannot store falls back rather than failing."""
+
+    MOD = "src.server.services.persistence.download_link"
+    WS = {"workspace_id": "ws-1", "user_id": "u-1"}
+
+    def _entry(self, size: int) -> ScanEntry:
+        return ScanEntry("big.bin", "file", size, 1, 0o644, "a" * 64, None, True)
+
+    async def _link(self, size: int, *, cap, persisted, hashed=None):
+        from src.server.services.persistence import download_link
+
+        hashed = hashed or AsyncMock(return_value=self._entry(size))
+        with (
+            patch(f"{self.MOD}.is_storage_enabled", return_value=True),
+            patch(f"{self.MOD}.get_file_locator", AsyncMock(return_value=None)),
+            patch(f"{self.MOD}.hash_one_file", hashed),
+            patch(f"{self.MOD}.scan_cap_bytes", return_value=cap),
+            patch(f"{self.MOD}._persist_blobs", AsyncMock(return_value=persisted)) as push,
+            patch(f"{self.MOD}._sign", AsyncMock(return_value="https://signed")),
+        ):
+            url = await download_link.live_download_link(
+                self.WS, MagicMock(), "big.bin", layout=SandboxLayout()
+            )
+        return url, push
+
+    @pytest.mark.asyncio
+    async def test_file_the_route_can_serve_falls_back_when_the_export_fails(self):
+        changed = UnsavedFile(path="big.bin", size=50 << 20, reason="changed")
+        url, _ = await self._link(50 << 20, cap=None, persisted=([], [changed]))
+        assert url is None
+
+    @pytest.mark.asyncio
+    async def test_relay_mode_falls_back_to_the_stream_without_exporting(self):
+        url, push = await self._link(300 << 20, cap=256 << 20, persisted=([], []))
+        assert url is None
+        push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_hash_that_raises_falls_back_without_exporting(self):
+        failing = AsyncMock(side_effect=RuntimeError("transfer op timed out"))
+        url, push = await self._link(50 << 20, cap=None, persisted=([], []), hashed=failing)
+        assert url is None
+        push.assert_not_awaited()

@@ -14,6 +14,7 @@ const TOKEN = 'tok-abc';
 const THREAD_ID = 'th-s1';
 
 const sharedMetadata = {
+  kind: 'thread',
   thread_id: THREAD_ID,
   title: 'Shared Analysis',
   workspace_name: 'Research',
@@ -171,7 +172,7 @@ test.describe('SharedChat page', () => {
 
     // Error message for 404
     await expect(
-      page.getByText('This shared conversation is no longer available.')
+      page.getByText("You don't have access, or this link is unavailable")
     ).toBeVisible({ timeout: 10000 });
 
     // "Go to LangAlpha" link

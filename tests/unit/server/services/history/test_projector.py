@@ -64,6 +64,47 @@ def test_reasoning_blocks_split_from_text():
     assert items[-1]["data"]["finish_reason"] == "stop"
 
 
+def test_text_phase_rides_the_replayed_chunk():
+    msg = AIMessage(
+        content=[{"type": "text", "text": "the answer", "phase": "final_answer"}],
+        id="ai-1",
+    )
+    items = _sse([msg])
+    assert items[0]["data"]["phase"] == "final_answer"
+
+
+def test_disagreeing_text_phases_omit_the_key():
+    # The blocks are joined into one chunk, so a single phase would misdescribe
+    # half of it. Splitting the run per phase is a later change.
+    msg = AIMessage(
+        content=[
+            {"type": "text", "text": "hold on ", "phase": "commentary"},
+            {"type": "text", "text": "the answer", "phase": "final_answer"},
+        ],
+        id="ai-1",
+    )
+    items = _sse([msg])
+    assert items[0]["data"]["content"] == "hold on the answer"
+    assert "phase" not in items[0]["data"]
+
+
+def test_a_phaseless_block_beside_a_phased_one_omits_the_key():
+    msg = AIMessage(
+        content=[
+            {"type": "text", "text": "hold on ", "phase": "commentary"},
+            {"type": "text", "text": "the answer"},
+        ],
+        id="ai-1",
+    )
+    items = _sse([msg])
+    assert "phase" not in items[0]["data"]
+
+
+def test_phaseless_text_omits_the_key():
+    items = _sse([AIMessage(content=[{"type": "text", "text": "plain"}], id="ai-1")])
+    assert "phase" not in items[0]["data"]
+
+
 def test_tool_call_suppresses_stop_finish():
     msg = AIMessage(
         content="running a tool",
@@ -448,6 +489,36 @@ def test_market_watch_stamp_is_skipped():
     )
     assert [i["event"] for i in items] == ["message_chunk"]
     assert items[0]["data"]["content"] == "ok"
+
+
+def test_runtime_update_row_is_hidden_and_opens_no_run():
+    """A durable row is a real message in history now, so the projector has to
+    recognize the writer's own stamp rather than a marker in the text."""
+    from ptc_agent.agent.middleware.runtime_context import (
+        DurableUpdate,
+        build_update_message,
+    )
+    from src.server.services.history.projector import is_run_boundary_message
+
+    row = build_update_message(
+        DurableUpdate(
+            kind="agent_md_changed",
+            schema_version=1,
+            text="+ a Thread Index section",
+            provenance={"source": "sandbox", "writer": "subagent:research"},
+        )
+    )
+    row.id = "runtime-update-1"
+
+    # It never surfaces as user input, in the main transcript or in a task one.
+    assert _sse([row, AIMessage(content="ok", id="ai-1")]) == _sse(
+        [AIMessage(content="ok", id="ai-1")]
+    )
+    assert _sse([row], agent="task:abc123") == []
+
+    # And it never opens a run: a run opened here would start mid-turn.
+    assert not is_run_boundary_message(row)
+    assert is_run_boundary_message(HumanMessage(content="what moved?", id="h-1"))
 
 
 def test_stamped_steering_message_projects_delivered():

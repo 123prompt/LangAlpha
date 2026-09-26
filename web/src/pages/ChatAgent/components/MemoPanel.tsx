@@ -38,6 +38,7 @@ import {
 import { useWorkspaces } from '../../../hooks/useWorkspaces';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { formatBytes } from '@/lib/format';
 import {
   deleteUserMemo,
   triggerUserMemoDownload,
@@ -47,6 +48,7 @@ import {
 } from '../utils/api';
 import Markdown from './Markdown';
 import { MEMO_USER_DIR } from '../utils/agentPaths';
+import type { FileLocation, OpenFileHandler } from '../utils/fileLocation';
 import './FilePanel.css';
 
 // --- Constants -------------------------------------------------------------
@@ -72,13 +74,6 @@ const ACCEPTED_EXTENSIONS = new Set<string>([
 const ACCEPT_ATTR = '.md,.txt,.csv,.json,.pdf,text/markdown,text/plain,text/csv,application/json,application/pdf';
 
 // --- Helpers ---------------------------------------------------------------
-
-function formatBytes(n: number): string {
-  if (!n) return '0 B';
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(2)} MB`;
-}
 
 function formatDate(iso: string | null): string {
   if (!iso) return '';
@@ -152,7 +147,7 @@ function errToString(err: unknown): string {
 }
 
 // --- Layout breakpoints (panel-relative, not viewport) -------------------
-// The memo panel lives inside RightPanel which the user can resize, so the
+// The memo panel lives in the file panel, which the user can resize, so the
 // breakpoints are container-relative. Tracked via ResizeObserver.
 const BREAK_HIDE_PROVENANCE = 520; // below this, hide the workspace · path subline
 const BREAK_HIDE_TYPE = 640;       // below this, hide the Type column
@@ -326,7 +321,7 @@ interface MemoPanelProps {
   /** Routes a clicked link inside the rendered memo body through the
    * parent's path-aware router. Bare sibling slugs are resolved against
    * the memo dir before calling. */
-  onOpenFile?: (path: string, workspaceId?: string) => void;
+  onOpenFile?: OpenFileHandler;
 }
 
 export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: MemoPanelProps = {}) {
@@ -341,7 +336,7 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
   // href containing a `/` (e.g. `reports/q1.pdf`) is a sandbox file
   // referenced from the memo body and must pass through to file routing.
   const handleBodyLinkOpen = useCallback(
-    (href: string, wsId?: string) => {
+    (href: string, wsId?: string, location?: FileLocation) => {
       if (!onOpenFile || !href) return;
       const isAlreadyQualified =
         href.startsWith('.agents/') ||
@@ -349,7 +344,7 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
         href.startsWith('/') ||
         /^[a-z][a-z0-9+.-]*:/i.test(href);
       if (isAlreadyQualified) {
-        onOpenFile(href, wsId);
+        onOpenFile(href, wsId, location);
         return;
       }
       const clean = href.replace(/^\.\//, '');
@@ -357,10 +352,10 @@ export default function MemoPanel({ targetKey, onTargetHandled, onOpenFile }: Me
       // (or a 404 in the file panel) handles it instead of fabricating a
       // bogus `.agents/user/memo/reports/q1.pdf` path.
       if (clean.includes('/')) {
-        onOpenFile(clean, wsId);
+        onOpenFile(clean, wsId, location);
         return;
       }
-      onOpenFile(`${MEMO_USER_DIR}/${clean}`, wsId);
+      onOpenFile(`${MEMO_USER_DIR}/${clean}`, wsId, location);
     },
     [onOpenFile],
   );

@@ -11,8 +11,6 @@ export interface UseWorkspaceMutationOptions<A> {
   mutationFn: (wsId: string, args: A) => Promise<unknown>;
   /** Optional cache patch applied optimistically before the request; rolled back on error. */
   optimisticPatch?: (args: A) => Record<string, unknown>;
-  /** Also invalidate the per-tier quota query on success. */
-  invalidateQuota?: boolean;
   /** i18n key for the failure toast title. */
   errorTitleKey: string;
   /** Map an error to the failure toast description (defaults to formatApiErrorDetail). */
@@ -28,7 +26,7 @@ export interface UseWorkspaceMutationResult<A> {
 
 /**
  * Shared skeleton for per-workspace mutations: race-safe busy tracking →
- * optimistic patch → request → invalidate lists + detail (+quota) → rollback +
+ * optimistic patch → request → invalidate lists + detail → rollback +
  * console.error + toast on error → clear busy. Success side effects (closing a
  * dialog, success toast) stay with the caller, gated on the returned boolean.
  */
@@ -43,7 +41,7 @@ export function useWorkspaceMutation<A>(
 
   const run = useCallback(
     async (wsId: string, args: A): Promise<boolean> => {
-      const { mutationFn, optimisticPatch, invalidateQuota, errorTitleKey, mapError } = optionsRef.current;
+      const { mutationFn, optimisticPatch, errorTitleKey, mapError } = optionsRef.current;
 
       // Dedupe inside the functional update so a fast double-submit (two calls in
       // one render frame, both seeing a stale closure) can't fire twice.
@@ -59,7 +57,6 @@ export function useWorkspaceMutation<A>(
         await mutationFn(wsId, args);
         queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
         queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.detail(wsId) });
-        if (invalidateQuota) queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
         return true;
       } catch (err) {
         if (previous) rollbackCachedWorkspaces(queryClient, previous);

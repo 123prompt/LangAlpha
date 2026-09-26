@@ -19,7 +19,7 @@ def _normalize(path: str, work_dir: str = "/home/workspace") -> str:
     Reached through the middleware's configured work_dir rather than a literal
     so a change to how that is stored shows up here too.
     """
-    mw = FileOperationMiddleware(on_agent_md_write=lambda: None, work_dir=work_dir)
+    mw = FileOperationMiddleware(on_agent_md_write=lambda _stamp=None: None, work_dir=work_dir)
     return workspace_relative_path(path, mw._work_dir)
 
 

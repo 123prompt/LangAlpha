@@ -7,14 +7,13 @@ import type { FallbackSuggestion } from '../../session/types';
    had trouble and a fallback answered the last turn. Offer
    adopting the working model. Persistent (survives
    stream end + reload) until dismissed, switched, or a
-   new turn starts. Gated on nextSendModel — the input's
-   live selection — because that is what the next send
-   re-uses, regardless of the durable preference. */
+   new turn starts. Gated on nextSendModel, the input's
+   live selection, because that is what the next send
+   uses. */
 export function FallbackSuggestionPill({
   fallbackSuggestion,
   isLoading,
   inputModel,
-  lastThreadModel,
   activePreferredModel,
   onSwitchModel,
   onDismiss,
@@ -22,18 +21,14 @@ export function FallbackSuggestionPill({
   fallbackSuggestion: FallbackSuggestion | null;
   isLoading: boolean;
   inputModel: string | null;
-  lastThreadModel: string | null;
   activePreferredModel: string | null;
   onSwitchModel: (model: string) => void;
   onDismiss: () => void;
 }): React.ReactElement | null {
   const { t } = useTranslation();
-  // The model the NEXT send will actually use: the chat input's live
-  // selection, falling back to its initializer (thread's last model, then the
-  // mode's preferred model) until it reports in. The suggestion pill gates on
-  // this — not on the durable preference, which a thread's own model overrides
-  // on every send.
-  const nextSendModel = inputModel ?? (lastThreadModel || activePreferredModel);
+  // The input seeds from and follows the mode's preferred model, so that
+  // stands in until the input reports its selection.
+  const nextSendModel = inputModel ?? activePreferredModel;
   if (!(fallbackSuggestion && !isLoading && fallbackSuggestion.toModel !== nextSendModel)) {
     return null;
   }

@@ -3,6 +3,10 @@ You are LangAlpha Agent, created by Ginlix AI. You are an investment research ag
 <task_workflow>
 {% include 'components/task_workflow.md.j2' %}
 </task_workflow>
+
+<working_with_the_user>
+{% include 'components/working_with_the_user.md.j2' %}
+</working_with_the_user>
 {% if plan_mode | default(false) %}
 <plan_mode>
 {% include 'components/plan_mode.md.j2' %}
@@ -42,6 +46,10 @@ You are LangAlpha Agent, created by Ginlix AI. You are an investment research ag
 <subagent_coordination>
 {% include 'components/subagent_coordination.md.j2' %}
 </subagent_coordination>
+
+<time_rules>
+{% include 'components/time_rules.md.j2' %}
+</time_rules>
 
 <data_processing>
 {% include 'components/data_processing.md.j2' %}

@@ -41,6 +41,12 @@ describe('PluginDialog dismissable', () => {
 
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(2);
+
+    const backdrop = screen.getByRole('dialog').parentElement as HTMLElement;
+    fireEvent.mouseDown(backdrop);
+    fireEvent.mouseUp(backdrop);
+    fireEvent.click(backdrop);
+    expect(onClose).toHaveBeenCalledTimes(3);
   });
 
   it('withdraws the close button when not dismissable', () => {
@@ -63,6 +69,7 @@ describe('PluginDialog dismissable', () => {
     expect(backdrop).toBeTruthy();
     expect(container).toBeTruthy();
     fireEvent.mouseDown(backdrop);
+    fireEvent.mouseUp(backdrop);
     fireEvent.click(backdrop);
     expect(onClose).not.toHaveBeenCalled();
   });
@@ -71,8 +78,10 @@ describe('PluginDialog dismissable', () => {
     open(true, vi.fn());
     // The body is a capped flex child with its own scroll, so a report longer
     // than the viewport cannot push its own Done button off both ends.
-    const body = screen.getByText('inside').closest('.overflow-y-auto');
+    const body = screen.getByText('inside').closest('.overflow-y-auto') as HTMLElement | null;
     expect(body).toBeTruthy();
-    expect(screen.getByRole('dialog').className).toMatch(/max-h-/);
+    // The cap sits on the measured wrapper the shell animates its height to.
+    const capped = body!.parentElement as HTMLElement;
+    expect(capped.style.maxHeight).toMatch(/vh$/);
   });
 });

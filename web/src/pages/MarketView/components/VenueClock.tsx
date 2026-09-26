@@ -5,7 +5,7 @@
  * agree on whose wall clock is shown.
  */
 import { memo, useEffect, useState } from 'react';
-import { utcOffsetLabel } from '@/lib/utils';
+import { formatUtcOffset, utcOffsetMinutes } from '@/lib/timezones';
 
 // Memoized: ticks itself once a second; parent chart re-renders shouldn't add
 // extra toLocaleTimeString/Intl work on top.
@@ -23,7 +23,7 @@ export default memo(function VenueClock({ tz }: { tz: string }) {
   return (
     <span className="venue-clock" title={tz}>
       <span className="venue-clock-time">{time}</span>
-      <span className="venue-clock-offset">{utcOffsetLabel(tz, now)}</span>
+      <span className="venue-clock-offset">{formatUtcOffset(utcOffsetMinutes(tz, now))}</span>
     </span>
   );
 });

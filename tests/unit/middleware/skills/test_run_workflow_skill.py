@@ -95,7 +95,7 @@ def test_tool_hidden_until_skill_loaded():
 
 def test_manifest_advertises_skill_and_gated_tool():
     middleware = SkillsMiddleware(mode="ptc")
-    manifest = middleware._build_combined_manifest({})
+    manifest = middleware.build_manifest({})
     assert f"**{SKILL_NAME}**" in manifest
     assert f"(tools: {TOOL_NAME})" in manifest
 
@@ -115,7 +115,7 @@ def test_build_gate_drop_ungates_nothing():
     build_registry.pop(SKILL_NAME, None)
     middleware = SkillsMiddleware(skill_registry=build_registry, mode="ptc")
     assert TOOL_NAME not in middleware._tool_to_skills
-    manifest = middleware._build_combined_manifest({})
+    manifest = middleware.build_manifest({})
     assert f"**{SKILL_NAME}**" not in manifest
 
 
@@ -157,4 +157,4 @@ async def test_gated_skill_is_not_rediscovered_from_the_sandbox(monkeypatch):
 
     update = await middleware.abefore_agent({}, MagicMock(), config=None)
     assert update["discovered_skills"] == []
-    assert f"**{SKILL_NAME}**" not in (middleware._build_combined_manifest(update) or "")
+    assert f"**{SKILL_NAME}**" not in (middleware.build_manifest(update) or "")

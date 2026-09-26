@@ -45,6 +45,20 @@ describe('FileErrorDisplay', () => {
     expect(screen.queryByText('filePanel.error.download')).not.toBeInTheDocument();
   });
 
+  // The binary hint ends "but you can download it". With no handler there is no
+  // button to keep that promise, so the sentence loses the clause instead.
+  it('drops the download offer, and the copy promising it, with no handler', () => {
+    render(<FileErrorDisplay error={{ category: 'binary_file' }} />);
+    expect(screen.queryByText('filePanel.error.download')).not.toBeInTheDocument();
+    expect(screen.getByText('filePanel.error.binaryFileNoDownloadHint')).toBeInTheDocument();
+    expect(screen.queryByText('filePanel.error.binaryFileHint')).not.toBeInTheDocument();
+  });
+
+  it('keeps the download copy when a handler is given', () => {
+    render(<FileErrorDisplay error={{ category: 'binary_file' }} onDownload={vi.fn()} />);
+    expect(screen.getByText('filePanel.error.binaryFileHint')).toBeInTheDocument();
+  });
+
   it('hides retry button when onRetry is not provided', () => {
     render(<FileErrorDisplay error={{ category: 'unknown' }} />);
     expect(screen.queryByText('filePanel.error.retry')).not.toBeInTheDocument();

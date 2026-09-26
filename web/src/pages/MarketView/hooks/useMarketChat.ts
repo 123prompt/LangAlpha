@@ -29,8 +29,9 @@ interface ReasoningProcess {
   isReasoning: boolean;
   reasoningComplete: boolean;
   order: number;
-  reasoningTitle?: string | null;
+  _startedAt?: number;
   _completedAt?: number;
+  elapsedMs?: number;
 }
 
 interface ToolCallResult {
@@ -66,6 +67,9 @@ export interface MarketChatMessage {
   contentType: string;
   timestamp: string;
   isStreaming?: boolean;
+  /** When the client saw this turn stop. `MessageList` renders these messages
+   *  too, and its turn fold measures the turn against this. */
+  completionObservedAt?: number;
   error?: string;
   attachments?: AttachmentMeta[];
   contentSegments?: ContentSegment[];
@@ -209,7 +213,9 @@ export function useMarketChat(): UseMarketChatReturn {
   /**
    * Handles reasoning signal events
    */
-  function handleReasoningSignal({ assistantMessageId, signalContent }: { assistantMessageId: string; signalContent: string }): boolean {
+  function handleReasoningSignal({ assistantMessageId, signalContent, elapsedMs }: { assistantMessageId: string; signalContent: string; elapsedMs?: number }): boolean {
+    // Stamped here, not inside the updaters: React may run those later.
+    const now = Date.now();
     if (signalContent === 'start') {
       const reasoningId = `reasoning-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       currentReasoningIdRef.current = reasoningId;
@@ -237,6 +243,7 @@ export function useMarketChat(): UseMarketChatReturn {
               isReasoning: true,
               reasoningComplete: false,
               order: currentOrder,
+              _startedAt: now,
             },
           };
 
@@ -257,13 +264,14 @@ export function useMarketChat(): UseMarketChatReturn {
             if (msg.id !== assistantMessageId) return msg;
 
             const reasoningProcesses = { ...(msg.reasoningProcesses || {}) };
-            if (reasoningProcesses[reasoningId]) {
+            const open = reasoningProcesses[reasoningId];
+            if (open) {
               reasoningProcesses[reasoningId] = {
-                ...reasoningProcesses[reasoningId],
+                ...open,
                 isReasoning: false,
                 reasoningComplete: true,
-                reasoningTitle: null,
-                _completedAt: Date.now(),
+                _completedAt: now,
+                elapsedMs: elapsedMs ?? (open._startedAt ? now - open._startedAt : undefined),
               };
             }
 
@@ -459,6 +467,7 @@ export function useMarketChat(): UseMarketChatReturn {
               handleReasoningSignal({
                 assistantMessageId,
                 signalContent,
+                elapsedMs: typeof event.elapsed_ms === 'number' ? event.elapsed_ms : undefined,
               });
             }
             // Handle reasoning content
@@ -522,6 +531,11 @@ export function useMarketChat(): UseMarketChatReturn {
                   ...msg,
                   error: errorMessage,
                   isStreaming: false,
+                  // The turn fold reads this to say how long the turn took, and
+                  // this panel is a `MessageList` host like any other. Kept if
+                  // already set: the error callback and the catch below can both
+                  // run for one turn, and the first stop is the real one.
+                  completionObservedAt: msg.completionObservedAt ?? Date.now(),
                 };
               })
             );
@@ -544,6 +558,7 @@ export function useMarketChat(): UseMarketChatReturn {
             return {
               ...msg,
               isStreaming: false,
+              completionObservedAt: msg.completionObservedAt ?? Date.now(),
             };
           })
         );
@@ -583,6 +598,7 @@ export function useMarketChat(): UseMarketChatReturn {
             return {
               ...msg,
               isStreaming: false,
+              completionObservedAt: msg.completionObservedAt ?? Date.now(),
             };
           })
         );

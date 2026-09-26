@@ -175,6 +175,9 @@ def _client_ns(tmp_path, mode, transport="stdio"):
     code = ToolFunctionGenerator().generate_mcp_client_code(
         [config], working_dir=str(tmp_path)
     )
+    config_path = tmp_path / ".agents/tools/mcp_client_config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"workspace_id": "test", "servers": {"fake": {}}}))
     ns = {"__name__": "mcp_client_under_test"}
     exec(compile(code, "mcp_client.py", "exec"), ns)  # noqa: S102
     ns["_PROBE_TIMEOUT"] = 1.0  # keep silence/timeout scenarios fast

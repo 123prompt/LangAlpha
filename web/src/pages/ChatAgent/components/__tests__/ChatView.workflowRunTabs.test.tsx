@@ -121,7 +121,6 @@ vi.mock('../../hooks/useChatMessages', async (importOriginal) => ({
     tokenUsage: null,
     threadId: THREAD_ID,
     threadModels: [],
-    lastThreadModel: null,
     marketWatch: null,
     isShared: false,
     insertNotification: vi.fn(),

@@ -4,9 +4,10 @@
  */
 
 import { isToolResultFailure, toolNameOf } from '../subagents/subagentStatus';
+import { ownerOfToolCall } from '../toolCallOwner';
 import { isTaskAgentId } from '../../utils/agentId';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
-import type { SubagentTaskRecord } from '@/types/chat';
+import type { SubagentTaskRecord, TextSegment } from '@/types/chat';
 import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
 import type { PairState } from '../types';
 
@@ -202,13 +203,14 @@ export function handleHistoryUserMessage({
 }
 
 /** Handles reasoning signal events ('start' | 'complete') in history replay. */
-export function handleHistoryReasoningSignal({ assistantMessageId, signalContent, pairIndex, pairState, setMessages, eventId }: {
+export function handleHistoryReasoningSignal({ assistantMessageId, signalContent, pairIndex, pairState, setMessages, eventId, elapsedMs }: {
   assistantMessageId: string;
   signalContent: string;
   pairIndex: number;
   pairState: PairState;
   setMessages: SetMessages;
   eventId?: number | null;
+  elapsedMs?: number;
 }): boolean {
   if (signalContent === 'start') {
     const reasoningId = `history-reasoning-${pairIndex}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -261,6 +263,7 @@ export function handleHistoryReasoningSignal({ assistantMessageId, signalContent
               isReasoning: false,
               reasoningComplete: true,
               _completedAt: 1,
+              elapsedMs,
             };
           }
 
@@ -313,13 +316,14 @@ export function handleHistoryReasoningContent({ assistantMessageId, content, pai
 }
 
 /** Handles text content chunks and finish_reason in history replay. */
-export function handleHistoryTextContent({ assistantMessageId, content, finishReason, pairState, setMessages, eventId }: {
+export function handleHistoryTextContent({ assistantMessageId, content, finishReason, pairState, setMessages, eventId, phase }: {
   assistantMessageId: string;
   content: string;
   finishReason: string | undefined;
   pairState: PairState;
   setMessages: SetMessages;
   eventId?: number | null;
+  phase?: TextSegment['phase'];
 }): boolean {
   if (content) {
     const currentOrder = eventId != null ? eventId : ++pairState.contentOrderCounter;
@@ -334,6 +338,7 @@ export function handleHistoryTextContent({ assistantMessageId, content, finishRe
             type: 'text',
             content,
             order: currentOrder,
+            ...(phase ? { phase } : {}),
           },
         ];
 
@@ -448,9 +453,12 @@ export function handleHistoryToolCallResult({ assistantMessageId, toolCallId, re
     return false;
   }
 
-  setMessages((prev: MessageRecord[]) =>
-    prev.map((msg: MessageRecord) => {
-      if (msg.id !== assistantMessageId) return msg;
+  setMessages((prev: MessageRecord[]) => {
+    // The message that made the call, which is an earlier one whenever a gate
+    // stopped it: the resume answers it in the next turn.
+    const targetId = ownerOfToolCall(prev, toolCallId) ?? assistantMessageId;
+    return prev.map((msg: MessageRecord) => {
+      if (msg.id !== targetId) return msg;
 
       const toolCallProcesses = { ...((msg.toolCallProcesses as Record<string, Record<string, unknown>>) || {}) };
       const subagentTasks = { ...((msg.subagentTasks as Record<string, SubagentTaskRecord>) || {}) };
@@ -485,8 +493,8 @@ export function handleHistoryToolCallResult({ assistantMessageId, toolCallId, re
         toolCallProcesses,
         subagentTasks,
       };
-    })
-  );
+    });
+  });
 
   return true;
 }

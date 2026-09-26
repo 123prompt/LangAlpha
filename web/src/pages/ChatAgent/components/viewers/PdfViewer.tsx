@@ -1,4 +1,5 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { useStableHandler } from '@/hooks/useStableHandler';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -13,9 +14,13 @@ const DEFAULT_ZOOM_INDEX = 2; // 1.0
 
 interface PdfViewerProps {
   data: ArrayBuffer | Uint8Array;
+  /** Page a reference pointed at; `focusSeq` changes on each visit so a repeat click returns to it. */
+  focusPage?: number | null;
+  focusSeq?: number | null;
+  onPageCount?: (count: number) => void;
 }
 
-export default function PdfViewer({ data }: PdfViewerProps) {
+export default function PdfViewer({ data, focusPage = null, focusSeq = null, onPageCount }: PdfViewerProps) {
   const [numPages, setNumPages] = useState<number | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
   const [zoomIndex, setZoomIndex] = useState(DEFAULT_ZOOM_INDEX);
@@ -23,10 +28,15 @@ export default function PdfViewer({ data }: PdfViewerProps) {
 
   const scale = ZOOM_STEPS[zoomIndex];
 
-  const onDocumentLoadSuccess = useCallback(({ numPages: n }: { numPages: number }) => {
+  const onDocumentLoadSuccess = useStableHandler(({ numPages: n }: { numPages: number }) => {
     setNumPages(n);
-    setPageNumber(1);
-  }, []);
+    setPageNumber(focusPage && focusPage <= n ? focusPage : 1);
+    onPageCount?.(n);
+  });
+
+  useEffect(() => {
+    if (focusPage && numPages && focusPage <= numPages) setPageNumber(focusPage);
+  }, [focusSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const goToPrev = () => setPageNumber((p) => Math.max(1, p - 1));
   const goToNext = () => setPageNumber((p) => Math.min(numPages || 1, p + 1));

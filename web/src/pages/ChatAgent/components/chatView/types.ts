@@ -1,5 +1,6 @@
 /** ChatView's local type contracts, carved out of ChatView.tsx (5.9b). */
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
+import type { ChartSelectionSnapshot } from '@/pages/MarketView/stores/chartSelectionStore';
 import type { SubagentTokenUsage } from '../../utils/tokenUsage';
 
 export type MessageRecord = Record<string, unknown>;
@@ -43,15 +44,7 @@ export interface LocationState {
   [key: string]: unknown;
 }
 
-export interface ToolCallProcessRecord {
-  toolName?: string;
-  toolCallResult?: { artifact?: { type?: string } };
-  [key: string]: unknown;
-}
-
-export interface PlanData {
-  [key: string]: unknown;
-}
+export type { PlanData } from '../filePanel/types';
 
 /** Subagent message shape (matches useCardState's SubagentMessage) */
 export interface SubagentMessage {
@@ -138,6 +131,8 @@ export interface ModelOptions {
    * per snapshot) by `handleSendWithAttachments`.
    */
   widgetSnapshots?: WidgetContextSnapshot[];
+  /** Chart selections riding this send, so the user bubble renders their cards. */
+  chartSelections?: ChartSelectionSnapshot[];
 }
 
 export interface ActionCommand {

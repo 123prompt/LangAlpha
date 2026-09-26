@@ -1,13 +1,13 @@
 /**
  * ChatView routing — verifies the pure routing function used by
- * `handleOpenAgentArtifactFromChat`. Critical regressions:
+ * `handleOpenFileFromChat`. Critical regressions:
  *  - all targets are cleared per call (no stale-target hijacking)
  *  - memo index opens to LIST view (empty-string targetMemoKey sentinel)
  *  - user-scoped artifacts (memo, user-tier memory) clear filePanelWorkspaceId
  *  - cross-workspace ws:// links pass through targetWorkspaceId
  */
 import { describe, it, expect } from 'vitest';
-import { computeAgentArtifactRouting } from '../../utils/agentPaths';
+import { MEMORY_WORKSPACE_DIR, computeAgentArtifactRouting } from '../../utils/agentPaths';
 
 describe('computeAgentArtifactRouting — per-kind routing', () => {
   it('routes user memory entry → Memory tab + tier user + clears workspace id', () => {
@@ -20,13 +20,14 @@ describe('computeAgentArtifactRouting — per-kind routing', () => {
       targetUserProfile: null,
       clearWorkspaceId: true,
       setWorkspaceId: null,
+      targetDirectory: null,
     });
   });
 
   it('routes workspace memory without a wsid → clears stale filePanelWorkspaceId (flash-mode wsid leak guard)', () => {
     // Regression: prior versions left clearWorkspaceId=false, leaking a stale
     // ws id from a prior cross-workspace click into the new memory query.
-    const r = computeAgentArtifactRouting('.agents/workspace/memory/foo.md');
+    const r = computeAgentArtifactRouting(`${MEMORY_WORKSPACE_DIR}/foo.md`);
     expect(r.targetMemoryKey).toBe('foo.md');
     expect(r.targetMemoryTier).toBe('workspace');
     expect(r.clearWorkspaceId).toBe(true);
@@ -45,6 +46,7 @@ describe('computeAgentArtifactRouting — per-kind routing', () => {
       targetUserProfile: null,
       clearWorkspaceId: true,
       setWorkspaceId: null,
+      targetDirectory: null,
     });
   });
 
@@ -73,10 +75,10 @@ describe('computeAgentArtifactRouting — per-kind routing', () => {
 
   it('propagates targetWorkspaceId for workspace-tier memory (cross-workspace __wsref__ links)', () => {
     // Regression guard: when a markdown link reaches into another workspace's
-    // memory (`__wsref__/ws-other/.agents/workspace/memory/notes.md`), the
+    // memory (`__wsref__/ws-other/<workspace memory dir>/notes.md`), the
     // routing must hand the linked workspace id to MemoryPanel so it queries
     // the correct workspace, not the chat's current one.
-    const r = computeAgentArtifactRouting('.agents/workspace/memory/notes.md', 'ws-other');
+    const r = computeAgentArtifactRouting(`${MEMORY_WORKSPACE_DIR}/notes.md`, 'ws-other');
     expect(r.targetMemoryKey).toBe('notes.md');
     expect(r.targetMemoryTier).toBe('workspace');
     expect(r.setWorkspaceId).toBe('ws-other');
@@ -95,7 +97,7 @@ describe('computeAgentArtifactRouting — per-kind routing', () => {
   });
 
   it('extracts wsid from __wsref__ for workspace-tier memory and sets it on the panel', () => {
-    const r = computeAgentArtifactRouting('__wsref__/ws-X/.agents/workspace/memory/foo.md');
+    const r = computeAgentArtifactRouting(`__wsref__/ws-X/${MEMORY_WORKSPACE_DIR}/foo.md`);
     expect(r.targetMemoryKey).toBe('foo.md');
     expect(r.targetMemoryTier).toBe('workspace');
     expect(r.setWorkspaceId).toBe('ws-X');
@@ -132,6 +134,38 @@ describe('computeAgentArtifactRouting — per-kind routing', () => {
     const b = computeAgentArtifactRouting('home/workspace/.agents/user/memory/foo.md');
     expect(a.targetMemoryKey).toBe('foo.md');
     expect(b.targetMemoryKey).toBe('foo.md');
+  });
+
+  it('routes a folder link → Files tab on that folder instead of a file lookup', () => {
+    expect(computeAgentArtifactRouting('results/q3/')).toMatchObject({ targetFile: null, targetDirectory: 'results/q3' });
+    expect(computeAgentArtifactRouting('/home/workspace/results/')).toMatchObject({ targetFile: null, targetDirectory: 'results' });
+    expect(computeAgentArtifactRouting('/home/workspace/')).toMatchObject({ targetFile: null, targetDirectory: '' });
+    const ws = '20cc68e8-d057-41f4-9bb1-57aa8d310704';
+    expect(computeAgentArtifactRouting(`__wsref__/${ws}/work/`, ws)).toMatchObject({ targetDirectory: 'work', setWorkspaceId: ws });
+  });
+
+  it('removes the selected project folder from absolute artifact paths', () => {
+    expect(
+      computeAgentArtifactRouting(
+        '/home/workspace/acme-a1b2/results/',
+        undefined,
+        'acme-a1b2',
+      ),
+    ).toMatchObject({ targetFile: null, targetDirectory: 'results' });
+    expect(
+      computeAgentArtifactRouting(
+        '/home/workspace/acme-a1b2/results/report.md',
+        undefined,
+        'acme-a1b2',
+      ),
+    ).toMatchObject({ targetFile: 'results/report.md' });
+    expect(
+      computeAgentArtifactRouting(
+        '/home/workspace/acme-a1b2/.agents/workspace/memory/notes.md',
+        undefined,
+        'acme-a1b2',
+      ),
+    ).toMatchObject({ targetMemoryKey: 'notes.md', targetMemoryTier: 'workspace' });
   });
 
   it('falls back to file routing for unknown agent paths', () => {

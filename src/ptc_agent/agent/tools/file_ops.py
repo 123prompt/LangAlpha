@@ -10,6 +10,12 @@ import structlog
 from langchain_core.tools import tool
 
 from ptc_agent.agent.backends import FilesystemBackend, ReadOnlyStoreError
+from ptc_agent.agent.tools.context_file_policy import (
+    CappedFile,
+    capped_file,
+    fill_note,
+    over_cap_refusal,
+)
 from ptc_agent.core.paths import MEMO_USER_DIR
 from src.server.services.user_data_io import UserDataValidationError
 
@@ -68,16 +74,27 @@ _MAX_READ_CHARS = 160_000
 def create_filesystem_tools(
     backend: FilesystemBackend,
     operation_callback: OperationCallback | None = None,
+    *,
+    refuse_over_cap: bool = False,
 ) -> tuple:
     """Create the Read, Write, and Edit tools bound to ``backend``.
 
     ``backend`` is either a plain ``SandboxBackend`` or a
     ``CompositeFilesystemBackend`` that adds store-backed memory/memo routing;
-    the tools see a uniform interface either way.
+    the tools see a uniform interface either way. ``refuse_over_cap`` turns the
+    fill note on the capped context files into a hard refusal for a Write that
+    would land past the cap.
     """
 
     def _format_cat_n(lines: list[str], *, start_line_number: int) -> str:
         return "\n".join(f"{i:6}\t{line}" for i, line in enumerate(lines, start=start_line_number))
+
+    def _capped(normalized_path: str) -> CappedFile | None:
+        return capped_file(
+            normalized_path,
+            workspace_dir=backend.workspace_dir,
+            computer_root=backend.computer_root,
+        )
 
     @tool("Read")
     async def read_file(file_path: str, offset: int | None = None, limit: int | None = None) -> str:
@@ -111,7 +128,7 @@ def create_filesystem_tools(
                 normalized_path = backend.normalize_path(file_path)
                 logger.info("Loading image file", file_path=file_path, normalized_path=normalized_path)
 
-                if backend.filesystem_config.enable_path_validation and not backend.validate_path(normalized_path):
+                if backend.filesystem_config.enable_path_validation and not backend.validate_path(file_path):
                     error_msg = f"Access denied: {file_path} is not in allowed directories"
                     logger.error(error_msg, file_path=file_path)
                     return f"ERROR: {error_msg}"
@@ -123,7 +140,7 @@ def create_filesystem_tools(
             normalized_path = backend.normalize_path(file_path)
             logger.info("Reading file", file_path=file_path, normalized_path=normalized_path, offset=offset, limit=limit)
 
-            if backend.filesystem_config.enable_path_validation and not backend.validate_path(normalized_path):
+            if backend.filesystem_config.enable_path_validation and not backend.validate_path(file_path):
                 error_msg = f"Access denied: {file_path} is not in allowed directories"
                 logger.error(error_msg, file_path=file_path)
                 return f"ERROR: {error_msg}"
@@ -232,10 +249,22 @@ def create_filesystem_tools(
             normalized_path = backend.normalize_path(file_path)
             logger.info("Writing file", file_path=file_path, normalized_path=normalized_path, size=len(content))
 
-            if backend.filesystem_config.enable_path_validation and not backend.validate_path(normalized_path):
+            if backend.filesystem_config.enable_path_validation and not backend.validate_path(file_path):
                 error_msg = f"Access denied: {file_path} is not in allowed directories"
                 logger.error(error_msg, file_path=file_path)
                 return f"ERROR: {error_msg}"
+
+            capped = _capped(normalized_path)
+            if capped is not None and refuse_over_cap:
+                refusal = over_cap_refusal(capped.name, len(content), capped.cap)
+                if refusal is not None:
+                    logger.info(
+                        "Write refused past its context cap",
+                        file_path=file_path,
+                        size=len(content),
+                        cap=capped.cap,
+                    )
+                    return refusal
 
             try:
                 success = await backend.awrite_text(normalized_path, content)
@@ -265,7 +294,9 @@ def create_filesystem_tools(
 
             bytes_written = len(content.encode("utf-8"))
             virtual_path = backend.virtualize_path(normalized_path)
-            return f"Wrote {bytes_written} bytes to {virtual_path}"
+            message = f"Wrote {bytes_written} bytes to {virtual_path}"
+            note = fill_note(capped.name, len(content), capped.cap) if capped else None
+            return f"{message}\n\n{note}" if note else message
 
         except Exception as e:
             error_msg = f"Failed to write file: {e!s}"
@@ -294,7 +325,7 @@ def create_filesystem_tools(
                 replace_all=replace_all,
             )
 
-            if backend.filesystem_config.enable_path_validation and not backend.validate_path(normalized_path):
+            if backend.filesystem_config.enable_path_validation and not backend.validate_path(file_path):
                 error_msg = f"Access denied: {file_path} is not in allowed directories"
                 logger.error(error_msg, file_path=file_path)
                 return f"ERROR: {error_msg}"
@@ -320,7 +351,14 @@ def create_filesystem_tools(
                 except Exception as cb_err:
                     logger.warning("Operation callback failed", error=str(cb_err))
 
-            return str(result.get("message", "File edited successfully"))
+            message = str(result.get("message", "File edited successfully"))
+            capped = _capped(normalized_path)
+            size = result.get("size")
+            if capped is not None and isinstance(size, int):
+                note = fill_note(capped.name, size, capped.cap)
+                if note is not None:
+                    return f"{message}\n\n{note}"
+            return message
 
         except Exception as e:
             error_msg = f"Failed to edit file: {e!s}"

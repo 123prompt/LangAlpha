@@ -711,6 +711,24 @@ async def fetch_watchlist_for_user(user_id: str) -> tuple[list[dict[str, Any]], 
     return watchlists, items
 
 
+async def list_watchlist_symbols_for_user(user_id: str) -> list[str]:
+    """Distinct watchlist symbols in first-added order, for the market vote."""
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT wi.symbol, MIN(wi.created_at) AS first_added
+                FROM watchlist_items wi
+                INNER JOIN watchlists w ON wi.watchlist_id = w.watchlist_id
+                WHERE w.user_id = %s AND wi.symbol IS NOT NULL
+                GROUP BY wi.symbol
+                ORDER BY first_added, wi.symbol
+                """,
+                (user_id,),
+            )
+            return [str(symbol) for (symbol, _first) in await cur.fetchall()]
+
+
 async def count_watchlist_for_user(user_id: str) -> tuple[int, int]:
     """(num_watchlists, total_items) for the awareness block."""
     async with get_db_connection() as conn:

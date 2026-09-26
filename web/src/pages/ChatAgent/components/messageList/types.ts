@@ -6,8 +6,12 @@ export const EMPTY_OBJ = {} as Record<string, never>;
 /** Loosely typed message record from SSE/API */
 export type MessageRecord = Record<string, unknown>;
 
-/** Loosely typed tool call process record */
-export type ToolCallProcessRecord = Record<string, unknown>;
+/** A turn without foldable work is `unfolded`. Both preferences use `live`
+ * while running, `collapsed` for a settled answer, and `expanded` on request.
+ * `process` keeps cards and activity summaries visible when there is no answer. */
+export type FoldState = 'unfolded' | 'live' | 'collapsed' | 'process' | 'expanded';
+
+export type { ToolCallProcessRecord } from '../ToolCallDetailView';
 
 /** Content segment from message data */
 export interface ContentSegmentRecord {

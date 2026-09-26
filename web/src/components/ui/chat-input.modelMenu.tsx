@@ -10,15 +10,19 @@ import { useIsMobile } from '@/hooks/useIsMobile';
 import { getModelDisplayName } from './chat-input.helpers';
 import { EFFORT_LABELS, effortLabelFor } from '@/lib/modelTuning';
 import { derivePrimaryModels } from './chat-input.models';
+import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
+
+type ModelMetadata = Record<string, ModelMetadataEntry>;
 
 /** Pill geometry for the model trigger — shared with the measure chip so the
  *  fold budget can never drift from what actually renders. */
 const TRIGGER_CLASS = 'inline-flex min-w-0 items-center gap-1 rounded-full py-1.5 px-2.5 text-[0.8125rem] font-medium border border-transparent whitespace-nowrap';
 
 function TriggerBody({
-  selectedModel, effortLabel, fastMode, isCodexModel, accent,
+  selectedModel, metadata, effortLabel, fastMode, isCodexModel, accent,
 }: {
   selectedModel: string | null;
+  metadata?: ModelMetadata;
   /** Already-translated effective level, or null when the model has no ladder. */
   effortLabel: string | null;
   fastMode: boolean;
@@ -27,7 +31,7 @@ function TriggerBody({
 }) {
   return (
     <>
-      <span className="min-w-0 max-w-[120px] truncate">{getModelDisplayName(selectedModel) || 'Model'}</span>
+      <span className="min-w-0 max-w-[120px] truncate">{getModelDisplayName(selectedModel, metadata) || 'Model'}</span>
       {effortLabel && (
         <span className="flex-none" style={{ color: 'var(--color-text-tertiary)' }}>{effortLabel}</span>
       )}
@@ -42,6 +46,7 @@ function TriggerBody({
 /** Measure-row twin of the model trigger: same geometry, no interactivity. */
 export function ModelTriggerMeasure(props: {
   selectedModel: string | null;
+  metadata?: ModelMetadata;
   effortLabel: string | null;
   fastMode: boolean;
   isCodexModel: boolean;
@@ -148,14 +153,15 @@ function SettingOption({
 
 /** One model in a picker list. Unlike a setting option, choosing a model is a
  *  commitment rather than an adjustment, so the menu closes behind it. */
-function ModelOption({ model, selected, onPick }: {
+function ModelOption({ model, metadata, selected, onPick }: {
   model: string;
+  metadata?: ModelMetadata;
   selected: boolean;
   onPick: () => void;
 }) {
   return (
     <DropdownMenuItem variant="setting" onSelect={onPick} style={{ color: 'var(--color-text-primary)' }}>
-      <span>{getModelDisplayName(model)}</span>
+      <span>{getModelDisplayName(model, metadata)}</span>
       {selected && <Check className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
     </DropdownMenuItem>
   );
@@ -169,6 +175,7 @@ function ModelOption({ model, selected, onPick }: {
  */
 export function ChatInputModelMenu({
   selectedModel,
+  metadata,
   onSelectModel,
   threadModels,
   validModelNames,
@@ -183,8 +190,11 @@ export function ChatInputModelMenu({
   reasoningEfforts,
   dropdownDirection,
   containerRef,
+  disabled = false,
 }: {
   selectedModel: string | null;
+  /** Supplies authored display names; a model without one gets a derived name. */
+  metadata?: ModelMetadata;
   onSelectModel: (model: string) => void;
   threadModels: string[];
   /** Gates thread history — a model can be revoked after a turn used it. */
@@ -207,6 +217,10 @@ export function ChatInputModelMenu({
   dropdownDirection: 'up' | 'down';
   /** Mobile portals into the composer so the menu can't escape the sheet. */
   containerRef: RefObject<HTMLElement | null>;
+  /** Until the model list arrives every thread model reads as reachable, and a
+   *  pick is saved to the account, so an unreachable one would become every
+   *  composer's default. */
+  disabled?: boolean;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -227,14 +241,14 @@ export function ChatInputModelMenu({
 
   return (
     <DropdownMenu modal={false} open={menuOpen} onOpenChange={(open) => { setMenuOpen(open); if (!open) { setShowMoreModels(false); setExpanded(null); } }}>
-      <DropdownMenuTrigger asChild>
+      <DropdownMenuTrigger asChild disabled={disabled}>
         <button
-          className={`model-selector-trigger ${TRIGGER_CLASS} cursor-pointer transition-colors`}
+          className={`model-selector-trigger ${TRIGGER_CLASS} cursor-pointer transition-colors disabled:cursor-progress`}
           onClick={(e) => e.stopPropagation()}
           type="button"
           title="Select model"
         >
-          <TriggerBody selectedModel={selectedModel} effortLabel={effortLabel} fastMode={fastMode} isCodexModel={isCodexModel} accent />
+          <TriggerBody selectedModel={selectedModel} metadata={metadata} effortLabel={effortLabel} fastMode={fastMode} isCodexModel={isCodexModel} accent />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
@@ -248,7 +262,7 @@ export function ChatInputModelMenu({
       >
         {/* Thread models */}
         {primaryModels.map((m) => (
-          <ModelOption key={m} model={m} selected={m === selectedModel} onPick={() => onSelectModel(m)} />
+          <ModelOption key={m} model={m} metadata={metadata} selected={m === selectedModel} onPick={() => onSelectModel(m)} />
         ))}
         {(reasoningEfforts.length > 0 || isCodexModel) && (
           <DropdownMenuSeparator style={{ backgroundColor: 'var(--color-border-muted)' }} />
@@ -312,7 +326,7 @@ export function ChatInputModelMenu({
         >
           {moreModelsItems.length > 0 ? (
             moreModelsItems.map((m) => (
-              <ModelOption key={m} model={m} selected={m === selectedModel} onPick={() => onSelectModel(m)} />
+              <ModelOption key={m} model={m} metadata={metadata} selected={m === selectedModel} onPick={() => onSelectModel(m)} />
             ))
           ) : (
             <DropdownMenuItem

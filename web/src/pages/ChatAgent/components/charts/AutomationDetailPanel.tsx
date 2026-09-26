@@ -1,6 +1,7 @@
 import React from 'react';
 import { relativeTime } from '@/lib/format';
 import { useNavigate } from 'react-router-dom';
+import { useRouteLeaveGuard } from '../../contexts/RouteLeaveGuardContext';
 import { Clock, Timer, TrendingUp, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { cronToHuman } from '../../../Automations/utils/cron';
@@ -21,6 +22,9 @@ const STATUS_COLORS: Record<string, string> = {
   running: GREEN,
   paused: YELLOW,
   failed: RED,
+  // A run that ran out of time failed too (isRunFailed in the Automations
+  // page's status rules).
+  timeout: RED,
   completed: BLUE,
   disabled: RED,
 };
@@ -36,6 +40,7 @@ const STATUS_BG: Record<string, string> = {
   running: 'var(--color-profit-soft)',
   paused: 'var(--color-warning-soft)',
   failed: 'var(--color-loss-soft)',
+  timeout: 'var(--color-loss-soft)',
   completed: 'var(--color-info-soft)',
   disabled: 'var(--color-loss-soft)',
 };
@@ -149,10 +154,11 @@ interface AutomationsPageLinkProps {
 function AutomationsPageLink({ automationId }: AutomationsPageLinkProps): React.ReactElement {
   const { t } = useTranslation();
   const navigate = useNavigate();
+  const guardLeave = useRouteLeaveGuard();
   const path = automationId ? `/automations?id=${automationId}` : '/automations';
   return (
     <button
-      onClick={() => navigate(path)}
+      onClick={() => guardLeave(() => navigate(path))}
       className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition-colors hover:bg-foreground/5"
       style={{ color: ACCENT, border: '1px solid var(--color-accent-soft)' }}
     >

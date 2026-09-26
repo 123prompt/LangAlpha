@@ -2,9 +2,9 @@
 
 OpenAI analog of ``AnthropicPromptCachingMiddleware``: tags the last system
 content block it sees with a ``prompt_cache_breakpoint`` marker so the static
-prefix (system prompt + skills) is written to cache at a stable boundary.
-Dynamic-context middlewares (workspace, runtime) run innermost and append
-after the marker, keeping the cached prefix stable across requests.
+system prompt is written to cache at a stable boundary. Dynamic-context
+middlewares (workspace, runtime) run innermost and append after the marker,
+keeping the cached prefix stable across requests.
 """
 
 from collections.abc import Awaitable, Callable

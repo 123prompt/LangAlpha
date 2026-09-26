@@ -15,8 +15,8 @@ global pooled saver, lifecycle SQL on the app pool, single worker only.
 """
 
 import asyncio
+import contextvars
 import contextlib
-import hashlib
 import logging
 from typing import Any, Callable, Optional
 
@@ -25,6 +25,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from src.config.settings import get_writer_pool_max
+from src.server.database.sql_fences import advisory_key
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +73,10 @@ class GuardSessionLost(Exception):
 
 
 # --------------------------------------------------------------------------
-# Advisory key scheme — 64-bit, domain-separated (not 32-bit hashtext).
+# Advisory key scheme: 64-bit, domain-separated (not 32-bit hashtext). The
+# function itself lives in sql_fences so operator scripts share it without
+# importing the app; it is re-exported here for the lock-key helpers below.
 # --------------------------------------------------------------------------
-
-
-def advisory_key(domain: str, *parts: str) -> int:
-    """sha256("domain|part|part")[:8] as a signed bigint for pg advisory locks."""
-    digest = hashlib.sha256("|".join((domain, *parts)).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 def thread_key(thread_id: str) -> int:
@@ -356,8 +353,13 @@ class WriterGuard:
                         exc_info=True,
                     )
             raise
+        # Fresh contexts for both guard tasks: the guard and its tasks form a
+        # reference cycle that outlives the turn until a full collection, and
+        # a copied context would pin the turn's request-scoped state with it.
         guard._monitor_task = asyncio.create_task(
-            guard._monitor(), name=f"writer-guard-monitor-{run_id[:8]}"
+            guard._monitor(),
+            name=f"writer-guard-monitor-{run_id[:8]}",
+            context=contextvars.Context(),
         )
         logger.info(
             f"[WriterGuard] fenced run={run_id} thread={thread_id} "
@@ -646,7 +648,9 @@ class WriterGuard:
             if discard:
                 self._discard = True
             self._release_task = asyncio.create_task(
-                self._do_release(), name=f"writer-guard-release-{self.run_id[:8]}"
+                self._do_release(),
+                name=f"writer-guard-release-{self.run_id[:8]}",
+                context=contextvars.Context(),
             )
         elif discard and not self._discard:
             logger.warning(

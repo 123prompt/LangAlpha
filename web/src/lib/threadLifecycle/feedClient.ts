@@ -64,6 +64,8 @@ interface ClientState {
    * 600s cap) and the feed has no replay. */
   resyncOnSnapshot: boolean;
   pendingFullInvalidate: boolean;
+  /** An automation joined or left a thread's line since the last flush. */
+  pendingAutomations: boolean;
   invalidateTimer: ReturnType<typeof setTimeout> | null;
   unsubscribeCache: (() => void) | null;
   detachWindow: (() => void) | null;
@@ -86,6 +88,7 @@ const client: ClientState =
     pendingWorkspaces: new Set(),
     resyncOnSnapshot: false,
     pendingFullInvalidate: false,
+    pendingAutomations: false,
     invalidateTimer: null,
     unsubscribeCache: null,
     detachWindow: null,
@@ -138,12 +141,17 @@ function scheduleInvalidate(workspaceId?: string | null): void {
     if (!qc) return;
     const full = client.pendingFullInvalidate;
     client.pendingFullInvalidate = false;
+    const automations = client.pendingAutomations;
+    client.pendingAutomations = false;
     const workspaces = [...client.pendingWorkspaces];
     client.pendingWorkspaces.clear();
     if (full) {
       // Reconnect resync: one prefix-wide invalidate subsumes the scoped ones.
       void qc.invalidateQueries({ queryKey: queryKeys.threads.all });
       refetchCacheOnlyLists(qc, queryKeys.threads.all);
+      // The automation announcements have no replay either, and a wait that
+      // started while detached would otherwise stay unseen until its poll.
+      void qc.invalidateQueries({ queryKey: queryKeys.automations.all });
       return;
     }
     for (const ws of workspaces) {
@@ -151,6 +159,13 @@ function scheduleInvalidate(workspaceId?: string | null): void {
       refetchCacheOnlyLists(qc, queryKeys.threads.byWorkspace(ws));
     }
     void qc.invalidateQueries({ queryKey: queryKeys.threads.recentAll() });
+    // A wait starting or ending moves the whole automations family: the chat
+    // notice, the list and the run feed. Any other turn may be a scheduled
+    // run, which the feed shows and stops polling for once a second page is
+    // loaded.
+    void qc.invalidateQueries({
+      queryKey: automations ? queryKeys.automations.all : queryKeys.automations.runs(),
+    });
   }, INVALIDATE_DEBOUNCE_MS);
 }
 
@@ -277,6 +292,16 @@ function onFeedEvent(raw: Record<string, unknown>): void {
         );
       }
       scheduleInvalidate(evt.workspace_id);
+      return;
+    }
+    // An automation joined or left the line behind a thread's running turn:
+    // the chat notice and the Automations page both read it through the
+    // automations family, so refetch that. Debounced, since a firing that
+    // queues behind another sends both events at once.
+    case 'automation_waiting':
+    case 'automation_waiting_ended': {
+      client.pendingAutomations = true;
+      scheduleInvalidate();
       return;
     }
     default:

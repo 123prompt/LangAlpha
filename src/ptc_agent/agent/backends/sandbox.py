@@ -45,6 +45,8 @@ from deepagents.backends.protocol import (
     WriteResult,
 )
 
+from ptc_agent.agent.backends.results import EditTextResult
+from ptc_agent.core.paths import resolve_agent_path
 from ptc_agent.core.sandbox import ExecutionResult, PTCSandbox
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 
@@ -68,21 +70,28 @@ class SandboxBackend(SandboxBackendProtocol):
         *,
         virtual_mode: bool = True,
         operation_callback: OperationCallback | None = None,
+        preview_owner: str | None = None,
     ) -> None:
         """Create a new SandboxBackend.
 
         Args:
             sandbox: Initialized `PTCSandbox` instance.
-            root_dir: Root directory used when resolving virtual paths.
-                      Defaults to ``sandbox.config.filesystem.working_directory``.
+            root_dir: Computer root the store mounts hang off, and the base a
+                      relative path resolves against when it is passed
+                      explicitly. Defaults to
+                      ``sandbox.config.filesystem.working_directory``.
             virtual_mode: If True, treat non-absolute paths as relative to `root_dir`.
             operation_callback: Optional callback invoked on file operations (write, edit).
                                 Receives a dict with operation details for persistence/logging.
+            preview_owner: Workspace allowed to reuse preview ports started by
+                           this backend on a shared computer.
         """
         self.sandbox = sandbox
+        self._pinned_root = root_dir.rstrip("/") if root_dir else None
         self.root_dir = (root_dir or sandbox.config.filesystem.working_directory).rstrip("/")
         self.virtual_mode = virtual_mode
         self.operation_callback = operation_callback
+        self.preview_owner = preview_owner
         logger.debug("Initialized SandboxBackend", root_dir=self.root_dir, virtual_mode=self.virtual_mode)
 
     @property
@@ -90,24 +99,54 @@ class SandboxBackend(SandboxBackendProtocol):
         """Return a stable identifier for this backend instance."""
         return self.sandbox.sandbox_id or "unknown"
 
+    @property
+    def workspace_dir(self) -> str:
+        """The workspace root a relative agent path resolves against.
+
+        The turn's own folder, or the one this backend was pinned to. Read
+        rather than stored so a reconnect that moves the computer root reaches
+        it, and read by callers that need the folder a file belongs to rather
+        than the machine it sits on.
+        """
+        if self._pinned_root is not None:
+            return self._pinned_root
+        return self.sandbox.workspace().workspace
+
+    @property
+    def computer_root(self) -> str:
+        """The machine root the computer-tier subtrees resolve against.
+
+        Never the pin: the user memory and memo mounts are shared by every
+        workspace on the computer, so they keep their machine-root spelling
+        even for a backend pinned to one folder.
+        """
+        return self.sandbox.layout.root
+
     def _normalize_path(self, path: str) -> str:
-        """Normalize a path into an absolute sandbox path."""
+        """Normalize a path into an absolute sandbox path.
+
+        The sandbox decides the tier unless a caller pinned a root: one backend
+        serves a whole session, so a base fixed at construction would file every
+        turn's scratch on the machine root rather than in the workspace that
+        produced it, and a relative name that spells a computer subtree (the
+        store-backed user mounts) has to keep folding onto the root either way.
+        """
         if not self.virtual_mode:
             return path
 
-        if path in (None, "", ".", "/"):
-            return self.root_dir
+        if self._pinned_root is None:
+            return self.sandbox.normalize_path(path)
 
-        path = path.strip()
-
-        # Already absolute in sandbox (working directory or /tmp)
-        if path.startswith((self.root_dir, "/tmp")):
-            return path
-
-        if path.startswith("/"):
-            return f"{self.root_dir}{path}"
-
-        return f"{self.root_dir}/{path}"
+        # Same fold as the unpinned path, with the base named instead of
+        # resolved: a second implementation here is how a pinned backend
+        # once filed a store-backed user path inside the workspace folder,
+        # where no store route could see it.
+        return resolve_agent_path(
+            path,
+            workspace=self._pinned_root,
+            root=self.sandbox._work_dir,
+            allowed=self.sandbox.config.filesystem.allowed_directories,
+        )
 
     def _invoke_operation_callback(self, operation: str, file_path: str, **kwargs: Any) -> None:
         """Invoke the operation callback if configured."""
@@ -496,7 +535,7 @@ class SandboxBackend(SandboxBackendProtocol):
         new_string: str,
         *,
         replace_all: bool = False,
-    ) -> dict[str, Any]:
+    ) -> EditTextResult:
         """Edit by exact-string replacement. Returns PTCSandbox's raw result dict."""
         normalized = self.normalize_path(file_path)
         return await self.sandbox.aedit_file_text(
@@ -610,9 +649,14 @@ class SandboxBackend(SandboxBackendProtocol):
         startup_timeout: float = 10.0,
     ) -> PreviewInfo:
         """Start a server command in the sandbox and return a signed preview URL."""
+        kwargs: dict[str, Any] = {
+            "expires_in": expires_in,
+            "startup_timeout": startup_timeout,
+        }
+        if self.preview_owner is not None:
+            kwargs["owner"] = self.preview_owner
         return await self.sandbox.start_and_get_preview_url(
-            command,
+            f"cd {shlex.quote(self.workspace_dir)} && {command}",
             port,
-            expires_in=expires_in,
-            startup_timeout=startup_timeout,
+            **kwargs,
         )

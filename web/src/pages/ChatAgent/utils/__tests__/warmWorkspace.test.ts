@@ -55,7 +55,20 @@ afterEach(() => {
 });
 
 describe('warmWorkspace', () => {
-  it('skips when cached status is not stopped', async () => {
+  it('skips when cached status is transitional', async () => {
+    const qc = makeClient();
+    qc.setQueryData(queryKeys.workspaces.detail('ws-1'), {
+      workspace_id: 'ws-1',
+      status: 'starting',
+    });
+
+    await warmWorkspace('ws-1', qc);
+
+    expect(mockPost).not.toHaveBeenCalled();
+    expect(mockGet).not.toHaveBeenCalled();
+  });
+
+  it('fires /start?lazy=true for a running computer so the workspace is attached', async () => {
     const qc = makeClient();
     qc.setQueryData(queryKeys.workspaces.detail('ws-1'), {
       workspace_id: 'ws-1',
@@ -64,8 +77,10 @@ describe('warmWorkspace', () => {
 
     await warmWorkspace('ws-1', qc);
 
-    expect(mockPost).not.toHaveBeenCalled();
-    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockPost).toHaveBeenCalledWith('/api/v1/workspaces/ws-1/start?lazy=true');
+    expect(
+      (qc.getQueryData(queryKeys.workspaces.detail('ws-1')) as { status: string }).status,
+    ).toBe('running');
   });
 
   it('fires /start?lazy=true when cached status is stopped', async () => {
@@ -99,6 +114,35 @@ describe('warmWorkspace', () => {
     expect(cached.name).toBe('foo');
   });
 
+  it('arms the computer stream and updates sibling workspaces', async () => {
+    const qc = makeClient();
+    qc.setQueryData(queryKeys.computers.lists(), {
+      computers: [{ computer_id: 'comp-1', status: 'stopped' }],
+    });
+    qc.setQueryData(queryKeys.workspaces.detail('ws-1'), {
+      workspace_id: 'ws-1', computer_id: 'comp-1', status: 'stopped',
+    });
+    qc.setQueryData(queryKeys.workspaces.detail('ws-2'), {
+      workspace_id: 'ws-2', computer_id: 'comp-1', status: 'stopped',
+    });
+    qc.setQueryData(queryKeys.workspaces.list({ limit: 20 }), {
+      workspaces: [
+        { workspace_id: 'ws-1', computer_id: 'comp-1', status: 'stopped' },
+        { workspace_id: 'ws-2', computer_id: 'comp-1', status: 'stopped' },
+      ],
+      total: 2,
+    });
+
+    await warmWorkspace('ws-1', qc);
+
+    const computers = qc.getQueryData(queryKeys.computers.lists()) as {
+      computers: Array<{ status: string }>;
+    };
+    expect(computers.computers[0].status).toBe('starting');
+    expect((qc.getQueryData(queryKeys.workspaces.detail('ws-2')) as { status: string }).status)
+      .toBe('starting');
+  });
+
   it('patches matching workspace in cached list query', async () => {
     const qc = makeClient();
     qc.setQueryData(queryKeys.workspaces.detail('ws-1'), {
@@ -106,16 +150,21 @@ describe('warmWorkspace', () => {
       status: 'stopped',
     });
     const listKey = queryKeys.workspaces.list({ limit: 20 });
-    qc.setQueryData(listKey, [
-      { workspace_id: 'ws-1', status: 'stopped' },
-      { workspace_id: 'ws-2', status: 'running' },
-    ]);
+    // The shape every list entry actually has: `getWorkspaces` returns a
+    // WorkspacesResponse, so that is the only shape the patcher handles.
+    qc.setQueryData(listKey, {
+      workspaces: [
+        { workspace_id: 'ws-1', status: 'stopped' },
+        { workspace_id: 'ws-2', status: 'running' },
+      ],
+      total: 2,
+    });
 
     await warmWorkspace('ws-1', qc);
 
-    const list = qc.getQueryData(listKey) as Array<{ workspace_id: string; status: string }>;
-    expect(list[0].status).toBe('starting');
-    expect(list[1].status).toBe('running');
+    const list = qc.getQueryData(listKey) as { workspaces: Array<{ status: string }> };
+    expect(list.workspaces[0].status).toBe('starting');
+    expect(list.workspaces[1].status).toBe('running');
   });
 
   it('dedupes concurrent calls via in-flight Map', async () => {
@@ -158,10 +207,10 @@ describe('warmWorkspace', () => {
     expect(mockPost).toHaveBeenCalledTimes(1);
   });
 
-  it('does not fire if fetched detail is not stopped', async () => {
+  it('does not fire if fetched detail is transitional', async () => {
     const qc = makeClient();
     mockGet.mockResolvedValueOnce({
-      data: { workspace_id: 'ws-1', status: 'running' },
+      data: { workspace_id: 'ws-1', status: 'starting' },
     });
 
     await warmWorkspace('ws-1', qc);

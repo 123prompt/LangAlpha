@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
 
 import { useHtmlActions, exportServedPdf } from '../useHtmlActions';
-import { buildWsfilesUrl, buildSharedServeUrl } from '../wsfilesUrl';
+import { buildServeUrl, pdfQuery } from '../wsfilesUrl';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -19,89 +19,76 @@ vi.mock('@/components/ui/use-toast', () => ({
 }));
 
 const WIDGET_SRCDOC = '<!DOCTYPE html><html><body>widget</body></html>';
+// The owner's served URL rides a grant prefix; what opens in a tab is the
+// item's own page, never a served URL.
+const GRANT = '/api/v1/wsfiles/g/grant-1/';
+const SERVED = '/api/v1/wsfiles/g/grant-1/results/report.html';
+const OPEN = 'http://localhost:3000/a/abc123abc123';
 
-describe('buildWsfilesUrl', () => {
+describe('buildServeUrl', () => {
   it('builds a path-style URL with slashes preserved', () => {
-    expect(buildWsfilesUrl('ws-1', 'results/report.html')).toBe(
-      '/api/v1/wsfiles/ws-1/results/report.html',
+    expect(buildServeUrl(GRANT, 'results/report.html')).toBe(
+      '/api/v1/wsfiles/g/grant-1/results/report.html',
     );
   });
 
   it('encodes path segments but keeps slashes', () => {
-    expect(buildWsfilesUrl('ws-1', 'results/my report.html')).toBe(
-      '/api/v1/wsfiles/ws-1/results/my%20report.html',
+    expect(buildServeUrl(GRANT, 'results/my report.html')).toBe(
+      '/api/v1/wsfiles/g/grant-1/results/my%20report.html',
     );
   });
 
   it('strips a leading slash', () => {
-    expect(buildWsfilesUrl('ws-1', '/results/report.html')).toBe(
-      '/api/v1/wsfiles/ws-1/results/report.html',
+    expect(buildServeUrl(GRANT, '/results/report.html')).toBe(
+      '/api/v1/wsfiles/g/grant-1/results/report.html',
     );
   });
 
   it('appends ?inject=theme only when requested', () => {
-    expect(buildWsfilesUrl('ws-1', 'results/report.html', { injectTheme: true })).toBe(
-      '/api/v1/wsfiles/ws-1/results/report.html?inject=theme',
+    expect(buildServeUrl(GRANT, 'results/report.html', { injectTheme: true })).toBe(
+      '/api/v1/wsfiles/g/grant-1/results/report.html?inject=theme',
     );
-    expect(buildWsfilesUrl('ws-1', 'results/report.html')).not.toContain('inject=theme');
-  });
-
-  it('appends ?format=pdf when format is pdf (takes precedence over inject)', () => {
-    expect(buildWsfilesUrl('ws-1', 'results/report.html', { format: 'pdf' })).toBe(
-      '/api/v1/wsfiles/ws-1/results/report.html?format=pdf',
-    );
-    expect(
-      buildWsfilesUrl('ws-1', 'results/report.html', { format: 'pdf', injectTheme: true }),
-    ).toBe('/api/v1/wsfiles/ws-1/results/report.html?format=pdf');
-  });
-
-  it('appends the PDF knobs, omitting scale at the default 1', () => {
-    expect(
-      buildWsfilesUrl('ws-1', 'results/report.html', {
-        format: 'pdf',
-        pdfScale: 0.8,
-        pdfPageNumbers: true,
-      }),
-    ).toBe('/api/v1/wsfiles/ws-1/results/report.html?format=pdf&scale=0.8&page_numbers=true');
-    expect(
-      buildWsfilesUrl('ws-1', 'results/report.html', { format: 'pdf', pdfScale: 1 }),
-    ).toBe('/api/v1/wsfiles/ws-1/results/report.html?format=pdf');
-  });
-
-  it('appends branding=false only when branding is explicitly off', () => {
-    expect(
-      buildWsfilesUrl('ws-1', 'results/report.html', { format: 'pdf', pdfBranding: false }),
-    ).toBe('/api/v1/wsfiles/ws-1/results/report.html?format=pdf&branding=false');
-    expect(
-      buildWsfilesUrl('ws-1', 'results/report.html', { format: 'pdf', pdfBranding: true }),
-    ).toBe('/api/v1/wsfiles/ws-1/results/report.html?format=pdf');
+    expect(buildServeUrl(GRANT, 'results/report.html')).not.toContain('inject=theme');
   });
 });
 
-describe('buildSharedServeUrl', () => {
+// The PDF render query rides on the plain served URL, never the themed one.
+describe('pdfQuery', () => {
+  it('is bare at the defaults', () => {
+    expect(pdfQuery()).toBe('format=pdf');
+    expect(pdfQuery(1, false, true)).toBe('format=pdf');
+  });
+
+  it('appends the PDF knobs, omitting scale at the default 1', () => {
+    expect(pdfQuery(0.8, true)).toBe('format=pdf&scale=0.8&page_numbers=true');
+  });
+
+  it('appends branding=false only when branding is explicitly off', () => {
+    expect(pdfQuery(undefined, undefined, false)).toBe('format=pdf&branding=false');
+    expect(pdfQuery(undefined, undefined, undefined)).toBe('format=pdf');
+  });
+});
+
+describe('buildServeUrl under a share prefix', () => {
+  const prefix = '/api/v1/public/shared/tok-1/files/serve/';
+
   it('builds a token-prefixed serve URL with slashes preserved (no workspace UUID)', () => {
-    expect(buildSharedServeUrl('tok-1', 'results/report.html')).toBe(
+    expect(buildServeUrl(prefix, 'results/report.html')).toBe(
       '/api/v1/public/shared/tok-1/files/serve/results/report.html',
     );
   });
 
   it('encodes path segments but keeps slashes', () => {
-    expect(buildSharedServeUrl('tok-1', 'results/my report.html')).toBe(
+    expect(buildServeUrl(prefix, 'results/my report.html')).toBe(
       '/api/v1/public/shared/tok-1/files/serve/results/my%20report.html',
     );
   });
 
   it('appends ?inject=theme only when requested', () => {
-    expect(buildSharedServeUrl('tok-1', 'results/report.html', { injectTheme: true })).toBe(
+    expect(buildServeUrl(prefix, 'results/report.html', { injectTheme: true })).toBe(
       '/api/v1/public/shared/tok-1/files/serve/results/report.html?inject=theme',
     );
-    expect(buildSharedServeUrl('tok-1', 'results/report.html')).not.toContain('inject=theme');
-  });
-
-  it('appends ?format=pdf when format is pdf', () => {
-    expect(buildSharedServeUrl('tok-1', 'results/report.html', { format: 'pdf' })).toBe(
-      '/api/v1/public/shared/tok-1/files/serve/results/report.html?format=pdf',
-    );
+    expect(buildServeUrl(prefix, 'results/report.html')).not.toContain('inject=theme');
   });
 });
 
@@ -222,16 +209,12 @@ describe('useHtmlActions — file mode', () => {
     toastDismiss.mockClear();
   });
 
-  it('opens the served wsfiles URL (byte-faithful, no inject=theme)', () => {
+  it("opens the item's own page, never the served URL", () => {
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     result.current.openInNewTab!();
-    expect(open).toHaveBeenCalledWith(
-      '/api/v1/wsfiles/ws-1/results/report.html',
-      '_blank',
-      'noopener,noreferrer',
-    );
+    expect(open).toHaveBeenCalledWith(OPEN, '_blank', 'noopener,noreferrer');
   });
 
   it('downloads server original bytes via triggerDownload', () => {
@@ -239,23 +222,24 @@ describe('useHtmlActions — file mode', () => {
     const { result } = renderHook(() =>
       useHtmlActions({
         mode: 'file',
-        workspaceId: 'ws-1',
         filePath: 'results/report.html',
+        servedUrl: SERVED,
+        openUrl: OPEN,
         triggerDownload,
       }),
     );
     result.current.downloadHtml();
-    expect(triggerDownload).toHaveBeenCalledWith('ws-1', 'results/report.html');
+    expect(triggerDownload).toHaveBeenCalledTimes(1);
   });
 
   it('fetches the server PDF and downloads it via an anchor named <stem>.pdf', async () => {
     fetchMock.mockResolvedValue(pdfResponse(true));
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     await result.current.exportPdf();
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/wsfiles/ws-1/results/report.html?format=pdf',
+      `${SERVED}?format=pdf`,
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(createObjectURL).toHaveBeenCalled();
@@ -276,7 +260,6 @@ describe('useHtmlActions — file mode', () => {
     const { result } = renderHook(() =>
       useHtmlActions({
         mode: 'file',
-        workspaceId: '',
         filePath: 'results/report.html',
         servedUrl: served,
       }),
@@ -293,7 +276,6 @@ describe('useHtmlActions — file mode', () => {
     fetchMock.mockResolvedValue(pdfResponse(true));
     const served = '/api/v1/public/shared/tok-1/files/serve/results/report.html';
     await exportServedPdf({
-      workspaceId: '',
       filePath: 'results/report.html',
       servedUrl: served,
       printHint: 'hint',
@@ -315,7 +297,6 @@ describe('useHtmlActions — file mode', () => {
     const { result } = renderHook(() =>
       useHtmlActions({
         mode: 'file',
-        workspaceId: '',
         filePath: 'results/report.html',
         servedUrl: served,
       }),
@@ -335,11 +316,11 @@ describe('useHtmlActions — file mode', () => {
       },
     });
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     await result.current.exportPdf();
     // Keep the handle: open with no third arg.
-    expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
+    expect(open).toHaveBeenCalledWith(OPEN, '_blank');
     expect(toastMock).toHaveBeenCalledWith({ description: 'filePanel.pdfPrintHint' });
     // No anchor download on the failure path.
     expect(anchorClick).not.toHaveBeenCalled();
@@ -350,10 +331,10 @@ describe('useHtmlActions — file mode', () => {
     fetchMock.mockResolvedValue(pdfResponse(false, 501));
     open.mockReturnValue({ print });
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     await result.current.exportPdf();
-    expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
+    expect(open).toHaveBeenCalledWith(OPEN, '_blank');
     expect(print).toHaveBeenCalled();
     // Print succeeded → no print-hint toast (the generating toast still fires).
     expect(toastMock).not.toHaveBeenCalledWith({ description: 'filePanel.pdfPrintHint' });
@@ -367,10 +348,10 @@ describe('useHtmlActions — file mode', () => {
       },
     });
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     await result.current.exportPdf();
-    expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
+    expect(open).toHaveBeenCalledWith(OPEN, '_blank');
     expect(toastMock).toHaveBeenCalledWith({ description: 'filePanel.pdfPrintHint' });
   });
 
@@ -388,20 +369,20 @@ describe('useHtmlActions — file mode', () => {
         }),
     );
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     const pending = result.current.exportPdf();
     // 120s client cap — advance past it to trip the AbortController.
     await vi.advanceTimersByTimeAsync(120_000);
     await pending;
-    expect(open).toHaveBeenCalledWith('/api/v1/wsfiles/ws-1/results/report.html', '_blank');
+    expect(open).toHaveBeenCalledWith(OPEN, '_blank');
   });
 
   it('shows the hint toast when the print popup is blocked (no window)', async () => {
     fetchMock.mockResolvedValue(pdfResponse(false, 504));
     open.mockReturnValue(null);
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     await result.current.exportPdf();
     expect(toastMock).toHaveBeenCalledWith({ description: 'filePanel.pdfPrintHint' });
@@ -415,7 +396,7 @@ describe('useHtmlActions — file mode', () => {
       }),
     );
     const { result } = renderHook(() =>
-      useHtmlActions({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     const first = result.current.exportPdf();
     result.current.exportPdf(); // re-entry, should be ignored
@@ -428,18 +409,26 @@ describe('useHtmlActions — file mode', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('uses the servedUrl override (share page) for open-in-new-tab with noopener', () => {
-    const served = '/api/v1/public/shared/tok-1/files/serve/results/report.html';
+  it('withholds open-in-new-tab until the page to open is known', () => {
     const { result } = renderHook(() =>
-      useHtmlActions({
-        mode: 'file',
-        workspaceId: '',
-        filePath: 'results/report.html',
-        servedUrl: served,
-      }),
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED }),
     );
-    result.current.openInNewTab!();
-    expect(open).toHaveBeenCalledWith(served, '_blank', 'noopener,noreferrer');
+    expect(result.current.openInNewTab).toBeUndefined();
+  });
+
+  it('opens the share page for the print fallback, with the handle kept', async () => {
+    fetchMock.mockResolvedValue(pdfResponse(false, 501));
+    const print = vi.fn();
+    open.mockReturnValue({ print });
+    await exportServedPdf({
+      filePath: 'results/report.html',
+      servedUrl: '/api/v1/public/shared/tok-1/files/serve/results/report.html',
+      openUrl: 'http://localhost:3000/s/tok-1',
+      printHint: 'hint',
+      generatingHint: 'generating',
+    });
+    expect(open).toHaveBeenCalledWith('http://localhost:3000/s/tok-1', '_blank');
+    expect(print).toHaveBeenCalled();
   });
 });
 
@@ -490,7 +479,7 @@ describe('useHtmlActions — inside the desktop shell', () => {
   it('keeps it for a served file, whose URL opens in the real browser', async () => {
     const hook = await install();
     const { result } = renderHook(() =>
-      hook({ mode: 'file', workspaceId: 'ws-1', filePath: 'results/report.html' }),
+      hook({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
     );
     expect(result.current.openInNewTab).toBeDefined();
   });

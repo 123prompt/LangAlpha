@@ -14,17 +14,36 @@
  * fallback for isolated renders in tests, not a supported host configuration.
  */
 import React from 'react';
-import type { FeedbackResult, SubagentInfo, ToolCallProcessRecord } from './types';
+import type { FeedbackResult, SubagentInfo } from './types';
+import type { ToolApprovalPosition } from '@/types/chat';
+import type { OpenFileHandler } from '../../utils/fileLocation';
+import type { ChartTabSpec } from '../filePanel/types';
 
 export interface MessageActions {
   onOpenSubagentTask?: (info: SubagentInfo) => void;
-  onOpenFile?: (filePath: string, workspaceId?: string) => void;
+  onOpenFile?: OpenFileHandler;
+  /** Brings a turn's deliverables deck into view as it unfolds. The deck owns
+   *  no scroll container and must not grab one: the host's scroll controller
+   *  re-asserts its own position on every content growth, which a fanning deck
+   *  produces on every frame. Its absence just means the deck does not scroll. */
+  onRevealFiles?: (messageId: string) => void;
+  /** Saves a workspace file to disk. Separate from `onOpenFile` because a host
+   *  may grant reading without granting download: a copy-link share does. Its
+   *  absence is what hides the deliverable card's Download item. */
+  onDownloadFile?: (path: string, workspaceId?: string) => void;
+  /** The key a card's save is tracked under. The host builds it because only
+   *  the host knows which workspace a card without its own names, and the
+   *  click and the card's busy state must agree on it. */
+  downloadKeyFor?: (path: string, workspaceId?: string) => string;
   onOpenSources?: (messageId: string) => void;
-  onOpenDir?: (dirPath: string) => void;
-  onToolCallDetailClick?: (proc: ToolCallProcessRecord) => void;
+  /** Opens a live chart for a symbol beside the chat; absent where there is no panel to land in. */
+  onOpenChart?: (spec: ChartTabSpec) => void;
+  /** Opens a tool call's result by id; the host reads the live record. */
+  onToolCallDetailClick?: (toolCallId: string) => void;
   onApprovePlan?: () => void;
   onRejectPlan?: () => void;
-  onPlanDetailClick?: (planData: Record<string, unknown>) => void;
+  /** Opens a plan's text; the approval id keeps one tab per plan. */
+  onPlanDetailClick?: (planApprovalId: string, planData: Record<string, unknown>) => void;
   onAnswerQuestion?: (answer: string, questionId: string, interruptId: string) => void;
   onSkipQuestion?: (questionId: string, interruptId: string) => void;
   onApproveCreateWorkspace?: (proposalData: Record<string, unknown>) => void;
@@ -36,6 +55,13 @@ export interface MessageActions {
   onApproveSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onRejectSecretaryAction?: (proposalData: Record<string, unknown>) => void;
   onResumeCreditPause?: (pauseId: string, interruptId: string) => void;
+  /** `position` is the card's slot among its interrupt's action requests. The
+   *  resume must answer all of them in order, and only the card knows where it
+   *  sits, so it says rather than the hook looking it up. */
+  /** `attemptId` rides along for a call the order gate keyed: the resume names
+   *  it rather than trusting the slot, so a batch cannot misassign a verdict. */
+  onApproveToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, attemptId?: string) => void;
+  onRejectToolCall?: (approvalId: string, interruptId: string, position: ToolApprovalPosition, message?: string, attemptId?: string) => void;
   onEditMessage?: (messageId: string, content: string) => void;
   onRegenerate?: (messageId: string) => void;
   onRetry?: () => void;

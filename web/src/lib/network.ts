@@ -14,6 +14,14 @@ export function isOnline(): boolean {
 }
 
 /**
+ * Options for a mutation a dialog stays open for until it settles. React Query
+ * pauses a mutation started offline until the link returns, which would keep
+ * that dialog locked with no way out. Sent anyway, the request fails at once
+ * and its error lands in the form, where the user can retry or cancel.
+ */
+export const FAIL_FAST_OFFLINE = { networkMode: 'always' } as const;
+
+/**
  * Resolve once the browser reports a link again, or `false` if `timeoutMs`
  * elapses first. Resolves immediately when already online.
  *

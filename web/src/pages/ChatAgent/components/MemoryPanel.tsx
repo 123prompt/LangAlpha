@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, useMemo } from 'react';
-import { ArrowLeft, Brain, FileText, RefreshCw, X } from 'lucide-react';
+import { ArrowLeft, BookMarked, FileText, RefreshCw, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { formatBytes } from '@/lib/format';
 import { useTranslation } from 'react-i18next';
 import {
   useUserMemory,
@@ -11,6 +12,7 @@ import {
 import Markdown from './Markdown';
 import type { MemoryEntry } from '../utils/api';
 import { MEMORY_USER_DIR, MEMORY_WORKSPACE_DIR } from '../utils/agentPaths';
+import type { FileLocation, OpenFileHandler } from '../utils/fileLocation';
 
 type Tier = 'user' | 'workspace';
 
@@ -25,13 +27,7 @@ interface MemoryPanelProps {
    * parent's path-aware router. The panel resolves bare sibling refs
    * (e.g. `feedback_visualization_preference.md`) against the current
    * memory tier's dir before calling. */
-  onOpenFile?: (path: string, workspaceId?: string) => void;
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  onOpenFile?: OpenFileHandler;
 }
 
 function formatTime(iso: string | null): string {
@@ -82,7 +78,7 @@ export default function MemoryPanel({
   // them through to file routing instead of forcing them into the memory
   // store path (where they'd 404).
   const handleBodyLinkOpen = useCallback(
-    (href: string, wsId?: string) => {
+    (href: string, wsId?: string, location?: FileLocation) => {
       if (!onOpenFile || !href) return;
       const isAlreadyQualified =
         href.startsWith('.agents/') ||
@@ -90,7 +86,7 @@ export default function MemoryPanel({
         href.startsWith('/') ||
         /^[a-z][a-z0-9+.-]*:/i.test(href);
       if (isAlreadyQualified) {
-        onOpenFile(href, wsId);
+        onOpenFile(href, wsId, location);
         return;
       }
       const clean = href.replace(/^\.\//, '');
@@ -99,11 +95,11 @@ export default function MemoryPanel({
       const SIBLING_EXTS = new Set(['md', 'markdown']);
       if (!SIBLING_EXTS.has(ext)) {
         // Not a memory entry — let file routing decide where it belongs.
-        onOpenFile(clean, wsId);
+        onOpenFile(clean, wsId, location);
         return;
       }
       const dir = tier === 'user' ? MEMORY_USER_DIR : MEMORY_WORKSPACE_DIR;
-      onOpenFile(`${dir}/${clean}`, wsId);
+      onOpenFile(`${dir}/${clean}`, wsId, location);
     },
     [onOpenFile, tier],
   );
@@ -181,8 +177,7 @@ export default function MemoryPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entriesSig, notFoundKey]);
 
-  const rootLabel =
-    tier === 'user' ? '.agents/user/memory/' : '.agents/workspace/memory/';
+  const rootLabel = `${tier === 'user' ? MEMORY_USER_DIR : MEMORY_WORKSPACE_DIR}/`;
 
   // Viewer mode
   if (selectedKey) {
@@ -315,7 +310,7 @@ export default function MemoryPanel({
         {!list.loading && !list.error && sorted.length === 0 && (
           <div className="px-4 py-8 flex flex-col items-center gap-3 text-center"
                style={{ color: 'var(--color-text-tertiary)' }}>
-            <Brain className="h-8 w-8 opacity-40" />
+            <BookMarked className="h-8 w-8 opacity-40" />
             <div className="text-xs max-w-[16rem]">
               <div>
                 {tier === 'user'

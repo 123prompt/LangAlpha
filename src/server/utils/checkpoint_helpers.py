@@ -16,10 +16,18 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-# Import setup module to access initialized globals
-from src.server.app import setup
-
 logger = logging.getLogger(__name__)
+
+
+def _setup():
+    """The app's setup module, read at call time.
+
+    Importing it at module load builds the whole app, and the app's routers
+    import history, which imports this module: a cold import of history
+    then fails on the half-built cycle."""
+    from src.server.app import setup
+
+    return setup
 
 # Type variable for decorated functions
 F = TypeVar("F", bound=Callable[..., Any])
@@ -74,7 +82,7 @@ def require_checkpointer(func: F) -> F:
     """
     @wraps(func)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        if not setup.checkpointer:
+        if not _setup().checkpointer:
             raise HTTPException(
                 status_code=500,
                 detail="Checkpointer not initialized"
@@ -93,12 +101,13 @@ def get_checkpointer():
     Raises:
         HTTPException: If checkpointer is not initialized
     """
-    if not setup.checkpointer:
+    checkpointer = _setup().checkpointer
+    if not checkpointer:
         raise HTTPException(
             status_code=500,
             detail="Checkpointer not initialized"
         )
-    return setup.checkpointer
+    return checkpointer
 
 
 def is_turn_boundary(cp_tuple: Any) -> bool:

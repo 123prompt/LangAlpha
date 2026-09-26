@@ -17,6 +17,7 @@ import {
 import type { GuidanceLevel } from '@/lib/modelTuning';
 import type { CompactionProfileCatalog, CompactionProfileName } from '@/hooks/useAllModels';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
+import { modelLabel } from '@/lib/modelLabel';
 
 export interface PerModelMatrixProps {
   metadata: Record<string, ModelMetadataEntry>;
@@ -169,7 +170,7 @@ export function PerModelMatrix({
                   return (
                     <tr key={model} style={{ borderTop: '1px solid var(--color-border-muted)' }}>
                       <td className="py-2 pr-3 align-middle" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {model}
+                        {modelLabel(model, metadata)}
                       </td>
                       <td className="py-2 pr-3 align-middle" colSpan={4}>
                         <NotSupported label={t('settings.modelTuning.modelUnavailable')} />
@@ -207,7 +208,7 @@ export function PerModelMatrix({
                 return (
                   <tr key={model} style={{ borderTop: '1px solid var(--color-border-muted)' }}>
                     <td className="py-2 pr-3 align-middle" style={{ color: 'var(--color-text-primary)' }}>
-                      {model}
+                      {modelLabel(model, metadata)}
                     </td>
                     <td className="py-2 pr-3 align-middle">
                       {orderedEfforts.length > 0 ? (
@@ -299,7 +300,7 @@ export function PerModelMatrix({
         >
           <option value="">+ {t('settings.modelTuning.addModel')}</option>
           {addable.map((m) => (
-            <option key={m} value={m}>{m}</option>
+            <option key={m} value={m}>{modelLabel(m, metadata)}</option>
           ))}
         </Select>
       )}

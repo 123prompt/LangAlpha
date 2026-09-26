@@ -13,7 +13,7 @@ what gets returned) independently of build_skill_content's own logic.
 from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ptc_agent.agent.middleware.skills.content import (
     SkillPrefixResult,
@@ -341,3 +341,41 @@ async def test_discovery_does_not_readvertise_a_disabled_skill():
 
     names = {s["name"] for s in out["discovered_skills"]}
     assert names == {"genuinely-user-installed"}
+
+
+class TestManifestInjection:
+    """``inject_manifest`` decides whether the manifest rides the system message.
+
+    The main PTC and Flash stacks freeze it into the runtime-context baseline
+    instead, so their copy must leave the system message alone; a subagent has
+    no baseline and keeps the per-call append.
+    """
+
+    class _Request:
+        """Minimal stand-in for ModelRequest as ``_filter_tools`` consumes it."""
+
+        def __init__(self, system_message):
+            self.tools = []
+            self.state = {}
+            self.system_message = system_message
+
+        def override(self, **kwargs):
+            new = TestManifestInjection._Request(self.system_message)
+            for key, value in kwargs.items():
+                setattr(new, key, value)
+            return new
+
+    def test_the_default_appends_the_manifest(self):
+        mw = SkillsMiddleware(mode="flash")
+        out = mw._filter_tools(self._Request(SystemMessage(content="Static prompt.")))
+        blocks = out.system_message.content
+        assert blocks[0]["text"] == "Static prompt."
+        assert "Available Skills" in blocks[-1]["text"]
+
+    def test_a_baseline_stack_leaves_the_system_message_alone(self):
+        mw = SkillsMiddleware(mode="flash", inject_manifest=False)
+        request = self._Request(SystemMessage(content="Static prompt."))
+        out = mw._filter_tools(request)
+        assert out.system_message is request.system_message
+        # The manifest is still available to whoever freezes it.
+        assert "Available Skills" in mw.build_manifest({})

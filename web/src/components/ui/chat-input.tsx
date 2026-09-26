@@ -4,12 +4,16 @@ import {
   ChartCandlestick, TextSelect, MoreHorizontal, Mic, MicOff,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useQueryClient } from '@tanstack/react-query';
 import { TokenUsageRing, type TokenUsageData } from './token-usage-ring';
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuSeparator,
 } from './dropdown-menu';
 import { Loader } from './loader';
 import { usePreferences } from '@/hooks/usePreferences';
+import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
+import { toast } from './use-toast';
+import { ToastAction } from './toast';
 import { useEffectiveTuning, useModelProfileWriter } from '@/hooks/useModelProfile';
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { useAllModels } from '@/hooks/useAllModels';
@@ -19,7 +23,7 @@ import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
 import type { ModelOptions, ReadyAttachment, SlashCommand, Workspace } from './chat-input.types';
-import { getSlashCommandIcon, isLargePaste } from './chat-input.helpers';
+import { getSlashCommandIcon, isLargePaste, getModelDisplayName, modelPickWrite } from './chat-input.helpers';
 import { effortLabelFor } from '@/lib/modelTuning';
 import type { ModelProfile } from '@/lib/modelTuning';
 import {
@@ -35,14 +39,19 @@ import { useSlashCommands } from './chat-input.useSlashCommands';
 import { speechSupported, useVoiceInput } from './chat-input.useVoiceInput';
 import { useFileAttachments } from './chat-input.useFileAttachments';
 import { modelPrefs, modelProfile } from '@/lib/modelPreferences';
+import { queryKeys } from '@/lib/queryKeys';
+import { formatContextBlock } from './chat-input.contextBlocks';
 
 /** Autosize cap for the composer textarea; past this the box scrolls. */
 const MAX_TEXTAREA_HEIGHT = 200;
 
+/** Long enough to read the line and reach the undo; the 3s default is not. */
+const MODEL_SWITCH_TOAST_MS = 8000;
+
 
 export interface ChatInputHandle {
   getModelOptions: () => ModelOptions;
-  addContext: (ctx: { path?: string; snippet?: string; label?: string; lineStart?: number; lineEnd?: number; lineCount?: number; source?: string }) => void;
+  addContext: (ctx: { path?: string; snippet?: string; label?: string; locator?: string; lineStart?: number; lineEnd?: number; lineCount?: number; source?: string }) => void;
   /**
    * Imperatively add a widget context snapshot to the deck. Local-only —
    * this does NOT publish to ContextBus. Use this when re-seeding the deck
@@ -92,7 +101,6 @@ export interface ChatInputProps {
   hasExternalContext?: boolean;
   tokenUsage?: TokenUsageData | null;
   onAction?: ((cmd: SlashCommand) => void) | null;
-  initialModel?: string | null;
   /** Reports the live model selection (fires on mount and every change). */
   onModelChange?: ((model: string | null) => void) | null;
   threadModels?: string[];
@@ -132,7 +140,6 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   // Action commands (e.g. /compact) — dispatched on send, not on selection
   onAction = null,
   // Model selector
-  initialModel = null,
   onModelChange = null,
   // All models used in this thread (shown in primary menu)
   threadModels: threadModelsProp = [],
@@ -144,8 +151,10 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   const { t } = useTranslation();
   const isMobile = useIsMobile();
   const { preferences } = usePreferences();
+  const { mutateAsync: updatePreferencesAsync } = useUpdatePreferences();
+  const queryClient = useQueryClient();
   const marketWatchEnabled = useFeatureEnabled('market_watch');
-  const { validModelNames, metadata: modelMetadata } = useAllModels();
+  const { validModelNames, metadata: modelMetadata, isLoading: modelsLoading, systemDefaults } = useAllModels();
   const otherPref = (preferences as Record<string, Record<string, unknown>> | null)?.other_preference;
   const starredModels = Array.isArray(otherPref?.starred_models)
     ? (otherPref.starred_models as unknown[]).filter((m): m is string => typeof m === 'string')
@@ -166,8 +175,22 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
 
   // Model selector state — use flash model preference when in flash mode
   const modePreferredModel = mode === 'fast' ? (preferredFlashModel || preferredModel) : preferredModel;
-  const effectiveInitialModel = initialModel || modePreferredModel;
-  const [selectedModel, setSelectedModel] = useState<string | null>(effectiveInitialModel);
+  // Every thread opens on the account's current preference, never on the model
+  // its last turn happened to use. That is what lets a retired model disappear
+  // without rewriting a single conversation, and it is why a pick below writes
+  // the preference instead of parking a model name on the thread.
+  const [selectedModel, setSelectedModel] = useState<string | null>(modePreferredModel);
+  // With nothing saved, a send carries no model and the server runs the
+  // deployment's default for the mode. The pill names that model instead of
+  // disappearing, and its tuning controls are that model's. Flash has its own
+  // default rather than the primary one, and a deployment that names none
+  // (reported as "") runs flash turns on the primary. Only once the preference
+  // is known: until then the server may run a stored model this composer
+  // cannot name, and the default's tuning would ride along on it.
+  const systemDefaultModel = (mode === 'fast' && systemDefaults?.flash_model)
+    || systemDefaults?.default_model
+    || null;
+  const pillModel = selectedModel || (preferences ? systemDefaultModel : null);
 
   // Per-model tuning is an account preference, not a device one: the server
   // resolves ``profiles[<model>]`` for turns this input never starts (schedules,
@@ -179,7 +202,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   // copy: a failed write rolls the cache back and the pill follows it, instead
   // of naming a level the next scheduled turn will not run.
   const { profile: modelTuningProfile, efforts: reasoningEfforts, inherited, effective } =
-    useEffectiveTuning(selectedModel);
+    useEffectiveTuning(pillModel);
   // The raw override, which is what the effort menu needs: it renders "Default"
   // from the absence of one. The fast-mode toggle has no such state, so it
   // reads the resolved value below.
@@ -195,10 +218,13 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   const resolvedEffort = effective.reasoning_effort;
   const resolvedFastMode = effective.fast_mode;
 
-  // Sync selectedModel when initialModel or preferredModel changes
+  // Follow the preference when it moves, which includes the optimistic write a
+  // pick (or its undo) makes below, and its rollback. A preference that goes
+  // back to unset is followed too: holding the old selection would keep
+  // sending a model the account never kept.
   useEffect(() => {
-    if (effectiveInitialModel) setSelectedModel(effectiveInitialModel);
-  }, [effectiveInitialModel]);
+    setSelectedModel(modePreferredModel);
+  }, [modePreferredModel]);
 
   // Mirror the live selection to the host (ChatView gates the fallback
   // suggestion pill on the model the next send will actually use).
@@ -206,7 +232,64 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     onModelChange?.(selectedModel);
   }, [selectedModel, onModelChange]);
 
-  const isCodexModel = selectedModel ? modelMetadata[selectedModel]?.sdk === 'codex' : false;
+  // A pick answers "which model do I want", not "which model does this one
+  // message run on", so it writes the account preference and every thread
+  // follows. Keeping the answer in one place is what makes a retirement a
+  // single sweep. The toast is what makes a global effect legible from a
+  // control that looks local, so it carries the undo rather than a confirm
+  // step standing between the user and send.
+  const switchToastRef = useRef<ReturnType<typeof toast> | null>(null);
+  const pickSeqRef = useRef(0);
+  const handlePickModel = useCallback((model: string) => {
+    // The checked row is the model the composer already runs, saved or not.
+    // Writing it would pin today's deployment default in place of following it.
+    if (model === pillModel) return;
+    setSelectedModel(model);
+    // Without a loaded preference (its request failed) there is no known value
+    // for an undo to restore, and an unset one would delete a choice the
+    // account does hold. The pick then applies to this composer only.
+    if (!preferences) return;
+    const write = modelPickWrite(mode, model, preferredModel, preferredFlashModel);
+    if (!write) return;
+    const { key, previous } = write;
+    // A newer pick makes every older undo stale: restoring its value would
+    // overwrite the model the user just chose. An older write's failure is
+    // stale too, and its toast would replace the newer pick's undo.
+    const seq = ++pickSeqRef.current;
+    switchToastRef.current?.dismiss();
+    switchToastRef.current = null;
+    const failed = () => {
+      if (seq !== pickSeqRef.current) return;
+      toast({ description: t('chat.modelSwitchFailed'), variant: 'destructive' });
+    };
+    // `null` deletes the key, which is the only faithful undo for someone who
+    // had never chosen a model: writing today's default back would record a
+    // choice they never made. The composer follows the restored preference
+    // through the sync effect; set directly, it would take the pick's mode
+    // along and put a Flash model on the PTC composer.
+    const restore = () => {
+      // The toast outlives this composer, so Settings may have saved a newer
+      // choice since. The undo only reverts a preference that still holds
+      // this pick.
+      const current = modelPrefs(queryClient.getQueryData(queryKeys.user.preferences()))[key];
+      if (current !== model) return;
+      updatePreferencesAsync({ model_preference: { [key]: previous } }).catch(failed);
+    };
+    updatePreferencesAsync({ model_preference: { [key]: model } }).then(() => {
+      if (seq !== pickSeqRef.current) return;
+      switchToastRef.current = toast({
+        description: t('chat.modelSwitched', { model: getModelDisplayName(model, modelMetadata) }),
+        duration: MODEL_SWITCH_TOAST_MS,
+        action: (
+          <ToastAction altText={t('chat.undoModelSwitch')} onClick={restore}>
+            {t('chat.undo')}
+          </ToastAction>
+        ),
+      });
+    }).catch(failed);
+  }, [pillModel, preferences, mode, preferredModel, preferredFlashModel, updatePreferencesAsync, queryClient, modelMetadata, t]);
+
+  const isCodexModel = pillModel ? modelMetadata[pillModel]?.sdk === 'codex' : false;
 
   // Widget context deck state. Snapshots arrive via ContextBus.attach (when
   // the user clicks "+" on any widget on the page) or via addWidgetSnapshot
@@ -254,13 +337,13 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
         marketWatch: effectiveMarketWatch,
       };
     },
-    addContext({ path, snippet, label, lineStart, lineEnd, lineCount, source }) {
+    addContext({ path, snippet, label, locator, lineStart, lineEnd, lineCount, source }) {
       if (snippet) {
         // Snippet context — add pill with snippet data, don't modify textarea
         setMentionedFiles((prev) => {
           // Deduplicate by exact snippet content (handles multiple selections)
-          if (prev.some((f) => f.snippet === snippet && f.path === (path || '') && f.source === (source || undefined))) return prev;
-          return [...prev, { path: path || '', snippet, label, lineStart, lineEnd, lineCount, source }];
+          if (prev.some((f) => f.snippet === snippet && f.path === (path || '') && f.locator === locator && f.source === (source || undefined))) return prev;
+          return [...prev, { path: path || '', snippet, label, locator, lineStart, lineEnd, lineCount, source }];
         });
       } else if (path) {
         // Whole file context — same behavior as selectFile via @mention
@@ -336,19 +419,21 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   // saw them. Lift what this device still holds into the account profile, then
   // drop the keys. Per field, not per record: a profile that already carries one
   // of the two must not strand the other. And the keys are this value's only
-  // copy until the write lands, so they go only once it has.
+  // copy until the write lands, so they go only once it has. The pill's model,
+  // not the selection: with nothing saved the default is what runs, and its
+  // keys are the ones this device has been using.
   const liftedModelRef = useRef<string | null>(null);
   useEffect(() => {
     // The model's own row has to be in hand first: `reasoningEfforts` reads
     // empty both while the catalog loads and for a model that declares no
     // ladder, and the clamp below wants opposite answers for the two.
-    const meta = selectedModel ? modelMetadata[selectedModel] : undefined;
-    if (!selectedModel || !preferences || !meta || liftedModelRef.current === selectedModel) return;
-    liftedModelRef.current = selectedModel;
+    const meta = pillModel ? modelMetadata[pillModel] : undefined;
+    if (!pillModel || !preferences || !meta || liftedModelRef.current === pillModel) return;
+    liftedModelRef.current = pillModel;
 
-    const profile = modelProfile(preferences, selectedModel);
-    const storedEffort = localStorage.getItem(`reasoning_effort:${selectedModel}`);
-    const storedFast = localStorage.getItem(`fast_mode:${selectedModel}`) === 'true';
+    const profile = modelProfile(preferences, pillModel);
+    const storedEffort = localStorage.getItem(`reasoning_effort:${pillModel}`);
+    const storedFast = localStorage.getItem(`fast_mode:${pillModel}`) === 'true';
     const lift: ModelProfile = {};
     // These keys predate per-model ladders, when one fixed list of levels was
     // offered for every model, so a device may hold a level this model never
@@ -360,31 +445,31 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     if (storedFast && profile.fast_mode === undefined) lift.fast_mode = true;
 
     const dropDeviceKeys = () => {
-      localStorage.removeItem(`reasoning_effort:${selectedModel}`);
-      localStorage.removeItem(`fast_mode:${selectedModel}`);
+      localStorage.removeItem(`reasoning_effort:${pillModel}`);
+      localStorage.removeItem(`fast_mode:${pillModel}`);
     };
     if (Object.keys(lift).length > 0) {
       // No release of the guard on failure: the write moves `preferences`
       // twice, so re-entry is immediate and a rejection would resubmit itself
       // without bound. A failed lift keeps its device keys and is retried on
       // the next mount or model switch.
-      writeModelProfile(selectedModel, lift, { onSuccess: dropDeviceKeys });
+      writeModelProfile(pillModel, lift, { onSuccess: dropDeviceKeys });
     } else {
       dropDeviceKeys();
     }
-  }, [selectedModel, preferences, writeModelProfile, modelMetadata, reasoningEfforts]);
+  }, [pillModel, preferences, writeModelProfile, modelMetadata, reasoningEfforts]);
 
   const handleReasoningEffortChange = useCallback((effort: string | null) => {
-    if (selectedModel) writeModelProfile(selectedModel, { reasoning_effort: effort });
-  }, [selectedModel, writeModelProfile]);
+    if (pillModel) writeModelProfile(pillModel, { reasoning_effort: effort });
+  }, [pillModel, writeModelProfile]);
 
   const handleFastModeChange = useCallback((fast: boolean) => {
     // Both states are explicit. `null` here would mean "inherit", which this
     // toggle cannot express — and on an account defaulting to fast it would
     // delete the override and snap straight back to fast. Clearing is the
     // per-model matrix's job, where Default is its own option.
-    if (selectedModel) writeModelProfile(selectedModel, { fast_mode: fast });
-  }, [selectedModel, writeModelProfile]);
+    if (pillModel) writeModelProfile(pillModel, { fast_mode: fast });
+  }, [pillModel, writeModelProfile]);
 
   // Reset isStopping once both a running turn and a compaction have finished.
   useEffect(() => {
@@ -485,18 +570,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     let finalMessage = message;
     const snippetMentions = mentionedFiles.filter((f) => f.snippet);
     if (snippetMentions.length > 0) {
-      const blocks = snippetMentions.map((f) => {
-        if (f.source === 'chat') {
-          return `\n<details>\n<summary>[${t('context.fromAgentResponse')}]</summary>\n\n\`\`\`\n${f.snippet}\n\`\`\`\n</details>`;
-        }
-        if (f.source === 'paste') {
-          return `\n<details>\n<summary>[${t('context.pastedText')}]</summary>\n\n\`\`\`\n${f.snippet}\n\`\`\`\n</details>`;
-        }
-        const lineInfo = f.lineStart != null
-          ? ` (lines ${f.lineStart}-${f.lineEnd}, ${f.lineCount} line${f.lineCount !== 1 ? 's' : ''})`
-          : '';
-        return `\n<details>\n<summary>@${f.path}${lineInfo}</summary>\n\n\`\`\`\n${f.snippet}\n\`\`\`\n</details>`;
-      });
+      const blocks = snippetMentions.map((f) => formatContextBlock(f, t));
       finalMessage = finalMessage.trimEnd() + '\n' + blocks.join('\n');
     }
     onSend(finalMessage, planMode, readyAttachments, slashCommands, {
@@ -579,8 +653,10 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   const { measureRowRef, fold } = useToolbarFold({
     containerRef: chatContainerRef,
     items: toolbarItems,
-    // The model pill is measured too, but it isn't foldable.
-    measureKey: `${selectedModel}|${resolvedEffort}|${resolvedFastMode && isCodexModel}`,
+    // The model pill is measured too, but it isn't foldable. Its label joins
+    // the key because an authored display_name comes with the models request,
+    // which can land after the pill was first measured under the key's label.
+    measureKey: `${pillModel}|${getModelDisplayName(pillModel, modelMetadata)}|${resolvedEffort}|${resolvedFastMode && isCodexModel}`,
     // Left of the first pill: container border + px-3, the attach button, and
     // the optional ring / chart-capture button (see the action bar below).
     fixedLeft: CONTAINER_BORDER + CONTAINER_PX + ICON_BUTTON_W
@@ -601,9 +677,9 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     () => deriveQuickAccessModels({
       preferredModel, preferredFlashModel, starredModels, validModelNames,
       // Don't repeat models already shown in the primary (selected + thread) section.
-      excludeModels: [selectedModel, ...threadModelsProp].filter((m): m is string => !!m),
+      excludeModels: [pillModel, ...threadModelsProp].filter((m): m is string => !!m),
     }),
-    [preferredModel, preferredFlashModel, starredModels, validModelNames, selectedModel, threadModelsProp],
+    [preferredModel, preferredFlashModel, starredModels, validModelNames, pillModel, threadModelsProp],
   );
 
   return (
@@ -616,7 +692,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
       {/* Main Container */}
       <div
         ref={chatContainerRef}
-        className={`chat-input-container flex flex-col items-stretch transition-all duration-200 relative z-10 rounded-2xl cursor-text border border-[var(--color-border-input)] bg-[var(--color-bg-card)] ${isListening ? 'recording' : ''}`}
+        className={`chat-input-container owns-its-edge flex flex-col items-stretch transition-all duration-200 relative z-10 rounded-2xl cursor-text border border-[var(--color-border-input)] bg-[var(--color-bg-card)] ${isListening ? 'recording' : ''}`}
         onClick={() => textareaRef.current?.focus()}
       >
         {isListening && (
@@ -683,6 +759,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
               {mentionedFiles.map((f, idx) => {
                 const isSnippet = !!f.snippet;
                 const isPaste = f.source === 'paste';
+                const isChart = f.source === 'chart';
                 const name = isSnippet ? f.label : f.path.split('/').pop();
                 const pillKey = (f.path || '') + '::' + (f.label || '') + '::' + idx;
                 // Snippet tooltips preview, not mirror — a condensed paste can
@@ -698,6 +775,8 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                   >
                     {isPaste
                       ? <ClipboardList className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
+                      : isChart
+                        ? <ChartCandlestick className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
                       : isSnippet
                         ? <TextSelect className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
                         : <FileText className="h-3 w-3 flex-shrink-0" style={{ color: 'var(--color-accent-primary)' }} />
@@ -872,7 +951,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                   <span key={item.id} data-measure={item.id}>{item.inline({ measureOnly: true })}</span>
                 ))}
                 <span data-measure="model">
-                  <ModelTriggerMeasure selectedModel={selectedModel} effortLabel={effortLabelFor(t, resolvedEffort)} fastMode={resolvedFastMode} isCodexModel={isCodexModel} />
+                  <ModelTriggerMeasure selectedModel={pillModel} metadata={modelMetadata} effortLabel={effortLabelFor(t, resolvedEffort)} fastMode={resolvedFastMode} isCodexModel={isCodexModel} />
                 </span>
               </div>
             </div>
@@ -880,8 +959,9 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
             {/* Right Tools */}
             <div className="flex flex-row items-center min-w-0 gap-1">
               <ChatInputModelMenu
-                selectedModel={selectedModel}
-                onSelectModel={setSelectedModel}
+                selectedModel={pillModel}
+                metadata={modelMetadata}
+                onSelectModel={handlePickModel}
                 threadModels={threadModelsProp}
                 validModelNames={validModelNames}
                 moreModelsItems={moreModelsItems}
@@ -895,6 +975,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                 reasoningEfforts={reasoningEfforts}
                 dropdownDirection={dropdownDirection}
                 containerRef={chatContainerRef}
+                disabled={modelsLoading}
               />
               {/* Voice Input Button (Show only if enabled in user settings) */}
               {speechSupported && !isLoading && !!otherPref?.voice_input_enabled && (

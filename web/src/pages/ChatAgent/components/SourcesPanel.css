@@ -11,6 +11,9 @@
 }
 
 .source-deck-card {
+  /* The whole offset rides `transform`, which is what the transition below
+     animates; a card moved by `top` would jump to its fanned slot. */
+  top: 0;
   transition:
     transform 260ms cubic-bezier(0.16, 1, 0.3, 1),
     opacity 260ms cubic-bezier(0.16, 1, 0.3, 1),

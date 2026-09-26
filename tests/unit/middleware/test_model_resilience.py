@@ -336,6 +336,22 @@ class TestBuildFallbackPairs:
             ("sdk-id-b", clients[1]),
         ]
 
+    def test_resolved_empty_does_not_retry_rejected_names(self):
+        cfg = self._Cfg(clients=[], names=[], fallback=["deepseek-v4-pro"])
+        assert build_fallback_pairs(cfg) == []
+
+    def test_unresolved_config_uses_name_factory(self, monkeypatch):
+        client = _FakeModel("standalone")
+        calls = []
+
+        def factory(name):
+            calls.append(name)
+            return client
+
+        monkeypatch.setattr("src.llms.get_llm_by_type", factory)
+        assert build_fallback_pairs(self._Cfg(fallback=["standalone"])) == [("standalone", client)]
+        assert calls == ["standalone"]
+
     def test_empty_config_returns_empty(self):
         assert build_fallback_pairs(self._Cfg()) == []
 

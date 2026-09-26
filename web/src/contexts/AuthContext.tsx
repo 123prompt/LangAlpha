@@ -9,6 +9,7 @@ import { resetNavPanelExpansion } from '@/pages/ChatAgent/components/navExpansio
 import { resetStableNavOrder } from '@/pages/ChatAgent/hooks/useNavigationData';
 import { resetSharedWorkspaceThreads } from '@/lib/navThreadsStore';
 import { runAuthResets } from '../lib/authResets';
+import { detectedTimezone } from '@/lib/deviceTimezone';
 
 import type {
   AuthError,
@@ -135,7 +136,7 @@ function SupabaseAuthProvider({ children }: { children: React.ReactNode }) {
             email: sess.user?.email,
             name: meta.name || meta.full_name || null,
             avatar_url: meta.avatar_url || null,
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+            timezone: detectedTimezone(),
             // `locale` deliberately omitted — only the Settings dropdown
             // writes it. The frontend detector reads browser locale on cold
             // load. See `useSyncUserLocale`.

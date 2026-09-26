@@ -24,6 +24,33 @@
   color: var(--color-text-primary);
 }
 
+/* The ticker as a control: same type as the label, plus the chevron that says
+   it opens. Hover lifts it the way the header's other pills lift. */
+.stock-symbol-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin: -2px -6px;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  cursor: pointer;
+}
+.stock-symbol-btn:hover {
+  background: var(--color-bg-hover);
+}
+.stock-symbol-btn svg {
+  color: var(--color-icon-muted);
+}
+
+.stock-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
 .stock-name {
   font-size: 1rem;
   color: var(--color-text-secondary);
@@ -162,27 +189,6 @@
   font-size: 0.875rem;
   color: var(--color-text-primary);
   font-weight: 500;
-}
-
-.stock-overview-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-top: 6px;
-  padding: 3px 10px;
-  font-size: 0.75rem;
-  color: var(--color-text-secondary);
-  background: transparent;
-  border: 1px solid var(--color-border-default);
-  border-radius: 4px;
-  cursor: pointer;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-
-.stock-overview-toggle:hover {
-  color: var(--color-text-primary);
-  background: var(--color-bg-hover);
-  border-color: var(--color-border-elevated);
 }
 
 .metrics-discrepancy-hint {

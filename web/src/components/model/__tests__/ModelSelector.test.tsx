@@ -59,6 +59,15 @@ describe('ModelSelector', () => {
     expect(onChange).toHaveBeenCalledWith('gpt-4o-mini');
   });
 
+  it('prints the authored display name while the key stays the value', () => {
+    render(
+      <ModelSelector {...defaultProps} metadata={{ 'gpt-4o': { display_name: 'GPT-4o' } }} />,
+    );
+
+    expect(screen.getByRole('option', { name: 'GPT-4o' })).toHaveValue('gpt-4o');
+    expect(screen.getByRole('option', { name: 'gpt-4o-mini' })).toBeInTheDocument();
+  });
+
   it('shows "No models available" when no models', () => {
     render(
       <ModelSelector

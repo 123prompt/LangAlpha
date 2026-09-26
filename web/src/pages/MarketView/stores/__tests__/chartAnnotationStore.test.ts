@@ -421,7 +421,7 @@ describe('applyAnnotationArtifact', () => {
   });
 
   it('rejects a marker with no valid shape (would blank the shared marker layer)', () => {
-    // A marker with no shape makes lightweight-charts' setMarkers throw, which
+    // A marker with no shape makes the lightweight-charts markers plugin throw, which
     // would wipe earnings + grade markers too — reject it at the store boundary.
     applyAnnotationArtifact('chart_annotation', {
       op: 'add',

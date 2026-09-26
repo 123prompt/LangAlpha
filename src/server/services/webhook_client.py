@@ -45,12 +45,24 @@ class WebhookClient:
         thread_id: str | None,
         workspace_id: str | None,
         error: str | None = None,
+        run_id: str | None = None,
+        failure_reason: str | None = None,
     ) -> list[dict] | None:
         """Fire an event to all configured delivery methods.
 
         Reads delivery_config.methods from the automation and resolves
         the webhook URL and secret from environment variables.
         Never raises — all errors are logged and swallowed.
+
+        ``run_id`` names the turn this execution ran. A thread can hold a
+        newer turn by the time the event lands (the next firing of a pinned
+        thread can start within seconds), so a receiver reading the report
+        should read that turn, not the thread's latest.
+
+        ``failure_reason`` sets apart a failed run the user has to act on:
+        ``usage_limit`` (``error`` is then the quota service's own message)
+        or ``provider_auth`` (their key was rejected and the automation is
+        now disabled). None for any other event or failure.
 
         Returns a list of per-method results, or None if no delivery configured.
         Each result: {"method": str, "success": bool, "error"?: str}
@@ -75,6 +87,8 @@ class WebhookClient:
             "automation_name": automation.get("name"),
             "execution_id": execution_id,
             "thread_id": thread_id,
+            "run_id": run_id,
+            "failure_reason": failure_reason,
             "user_id": automation["user_id"],
             "agent_mode": automation.get("agent_mode"),
             "workspace_id": str(workspace_id) if workspace_id else None,

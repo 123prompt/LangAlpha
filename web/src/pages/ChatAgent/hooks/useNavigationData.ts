@@ -537,9 +537,20 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     combine: (results) => results.map((r) => r.data as ThreadsResponse | undefined),
   });
 
+  // Each workspace keeps its previous ThreadsData object while its rows are
+  // the same records: the sidebar rows are memoized on that identity, and a
+  // refetch that changed one thread used to rebuild every workspace's block.
+  const prevThreadsByWsRef = useRef<Record<string, ThreadsData>>({});
   const merged = useMemo(() => {
     const threadsByWs: Record<string, ThreadsData> = {};
     const orders: Record<string, string[]> = {};
+    const prev = prevThreadsByWsRef.current;
+    const keep = (wsId: string, next: ThreadsData): ThreadsData => {
+      const last = prev[wsId];
+      const same = !!last && last.loading === next.loading && last.total === next.total
+        && last.threads.length === next.threads.length && last.threads.every((t, i) => t === next.threads[i]);
+      return same ? last : next;
+    };
 
     // Every workspace group (not just the current one) renders page 0 read
     // through the query cache, with any "Show more" pages from the shared
@@ -553,7 +564,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       const loading = (isCurrent && currentWsThreadsLoading) || stored?.loading || false;
       const page = pageData[index];
       if (page === undefined) {
-        threadsByWs[wsId] = { threads: stored?.threads || [], loading, total: stored?.total };
+        threadsByWs[wsId] = keep(wsId, { threads: stored?.threads || [], loading, total: stored?.total });
         return;
       }
       const pageThreads = page.threads || [];
@@ -561,9 +572,10 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
       const extras = (stored?.threads || []).filter((t) => !pageIds.has(t.thread_id));
       const { order, threads } = orderThreads(wsId, [...pageThreads, ...extras]);
       orders[wsId] = order;
-      threadsByWs[wsId] = { threads, loading, total: page.total ?? stored?.total };
+      threadsByWs[wsId] = keep(wsId, { threads, loading, total: page.total ?? stored?.total });
     });
 
+    prevThreadsByWsRef.current = threadsByWs;
     return { threadsByWs, orders };
   }, [observedWsIds, pageData, workspaceThreads, currentWorkspaceId, currentWsThreadsLoading, orderThreads]);
 
@@ -573,6 +585,10 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   }, [merged]);
 
   const mergedThreads = merged.threadsByWs;
+  // Read by the handlers below at call time, so their identity does not
+  // follow the thread data: each is a prop of every memoized sidebar row.
+  const mergedThreadsRef = useRef(mergedThreads);
+  mergedThreadsRef.current = mergedThreads;
 
   const expandWorkspace = useCallback((wsId: string) => {
     const mergeFetched = (data: ThreadsResponse) => {
@@ -623,13 +639,13 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
   const loadMoreThreads = useCallback(async (wsId: string) => {
     if (loadMoreInflightRef.current.has(wsId)) return;
     loadMoreInflightRef.current.add(wsId);
-    const shown = mergedThreads[wsId]?.threads || [];
+    const shown = mergedThreadsRef.current[wsId]?.threads || [];
     setSharedWorkspaceThreads(prev => ({
       ...prev,
       [wsId]: {
         threads: prev[wsId]?.threads || shown,
         loading: true,
-        total: prev[wsId]?.total ?? mergedThreads[wsId]?.total,
+        total: prev[wsId]?.total ?? mergedThreadsRef.current[wsId]?.total,
       },
     }));
     try {
@@ -673,7 +689,7 @@ export function useNavigationData(currentWorkspaceId: string, { enabled = true }
     } finally {
       loadMoreInflightRef.current.delete(wsId);
     }
-  }, [mergedThreads, threadPageSize, orderThreads, queryClient]);
+  }, [threadPageSize, orderThreads, queryClient]);
 
   const loadAll = useCallback(() => {
     // The page-in effect above fetches the remainder once this flips.

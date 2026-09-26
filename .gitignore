@@ -144,3 +144,6 @@ docs/pr_context/
 # Written by scripts/build.mjs to inject the update feed, and removed again after
 # the build. Tracked here only so a crashed build cannot leave a feed URL behind.
 /desktop/.electron-builder.resolved.yml
+
+# Vite dep cache written from the repo root
+/.vite/

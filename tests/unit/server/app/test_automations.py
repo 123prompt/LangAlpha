@@ -84,6 +84,7 @@ async def client():
 
 HANDLER = "src.server.app.automations.handler"
 AUTO_DB = "src.server.app.automations.auto_db"
+HANDLER_DB = "src.server.handlers.automation_handler.auto_db"
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +144,24 @@ async def test_create_automation_validation_error(client):
         json={"name": "No trigger"},
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_create_refuses_a_schedule_field_of_another_kind(client):
+    with patch(f"{HANDLER}.create_automation", new_callable=AsyncMock) as create:
+        resp = await client.post(
+            "/api/v1/automations",
+            json={
+                "name": "Daily Briefing",
+                "trigger_type": "cron",
+                "cron_expression": "0 8 * * *",
+                "next_run_at": NOW.isoformat(),
+                "instruction": "Give me a market summary",
+            },
+        )
+
+    assert resp.status_code == 422
+    create.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +285,25 @@ async def test_update_automation_conflict_409(client):
         )
 
     assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_update_refuses_a_schedule_field_of_another_kind(client):
+    """The body parses, and only the stored row says a cron takes no
+    next_run_at; the refusal answers in the 422 shape of a bad body."""
+    with (
+        patch(f"{HANDLER_DB}.get_automation", new_callable=AsyncMock, return_value=_automation()),
+        patch(f"{HANDLER_DB}.update_automation", new_callable=AsyncMock) as update,
+    ):
+        resp = await client.patch(
+            f"/api/v1/automations/{AUTO_ID}",
+            json={"next_run_at": NOW.isoformat()},
+        )
+
+    assert resp.status_code == 422
+    [error] = resp.json()["detail"]
+    assert "next_run_at doesn't apply to a 'cron' automation" in error["msg"]
+    update.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -429,5 +467,73 @@ async def test_list_executions_with_pagination(client):
 
     assert resp.status_code == 200
     mock_list.assert_awaited_once_with(
-        AUTO_ID, "test-user-123", limit=5, offset=10
+        "test-user-123", automation_id=AUTO_ID, limit=5, offset=10
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/automations/executions — the run feed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_feed_is_not_captured_by_the_automation_route(client):
+    """Declared before /automations/{automation_id}; moved after it, the feed
+    would be read as an automation named "executions"."""
+    run = _execution(
+        automation_name="Daily Briefing", agent_mode="flash", trigger_type="cron"
+    )
+    with (
+        patch(
+            f"{AUTO_DB}.list_executions",
+            new_callable=AsyncMock,
+            return_value=([run], 1),
+        ) as mock_list,
+        patch(f"{AUTO_DB}.get_automation", new_callable=AsyncMock) as mock_get,
+    ):
+        resp = await client.get("/api/v1/automations/executions")
+
+    assert resp.status_code == 200
+    assert resp.json()["executions"][0]["automation_name"] == "Daily Briefing"
+    mock_list.assert_awaited_once_with(
+        "test-user-123", thread_id=None, status=None, limit=20, offset=0
+    )
+    mock_get.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/automations/{automation_id}/executions/{execution_id}/skip
+# ---------------------------------------------------------------------------
+
+HANDLER_DB = "src.server.handlers.automation_handler.auto_db"
+SETTLE = "src.server.handlers.automation_handler.settle"
+SKIP_URL = f"/api/v1/automations/{AUTO_ID}/executions/{EXEC_ID}/skip"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_now", "expected"),
+    [("completed", 409), (None, 404)],
+    ids=["no-longer-waiting", "nonexistent"],
+)
+async def test_skip_that_does_not_land(client, status_now, expected):
+    with (
+        patch(HANDLER_DB) as db,
+        patch(SETTLE, new_callable=AsyncMock, return_value=False),
+    ):
+        db.get_automation = AsyncMock(return_value=_automation())
+        db.get_execution_status = AsyncMock(return_value=status_now)
+        resp = await client.post(SKIP_URL)
+
+    assert resp.status_code == expected
+
+
+@pytest.mark.asyncio
+async def test_skip_with_a_malformed_id_is_422(client):
+    with patch(f"{HANDLER}.skip_execution", new_callable=AsyncMock) as mock_skip:
+        resp = await client.post(
+            f"/api/v1/automations/{AUTO_ID}/executions/not-a-uuid/skip"
+        )
+
+    assert resp.status_code == 422
+    mock_skip.assert_not_awaited()

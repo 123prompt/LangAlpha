@@ -25,7 +25,7 @@ const LoginPage = React.lazy(() => import('./pages/Login/LoginPage'));
 // The public share route reuses the chat transcript renderer, so a static import
 // pulled the whole ChatAgent tree — plus the markdown and chart vendors it reaches
 // — into the entry chunk that every visitor loads before login.
-const SharedChatView = React.lazy(() => import('./pages/SharedChat/SharedChatView'));
+const SharePage = React.lazy(() => import('./pages/SharedChat/SharePage'));
 const SetupWizard = React.lazy(() => import('./pages/Setup/SetupWizard'));
 const PrivacyPolicy = React.lazy(() => import('./pages/Legal/PrivacyPolicy'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
@@ -371,9 +371,16 @@ function App() {
           <ResetPassword />
         </Suspense>
       } />
+      {/* Chats share under /s/, files and apps live under /a/. The codes are
+          one namespace, so either prefix opens any of them. */}
       <Route path="/s/:shareToken" element={
         <Suspense fallback={<PageLoading />}>
-          <SharedChatView />
+          <SharePage />
+        </Suspense>
+      } />
+      <Route path="/a/:shareToken" element={
+        <Suspense fallback={<PageLoading />}>
+          <SharePage />
         </Suspense>
       } />
       <Route path="/privacy" element={

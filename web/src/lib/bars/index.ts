@@ -52,9 +52,9 @@ export type { RangePreset } from './rangePresets';
 
 export {
   advanceWatermark,
-  centerLatestBarView,
   computeInitialLoadRange,
   dedupeMergeByTime,
+  defaultBarsView,
   etDateStr,
   fetchBarsDelta,
   rangeBeforeOldest,

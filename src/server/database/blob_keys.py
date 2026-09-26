@@ -19,11 +19,23 @@ BLOB_KEY_PREFIX = "blobs/"
 # Serving derives Content-Type from the file's extension instead.
 BLOB_CONTENT_TYPE = "application/octet-stream"
 
-# Per-object cap, passed explicitly to the storage facade so its shared
+# A workspace is a filesystem, so its disk is the size limit and the direct
+# path carries no cap of its own: bytes stream from the sandbox to the store
+# and nothing in between holds them. What remains are the two paths that
+# cannot stream, each bounded by the thing that actually constrains it. Both
+# are passed explicitly to the storage facade so its shared
 # STORAGE_MAX_UPLOAD_SIZE default (10MB, sized for avatars and charts) can't
-# reject a file the sync path already accepted. ``FilePersistenceService``
-# derives MAX_FILE_SIZE from this: a file the sync path accepts must be storable.
-MAX_BLOB_BYTES = 100 * 1024 * 1024
+# reject a file the sync path already accepted.
+
+# Relay materializes the whole file in this process: the sandbox runtime's
+# ``download_file`` returns ``bytes``, so the bound is server memory. Files in
+# flight are bounded separately and by weight; see RELAY_MAX_INFLIGHT_BYTES.
+RELAY_MAX_BYTES = 256 * 1024 * 1024
+
+# Inline bytes land in a Postgres ``BYTEA``, hard-capped at 1GB by the wire
+# protocol and painful long before it. This is the number this module has
+# always carried, now applied only to the path it was actually sized for.
+INLINE_MAX_BYTES = 100 * 1024 * 1024
 
 # Garbage-collection windows, shared with scripts/ops/report_orphan_blobs.py.
 # A blob is condemned after GC_GRACE_DAYS with no reference and no writer

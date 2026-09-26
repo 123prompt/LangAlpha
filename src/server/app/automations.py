@@ -7,6 +7,7 @@ scheduled automations (cron and one-time triggers).
 Endpoints (/api/v1/automations):
 - POST   /automations                              - Create automation
 - GET    /automations                              - List automations
+- GET    /automations/executions                   - Run feed across automations
 - GET    /automations/{automation_id}              - Get automation
 - PATCH  /automations/{automation_id}              - Update automation
 - DELETE /automations/{automation_id}              - Delete automation
@@ -14,12 +15,17 @@ Endpoints (/api/v1/automations):
 - POST   /automations/{automation_id}/pause        - Pause
 - POST   /automations/{automation_id}/resume       - Resume
 - GET    /automations/{automation_id}/executions    - Execution history
+- POST   /automations/{automation_id}/executions/{execution_id}/skip
+                                                   - Skip a waiting run
 """
 
 import logging
+from typing import Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
+from pydantic import ValidationError
 
 from src.server.database import automation as auto_db
 from src.server.handlers import automation_handler as handler
@@ -28,8 +34,11 @@ from src.server.models.automation import (
     AutomationExecutionResponse,
     AutomationExecutionsListResponse,
     AutomationResponse,
+    AutomationRunResponse,
+    AutomationRunsListResponse,
     AutomationsListResponse,
     AutomationUpdate,
+    ExecutionStatus,
 )
 from src.server.utils.api import CurrentUserId, handle_api_exceptions, raise_not_found
 
@@ -50,10 +59,7 @@ async def create_automation(
     user_id: CurrentUserId,
 ):
     """Create a new scheduled automation."""
-    automation = await handler.create_automation(
-        user_id=user_id,
-        data=request.model_dump(exclude_none=True),
-    )
+    automation = await handler.create_automation(user_id=user_id, data=request)
     return AutomationResponse.model_validate(automation)
 
 
@@ -65,12 +71,37 @@ async def list_automations(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    """List automations for the current user."""
+    """List automations for the current user, each with its newest execution."""
     automations, total = await auto_db.list_automations(
         user_id, status=status, limit=limit, offset=offset,
     )
     return AutomationsListResponse(
         automations=[AutomationResponse.model_validate(a) for a in automations],
+        total=total,
+    )
+
+
+# Declared before /automations/{automation_id}, which would otherwise capture
+# "executions" as an id.
+@router.get("/automations/executions", response_model=AutomationRunsListResponse)
+@handle_api_exceptions("list automation runs", logger)
+async def list_automation_runs(
+    user_id: CurrentUserId,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    thread_id: Optional[UUID] = Query(None),
+    status: Optional[ExecutionStatus] = Query(None),
+):
+    """List executions across all of the current user's automations."""
+    executions, total = await auto_db.list_executions(
+        user_id,
+        thread_id=str(thread_id) if thread_id else None,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    return AutomationRunsListResponse(
+        executions=[AutomationRunResponse.model_validate(e) for e in executions],
         total=total,
     )
 
@@ -96,11 +127,19 @@ async def update_automation(
     user_id: CurrentUserId,
 ):
     """Partial update of an automation."""
-    automation = await handler.update_automation(
-        automation_id=automation_id,
-        user_id=user_id,
-        data=request.model_dump(exclude_none=True),
-    )
+    try:
+        automation = await handler.update_automation(
+            automation_id=automation_id,
+            user_id=user_id,
+            fields=request.model_dump(exclude_none=True),
+        )
+    except ValidationError as e:
+        # The body parsed, then failed against the stored kind of trigger:
+        # a 422 shaped like the one FastAPI answers a bad body with.
+        raise HTTPException(
+            status_code=422,
+            detail=e.errors(include_url=False, include_context=False, include_input=False),
+        )
     if not automation:
         raise_not_found("Automation")
     return AutomationResponse.model_validate(automation)
@@ -161,6 +200,22 @@ async def resume_automation(
     return AutomationResponse.model_validate(automation)
 
 
+@router.post("/automations/{automation_id}/executions/{execution_id}/skip")
+@handle_api_exceptions("skip execution", logger, conflict_on_value_error=True)
+async def skip_execution(
+    automation_id: UUID,
+    execution_id: UUID,
+    user_id: CurrentUserId,
+):
+    """Skip a run that is waiting for its thread's current turn to end."""
+    result = await handler.skip_execution(
+        str(automation_id), str(execution_id), user_id
+    )
+    if result is None:
+        raise_not_found("Automation")
+    return result
+
+
 # =============================================================================
 # Execution History
 # =============================================================================
@@ -179,7 +234,7 @@ async def list_executions(
 ):
     """List execution history for an automation."""
     executions, total = await auto_db.list_executions(
-        automation_id, user_id, limit=limit, offset=offset,
+        user_id, automation_id=automation_id, limit=limit, offset=offset,
     )
     return AutomationExecutionsListResponse(
         executions=[

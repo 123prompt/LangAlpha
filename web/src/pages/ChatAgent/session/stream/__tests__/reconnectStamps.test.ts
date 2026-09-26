@@ -39,6 +39,34 @@ describe('reconnect stamps are read on arrival', () => {
     expect(proc._completedAt).toBe(1);
   });
 
+  it('a reasoning start held in the backlog carries no start time', () => {
+    // `_startedAt` is what `useThinkingClock` counts from. Stamped with the
+    // reconnect instant, a thought replayed mid-stream reads "Thinking for 0s"
+    // and climbs from the moment the tab came back, instead of falling back to
+    // the pending label that says the start is unknown.
+    const refs = reconnectRefs();
+    const { setMessages, apply } = deferredSetMessages([{ id: 'a', role: 'assistant', contentSegments: [] } as MessageRecord]);
+    handleReasoningSignal({ assistantMessageId: 'a', signalContent: 'start', refs, setMessages });
+    refs.isReconnect = false;
+    const [msg] = apply();
+    const [proc] = Object.values(msg.reasoningProcesses as Record<string, Record<string, unknown>>);
+    expect(proc._startedAt).toBeUndefined();
+  });
+
+  it('a backlog thought with no server duration measures none of its own', () => {
+    // The two stamps have to agree about which world they are in. With the
+    // completion pinned to 1 and the start taken live, the subtraction runs
+    // across both and yields a large negative duration.
+    const refs = reconnectRefs();
+    const { setMessages, apply } = deferredSetMessages([{ id: 'a', role: 'assistant', contentSegments: [] } as MessageRecord]);
+    handleReasoningSignal({ assistantMessageId: 'a', signalContent: 'start', refs, setMessages });
+    handleReasoningSignal({ assistantMessageId: 'a', signalContent: 'complete', refs, setMessages });
+    refs.isReconnect = false;
+    const [msg] = apply();
+    const [proc] = Object.values(msg.reasoningProcesses as Record<string, Record<string, unknown>>);
+    expect(proc.elapsedMs).toBeUndefined();
+  });
+
   it('a tool call held in the backlog folds even if the bag flips before the updater runs', () => {
     const refs = reconnectRefs();
     const { setMessages, apply } = deferredSetMessages([{ id: 'a', role: 'assistant', contentSegments: [] } as MessageRecord]);

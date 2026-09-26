@@ -654,3 +654,29 @@ describe('NavigationPanel — shared expansion across instances', () => {
     expect(within(second.container).getByText('Thread B1')).toBeInTheDocument();
   });
 });
+
+describe('NavigationPanel — thread agent expansion', () => {
+  // The rows are memoized so the sidebar stays still during streaming, and the
+  // expansion store mutates one long-lived Set rather than replacing it. A memo
+  // that took that Set as its only signal compared equal on every toggle and
+  // froze the agent rows in whatever state they first rendered.
+  it('collapses and reopens the current thread agent rows on the chevron', async () => {
+    resetNavPanelExpansion();
+    const user = userEvent.setup();
+    renderPanel({
+      agents: [
+        { id: 'main', name: 'Lead Agent', isMainAgent: true },
+        { id: 'sub-1', name: 'Worker', description: 'Research revenue drivers', isMainAgent: false },
+      ],
+    });
+
+    // The current thread opens itself on mount, so its rows start visible.
+    expect(screen.getByText('Research revenue drivers')).toBeInTheDocument();
+
+    await user.click(screen.getByLabelText('nav.collapseAgents'));
+    await waitFor(() => expect(screen.queryByText('Research revenue drivers')).toBeNull());
+
+    await user.click(screen.getByLabelText('nav.expandAgents'));
+    await waitFor(() => expect(screen.getByText('Research revenue drivers')).toBeInTheDocument());
+  });
+});

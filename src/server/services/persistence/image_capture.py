@@ -10,6 +10,8 @@ No-op when storage is disabled (storage.provider = "none").
 
 import logging
 
+from ptc_agent.core.project_context import ProjectContext
+
 from ptc_agent.agent.middleware.image_capture import (
     IMAGE_MD_RE,
     capture_sandbox_images,
@@ -25,6 +27,9 @@ async def capture_and_rewrite_images(
     sse_events: list[dict],
     sandbox,
     thread_id: str = "",
+    *,
+    project: ProjectContext | None = None,
+    workspace_id: str | None = None,
 ) -> int:
     """Scan SSE events for sandbox image paths, upload to storage, rewrite in-place.
 
@@ -50,7 +55,23 @@ async def capture_and_rewrite_images(
     if not image_paths:
         return 0
 
-    path_to_url = await capture_sandbox_images(sandbox, image_paths, thread_id)
+    if project is None and workspace_id:
+        from src.server.services.workspace_layout import resolve_project_placement
+
+        try:
+            placement = await resolve_project_placement(
+                workspace_id, root=sandbox.working_dir
+            )
+        except Exception:
+            logger.warning("[IMAGE_CAPTURE] Workspace placement unavailable", exc_info=True)
+            return 0
+        project = ProjectContext(
+            workspace_id, placement.dir_name,
+            placement.sibling_dir_names, placement.layout_origin,
+        )
+    path_to_url = await capture_sandbox_images(
+        sandbox, image_paths, thread_id, project=project
+    )
     if not path_to_url:
         return 0
 

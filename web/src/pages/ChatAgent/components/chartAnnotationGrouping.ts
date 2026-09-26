@@ -11,7 +11,7 @@
  */
 
 interface ToolCallProcessLike {
-  toolCallResult?: { artifact?: Record<string, unknown> } | Record<string, unknown>;
+  toolCallResult?: { artifact?: Record<string, unknown> } | Record<string, unknown> | null;
 }
 
 interface SegmentLike {

@@ -13,11 +13,11 @@ import logging
 import re
 import secrets
 from datetime import datetime, timezone as dt_timezone
-from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
 from src.server.database.conversation import update_thread_title_cas
+from src.utils.timezone_utils import zone_or_none
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +33,10 @@ _TITLE_MAX_CHARS = 100
 
 def _current_time_context(tz_name: str | None) -> str:
     """User-local 'Weekday, YYYY-MM-DD HH:MM (tz)'; UTC on missing/bad tz."""
-    tz, label = dt_timezone.utc, "UTC"
-    if tz_name:
-        try:
-            tz, label = ZoneInfo(tz_name), tz_name
-        except Exception:
-            pass
-    return f"{datetime.now(tz).strftime('%A, %Y-%m-%d %H:%M')} ({label})"
+    tz = zone_or_none(tz_name)
+    if tz is None:
+        tz, tz_name = dt_timezone.utc, "UTC"
+    return f"{datetime.now(tz).strftime('%A, %Y-%m-%d %H:%M')} ({tz_name})"
 
 
 def _build_system_prompt(tz_name: str | None) -> str:

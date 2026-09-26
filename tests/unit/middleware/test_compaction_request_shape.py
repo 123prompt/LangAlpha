@@ -65,6 +65,31 @@ class TestBuildSummaryRequest:
         assert "<messages>" in result[1].content
         assert "</messages>" in result[1].content
 
+    def test_runtime_rows_are_not_rendered_as_the_user(self):
+        """A turn anchor is dropped; a change row is relabelled as System."""
+        from ptc_agent.agent.middleware.runtime_context.durable import (
+            DurableUpdate,
+            build_update_message,
+        )
+        from ptc_agent.agent.middleware.runtime_context.turn import TURN_ROW_KIND
+
+        anchor = build_update_message(
+            DurableUpdate(kind=TURN_ROW_KIND, schema_version=1, text="9:18 PM EDT, Saturday")
+        )
+        change = build_update_message(
+            DurableUpdate(kind="workspace_changed", schema_version=1, text="Name: New (the frozen block says Old)")
+        )
+        trimmed = [HumanMessage(content="what is AAPL?", id="h1"), anchor, change]
+
+        result = _build_summary_request("irrelevant system prompt", trimmed)
+
+        history = result[1].content
+        assert "Human: what is AAPL?" in history
+        assert "9:18 PM EDT" not in history
+        assert "System: " in history
+        assert "Name: New (the frozen block says Old)" in history
+        assert history.count("Human: ") == 1
+
     def test_empty_history_still_produces_non_empty_human_message(self):
         """Codex proxy rejects calls with empty input arrays. Even with zero
         messages, the nudge alone keeps the human turn non-empty."""

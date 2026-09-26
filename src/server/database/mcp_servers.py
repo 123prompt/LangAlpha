@@ -18,6 +18,7 @@ references resolved against ``workspace_vault_secrets`` inside the sandbox.
 
 import logging
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -47,12 +48,13 @@ MAX_CATALOG_SERVERS_PER_USER = 100
 
 # Mutable catalog columns, split by how a value binds. Anything outside the
 # union is rejected by ``update_catalog_server`` rather than silently dropped.
-_CATALOG_JSONB_COLUMNS = frozenset({"args", "env", "headers", "tool_binding"})
+_CATALOG_JSONB_COLUMNS = frozenset({
+    "args", "env", "headers", "tool_binding", "order_approval",
+})
 _CATALOG_SCALAR_COLUMNS = frozenset({
     "transport", "command", "url", "description", "instruction",
     "tool_exposure_mode", "discovery_uses_secrets",
 })
-CATALOG_COLUMNS = (_CATALOG_JSONB_COLUMNS - {"tool_binding"}) | _CATALOG_SCALAR_COLUMNS
 
 # How the row's tools reach the model. Writable through the binding endpoint
 # only and kept OUT of ``CATALOG_COLUMNS``: a PUT replaces the connection
@@ -60,6 +62,10 @@ CATALOG_COLUMNS = (_CATALOG_JSONB_COLUMNS - {"tool_binding"}) | _CATALOG_SCALAR_
 _CATALOG_BINDING_COLUMNS = frozenset({
     "tool_binding", "binding_preset", "order_approval",
 })
+
+CATALOG_COLUMNS = (
+    _CATALOG_JSONB_COLUMNS - _CATALOG_BINDING_COLUMNS
+) | _CATALOG_SCALAR_COLUMNS
 
 # Plugin provenance is writable too, but stays OUT of ``CATALOG_COLUMNS``:
 # that set is what a request body binds against, so ownership can never be
@@ -86,6 +92,7 @@ _CATALOG_SELECT = """
            s.args, s.url, s.env, s.headers, s.description, s.instruction,
            s.tool_exposure_mode, s.discovery_uses_secrets, s.enabled,
            s.tool_binding, s.binding_preset, s.order_approval,
+           s.probe_kicked_at,
            s.created_at, s.updated_at, s.plugin_id, s.plugin_server_key,
            p.name AS plugin_name, p.enabled AS plugin_enabled
     FROM user_mcp_servers s
@@ -122,20 +129,33 @@ async def list_catalog_servers(user_id: str) -> list[dict[str, Any]]:
 
 
 async def get_catalog_server(
-    user_id: str, name: str, *, conn=None, for_share: bool = False
+    user_id: str,
+    name: str,
+    *,
+    conn=None,
+    for_share: bool = False,
+    for_update: bool = False,
 ) -> dict[str, Any] | None:
     """Return a single catalog template by name, or None.
 
     ``for_share`` locks the row so concurrent edits block until the caller's
     transaction ends — pass ``conn`` with it so a snapshot write can fence on
-    the config still being the one it read.
+    the config still being the one it read. ``for_update`` is that fence plus
+    exclusion between the fencing readers themselves, which is what a writer
+    needs when what it writes depends on what it read; the two are mutually
+    exclusive because a caller wanting both wants ``for_update``.
     """
+    if for_share and for_update:
+        raise ValueError("for_share and for_update are mutually exclusive")
+    lock = (
+        " FOR UPDATE OF s" if for_update
+        else " FOR SHARE OF s" if for_share
+        else ""
+    )
     async with get_db_connection(conn) as db:
         async with db.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                _CATALOG_SELECT
-                + "WHERE s.user_id = %s AND s.name = %s"
-                + (" FOR SHARE OF s" if for_share else ""),
+                _CATALOG_SELECT + "WHERE s.user_id = %s AND s.name = %s" + lock,
                 (user_id, name),
             )
             row = await cur.fetchone()
@@ -360,6 +380,47 @@ async def set_catalog_server_enabled(
                     f"name={name} enabled={enabled}"
                 )
                 return _catalog_row_to_dict(row)
+
+
+async def claim_probe_kick(
+    user_id: str, name: str, *, throttle_s: float | None = None
+) -> datetime | None:
+    """Stamp this row's probe clock; the stamp written, or None if refused.
+
+    The throttle behind the list route's self-heal, held in Postgres because
+    the route runs on whichever worker took the request and a rate limit only
+    one of them can see is not one. ``throttle_s`` skips a row stamped more
+    recently than that; a caller that passes None (a write, an edit) always
+    wins and stamps anyway, so the next self-heal counts from its probe rather
+    than firing on top of it.
+
+    The stamp comes back so the probe it authorizes can fence its own write on
+    it: the discovery fingerprint hashes ``${vault:NAME}`` refs and never
+    values, so a rotated secret leaves it identical and only this clock can
+    tell a probe that dialled with the old key from the one that replaced it.
+
+    On the catalog row rather than the snapshot: the kick this rate-limits is
+    the one for a row that has no snapshot yet, so the snapshot is the one row
+    that cannot carry the clock.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE user_mcp_servers
+                SET probe_kicked_at = NOW()
+                WHERE user_id = %s AND name = %s
+                  AND (
+                    %s::float8 IS NULL
+                    OR probe_kicked_at IS NULL
+                    OR probe_kicked_at < NOW() - make_interval(secs => %s)
+                  )
+                RETURNING probe_kicked_at
+                """,
+                (user_id, name, throttle_s, throttle_s or 0),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else None
 
 
 async def list_enabled_user_servers(user_id: str) -> list[dict[str, Any]]:
@@ -769,7 +830,16 @@ def _catalog_row_to_dict(row: dict[str, Any]) -> dict[str, Any]:
         # binding columns; an absent value is the untouched-row default.
         "tool_binding": dict(row.get("tool_binding") or {}),
         "binding_preset": row.get("binding_preset"),
-        "order_approval": bool(row.get("order_approval", True)),
+        # Left as stored rather than filled out here: a row stores only the
+        # modes a user set, and the defaults for the rest belong to the one
+        # reader that knows them.
+        "order_approval": row.get("order_approval"),
+        # When a probe was last claimed for this row, so a reader can tell a
+        # kick still in flight from one that never started. Indexed, not
+        # .get(): it is part of ``_CATALOG_SELECT``.
+        "probe_kicked_at": (
+            row["probe_kicked_at"].isoformat() if row["probe_kicked_at"] else None
+        ),
         "created_at": row["created_at"].isoformat(),
         "updated_at": row["updated_at"].isoformat(),
     }

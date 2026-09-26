@@ -31,6 +31,7 @@ vi.mock('@/hooks/usePreferences', () => ({
 
 vi.mock('../use-toast', () => ({
   useToast: () => ({ toast: vi.fn() }),
+  toast: vi.fn(),
 }));
 
 function renderInput(props: { onSend?: ReturnType<typeof vi.fn>; onAction?: ReturnType<typeof vi.fn> } = {}) {

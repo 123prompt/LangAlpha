@@ -407,10 +407,16 @@ async def _call_validate_for_user(
     return None
 
 
-async def enforce_workspace_limit(
+async def enforce_computer_limit(
     user_id: str = Depends(get_current_user_id),
 ) -> str:
-    """FastAPI dependency: enforce active workspace limit via the auth/quota service. No-op in OSS mode."""
+    """FastAPI dependency: enforce the active computer limit. No-op in OSS mode.
+
+    The plan meters computers, so this is what a route allocating one asks.
+    ``check_quota``, the response fields and the 429 body still say workspace:
+    the platform already counts computers behind those names, and the strings
+    rename on their own release once both sides speak the new one.
+    """
     if not platform_gating_active():
         return user_id
 
@@ -571,22 +577,43 @@ async def require_workspace_scope(user_id: str, scope: str) -> None:
         raise HTTPException(403, detail=f"Requires scope: {scope}")
 
 
+def _first(quota: dict, *names: str) -> int | None:
+    """Read the first of ``names`` the quota object carries, by presence.
+
+    Presence decides, not the value: a name the platform sends as null stops
+    the search and yields None rather than falling through to the next one.
+    """
+    for name in names:
+        if name in quota:
+            return quota[name]
+    return None
+
+
 def _extract_capacity(quota: dict) -> tuple[int | None, int | None]:
     """Extract ``(used, limit)`` counts from a platform quota object.
 
-    Prefers the ``capacity_used``/``capacity_limit`` names, falling back to the
-    legacy ``active``/``limit`` and ``active_workspaces``/``workspace_limit``
-    aliases.
+    Prefers the ``capacity_used``/``capacity_limit`` names, then ``active``/
+    ``limit``, then the per-subject aliases.
+
+    The ``active_computers``/``computer_limit`` pair reads the names the platform
+    moves to when the capacity subject becomes the machine. It is accepted here
+    first so the two sides can be deployed in either order: this build keeps
+    reading the workspace names until the platform emits the computer ones, and
+    keeps working after it does.
     """
-    used = quota.get("capacity_used", quota.get("active", quota.get("active_workspaces")))
-    limit = quota.get("capacity_limit", quota.get("limit", quota.get("workspace_limit")))
+    used = _first(
+        quota, "capacity_used", "active", "active_computers", "active_workspaces"
+    )
+    limit = _first(
+        quota, "capacity_limit", "limit", "computer_limit", "workspace_limit"
+    )
     return used, limit
 
 
 async def enforce_capacity(user_id: str, check_quota: str) -> None:
     """Raise 429 when the platform reports the named count quota is exhausted.
 
-    Generalizes ``enforce_workspace_limit`` over ``check_quota`` (``always_on``,
+    Generalizes ``enforce_computer_limit`` over ``check_quota`` (``always_on``,
     ``spec_performance``, ``spec_max``). No-op in OSS mode and fail-open when the
     platform is unreachable or omits the quota object.
     """
@@ -649,6 +676,32 @@ async def get_capacity_status(user_id: str, check_quota: str) -> Optional[dict]:
     return {"used": int(used), "limit": int(limit)}
 
 
+async def get_entitlement_statuses(
+    user_id: str, entitlements: dict[str, tuple[str, str]]
+) -> dict[str, Optional[dict]]:
+    """Display status per entitlement, where a scope the plan lacks reads as ``limit 0``.
+
+    ``entitlements`` maps a caller's key to ``(scope, count-quota name)``. The
+    count quota alone cannot say "not on your plan": the platform reports the
+    tier's count limit whether or not the scope is granted, so a UI reading only
+    counts offers an upgrade the gate then refuses with 403. Scopes are read
+    once for all keys; None from the platform stays unknown (fail-open), the
+    same reading the gate gives it.
+    """
+    if not platform_gating_active():
+        return {key: None for key in entitlements}
+    scopes = await _get_user_scopes(user_id)
+
+    async def status(scope: str, quota: str) -> Optional[dict]:
+        if scopes is not None and scope not in scopes:
+            return {"used": 0, "limit": 0}
+        return await get_capacity_status(user_id, quota)
+
+    keys = list(entitlements)
+    results = await asyncio.gather(*(status(*entitlements[k]) for k in keys))
+    return dict(zip(keys, results))
+
+
 # Always-on entitlement identifiers — single source for the gate, the
 # reconciler probe, and the quota route.
 ALWAYS_ON_SCOPE = "workspace:always_on"
@@ -661,10 +714,10 @@ _SPEC_ENTITLEMENTS: dict[str, tuple[str, str]] = {
     "max": ("workspace:spec:max", "spec_max"),
 }
 
-# tier -> count-quota name, for callers that only need the quota identifier
-# (e.g. the /workspaces/quota route).
-SPEC_QUOTAS: dict[str, str] = {
-    tier: quota for tier, (_scope, quota) in _SPEC_ENTITLEMENTS.items()
+# key -> (scope, count-quota name) for every entitlement the quota route shows.
+DISPLAYED_ENTITLEMENTS: dict[str, tuple[str, str]] = {
+    **_SPEC_ENTITLEMENTS,
+    "always_on": (ALWAYS_ON_SCOPE, ALWAYS_ON_QUOTA),
 }
 
 # Ordering for upgrade-vs-downgrade decisions. Unknown tiers rank lowest so a
@@ -769,4 +822,4 @@ async def spec_entitlement_lost(user_id: str, tier: str) -> bool:
 
 # Annotated types for cleaner endpoint signatures
 ChatRateLimited = Annotated[ChatAuthResult, Depends(enforce_chat_limit)]
-WorkspaceLimitCheck = Annotated[str, Depends(enforce_workspace_limit)]
+ComputerLimitCheck = Annotated[str, Depends(enforce_computer_limit)]

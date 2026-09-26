@@ -10,10 +10,14 @@ classification and the terminal error funnel live in ``error_handling``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 
+from ptc_agent.agent.middleware.runtime_context import TurnContext
 from src.config.settings import (
     get_langsmith_metadata,
     get_langsmith_tags,
@@ -21,12 +25,14 @@ from src.config.settings import (
 )
 from src.server.app import setup
 from src.server.database import conversation as qr_db
+from src.server.database.runs import lifecycle as tl_db
 from src.server.models.chat import summarize_hitl_response_map
 from src.server.utils.skill_context import (
     detect_slash_commands,
     parse_skill_contexts,
 )
 from src.tools.web.fetch import fetch_llm_client_override, fetch_model_override
+from src.utils.timezone_utils import zone_or_none
 from src.utils.tracking import TokenTrackingManager
 from src.tools.decorators import ToolUsageTracker
 
@@ -85,21 +91,15 @@ def inject_inline_reminders(
             _append_to_last_user_message(messages, reminder)
 
 
-def _resolve_timezone(request_timezone: Optional[str], locale: Optional[str]) -> str:
-    """Validate request timezone, falling back to locale-based default."""
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-    if request_timezone:
-        try:
-            ZoneInfo(request_timezone)
-            return request_timezone
-        except ZoneInfoNotFoundError:
-            logger.warning(
-                f"Invalid timezone '{request_timezone}', falling back to locale-based timezone."
-            )
-
-    locale_config = get_locale_config(locale or "en-US", "en")
-    return locale_config.get("timezone", "UTC")
+def _first_zone(*candidates: Optional[str]) -> Optional[str]:
+    """The first candidate that names a zone; one that names none is logged
+    and skipped."""
+    for candidate in candidates:
+        if zone_or_none(candidate) is not None:
+            return candidate
+        if candidate:
+            logger.warning(f"Invalid timezone '{candidate}', trying the next source.")
+    return None
 
 
 def _resolve_fork(*, request: ChatRequest) -> tuple[str, Optional[ForkSpec]]:
@@ -181,52 +181,70 @@ async def _is_plan_interrupt_pending(thread_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def process_hitl_response(
-    request: ChatRequest,
-) -> tuple[str, str, dict, list, dict]:
+@dataclass(frozen=True)
+class PreparedHitl:
+    """A HITL resume turn's stored answer: how it is filed, and what it says.
+
+    ``metadata`` is ready to merge into the turn's query metadata, so the two
+    run handlers file an answer the same way rather than each re-packing the
+    same keys.
+    """
+
+    feedback_action: str
+    query_content: str
+    metadata: dict[str, Any]
+
+
+def process_hitl_response(request: ChatRequest) -> PreparedHitl:
     """Extract HITL answer metadata for persistence.
 
-    Returns (feedback_action, query_content, hitl_answers, interrupt_ids,
-    hitl_decisions).
-    ``feedback_action`` is "QUESTION_ANSWERED" or "QUESTION_SKIPPED".
-    ``query_content`` is the summarized content string.
-    ``hitl_answers`` maps interrupt_id -> answer string | None.
-    ``interrupt_ids`` is the list of interrupt IDs from the response map.
-    ``hitl_decisions`` maps interrupt_id -> the interrupt's decisions in the
-    order its action requests were raised, each a ``HITLDecision`` payload.
+    ``metadata`` carries ``hitl_interrupt_ids`` always, plus ``hitl_answers``,
+    ``hitl_decisions`` and ``order_decisions`` when there are any.
 
     One interrupt can stop several calls and be answered with a different
     verdict for each, which ``hitl_answers`` collapses into a single key.
     ``hitl_decisions`` keeps every decision under its own slot so slot i is the
     answer to action request i, and it carries the user's own reject message
-    rather than the wording the agent is handed on resume.
+    rather than the wording the agent is handed on resume. ``order_decisions``
+    is the same record for an order interrupt, keyed by attempt id instead of
+    by slot, so a stored verdict names the order it answered rather than a
+    position in a list that can change.
     """
-    summary = summarize_hitl_response_map(request.hitl_response)
+    from src.server.models.chat import HITLResponse
+
+    # The wire type is ``Dict[str, HITLResponse]``, but a caller that built the
+    # request itself can hand over the plain dicts the client sent. Normalized
+    # once here, so everything below reads one shape.
+    responses = {
+        interrupt_id: (
+            response
+            if isinstance(response, HITLResponse)
+            else HITLResponse.model_validate(response)
+        )
+        for interrupt_id, response in request.hitl_response.items()
+    }
+    summary = summarize_hitl_response_map(responses)
     feedback_action = summary["feedback_action"]
-    query_content = summary["content"]
-    interrupt_ids = summary["interrupt_ids"]
 
     hitl_answers: dict = {}
     hitl_decisions: dict = {}
-    for interrupt_id, response in request.hitl_response.items():
-        decisions = (
-            response.decisions
-            if hasattr(response, "decisions")
-            else response.get("decisions", [])
-        )
+    order_decisions: dict = {}
+    for interrupt_id, response in responses.items():
         recorded: list[dict] = []
-        for d in decisions:
-            d_type = d.type if hasattr(d, "type") else d.get("type")
-            d_msg = (
-                d.message if hasattr(d, "message") else d.get("message")
-            ) or ""
-            recorded.append({"type": d_type, "message": d_msg or None})
-            if d_type == "approve" and d_msg:
-                hitl_answers[interrupt_id] = d_msg
-            elif d_type == "reject" and not d_msg:
+        for d in response.decisions:
+            recorded.append({"type": d.type, "message": d.message or None})
+            if d.type == "approve" and d.message:
+                hitl_answers[interrupt_id] = d.message
+            elif d.type == "reject" and not d.message:
                 hitl_answers[interrupt_id] = None
         if recorded:
             hitl_decisions[interrupt_id] = recorded
+
+        for attempt_id, verdict in (response.order_decisions or {}).items():
+            order_decisions[str(attempt_id)] = {
+                "type": verdict.type,
+                "message": verdict.message or None,
+            }
 
     if hitl_answers:
         has_answers = any(v is not None for v in hitl_answers.values())
@@ -234,13 +252,15 @@ def process_hitl_response(
             "QUESTION_ANSWERED" if has_answers else "QUESTION_SKIPPED"
         )
 
-    return (
-        feedback_action,
-        query_content,
-        hitl_answers,
-        interrupt_ids,
-        hitl_decisions,
-    )
+    metadata: dict[str, Any] = {"hitl_interrupt_ids": summary["interrupt_ids"]}
+    for key, value in (
+        ("hitl_answers", hitl_answers),
+        ("hitl_decisions", hitl_decisions),
+        ("order_decisions", order_decisions),
+    ):
+        if value:
+            metadata[key] = value
+    return PreparedHitl(feedback_action, summary["content"], metadata)
 
 
 def serialize_context_metadata(
@@ -342,12 +362,72 @@ def init_tracking(thread_id: str) -> tuple[TokenTrackingManager, ToolUsageTracke
 
 
 def apply_fetch_override(config) -> None:
-    """Propagate fetch model / client overrides from *config* into context vars."""
-    if config.llm and config.llm.fetch:
-        fetch_model_override.set(config.llm.fetch)
-        fetch_client = config.subsidiary_llm_clients.get("fetch")
-        if fetch_client:
-            fetch_llm_client_override.set(fetch_client)
+    """Propagate fetch model / client overrides from *config* into context vars.
+
+    A blank fetch means the turn's flash model, the same default ``role_registry``
+    resolves a client for. Without the name override, web_fetch would fall back
+    to re-reading agent_config.yaml and miss the user's own flash choice.
+    """
+    fetch_client = config.subsidiary_llm_clients.get("fetch")
+    if fetch_client:
+        fetch_llm_client_override.set(fetch_client)
+    fetch_model = config.llm and config.llm.fetch_name
+    if fetch_model:
+        fetch_model_override.set(fetch_model)
+
+
+class PriorThread(NamedTuple):
+    """The thread row as it stood before this turn stamped it.
+
+    Both fields are absent on a thread's first turn, and on any turn whose read
+    failed: they are context for the turn anchor row rather than correctness,
+    so a read failure degrades to nothing rather than failing the turn start.
+    """
+
+    last_turn_at: Optional[datetime] = None
+
+
+def _fork_predecessor_turn(request: ChatRequest) -> Optional[int]:
+    """The turn a fork discards from, when this request is one (``_resolve_fork``)."""
+    if request.fork_from_turn is not None and request.checkpoint_id:
+        return request.fork_from_turn
+    return None
+
+
+async def _read_prior_thread(
+    thread_id: str, *, before_turn: Optional[int] = None
+) -> PriorThread:
+    """The prior-turn time.
+
+    The time is the latest attempt row's, never the thread's ``updated_at``: a
+    rename or a share bumps the thread stamp between turns, a concurrent POST
+    on another worker bumps it before losing admission, and the create-first
+    web flow leaves a thread behind when the send never happened, while an
+    attempt row is written only by a turn that was admitted. A thread with no
+    attempt has had no turn, so it has no prior-turn time.
+
+    An edit or a regenerate forks from an earlier turn, and the history the
+    model reads ends there, so its prior turn is the attempt before the fork
+    rather than the newest attempt on the thread.
+    """
+    try:
+        row, attempt = await asyncio.gather(
+            qr_db.get_thread_by_id(thread_id),
+            tl_db.get_latest_attempt(thread_id, before_turn=before_turn),
+        )
+    except Exception:
+        logger.debug("thread runtime-context read failed", exc_info=True)
+        return PriorThread()
+    if not row:
+        return PriorThread()
+
+    stamp = (attempt or {}).get("created_at")
+    last_turn_at = None
+    if isinstance(stamp, datetime):
+        # A naive stamp would raise against the envelope's aware clock.
+        last_turn_at = stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+
+    return PriorThread(last_turn_at)
 
 
 async def ensure_thread(
@@ -357,8 +437,17 @@ async def ensure_thread(
     user_id: str,
     msg_type: str,
     initial_query: str = "",
-) -> None:
-    """Ensure a thread record exists in the database, optionally with external linkage."""
+) -> PriorThread:
+    """Ensure a thread record exists in the database, optionally with external linkage.
+
+    Returns the prior turn as it stood on entry, read here so the ordering
+    against the ensure below (which stamps the thread row) stays off the
+    callers.
+    """
+    prior = await _read_prior_thread(
+        thread_id, before_turn=_fork_predecessor_turn(request)
+    )
+
     ensure_kwargs = dict(
         workspace_id=workspace_id,
         conversation_thread_id=thread_id,
@@ -390,6 +479,64 @@ async def ensure_thread(
             expected_title=initial_query[:255],
             timezone=request.timezone,
         )
+
+    return prior
+
+
+def build_turn_context(
+    request: ChatRequest,
+    prior: PriorThread,
+    *,
+    user_profile: dict[str, Any] | None,
+    disk_free_mb: int | None = None,
+    disk_known: bool = False,
+) -> TurnContext:
+    """What this turn knows about itself: the request's surface plus the prior row.
+
+    Origin, surface and rules all come from the request alone, because they
+    describe this turn. The stored origin is the thread's, and an automation's
+    thread can take a manual follow-up: that turn has a person waiting on it,
+    and the automation line in the rules would tell the model otherwise. An
+    automation stamps the origin on every request it sends, so nothing is lost.
+    ``disk_free_mb`` and ``disk_known`` come from :func:`read_disk_notice`.
+
+    The zone is the profile's before the request's: a channel or an
+    automation's own request names none, and the request alone would put
+    those turns on the locale default. When neither names one, as when the
+    profile read fails on such a turn, only ``tool_timezone`` takes the locale
+    default; the stamp keeps the frozen identity's zone.
+    """
+    zone = _first_zone((user_profile or {}).get("timezone"), request.timezone)
+    return TurnContext(
+        last_turn_at=prior.last_turn_at,
+        platform=request.platform,
+        origin=request.origin.type if request.origin else None,
+        surface_rules=request.surface_rules,
+        disk_free_mb=disk_free_mb,
+        disk_known=disk_known,
+        timezone=zone,
+        tool_timezone=zone
+        or get_locale_config(request.locale or "en-US", "en").get("timezone", "UTC"),
+    )
+
+
+async def read_disk_notice(workspace_id: str) -> tuple[int | None, bool]:
+    """The shared disk's free megabytes once low enough to tell the agent, and
+    whether a current reading backs the answer.
+
+    Read off the stored reading, never measured here: a turn does not wait on
+    the sandbox for context. A failed read is unknown, never "not low", so it
+    cannot take back an earlier low-disk line.
+    """
+    from src.server.database.computer import get_computer_for_workspace
+    from src.server.services.computer_disk import disk_is_known, low_disk_free_mb
+
+    try:
+        computer = await get_computer_for_workspace(workspace_id)
+    except Exception as e:  # noqa: BLE001 - context is never worth failing a turn for
+        logger.debug(f"Low-disk notice skipped for {workspace_id}: {e}")
+        return None, False
+    return low_disk_free_mb(computer), disk_is_known(computer)
 
 
 def _slash_text_target(content: Any) -> tuple[str, dict | None]:

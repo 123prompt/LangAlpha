@@ -7,6 +7,8 @@ import { getModelAccess } from './usePlatformModels';
  * Model metadata entry as returned by the `/api/v1/models` endpoint.
  */
 export interface ModelMetadataEntry {
+  /** Name the manifest authors for people to read. Absent = print the key. */
+  display_name?: string;
   provider?: string;
   sdk?: string;
   access_type?: string;
@@ -329,9 +331,13 @@ export function buildVisibleModels(
     // server resolves it identically (`with_inherited_declarations`). Presence,
     // not truthiness -- an entry declaring an empty ladder is saying the model
     // honors no levels, which the built-in's must not overwrite.
+    // The label is the exception. The entry's name is the label its author
+    // typed, while the built-in's display_name names the manifest's model,
+    // which this entry may not route to.
     const ladder = declaredLadder(cm);
+    const { display_name: _shadowedLabel, ...declared } = metadata[cm.name];
     metadata[cm.name] = {
-      ...metadata[cm.name],
+      ...declared,
       ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),
       ...('effortDefault' in ladder
         ? { reasoning_effort_default: ladder.effortDefault }

@@ -95,6 +95,39 @@ class TestStreamEventAccumulator:
         events = acc.get_events()
         assert len(events) == 2
 
+    def test_no_merge_across_phases(self):
+        """Commentary and the final answer are separate blocks upstream; fusing
+        them into one persisted chunk would erase the boundary."""
+        acc = self._make_accumulator()
+        base = {
+            "thread_id": "t1",
+            "agent": "main",
+            "id": "msg-1",
+            "role": "assistant",
+            "content_type": "text",
+        }
+        acc.add("message_chunk", {**base, "content": "thinking out loud", "phase": "commentary"})
+        acc.add("message_chunk", {**base, "content": "the answer", "phase": "final_answer"})
+        events = acc.get_events()
+        assert len(events) == 2
+
+    def test_merge_within_one_phase(self):
+        acc = self._make_accumulator()
+        base = {
+            "thread_id": "t1",
+            "agent": "main",
+            "id": "msg-1",
+            "role": "assistant",
+            "content_type": "text",
+            "phase": "final_answer",
+        }
+        acc.add("message_chunk", {**base, "content": "Hello"})
+        acc.add("message_chunk", {**base, "content": " world"})
+        events = acc.get_events()
+        assert len(events) == 1
+        assert events[0]["data"]["content"] == "Hello world"
+        assert events[0]["data"]["phase"] == "final_answer"
+
     def test_merge_respects_max_bytes(self):
         acc = self._make_accumulator(max_bytes=10)
         base = {
@@ -1087,6 +1120,112 @@ class TestCompactionChunkRouting:
         # Simulate the error-signal discard path
         handler._compaction_windows.discard(ns)
         assert ns not in handler._compaction_windows
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses `phase` passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestTextPhasePassthrough:
+    """`phase` rides the text event when known and is omitted when it isn't."""
+
+    def _handler(self):
+        from src.server.services.runs.sse_producer import RunSSEProducer
+        return RunSSEProducer(thread_id="t-phase", run_id="r-phase")
+
+    def _chunk(self, content, metadata=None):
+        from langchain_core.messages import AIMessageChunk
+        chunk = AIMessageChunk(content=content, id="msg-1")
+        chunk.response_metadata = metadata or {}
+        return chunk
+
+    def _text_payloads(self, events):
+        return [
+            json.loads(e.split("data: ", 1)[1])
+            for e in events
+            if "event: message_chunk\n" in e and '"content_type": "text"' in e
+        ]
+
+    def _drain(self, handler, chunk):
+        return asyncio.run(
+            self._collect(handler._process_message_chunk(chunk, "agent"))
+        )
+
+    async def _collect(self, agen):
+        return [e async for e in agen]
+
+    def test_streaming_deltas_inherit_the_announced_phase(self):
+        # output_item.added announces the phase in an empty text block, then
+        # every delta carries only its index.
+        handler = self._handler()
+        assert self._drain(handler, self._chunk(
+            [{"type": "text", "text": "", "phase": "commentary", "index": 0}]
+        )) == []
+
+        payloads = self._text_payloads(self._drain(handler, self._chunk(
+            [{"type": "text", "text": "hold on", "index": 0}]
+        )))
+        assert len(payloads) == 1
+        assert payloads[0]["content"] == "hold on"
+        assert payloads[0]["phase"] == "commentary"
+
+    def test_unknown_index_omits_the_key(self):
+        handler = self._handler()
+        payloads = self._text_payloads(self._drain(handler, self._chunk(
+            [{"type": "text", "text": "plain", "index": 3}]
+        )))
+        assert len(payloads) == 1
+        assert "phase" not in payloads[0]
+
+    def test_non_stream_block_carries_phase_directly(self):
+        handler = self._handler()
+        payloads = self._text_payloads(self._drain(handler, self._chunk(
+            [{"type": "text", "text": "the answer", "phase": "final_answer"}]
+        )))
+        assert len(payloads) == 1
+        assert payloads[0]["phase"] == "final_answer"
+
+    def test_disagreeing_blocks_omit_the_key(self):
+        handler = self._handler()
+        payloads = self._text_payloads(self._drain(handler, self._chunk([
+            {"type": "text", "text": "a", "phase": "commentary"},
+            {"type": "text", "text": "b", "phase": "final_answer"},
+        ])))
+        assert len(payloads) == 1
+        assert "phase" not in payloads[0]
+
+    def test_a_phaseless_block_beside_a_phased_one_omits_the_key(self):
+        # Live and replay share one rule: a block with no phase is its own
+        # answer, so the chunk has no single phase to carry.
+        handler = self._handler()
+        payloads = self._text_payloads(self._drain(handler, self._chunk([
+            {"type": "text", "text": "a", "phase": "commentary"},
+            {"type": "text", "text": "b"},
+        ])))
+        assert len(payloads) == 1
+        assert "phase" not in payloads[0]
+
+    def test_plain_string_content_omits_the_key(self):
+        handler = self._handler()
+        payloads = self._text_payloads(self._drain(handler, self._chunk("hello")))
+        assert len(payloads) == 1
+        assert "phase" not in payloads[0]
+
+    def test_finish_clears_the_index_table(self):
+        # Indices restart with the next message, so index 0 must not keep
+        # resolving to the finished message's phase.
+        handler = self._handler()
+        self._drain(handler, self._chunk(
+            [{"type": "text", "text": "", "phase": "commentary", "index": 0}]
+        ))
+        self._drain(handler, self._chunk("", metadata={"finish_reason": "stop"}))
+
+        payloads = self._text_payloads(self._drain(handler, self._chunk(
+            [{"type": "text", "text": "next turn", "index": 0}]
+        )))
+        assert len(payloads) == 1
+        assert "phase" not in payloads[0]
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import i18n from '@/i18n';
 import { createPortal } from 'react-dom';
 import { ChevronRight, X, Calendar } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useBackdropDismiss } from '@/hooks/useDialogA11y';
 import { getEarningsCalendar } from '../utils/api';
 
 interface EarningsEntry {
@@ -126,6 +127,7 @@ function formatDateTab(dateStr: string | undefined): DateTabInfo {
 
 function EarningsModal({ earnings, onClose }: EarningsModalProps) {
   const { t } = useTranslation();
+  const backdrop = useBackdropDismiss<HTMLDivElement>(onClose);
   const todayStr = new Date().toISOString().split('T')[0];
 
   // Group by date, sorted chronologically
@@ -170,7 +172,7 @@ function EarningsModal({ earnings, onClose }: EarningsModalProps) {
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      onClick={onClose}
+      {...backdrop}
       className="fixed inset-0 z-[1030] flex items-center justify-center p-4 md:p-8"
       style={{ backgroundColor: 'var(--color-bg-overlay, rgba(0,0,0,0.6))', backdropFilter: 'blur(4px)' }}
     >
@@ -178,7 +180,6 @@ function EarningsModal({ earnings, onClose }: EarningsModalProps) {
         initial={{ opacity: 0, scale: 0.95, y: 20 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.95, y: 20 }}
-        onClick={(e) => e.stopPropagation()}
         className="w-full max-w-4xl max-h-[80vh] rounded-3xl overflow-hidden shadow-2xl flex flex-col relative border"
         style={{
           backgroundColor: 'var(--color-bg-elevated)',

@@ -27,11 +27,14 @@ CLIENTS = "src.server.services.llm.clients"
 LLM_HANDLER = "src.server.services.llm.config"
 
 
-def _make_agent_config(compaction_model: str | None = "system-compaction") -> AgentConfig:
+def _make_agent_config(
+    compaction_model: str | None = "system-compaction",
+    flash_model: str | None = "system-flash-model",
+) -> AgentConfig:
     return AgentConfig(
         llm=LLMConfig(
             name="system-default-model",
-            flash="system-flash-model",
+            flash=flash_model,
             compaction=compaction_model,
         ),
         security=SecurityConfig(),
@@ -342,11 +345,12 @@ async def test_manual_compact_forwards_subsidiary_oauth_client(base_config):
 
 
 @pytest.mark.asyncio
-async def test_manual_compact_falls_back_to_main_llm_client(base_config):
-    """When no compaction-specific subsidiary client is present but the main
-    agent has a BYOK/OAuth llm_client, forward that — mirrors the middleware's
-    priority order in PTCAgent.create_agent."""
+async def test_manual_compact_falls_back_to_main_llm_client():
+    """With no compaction model at all (blank compaction, no flash), forward a
+    copy of the main client, as the automatic path does."""
     from src.server.handlers.thread_maintenance import trigger_compaction
+
+    base_config = _make_agent_config(compaction_model=None, flash_model=None)
 
     stub_resolve = _stub_resolve_graph_and_state()
 
@@ -368,7 +372,6 @@ async def test_manual_compact_falls_back_to_main_llm_client(base_config):
         resolve_kwargs.update(kwargs)
         cfg = base_cfg.model_copy(deep=True)
         cfg.llm_client = main_client
-        # No subsidiary compaction client — user picked default compaction model.
         cfg.subsidiary_llm_clients.pop("compaction", None)
         return cfg
 
@@ -398,7 +401,47 @@ async def test_manual_compact_falls_back_to_main_llm_client(base_config):
 
 
 @pytest.mark.asyncio
-async def test_manual_compact_copies_llm_client_before_forwarding(base_config):
+async def test_manual_compact_platform_user_resolves_by_name():
+    """A platform user has a main client but no role client. Manual /compact
+    must still run the compaction model by name, the same model automatic
+    compaction uses, not a copy of the main client. A blank compaction means
+    flash."""
+    from src.server.handlers.thread_maintenance import trigger_compaction
+
+    base_config = _make_agent_config(compaction_model=None)
+    base_config.llm_client = MagicMock(name="platform-main-client")
+    base_config.subsidiary_llm_clients.pop("compaction", None)
+
+    compact_mock = AsyncMock(
+        return_value={
+            "event": {"summary_text": "ok"},
+            "summary_text": "ok",
+            "original_count": 2,
+            "preserved_count": 1,
+            "offloaded_arg_ids": set(),
+            "offloaded_read_ids": set(),
+        }
+    )
+
+    with (
+        patch("src.server.app.setup.agent_config", base_config),
+        patch(f"{HANDLER}._resolve_graph_and_state", new=_stub_resolve_graph_and_state()),
+        patch(f"{HANDLER}._persist_context_window_event", new=_noop_persist),
+        patch(
+            "ptc_agent.agent.middleware.compaction.compact_messages",
+            new=compact_mock,
+        ),
+    ):
+        await trigger_compaction("thread-1", keep_messages=5)
+
+    kwargs = compact_mock.await_args.kwargs
+    assert kwargs["model_name"] == "system-flash-model"
+    assert kwargs["llm_client"] is None
+    base_config.llm_client.model_copy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_copies_llm_client_before_forwarding():
     """Regression: the llm_client passed to compact_messages MUST be a copy.
 
     ``compact_messages`` calls ``_maybe_disable_streaming`` which sets
@@ -422,6 +465,7 @@ async def test_manual_compact_copies_llm_client_before_forwarding(base_config):
         }
     )
 
+    base_config = _make_agent_config(compaction_model=None, flash_model=None)
     shared_client = MagicMock(name="shared-main-client")
     base_config.llm_client = shared_client
     base_config.subsidiary_llm_clients.pop("compaction", None)
@@ -787,7 +831,9 @@ class TestSessionAcquireIdentity:
         a recovery taken from that path would carry the gap into provisioning."""
         from src.server.handlers.thread_maintenance import _resolve_graph_and_state
 
-        manager = MagicMock()
+        from src.server.services.workspace_manager import WorkspaceManager
+
+        manager = MagicMock(spec=WorkspaceManager)
         manager.get_session_for_workspace = AsyncMock(
             return_value=MagicMock(sandbox=None)
         )

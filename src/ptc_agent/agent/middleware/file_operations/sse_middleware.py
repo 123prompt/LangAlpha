@@ -31,7 +31,7 @@ from langchain.agents.middleware import AgentMiddleware, AgentState
 from typing_extensions import NotRequired
 from langgraph.config import get_stream_writer
 
-from ptc_agent.core.paths import workspace_relative_path
+from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT, workspace_relative_path
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +63,33 @@ class FileOperationMiddleware(AgentMiddleware):
 
     def __init__(
         self,
-        on_agent_md_write: Callable[[], None] | None = None,
-        work_dir: str = "/home/workspace",
+        on_agent_md_write: Callable[[dict[str, Any] | None], None] | None = None,
+        work_dir: str = DEFAULT_SANDBOX_ROOT,
+        thread_id: str | None = None,
     ) -> None:
         super().__init__()
         self._on_agent_md_write = on_agent_md_write
         self._work_dir = work_dir
+        self._thread_id = thread_id
+
+    def _writer_stamp(self) -> dict[str, Any]:
+        """Who wrote agent.md, from the background-subagent identity ContextVar.
+
+        The ContextVar is the only signal that distinguishes a subagent from the
+        main agent here: both stacks share this middleware instance and the
+        ``current_agent`` state key is set once for the whole run.
+        """
+        from ptc_agent.agent.middleware.background_subagent.context import (
+            current_background_agent_id,
+        )
+
+        agent_id = current_background_agent_id.get()
+        writer = f"subagent:{agent_id.split(':', 1)[0]}" if agent_id else "main"
+        return {
+            "thread_id": self._thread_id,
+            "writer": writer,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
 
     @staticmethod
     def _count_lines(text: str) -> int:
@@ -86,8 +107,13 @@ class FileOperationMiddleware(AgentMiddleware):
         Intercept tool calls and emit file operation events after execution.
 
         Emits a single event per operation with full content for frontend display.
-        Event field order: agent, operation, file_path, tool_call_id, timestamp,
-        status, line_count, content/old_string/new_string.
+        Event field order: agent, operation, file_path, sandbox_path, tool_call_id,
+        timestamp, status, line_count, content/old_string/new_string.
+
+        ``file_path`` is the workspace-relative spelling and ``sandbox_path`` the
+        one the tool was called with: the browser routes on the relative form
+        (a folder's absolute path matches none of its memory or memo prefixes)
+        and keeps the absolute one for opening the file where it sits.
 
         Args:
             request: Tool call request with tool_call dict containing name, args, id
@@ -112,6 +138,8 @@ class FileOperationMiddleware(AgentMiddleware):
         # Hardcode agent name for now (PTCAgent is the main agent)
         agent_name = "ptc"
 
+        normalized = workspace_relative_path(file_path, self._work_dir)
+
         # Get stream writer for custom event emission
         try:
             writer = get_stream_writer()
@@ -124,12 +152,13 @@ class FileOperationMiddleware(AgentMiddleware):
         try:
             result = await handler(request)
 
-            normalized = workspace_relative_path(file_path, self._work_dir)
-
-            # Invalidate agent.md cache when agent.md is written or edited
+            # Invalidate agent.md cache when agent.md is written or edited, and
+            # stamp who did it. The stamp is provenance for the runtime-context
+            # baseline, which finds the change by content hash regardless, so a
+            # failure here costs attribution, never the write.
             if self._on_agent_md_write and normalized == "agent.md":
                 try:
-                    self._on_agent_md_write()
+                    self._on_agent_md_write(self._writer_stamp())
                 except Exception:
                     logger.debug("[FILE_OP_MIDDLEWARE] Failed to invalidate agent.md cache")
 
@@ -140,7 +169,8 @@ class FileOperationMiddleware(AgentMiddleware):
             # Build payload with operation-specific content
             payload: dict[str, Any] = {
                 "operation": tool_name,
-                "file_path": file_path,
+                "file_path": normalized,
+                "sandbox_path": file_path,
             }
 
             if tool_name == "Write":
@@ -189,7 +219,8 @@ class FileOperationMiddleware(AgentMiddleware):
                 "status": "failed",
                 "payload": {
                     "operation": tool_name,
-                    "file_path": file_path,
+                    "file_path": normalized,
+                    "sandbox_path": file_path,
                     "error": str(e),
                 },
             }

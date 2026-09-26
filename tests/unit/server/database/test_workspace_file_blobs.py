@@ -15,7 +15,7 @@ from unittest.mock import patch
 import pytest
 
 from src.server.database import workspace_file_blobs as blobs
-from src.server.database.blob_keys import BLOB_KEY_PREFIX, MAX_BLOB_BYTES
+from src.server.database.blob_keys import BLOB_KEY_PREFIX, RELAY_MAX_BYTES
 from src.server.database.workspace_file_blobs import (
     BlobError,
     BlobFetchError,
@@ -213,9 +213,9 @@ async def test_store_blob_uploads_then_registers():
         await store_blob(USER, HELLO_SHA, HELLO)
 
     # Upload carries the explicit cap; the shared 10MB facade default would
-    # otherwise reject every file between 10MB and MAX_FILE_SIZE.
+    # otherwise reject every file between 10MB and the relay limit.
     assert up.call_args.args[0] == blob_key(USER, HELLO_SHA)
-    assert up.call_args.kwargs["max_size"] == MAX_BLOB_BYTES
+    assert up.call_args.kwargs["max_size"] == RELAY_MAX_BYTES
     # Claim first, upload, then the reviving upsert: a live row always has an
     # object behind it, and a concurrent reap cannot slip between the two.
     assert len(conn.statements) == 2

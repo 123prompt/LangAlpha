@@ -4,7 +4,7 @@
  * by hand off the same hook, so a prop added on one side silently stopped
  * existing on the other; only the genuinely per-surface pieces stay arguments.
  */
-import { useCallback, useMemo } from 'react';
+import { useCallback, useMemo, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useNavigationData } from './useNavigationData';
 import type { NavWorkspace } from './useNavigationData';
@@ -87,11 +87,16 @@ export function useNavTreeProps({
   // the workspace's last one. The target is computed BEFORE the await (the
   // optimistic patch removes the row) and navigation waits for the server —
   // a failed archive rolls back and must leave the user where they are.
+  // Read at call time: this handler reaches every memoized sidebar row, and
+  // an identity that followed the thread data re-rendered them all on each
+  // refetch.
+  const workspaceThreadsRef = useRef(workspaceThreads);
+  workspaceThreadsRef.current = workspaceThreads;
   const onArchiveThread = useCallback(async (wsId: string, threadId: string) => {
     const isCurrent = threadId === currentThreadId;
     let next;
     if (isCurrent) {
-      const rows = workspaceThreads[wsId]?.threads || [];
+      const rows = workspaceThreadsRef.current[wsId]?.threads || [];
       const idx = rows.findIndex((th) => th.thread_id === threadId);
       next = idx >= 0 ? rows[idx + 1] ?? rows[idx - 1] : undefined;
     }
@@ -108,7 +113,7 @@ export function useNavTreeProps({
         },
       });
     }
-  }, [currentThreadId, workspaceThreads, onNavigateThread, findWorkspace, navigate, fallbackWorkspaceName, archiveThread]);
+  }, [currentThreadId, onNavigateThread, findWorkspace, navigate, fallbackWorkspaceName, archiveThread]);
 
   return useMemo(() => ({
     workspaces,

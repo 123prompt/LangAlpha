@@ -58,6 +58,15 @@ class TestRatingMetadataSurfacing:
                 assert entry["context"] > 0, f"{key}: context must be positive"
 
 
+class TestDisplayNameSurfacing:
+    def test_display_name_mirrors_manifest(self, manifest, metadata):
+        """The pickers print display_name in place of the key, so an authored
+        name must reach the metadata and an absent one must not be invented."""
+        assert any("display_name" in e for e in metadata.values())
+        for key, entry in metadata.items():
+            assert entry.get("display_name") == manifest[key].get("display_name"), key
+
+
 class TestPriceTier:
     def test_metadata_price_is_valid_tier(self, metadata):
         priced = {k: v for k, v in metadata.items() if "price" in v}

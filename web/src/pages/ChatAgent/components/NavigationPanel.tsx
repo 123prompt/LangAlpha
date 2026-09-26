@@ -66,6 +66,12 @@ interface NavigationPanelProps {
 // deleted id that would otherwise page through the whole workspace.
 const MAX_REVEAL_PAGES = 20;
 
+const DND_MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
+// Hoisted with DND_MEASURING: dnd-kit memoizes on these objects' identity,
+// and an inline literal rebuilt the drag context on every render of this
+// panel, which re-rendered every sortable workspace row through it.
+const POINTER_SENSOR_OPTIONS = { activationConstraint: { distance: 8 } };
+
 /**
  * NavigationPanel -- hover-triggered overlay sidebar showing
  * Workspace -> Thread -> Agent hierarchy.
@@ -104,10 +110,17 @@ function NavigationPanel({
 }: NavigationPanelProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
-  // Change-spec / always-on / duplicate / delete are self-contained (mutations +
-  // dialogs) so every host — sidebar tree, mobile drawer — gets the same menu
-  // as the gallery card without extra wiring.
+  // Duplicate / delete are self-contained (mutations + dialogs) so every host
+  // (sidebar tree, mobile drawer) gets the same menu as the gallery card
+  // without extra wiring.
   const wsActions = useWorkspaceActions({ currentWorkspaceId });
+  // The rows get the handlers without the dialogs node, which is new JSX on
+  // every render and would defeat their memo.
+  const { openDuplicate, openDelete } = wsActions;
+  const rowActions = useMemo(
+    () => ({ openDuplicate, openDelete }),
+    [openDuplicate, openDelete],
+  );
   // Same reasoning for the thread archive confirm: this panel is the one tree
   // both hosts render, so gating here covers the sidebar and the mobile drawer
   // without either wiring a dialog of its own.
@@ -117,15 +130,25 @@ function NavigationPanel({
   }, [requestArchive, onArchiveThread]);
   // 8px activation distance (same as the gallery's reorder mode) keeps plain
   // clicks toggling expand/collapse instead of starting a drag.
-  const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }));
+  const dndSensors = useSensors(useSensor(PointerSensor, POINTER_SENSOR_OPTIONS));
   // Id of the workspace currently being dragged — drives the DragOverlay chip.
   const [activeDragId, setActiveDragId] = useState<string | null>(null);
   // Subscribe to the shared expansion store (navExpansionStore). One panel mounts
   // per cached ChatView instance; subscribing re-renders this panel whenever any
   // instance toggles a folder, so cached ChatViews never show stale folder state.
-  // The render reads the sets directly (below), so only the subscription is
-  // needed, not the returned version value.
-  useSyncExternalStore(subscribeNavExpansion, getNavExpansionVersion);
+  const navExpansionVersion = useSyncExternalStore(subscribeNavExpansion, getNavExpansionVersion);
+
+  // The store mutates one long-lived Set rather than replacing it, so the Set
+  // itself is a constant and says nothing about what changed. The memoized
+  // workspace rows compare it by reference, so handing them the live Set froze
+  // a thread's agent rows in whatever state they first rendered. Copy it when
+  // the store's version moves: the reference then changes exactly when the
+  // expansion did, and not once per streamed token.
+  const expandedThreadIds = useMemo(
+    () => new Set(expandedThreads),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- version IS the signal
+    [navExpansionVersion],
+  );
 
   // Seed the current workspace/thread as expanded, then keep them expanded when
   // they change. A layout effect (not a render-phase mutation) runs before paint,
@@ -313,6 +336,9 @@ function NavigationPanel({
   }, []);
 
   const activeDragWs = activeDragId ? workspaces.find((ws) => ws.workspace_id === activeDragId) : null;
+  // Identity matters here: a fresh id array is a new sortable context value,
+  // and every row's useSortable re-renders on it, memo or not.
+  const sortableIds = useMemo(() => workspaces.map((ws) => ws.workspace_id), [workspaces]);
 
   return (
     <div
@@ -328,12 +354,12 @@ function NavigationPanel({
           <DndContext
             sensors={dndSensors}
             collisionDetection={closestCenter}
-            measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+            measuring={DND_MEASURING}
             onDragStart={handleWorkspaceDragStart}
             onDragEnd={handleWorkspaceDragEnd}
             onDragCancel={handleWorkspaceDragCancel}
           >
-          <SortableContext items={workspaces.map((ws) => ws.workspace_id)} strategy={verticalListSortingStrategy}>
+          <SortableContext items={sortableIds} strategy={verticalListSortingStrategy}>
           {workspaces.map((ws) => {
             const wsId = ws.workspace_id;
             // While a drag is live, rows across the pin boundary from the
@@ -358,10 +384,10 @@ function NavigationPanel({
                 dragDisabled={dragDisabled}
                 threadsData={workspaceThreads[wsId]}
                 currentThreadId={currentThreadId}
-                expandedThreadIds={expandedThreads}
+                expandedThreadIds={expandedThreadIds}
                 agents={agents}
                 activeAgentId={activeAgentId}
-                wsActions={wsActions}
+                wsActions={rowActions}
                 rename={renamingWsId === wsId ? activeRename : inactiveRename}
                 onToggleWorkspace={toggleWorkspace}
                 onToggleThread={toggleThread}

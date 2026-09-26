@@ -29,7 +29,6 @@ def test_system_prompt_never_renders_the_market_watch_section():
         prompt = loader.get_system_prompt(
             current_time="2026-07-01 14:30 ET",
             subagent_summary="",
-            tool_summary="",
             **kwargs,
         )
         assert "<market_watch>" not in prompt
@@ -42,7 +41,6 @@ def test_tool_guide_row_follows_the_master_switch():
     base = dict(
         current_time="2026-07-01 14:30 ET",
         subagent_summary="",
-        tool_summary="",
     )
 
     assert "watch_market" in loader.get_system_prompt(**base)

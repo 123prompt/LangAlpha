@@ -413,6 +413,37 @@ async def test_no_dispatch_header_foreground_unchanged(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        ({}, None),
+        ({"X-Service-Token": TOKEN}, "Reply in one line."),
+    ],
+)
+async def test_surface_rules_survive_only_a_service_token_request(monkeypatch, headers, expected):
+    """The field is the gateway's; the text rides the operator role, so a
+    user's own copy is dropped with the other internal-only fields."""
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", TOKEN)
+    app = _app()
+    seen = {}
+
+    def _capture(**kwargs):
+        seen["request"] = kwargs["request"]
+        return _stub_ptc_workflow(**kwargs)
+
+    with (
+        _stub_workflow(),
+        patch("src.server.handlers.chat.astream_ptc_workflow", new=_capture),
+    ):
+        resp = await _post(
+            app, headers=headers, body={**_BODY, "surface_rules": "Reply in one line."}
+        )
+    assert resp.status_code == 200, resp.text
+    assert seen["request"].surface_rules == expected
+
+
+@pytest.mark.asyncio
 async def test_non_ascii_service_token_rejected_not_500(monkeypatch):
     """A non-ASCII X-Service-Token must 403, not 500. Header values arrive
     latin-1-decoded, and the compare now runs through service_token_matches

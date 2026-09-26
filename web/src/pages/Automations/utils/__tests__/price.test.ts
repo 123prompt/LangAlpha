@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { afterAll, beforeAll, describe, it, expect } from 'vitest';
+import i18n from '@/i18n';
 import {
   isPriceTriggerConfig,
   formatPriceTrigger,
@@ -199,5 +200,21 @@ describe('formatRetriggerMode', () => {
     // (retrigger is required in the type but might be absent at runtime)
     const cfg = { symbol: 'AAPL', conditions: [] } as any;
     expect(formatRetriggerMode(cfg)).toBe('One-shot');
+  });
+});
+
+describe('price text in Chinese', () => {
+  beforeAll(() => i18n.changeLanguage('zh-CN'));
+  afterAll(() => i18n.changeLanguage('en-US'));
+
+  it('reads in the reader\'s language', () => {
+    const move: PriceTriggerConfig = {
+      symbol: 'SPX',
+      conditions: [{ type: 'pct_change_above', value: 1.5, reference: 'previous_close' }],
+      retrigger: { mode: 'recurring', cooldown_seconds: 14400 },
+    };
+    expect(formatPriceTrigger(move)).toBe('SPX 较昨收 ↑1.50%');
+    expect(formatRetriggerMode(move)).toBe('循环（每 4 小时）');
+    expect(formatRetriggerMode(validConfig)).toBe('单次触发');
   });
 });

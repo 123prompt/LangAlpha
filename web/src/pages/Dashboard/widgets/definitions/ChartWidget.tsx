@@ -13,8 +13,13 @@ import {
   type ISeriesApi,
   type MouseEventParams,
   type UTCTimestamp,
+  AreaSeries,
+  CandlestickSeries,
+  HistogramSeries,
+  LineSeries,
 } from 'lightweight-charts';
-import { searchStocks } from '@/lib/marketUtils';
+import { useSymbolSearch } from '@/hooks/useSymbolSearch';
+import { normalizeSymbolInput, readTypedTicker } from '@/lib/marketUtils';
 import {
   getChartTheme,
   STAGE2_BACKFILL_DAYS,
@@ -33,8 +38,8 @@ import {
   WS_FOLD_INTERVALS,
   isUSEquity,
   fetchStockData,
-  centerLatestBarView,
   computeInitialLoadRange,
+  defaultBarsView,
   dedupeMergeByTime,
   rangeBeforeOldest,
   currencySymbol,
@@ -423,11 +428,11 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
     setSummary({ first, last });
   }, []);
 
-  // --- Default view: mirror MarketView's convention — latest bar centered
-  // at `TARGET_BAR_SPACING[interval]` pixels per bar. Keeps the candlestick
-  // ratio and scroll feel consistent between the widget and the full chart
-  // page. Half the chart width is reserved as empty future-space on the
-  // right (same as `centerLatestBarView`).
+  // --- Default view: mirror MarketView's framing (`defaultBarsView`): the
+  // latest bar centered at `TARGET_BAR_SPACING[interval]` pixels per bar with
+  // room to the right while the widget is wide, the bars packed with a gutter
+  // once it is narrow. Keeps the candlestick ratio and scroll feel consistent
+  // between the widget and the full chart page.
   const applyDefaultView = useCallback(() => {
     const chart = chartRef.current;
     if (!chart) return;
@@ -444,7 +449,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
       containerRef.current?.clientWidth ||
       800;
     ts.setVisibleLogicalRange(
-      centerLatestBarView({ chartWidth, barSpacing, dataLen: bars.length }),
+      defaultBarsView({ defaultView: 'centered', chartWidth, barSpacing, dataLen: bars.length }),
     );
   }, []);
 
@@ -562,7 +567,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
     });
     chartRef.current = chart;
 
-    const volume = chart.addHistogramSeries({
+    const volume = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' },
       priceScaleId: 'volume',
       color: 'rgba(128,128,128,0.3)',
@@ -712,7 +717,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
 
     let next: ISeriesApi<'Candlestick'> | ISeriesApi<'Area'> | ISeriesApi<'Line'>;
     if (config.chartType === 'candle') {
-      next = chart.addCandlestickSeries({
+      next = chart.addSeries(CandlestickSeries, {
         upColor: ct.upColor,
         downColor: ct.downColor,
         borderVisible: false,
@@ -721,7 +726,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
         priceFormat: priceFmt,
       });
     } else if (config.chartType === 'area') {
-      next = chart.addAreaSeries({
+      next = chart.addSeries(AreaSeries, {
         lineColor: changeColor,
         topColor: positive ? ct.baselineUpFill1 : ct.baselineDownFill2,
         bottomColor: positive ? ct.baselineUpFill2 : ct.baselineDownFill1,
@@ -731,7 +736,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
         priceFormat: priceFmt,
       });
     } else {
-      next = chart.addLineSeries({
+      next = chart.addSeries(LineSeries, {
         color: changeColor,
         lineWidth: 2,
         priceLineVisible: false,
@@ -1100,29 +1105,23 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
 
   const hasData = allDataRef.current.length > 0 || summary !== null;
 
-  // Inline symbol search — click the symbol text to edit in place. The same
-  // debounced search the DashboardHeader uses powers a dropdown of matches
-  // so users can ticker-hunt without leaving the widget. Enter picks the
-  // first match (or the raw uppercase query if no matches); Escape or
-  // outside-click cancels.
-  type SymbolHit = { symbol: string; name?: string };
+  // Inline symbol search: click the symbol text to edit in place, with a
+  // dropdown of matches. Enter picks the first match (or the raw uppercase
+  // query if no matches); Escape or outside-click cancels.
   const [editingSymbol, setEditingSymbol] = useState(false);
   const [symbolDraft, setSymbolDraft] = useState(config.symbol);
-  const [searchHits, setSearchHits] = useState<SymbolHit[]>([]);
-  const [searchLoading, setSearchLoading] = useState(false);
+  const { hits: searchHits, loading: searchLoading } = useSymbolSearch(symbolDraft, 8, { enabled: editingSymbol });
   const symbolEditorRef = useRef<HTMLDivElement | null>(null);
   const symbolInputRef = useRef<HTMLInputElement | null>(null);
 
   const selectSymbol = useCallback((sym: string) => {
-    const next = sym.trim().toUpperCase();
+    const next = normalizeSymbolInput(sym);
     if (next && next !== config.symbol) updateConfig({ symbol: next });
     setEditingSymbol(false);
-    setSearchHits([]);
   }, [config.symbol, updateConfig]);
 
   const startEditSymbol = useCallback(() => {
     setSymbolDraft(config.symbol);
-    setSearchHits([]);
     setEditingSymbol(true);
     requestAnimationFrame(() => {
       symbolInputRef.current?.focus();
@@ -1130,37 +1129,12 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
     });
   }, [config.symbol]);
 
-  // Debounced search while editing. Kept in the component (not extracted) —
-  // this is the only caller and the state is small.
-  useEffect(() => {
-    if (!editingSymbol) return;
-    const q = symbolDraft.trim();
-    if (!q) {
-      setSearchHits([]);
-      setSearchLoading(false);
-      return;
-    }
-    setSearchLoading(true);
-    const timer = setTimeout(async () => {
-      try {
-        const res = await searchStocks(q, 8);
-        setSearchHits(((res.results || []) as SymbolHit[]).slice(0, 8));
-      } catch {
-        setSearchHits([]);
-      } finally {
-        setSearchLoading(false);
-      }
-    }, 250);
-    return () => clearTimeout(timer);
-  }, [symbolDraft, editingSymbol]);
-
   // Outside-click dismiss for the editor + dropdown.
   useEffect(() => {
     if (!editingSymbol) return;
     const onMouseDown = (e: MouseEvent) => {
       if (symbolEditorRef.current && !symbolEditorRef.current.contains(e.target as Node)) {
         setEditingSymbol(false);
-        setSearchHits([]);
       }
     };
     document.addEventListener('mousedown', onMouseDown);
@@ -1186,14 +1160,18 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
                   // Prefer the top search hit so users can type "nvid" and
-                  // land on NVDA. Fall back to the raw draft for exact
-                  // symbols the search doesn't know (e.g. freshly listed).
-                  const pick = searchHits[0]?.symbol || symbolDraft;
-                  selectSymbol(pick);
+                  // land on NVDA. Neither the hit nor the draft is taken while
+                  // a search is resting or in flight, the same rule as
+                  // SymbolSearch: "goog" + a fast Enter must not open GOOG
+                  // while GOOGL is on its way, and the listed hits may still
+                  // answer the draft that was typed over.
+                  const hit = searchHits[0]?.symbol;
+                  const typed = readTypedTicker(symbolDraft);
+                  if (hit && !searchLoading) selectSymbol(hit);
+                  else if (typed && !searchLoading) selectSymbol(typed);
                 } else if (e.key === 'Escape') {
                   setEditingSymbol(false);
                   setSymbolDraft(config.symbol);
-                  setSearchHits([]);
                 }
               }}
               className="text-sm font-semibold tabular-nums bg-transparent border-b px-0 py-0 w-24"
@@ -1253,9 +1231,9 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
                   {t('dashboard.widgets.chart.noMatchesEnter', { symbol: symbolDraft.trim().toUpperCase() })}
                 </div>
               ) : (
-                searchHits.map((hit) => (
+                searchHits.map((hit, i) => (
                   <button
-                    key={hit.symbol}
+                    key={`${hit.symbol}-${i}`}
                     type="button"
                     onMouseDown={(e) => {
                       // Use onMouseDown so the click fires before the input

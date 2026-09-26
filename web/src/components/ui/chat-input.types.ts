@@ -16,6 +16,13 @@ export interface MentionedFile {
   lineStart?: number;
   lineEnd?: number;
   lineCount?: number;
+  /**
+   * Where inside the file the snippet came from, when lines are the wrong unit:
+   * a spreadsheet range writes `Model!B4:D9`. Fragment syntax without the `#`,
+   * so `@path#locator` round-trips back through `parseFragment` as a link the
+   * agent can answer with.
+   */
+  locator?: string;
   source?: string;
 }
 

@@ -8,6 +8,7 @@ import type React from 'react';
 import type { ChatMessage } from '@/types/chat';
 import type { ActionRequest, ToolCallData } from '@/types/sse';
 import type { SubagentTokenUsage } from '../utils/tokenUsage';
+import type { DecisionTarget } from './interrupts/toolApprovalCard';
 import type { StreamRefs } from './streamRefs';
 
 // --- Internal types for useChatMessages ---
@@ -66,6 +67,7 @@ interface SSEEvent {
   tool_call_id?: string;
   tool_call_chunks?: Array<{ id?: string; name?: string; args?: string }>;
   finish_reason?: string;
+  phase?: 'commentary' | 'final_answer';
   artifact_type?: string;
   artifact_id?: string;
   artifact?: Record<string, unknown>;
@@ -86,12 +88,21 @@ interface SSEEvent {
   original_message_count?: number;
   offloaded_args?: number;
   offloaded_reads?: number;
+  /** Discriminator carried by several event families; `order_approval` on an
+   *  interrupt the order gate raised. */
   kind?: string;
   position?: number;
   active_tasks?: string[];
   can_reconnect?: boolean;
   is_shared?: boolean;
   run_id?: string;
+  /** ISO instant the turn's run settled, on a terminal `user_message` only.
+   *  Live turns carry none — their tail bubble is stamped when it finalizes. */
+  run_completed_at?: string;
+  /** The server's measured thinking time, on a `reasoning_signal` close. Both
+   *  replay paths and the live stream read it, so it is stated rather than
+   *  left to the index signature below. */
+  elapsed_ms?: number;
   [key: string]: unknown;
 }
 
@@ -203,6 +214,10 @@ interface HistoryInterruptInfo {
   questionId?: string;
   proposalId?: string;
   interruptId?: string;
+  /** Where a stopped call's verdict is looked up, decided when the interrupt
+   *  was read so no settler has to rebuild it from the card id. Present only on
+   *  a `tool_approval` entry. */
+  target?: DecisionTarget;
   answer?: string | null;
 }
 

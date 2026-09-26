@@ -4,7 +4,7 @@
  * shape, and we leave every other reasoning untouched.
  */
 import { describe, it, expect } from 'vitest';
-import { extractLeadingBoldHeader } from '../ActivityBlock';
+import { extractLeadingBoldHeader } from '../../utils/reasoningHeaders';
 
 describe('extractLeadingBoldHeader', () => {
   it('promotes a leading bold heading + blank line + body', () => {
@@ -46,9 +46,16 @@ describe('extractLeadingBoldHeader', () => {
     expect(r.body).toBe(original);
   });
 
-  it('does not promote a bold-only paragraph with no body', () => {
-    const r = extractLeadingBoldHeader('**Just a bold line, nothing follows**\n\n');
-    expect(r.title).toBeNull();
+  it('promotes a bold-only paragraph as a header with an empty body', () => {
+    const r = extractLeadingBoldHeader('**Planning AMD quote retrieval**');
+    expect(r.title).toBe('Planning AMD quote retrieval');
+    expect(r.body).toBe('');
+  });
+
+  it('promotes a bold-only paragraph followed by a trailing newline', () => {
+    const r = extractLeadingBoldHeader('**Planning**\n\n');
+    expect(r.title).toBe('Planning');
+    expect(r.body).toBe('');
   });
 
   it('rejects an over-long candidate (looks like a sentence, not a heading)', () => {

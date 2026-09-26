@@ -58,7 +58,8 @@ const SelectTrigger = ({ className, children, ...props }: AriaButtonProps) => (
   <AriaButton
     className={composeRenderProps(className, (className) =>
       cn(
-        "flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background",
+        /* The field fill and hairline every text input carries */
+        "flex h-9 w-full items-center justify-between gap-2 rounded-md border border-[color:var(--color-border-muted)] bg-input px-3 py-2 text-left text-sm ring-offset-background",
         /* Disabled */
         "data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50",
         /* Focused */
@@ -73,16 +74,18 @@ const SelectTrigger = ({ className, children, ...props }: AriaButtonProps) => (
     {composeRenderProps(children, (children) => (
       <>
         {children}
-        <ChevronDown aria-hidden="true" className="size-4 opacity-50" />
+        <ChevronDown aria-hidden="true" className="size-4 shrink-0 opacity-50" />
       </>
     ))}
   </AriaButton>
 )
 
+// Never narrower than the trigger, and wider when an option needs it, so a
+// compact trigger does not fold its options onto two lines.
 const SelectPopover = ({ className, ...props }: AriaPopoverProps) => (
   <Popover
     className={composeRenderProps(className, (className) =>
-      cn("w-[--trigger-width]", className)
+      cn("w-max min-w-[--trigger-width] max-w-[calc(100vw_-_32px)]", className)
     )}
     {...props}
   />

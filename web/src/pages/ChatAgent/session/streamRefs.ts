@@ -50,20 +50,6 @@ export function nextArrivalSeq(msg: { arrivalSeq?: unknown }): number {
 }
 
 /**
- * Extracts the last markdown bold title (**...**) from reasoning content for the icon label.
- * Used only during live streaming; history always shows "Reasoning".
- * @param {string} content - Accumulated reasoning text
- * @returns {string|null} Last **title** inner text or null
- */
-function extractLastReasoningTitle(content: unknown): string | null {
-  if (!content || typeof content !== 'string') return null;
-  const matches = content.matchAll(/\*\*([^*]+)\*\*/g);
-  let last: string | null = null;
-  for (const m of matches) last = m[1].trim();
-  return last || null;
-}
-
-/**
  * Initializes per-task ref state if it doesn't exist yet.
  * Shared by all subagent event handlers to avoid repeated boilerplate.
  * @param {Object} refs - Refs object with subagentStateRefs
@@ -85,4 +71,3 @@ export function getOrCreateTaskRefs(refs: StreamRefs, taskId: string): TaskRefs 
 }
 
 export type { TaskRefs, StreamRefs, ToolCallChunkRecord, UpdateSubagentCard };
-export { extractLastReasoningTitle };

@@ -12,9 +12,11 @@ from typing import Any, Dict, List, Optional
 
 from psycopg.errors import LockNotAvailable
 from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
 from src.server.database.pool import get_db_connection
 from src.server.database.session_lock import release_session_lock
+from src.server.database.sql_fences import FENCE_LIVE_WORKSPACE
 from src.server.utils.pg_sanitize import strip_pg_nul_str
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,23 @@ _SYNC_LOCK_NS = "WSFILES_SYNC"
 # wedged; a bounded wait keeps a stuck holder from pinning every later sync's
 # pool slot behind it.
 SYNC_LOCK_WAIT = "120s"
+
+
+# ``file_path`` is VARCHAR(1024), and the unique (workspace_id, file_path) index
+# refuses a key past roughly 2.7 KB whatever the column allows. A sandbox has no
+# such bound (a tree can nest past PATH_MAX through relative paths), and one
+# path over either limit fails the whole batch insert, so the sync has to set
+# such a path aside before it writes. The byte bound only bites on multibyte
+# names: 1024 ASCII characters are 1024 bytes.
+MAX_FILE_PATH_CHARS = 1024
+_MAX_FILE_PATH_BYTES = 2048
+
+
+def path_fits_manifest(path: str) -> bool:
+    return (
+        len(path) <= MAX_FILE_PATH_CHARS
+        and len(path.encode("utf-8", "surrogatepass")) <= _MAX_FILE_PATH_BYTES
+    )
 
 
 class WorkspaceSyncBusy(Exception):
@@ -301,6 +320,42 @@ async def get_file(
         raise
 
 
+async def get_file_locator(
+    workspace_id: str, file_path: str, *, conn=None
+) -> Optional[Dict[str, Any]]:
+    """Where one file's bytes live, without the bytes.
+
+    ``get_file(include_content=False)`` leaves out the blob and pack pointers,
+    and ``include_content=True`` pulls an inline body of up to 100 MB to learn
+    them. ``mtime_ns`` matches ``get_file_metadata_for_sync``.
+    """
+
+    async def _execute(cur):
+        await cur.execute(
+            """
+            SELECT file_name, file_size, content_hash, blob_sha256, pack_sha256,
+                   mime_type, sandbox_modified_at
+            FROM workspace_files
+            WHERE workspace_id = %s AND file_path = %s AND kind = 'file'
+            """,
+            (workspace_id, file_path),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        micros = datetime_to_micros(out.pop("sandbox_modified_at"))
+        out["mtime_ns"] = micros * 1000 if micros is not None else None
+        return out
+
+    if conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            return await _execute(cur)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            return await _execute(cur)
+
+
 async def get_file_metadata_for_sync(
     workspace_id: str,
     *,
@@ -471,6 +526,7 @@ async def delete_removed_files(
     workspace_id: str,
     active_paths: set,
     *,
+    walked_dir_name: str,
     untouched_since: datetime,
     conn=None,
 ) -> int:
@@ -478,6 +534,13 @@ async def delete_removed_files(
     Delete files that are no longer present in the sandbox.
 
     Removes all workspace_files rows whose file_path is NOT in active_paths.
+
+    ``walked_dir_name`` is the folder the scan that produced ``active_paths``
+    actually walked, and the statement fires only when the row says the same,
+    so a scan of the computer root (or of a sibling's folder) prunes nothing.
+    Rows are keyed relative to one directory, which makes a path from the
+    wrong directory indistinguishable from a real subdirectory of this one,
+    and the only place the two can still be told apart is against the row.
 
     ``untouched_since`` fences the prune to rows nobody has written since the
     caller's scan began: two syncs may overlap (a post-turn backup and a stop,
@@ -488,6 +551,7 @@ async def delete_removed_files(
     Args:
         workspace_id: Workspace UUID
         active_paths: Set of file paths that still exist in the sandbox
+        walked_dir_name: The folder the scan walked ("" for the computer root)
         untouched_since: Only delete rows with ``updated_at`` before this
         conn: Optional database connection to reuse
 
@@ -500,12 +564,28 @@ async def delete_removed_files(
         async def _execute(cur):
             await cur.execute(
                 """
-                DELETE FROM workspace_files
-                WHERE workspace_id = %s
-                  AND NOT (file_path = ANY(%s::text[]))
-                  AND (%s::timestamptz IS NULL OR updated_at < %s::timestamptz)
+                DELETE FROM workspace_files f
+                USING workspaces w
+                WHERE w.workspace_id = %(workspace_id)s
+                  AND f.workspace_id = %(workspace_id)s
+                  AND COALESCE(w.dir_name, '') = %(walked_dir_name)s
+                  AND NOT (f.file_path = ANY(%(active_paths)s::text[]))
+                  AND (
+                        %(untouched_since)s::timestamptz IS NULL
+                        OR f.updated_at < %(untouched_since)s::timestamptz
+                      )
                 """,
-                (workspace_id, paths_list, untouched_since, untouched_since),
+                {
+                    "workspace_id": workspace_id,
+                    "walked_dir_name": walked_dir_name or "",
+                    "active_paths": paths_list,
+                    "untouched_since": untouched_since,
+                },
+                # Never prepared: Postgres hashes ``= ANY`` only over a constant
+                # array, which a generic plan does not have, so a prepared prune
+                # compares every row against every path. At 65k paths that
+                # measured 19.6 s against 0.15 s planned with the values.
+                prepare=False,
             )
             return cur.rowcount
 
@@ -550,6 +630,42 @@ async def delete_file_rows(
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             return await _execute(cur)
+
+
+async def set_files_scan_mark(
+    workspace_id: str, mark: dict[str, Any], *, conn=None
+) -> None:
+    sql = "UPDATE workspaces SET files_scan_mark = %s WHERE workspace_id = %s"
+    if conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (Json(mark), workspace_id))
+        return
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(sql, (Json(mark), workspace_id))
+
+
+async def get_scan_marks_for_computer(computer_id: str) -> List[Dict[str, Any]]:
+    """Every live project on the machine with its folder and scan mark.
+
+    The same set the machine-wide backup mirrors, so a sweep never skips a
+    project that backup would have covered.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT workspace_id, dir_name, files_scan_mark
+                FROM workspaces
+                WHERE computer_id = %s AND status <> 'deleted'
+                ORDER BY created_at
+                """,
+                (computer_id,),
+            )
+            return [
+                {**r, "workspace_id": str(r["workspace_id"])}
+                for r in await cur.fetchall()
+            ]
 
 
 async def copy_workspace_files(
@@ -640,9 +756,11 @@ async def get_workspace_total_size(
     try:
 
         async def _execute(cur):
+            # SUM over a bigint is numeric, which arrives as a Decimal and
+            # serializes as a string.
             await cur.execute(
                 """
-                SELECT COALESCE(SUM(file_size), 0) AS total_size
+                SELECT COALESCE(SUM(file_size), 0)::bigint AS total_size
                 FROM workspace_files
                 WHERE workspace_id = %s
                 """,
@@ -662,3 +780,20 @@ async def get_workspace_total_size(
     except Exception as e:
         logger.error(f"Error getting total size for workspace {workspace_id}: {e}")
         raise
+
+
+async def get_live_project_sizes_for_computer(computer_id: str) -> List[int]:
+    """Backed-up bytes of each live project on a computer, one entry per project."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT COALESCE(SUM(f.file_size), 0)::bigint AS total_size
+                FROM workspaces w
+                LEFT JOIN workspace_files f ON f.workspace_id = w.workspace_id
+                WHERE w.computer_id = %s AND w.{FENCE_LIVE_WORKSPACE}
+                GROUP BY w.workspace_id
+                """,
+                (computer_id,),
+            )
+            return [r["total_size"] for r in await cur.fetchall()]

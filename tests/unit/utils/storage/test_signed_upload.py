@@ -54,10 +54,12 @@ def test_transfer_mode_auto_is_direct_only_for_daytona_on_s3(monkeypatch):
 
 
 def test_transfer_mode_relay_for_stores_that_cannot_bind_content(monkeypatch):
-    monkeypatch.setattr(storage, "BLOB_TRANSFER_MODE", "auto")
-    for provider in ("oss", "none"):
-        monkeypatch.setattr(storage, "STORAGE_PROVIDER", provider)
-        assert storage.get_blob_transfer_mode("daytona") == "relay"
+    # Even when asked for direct: every push there falls back to relay.
+    for mode in ("auto", "direct"):
+        monkeypatch.setattr(storage, "BLOB_TRANSFER_MODE", mode)
+        for provider in ("oss", "none"):
+            monkeypatch.setattr(storage, "STORAGE_PROVIDER", provider)
+            assert storage.get_blob_transfer_mode("daytona") == "relay"
 
 
 def test_transfer_mode_explicit_overrides_auto(monkeypatch):

@@ -14,13 +14,15 @@ Design goals:
 Endpoints:
 - GET    /api/v1/workspaces/{workspace_id}/files
 - GET    /api/v1/workspaces/{workspace_id}/files/read
+- POST   /api/v1/workspaces/{workspace_id}/files/resolve
 - PUT    /api/v1/workspaces/{workspace_id}/files/write
 - GET    /api/v1/workspaces/{workspace_id}/files/download
 - POST   /api/v1/workspaces/{workspace_id}/files/upload
 - DELETE /api/v1/workspaces/{workspace_id}/files
 
-Plus an unauthenticated path-style serving router (workspace UUID = credential):
-- GET    /api/v1/wsfiles/{workspace_id}/{path:path}
+Plus a path-style serving router whose credential is a signed, expiring
+owner grant (``services/file_grants``):
+- GET    /api/v1/wsfiles/g/{grant}/{path:path}
 """
 
 from .crud import router

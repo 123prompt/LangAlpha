@@ -4,6 +4,7 @@
  * StreamRuntime lane port plus cross-lane orchestration callbacks.
  */
 
+import { finalizeAssistantMessage } from './finalizeMessage';
 import { isUpstreamHint, type StructuredError } from '@/utils/rateLimitError';
 import { applyAnnotationArtifact } from '@/pages/MarketView/stores/chartAnnotationStore';
 import type { AssistantMessage } from '@/types/chat';
@@ -494,6 +495,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
             contentType,
             content: event.content as string,
             finishReason: event.finish_reason,
+            elapsedMs: typeof event.elapsed_ms === 'number' ? event.elapsed_ms : undefined,
             refs,
             updateSubagentCard: rt.updateSubagentCard,
           });
@@ -631,6 +633,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           refs,
           setMessages: setMessagesForHandlers,
           eventId,
+          elapsedMs: typeof event.elapsed_ms === 'number' ? event.elapsed_ms : undefined,
         })) {
           return;
         }
@@ -657,6 +660,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
           refs,
           setMessages: setMessagesForHandlers,
           eventId,
+          phase: event.phase,
         })) {
           return;
         }
@@ -725,11 +729,9 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         rt.setMessageError(null);
         rt.setMessages((prev) =>
           updateMessage(prev, assistantMessageId, (msg) => ({
-            ...msg,
+            ...finalizeAssistantMessage(msg, 'failed'),
             content: msg.content || errorMessage,
             contentType: 'text',
-            isStreaming: false,
-            error: true,
             ...(structured ? { structuredError: structured } : {}),
           }))
         );

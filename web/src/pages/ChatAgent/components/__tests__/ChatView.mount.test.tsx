@@ -110,7 +110,6 @@ const baseChatState = () => ({
   tokenUsage: null,
   threadId: 'thread-mount-1',
   threadModels: [] as string[],
-  lastThreadModel: null,
   marketWatch: null,
   isShared: false,
   insertNotification: vi.fn(),

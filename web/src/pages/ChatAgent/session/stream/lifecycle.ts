@@ -6,6 +6,7 @@
  * via RecoveryDeps so this module never sees the full runtime.
  */
 
+import { finalizeAssistantMessage } from './finalizeMessage';
 import {
   reconnectToWorkflowStream, getWorkflowStatus, getReportBackStatus,
   type ReportBackStatusResponse,
@@ -58,6 +59,8 @@ export interface RecoveryDeps {
   markTranscriptPersisted: () => void;
   clearModelStatus: () => void;
   finalizePendingTodos: (() => void) | null;
+  /** Re-read the machine rows after a turn on a machine; null where there is none (flash). */
+  refreshComputerAfterTurn: (() => void) | null;
   reportBackWatch: {
     onStreamEnd: () => void;
     arm: (
@@ -390,10 +393,7 @@ export const reconnectToStream = async (
 
     // Mark message as complete
     rt.setMessages((prev) =>
-      updateMessage(prev,assistantMessageId, (msg) => ({
-        ...msg,
-        isStreaming: false,
-      }))
+      updateMessage(prev, assistantMessageId, (msg) => finalizeAssistantMessage(msg, wasInterruptedRef.current ? 'paused' : 'completed'))
     );
     deps.markTranscriptPersisted();
 
@@ -706,7 +706,7 @@ export const attemptReconnectAfterDisconnect = async (
   rt.setMessages((prev) =>
     prev.map((m) =>
       m.role === 'assistant' && m.id === assistantMessageId && m.isStreaming
-        ? { ...m, isStreaming: false }
+        ? finalizeAssistantMessage(m, 'disconnected')
         : m,
     ),
   );
@@ -747,6 +747,10 @@ export const cleanupAfterStreamEnd = (
   // Finalize pending todos as stale
   if (deps.finalizePendingTodos) deps.finalizePendingTodos();
   rt.setMessages((prev) => finalizeTodoListProcessesInMessages(prev, assistantMessageId));
+
+  // The server measures the machine's disk when a turn ends, onto the
+  // computer row; nothing else re-reads that row while the page is open.
+  if (deps.refreshComputerAfterTurn) deps.refreshComputerAfterTurn();
 
   // Re-arm the keyed report-back watch and poke a catch-up reconcile (no-op
   // when not awaiting): this turn's stream just ended, and the next ordered

@@ -5,6 +5,8 @@ import logging
 import re
 from typing import Any
 
+from ptc_agent.core.paths import SANDBOX_ROOTS
+
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 8000
@@ -20,66 +22,188 @@ _EMPTY_LATEST_FALLBACK_TURNS = 5
 # Inserted between turns when more than one turn is returned.
 _TURN_SEPARATOR = "\n\n---\n\n"
 
-# File extensions recognized as workspace file references (mirrors frontend KNOWN_EXTS)
+# Destinations worth rewriting into a workspace reference. Deliberately
+# narrower than the web client, which treats any relative link as a file
+# (`filePaths.isFilePath`) and leaves the panel to resolve the name: the relay
+# is rewriting text it will persist, so it only claims destinations that look
+# like files. Every extension the client's own tables name as one belongs here
+# -- `filePaths.KIND_BY_EXT` (what a deliverable card can show) and
+# `filePanel/fileMeta` (what the panel lists and offers to download) -- because
+# a deliverable that relays unqualified resolves against the Flash workspace,
+# which holds none of these files.
 _FILE_EXTS = (
-    r"md|txt|pdf|doc|docx|rtf|"
-    r"py|js|jsx|ts|tsx|html|css|sh|bash|sql|r|ipynb|"
-    r"csv|json|yaml|yml|xml|toml|ini|cfg|log|env|xlsx|xls|"
+    r"md|markdown|txt|pdf|doc|docx|odt|rtf|"
+    r"py|js|jsx|ts|tsx|html|htm|css|sh|bash|sql|r|rb|go|rs|java|ipynb|pptx|ppt|key|"
+    r"csv|tsv|json|jsonl|yaml|yml|xml|toml|ini|cfg|log|env|xlsx|xlsm|xls|"
     r"png|jpg|jpeg|gif|svg|webp|bmp|"
-    r"zip|tar|gz"
+    r"numbers|pages|"
+    r"parquet|feather|pkl|pickle|npy|npz|h5|hdf5|db|sqlite|"
+    r"mp3|wav|mp4|mov|webm|"
+    r"zip|tar|tgz|gz|bz2|xz|7z|rar"
 )
 
 # Workspace-qualified path prefix: __wsref__/{workspace_id}/relative/path
 # Uses a path-based encoding instead of ws:// protocol to survive HTML sanitizers.
 _WSREF_PREFIX = "__wsref__"
 
-# Matches markdown links: [text](path) and ![text](path)
-# Captures: group(1)=prefix "![text](" or "[text](", group(2)=path, group(3)=")"
-# Path must be relative (no http/https/mailto/#), contain at least one "/",
-# and end with a known extension.
-_MD_LINK_RE = re.compile(
-    r"(!?\[[^\]]*\]\()"  # prefix: ![...]( or [...](
-    r"((?!https?://|mailto:|#|__wsref__/|[a-zA-Z][a-zA-Z0-9+.-]*:)"  # not URL scheme or already qualified
-    r"(?:/home/(?:workspace|daytona)/)?[a-zA-Z_][^\s)]*/"  # at least one dir segment
-    r"[^\s)]*\.(?:" + _FILE_EXTS + r"))"  # filename.ext
-    r"(\))",  # closing paren
-    re.IGNORECASE,
+# A markdown link or image and its destination, bare or in angle brackets.
+# A bare destination carries one level of balanced parens, as CommonMark says and
+# the client's own `normalizeFileRefs.LINK_DEST_RE` already reads -- `report(1).pdf`
+# is a real deliverable name. A title or a URL fails the file test below.
+# A bare destination holds no angle bracket either, so an unclosed `<a.jsonl`
+# fails to match rather than matching bare and losing its last character to the
+# closing-bracket strip -- `.jsonl` shortened to `.json` is another live
+# extension, so that link would have resolved to a different real file.
+# The label is bounded because it is unanchored: on a run of `[` with no `]`,
+# an unbounded `[^\]\n]*` rescans to the end of the line from every one of
+# them, and this runs synchronously on a whole turn of agent text inside an
+# async handler. 512 is past any real link label.
+# A destination may carry a CommonMark title, which is not part of the path. The
+# title cannot be found by cutting at the first space, because a bare
+# `results/Q3 deck.pptx` is a name the agent really writes and the bracketed form
+# above exists to keep it: the quote or paren is the only signal. So the
+# destination stops as early as it can and the title rides in the closing group,
+# which `_rewrite` already emits untouched. Left unqualified, a titled link is
+# not safely ignored the way a URL is -- the parser hands the client the bare
+# path, which then resolves against the Flash workspace and opens nothing.
+_DEST = r"<[^<>\n]+>|(?:[^()<>\n]|\([^()<>\n]*\))+?"
+_TITLE = r"""(?:[ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^()\n]*\)))?"""
+_MD_LINK_RE = re.compile(r"(!?\[[^\]\n]{0,512}\]\()(" + _DEST + r")(" + _TITLE + r"\))")
+
+# Fenced blocks and inline code spans: shown, not read. A link inside one is
+# syntax the reply is displaying, so splicing a workspace id into it corrupts
+# what the reader copies out, and this text is persisted, so the corruption
+# outlives the turn. The web client splits the same way before its own rewrites
+# (`markdownSegments.mapOutsideCode`).
+# A closing fence only has to be *at least* as long as the opener, so the
+# closer is the opener plus any further run of its own character. Repeating
+# the whole opener instead would accept only multiples of its length, and a
+# three-backtick block closed by four would swallow the rest of the turn.
+# An inline span is delimited by a whole run of backticks and closes on the
+# next run of the same length, which is why both delimiters are fenced off by
+# lookarounds: a run is only a delimiter if nothing longer contains it. Reading
+# one backtick at a time instead paired the inner run of `` `[r](a.md)` `` with
+# itself and handed the link in between to the rewrite, so an agent showing the
+# citation syntax got a workspace id spliced into the example it was showing.
+_CODE_RE = re.compile(
+    r"^[ \t]*(?P<fence>(?P<fchar>[`~])(?P=fchar){2,})[^\n]*\n"
+    r".*?(?:^[ \t]*(?P=fence)(?P=fchar)*[ \t]*$|\Z)"
+    r"|(?<!`)(?P<tick>`+)(?!`)[^\n]*?(?<!`)(?P=tick)(?!`)",
+    re.MULTILINE | re.DOTALL,
 )
 
-# Strip file:// protocol from sandbox paths in markdown links before qualification.
-_FILE_PROTO_RE = re.compile(
-    r"(!?\[[^\]]*\]\()"  # prefix: ![...]( or [...](
-    r"file:///home/(?:workspace|daytona)/",  # file:///home/workspace/ or /daytona/
+
+def _map_outside_code(text: str, rewrite) -> str:
+    """Apply `rewrite` to the prose of `text`, leaving code spans untouched."""
+    out: list[str] = []
+    last = 0
+    for m in _CODE_RE.finditer(text):
+        out.append(rewrite(text[last : m.start()]))
+        out.append(m.group(0))
+        last = m.end()
+    out.append(rewrite(text[last:]))
+    return "".join(out)
+
+# Path separators, encoded or not: `..%2f..%2f` climbs exactly as `../../` does.
+_SEP_RE = re.compile(r"/|%2[fF]")
+
+# The place inside a file a reference points at, in its `:line` forms:
+# :line, :start-end, :line:col. The `#fragment` and `?query` forms are read by
+# `_split_location`.
+_LINE_LOCATION_RE = re.compile(r":\d+(?:-\d+|:\d+)?$")
+# The computer root in every spelling, current and legacy, with or without a
+# `file://` scheme.
+_SANDBOX_ROOT_RE = re.compile(
+    "^(?:file://)?(?:" + "|".join(re.escape(r) for r in SANDBOX_ROOTS) + ")/",
     re.IGNORECASE,
 )
+_BARE_DOMAIN_RE = re.compile(r"^www\.", re.IGNORECASE)
+_FILE_NAME_RE = re.compile(r"\.(?:" + _FILE_EXTS + r")$", re.IGNORECASE)
+# A colon introduces a scheme only before the first slash, which is the rule
+# every URL reader on the client uses too (react-markdown's `defaultUrlTransform`
+# and `hast-util-sanitize`). Rejecting every colon also rejected
+# `results/Q3:final.pdf`, a name the sandbox allows and the resolver accepts, so
+# the link relayed unqualified and opened nothing in the Flash workspace.
+_SCHEME_RE = re.compile(r"^[^/]*:")
+
+
+def _split_location(path: str) -> tuple[str, str]:
+    """A reference split into the file and everything trailing it.
+
+    A destination is a URL, so `#` opens the fragment and `?` the query, each
+    at its first occurrence. That is the reading `agentPaths.normalizeAgentHref`
+    does on the other side of the wire, and a name carrying either character
+    travels percent-encoded, so `results/issue%231.md` arrives here whole and
+    the client decodes it after the split. Reading a literal `#` as part of a
+    name instead would make this the only reader in the chain that disagrees
+    with the markdown its own client renders.
+
+    Whitespace marks nothing, which is the half worth spelling out: the panel's
+    `findHeadingIndex` matches a heading as written and not only as a slug, so
+    `report.md#Valuation Assumptions` is a reference it opens. Cutting at the
+    space left a head ending in `Assumptions`, which is no file, and the link
+    relayed unqualified into a workspace that does not hold it.
+    """
+    tail = ""
+    # `#` first: everything after it is fragment, a `?` inside it included, so
+    # the query pass then reads only what really precedes the fragment.
+    for mark in ("#", "?"):
+        cut = path.find(mark)
+        if cut != -1:
+            path, tail = path[:cut], path[cut:] + tail
+    line = _LINE_LOCATION_RE.search(path)
+    return (path[: line.start()], line.group(0) + tail) if line else (path, tail)
 
 
 def _qualify_file_paths(text: str, workspace_id: str) -> str:
-    """Rewrite relative file paths in markdown links to __wsref__/{workspace_id}/path.
+    """Rewrite workspace file links to __wsref__/{workspace_id}/path.
 
     Transforms:
-        [report.md](work/t/report.md) → [report.md](__wsref__/{wid}/work/t/report.md)
-        ![chart](work/t/charts/r.png)  → ![chart](__wsref__/{wid}/work/t/charts/r.png)
+        [report.md](t/report.md) → [report.md](__wsref__/{wid}/t/report.md)
+        [model](./model.py:42)        → [model](__wsref__/{wid}/model.py:42)
+        [deck](<t/Q3 deck.pptx>) → [deck](<__wsref__/{wid}/t/Q3 deck.pptx>)
 
-    Uses a path-based prefix instead of a protocol (ws://) because HTML sanitizers
-    strip non-standard URL protocols. The __wsref__ prefix looks like a relative path
-    to the sanitizer and passes through untouched.
-
-    Leaves external URLs and already-qualified __wsref__ paths untouched.
+    The relayed text renders in the Flash thread, whose own workspace holds none
+    of these files, so every relative file link has to carry where it lives,
+    bare names included. A path-based prefix survives HTML sanitizers that strip
+    unknown protocols. URLs, in-page anchors, paths outside the workspace and
+    already-qualified links are left as written.
     """
     if not workspace_id or not text:
         return text
 
-    # Normalize file:///home/workspace/... → relative path in markdown links
-    text = _FILE_PROTO_RE.sub(r"\1", text)
-
     def _rewrite(m: re.Match) -> str:
-        prefix, path, suffix = m.group(1), m.group(2), m.group(3)
-        # Strip sandbox absolute prefix if present
-        path = re.sub(r"^/home/(?:workspace|daytona)/", "", path)
-        return f"{prefix}{_WSREF_PREFIX}/{workspace_id}/{path}{suffix}"
+        prefix, dest, suffix = m.group(1), m.group(2), m.group(3)
+        bracketed = dest.startswith("<")
+        # `file_refs.clean_path` folds separators before it judges a path, so
+        # the guards below read the same string the resolver will, or the relay
+        # mints a reference that resolver then refuses.
+        path = (dest[1:-1] if bracketed else dest).strip().replace("\\", "/")
+        path, tail = _split_location(path)
+        path = _SANDBOX_ROOT_RE.sub("", path)
+        while path.startswith("./"):
+            path = path[2:]
+        if (
+            not path
+            or path.startswith(("/", "#", f"{_WSREF_PREFIX}/"))
+            or _SCHEME_RE.match(path)
+            # A destination that climbs out of the working directory names no
+            # workspace file, and `file_refs.clean_path` refuses one, so
+            # qualifying it would mint a reference the resolver rejects.
+            or ".." in _SEP_RE.split(path)
+            # A scheme-less bare domain is a link out, not a file. The client
+            # says so itself (`filePaths.isFilePath`), but reads the `__wsref__`
+            # prefix first, so a qualified one arrives already claimed.
+            or _BARE_DOMAIN_RE.match(path)
+            or not _FILE_NAME_RE.search(path)
+        ):
+            return m.group(0)
+        qualified = f"{_WSREF_PREFIX}/{workspace_id}/{path}{tail}"
+        if bracketed or any(c.isspace() for c in qualified):
+            qualified = f"<{qualified}>"
+        return f"{prefix}{qualified}{suffix}"
 
-    return _MD_LINK_RE.sub(_rewrite, text)
+    return _map_outside_code(text, lambda prose: _MD_LINK_RE.sub(_rewrite, prose))
 
 
 def _parse_sse_string(raw: str) -> tuple[str, dict] | None:

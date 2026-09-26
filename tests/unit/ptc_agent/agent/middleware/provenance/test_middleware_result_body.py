@@ -406,7 +406,7 @@ async def test_body_redacted_before_store_and_emit_unaffected():
 @pytest.mark.asyncio
 async def test_store_failure_does_not_break_turn():
     """store_result_body raising must not break the tool call or the SSE emit
-    (best-effort live write, like WorkspaceContextMiddleware front-matter sync)."""
+    (best-effort live write, like the agent.md writer-stamp sidecar)."""
     mw = ProvenanceMiddleware()
     store = AsyncMock(side_effect=RuntimeError("db down"))
     emitted = []

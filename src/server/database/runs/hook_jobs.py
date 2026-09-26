@@ -50,6 +50,13 @@ class WatchClearPayload(TypedDict):
     dispatch_gen: Optional[str]
 
 
+class AutomationSettlePayload(TypedDict):
+    execution_id: str
+    automation_id: str
+    user_id: Optional[str]
+    workspace_id: Optional[str]
+
+
 class UserFeedPayload(TypedDict):
     user_id: str
     thread_id: str
@@ -73,6 +80,9 @@ def build_finalize_jobs(
     workspace_id: Optional[str] = None,
     run_seq: Optional[int] = None,
     interrupt_reason: Optional[str] = None,
+    automation_execution_id: Optional[str] = None,
+    automation_id: Optional[str] = None,
+    superseded: bool = False,
 ) -> Callable[[str], List[HookJob]]:
     """The one decision table mapping a run's final status to its hook jobs.
 
@@ -120,6 +130,23 @@ def build_finalize_jobs(
                             if final_status == "interrupted"
                             else None
                         ),
+                    ),
+                )
+            )
+
+        if automation_execution_id and automation_id and not superseded:
+            # The firing that ran this turn ends as the run did. A run a
+            # concurrent one superseded at admission was never its turn: the
+            # firing is back in line for the thread instead.
+            jobs.append(
+                HookJob(
+                    hook_type="automation_settle",
+                    idempotency_key=f"{run_id}:automation_settle",
+                    payload=AutomationSettlePayload(
+                        execution_id=automation_execution_id,
+                        automation_id=automation_id,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
                     ),
                 )
             )
@@ -204,4 +231,8 @@ def build_finalize_jobs_from_run_row(
         run_seq=run.get("run_seq"),
         # The post-CAS row's column: NULL unless the CAS adopted 'interrupted'.
         interrupt_reason=run.get("interrupt_reason"),
+        automation_execution_id=meta.get("automation_execution_id"),
+        automation_id=meta.get("automation_id"),
+        # Stamped by the finalize itself, which the post-CAS row carries.
+        superseded=bool(meta.get("superseded")),
     )

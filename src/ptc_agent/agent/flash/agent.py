@@ -31,21 +31,27 @@ from ptc_agent.agent.middleware.openai_prompt_caching import (
     OpenAIPromptCachingMiddleware,
 )
 from ptc_agent.agent.middleware.direct_mcp import (
-    DirectMcpPolicyMiddleware,
     DirectToolSet,
+    direct_tool_middleware,
     direct_tool_summary,
 )
+from ptc_agent.agent.middleware.order_governance import OrderLedger
 from ptc_agent.agent.middleware.skills.registry import (
     build_effective_skill_registry,
 )
-from ptc_agent.agent.middleware.runtime_context import RuntimeContextMiddleware
+from ptc_agent.agent.context_stack import build_context_middleware
+from ptc_agent.agent.middleware.runtime_context import (
+    BaselineSources,
+    MemoryTierSource,
+    TurnContext,
+)
 from ptc_agent.agent.state import DeltaAgentState
 from ptc_agent.agent.prompts import (
-    format_current_time,
     get_loader,
     guidance_template_vars,
 )
 from ptc_agent.config import AgentConfig
+from ptc_agent.core.paths import MEMORY_INDEX_FILENAME, MEMORY_USER_DIR
 
 from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
 
@@ -165,19 +171,23 @@ class FlashAgent:
         return tools
 
     def _build_system_prompt(
-        self, tools: list[Any], guidance: str, direct_tool_summary: str = ""
+        self,
+        tools: list[Any],
+        guidance: str,
+        direct_tool_summary: str = "",
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
         ``guidance`` is resolved for the flash model, not the main one: a
-        deployment running Haiku on Flash and Opus on PTC sizes each prompt for
-        the model that renders it.
+        deployment running Haiku on Flash and Opus on PTC sizes each prompt
+        for the model that renders it.
         """
         loader = get_loader()
         return loader.render(
             "flash_system.md.j2",
             tools=tools,
             direct_tool_summary=direct_tool_summary,
+            ask_user_enabled=True,
             **guidance_template_vars(guidance),
         )
 
@@ -186,25 +196,34 @@ class FlashAgent:
         checkpointer: Any | None = None,
         llm: Any | None = None,
         user_profile: dict | None = None,
+        user_data_counts: dict | None = None,
         store: Any | None = None,
+        user_id: str | None = None,
         response_format: Any | None = None,
         direct_mcp: DirectToolSet | None = None,
+        order_ledger: OrderLedger | None = None,
+        turn_context: TurnContext | None = None,
     ) -> Any:
         """Create a Flash agent with minimal middleware stack.
 
         No MCP registry and no sandbox. ``direct_mcp`` is the one MCP surface
         Flash has: tools bound to the model as JSON tools through the relay,
         checked per call against the connection's current status and consent.
-        That check refuses; it does not ask. The per-call confirmation a live
-        order wants is what ``order_approval`` is reserved for, and it is not
-        built yet, so nothing here stops an order to put it to the user.
+        An order is stopped against the same durable attempt the PTC path
+        writes, so the user confirms before the vendor sees it.
 
         Args:
             checkpointer: Optional LangGraph checkpointer for state persistence
             llm: Optional LLM override
             user_profile: Optional user profile dict with name, timezone, locale
+            user_id: Owner of the user-tier memory namespace. None disables the
+                memory tier of the runtime-context baseline.
             response_format: Optional structured output schema (Pydantic model or dict).
                 When set, the agent is forced to return structured data matching this schema.
+            turn_context: What this turn knows about itself (when the previous
+                one ran, the surface it arrived on and that surface's delivery
+                rules, the zone its clock is stamped in), for the turn anchor
+                row. None for a context-free build.
 
         Returns:
             Configured LangGraph agent
@@ -213,16 +232,16 @@ class FlashAgent:
 
         # Freeze current time for this request (refreshes on each new query)
         request_time = datetime.now(tz=UTC)
-        timezone_str = (user_profile or {}).get("timezone")
-        current_time = format_current_time(request_time, timezone_str)
 
         # Build tools
         tools = self._build_tools()
         direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
 
-        # Build system prompt (time + profile injected by RuntimeContextMiddleware)
+        # Build system prompt (the volatile stamp rides the tail envelope)
         system_prompt = self._build_system_prompt(
-            tools, turn.guidance, direct_tool_summary=direct_tool_summary(direct_tools)
+            tools,
+            turn.guidance,
+            direct_tool_summary=direct_tool_summary(direct_tools),
         )
 
         # Leak detector wired into provenance so web/market/SEC snippets are
@@ -267,6 +286,9 @@ class FlashAgent:
             skill_dirs=[
                 d for d, _ in self.config.skills.local_skill_dirs_with_sandbox()
             ],
+            # The baseline states the manifest, so it is frozen for the epoch
+            # instead of sitting in front of the history and moving under it.
+            inject_manifest=False,
         )
         shared_middleware.append(skill_loader_middleware)
         tools.extend(skill_loader_middleware.tools)  # LoadSkill tool
@@ -287,11 +309,10 @@ class FlashAgent:
 
         main_middleware.append(SteeringMiddleware())
 
-        # Consent is re-read per call here, so a tool the connection no longer
-        # covers is refused rather than reaching the vendor.
-        if direct_tools:
-            main_middleware.append(DirectMcpPolicyMiddleware(direct_mcp))
-            tools.extend(direct_tools)
+        # Consent is re-read per call, and an order is stopped against its own
+        # durable attempt before the vendor sees it.
+        main_middleware.extend(direct_tool_middleware(direct_mcp, order_ledger))
+        tools.extend(direct_tools)
 
         # AskUserQuestion middleware (needed for onboarding and preference updates)
         ask_user_middleware = AskUserMiddleware()
@@ -301,9 +322,9 @@ class FlashAgent:
 
         # Optional compaction (shares config with main agent)
         compaction_config = None
-        if self.config.llm.compaction:
+        if self.config.llm.compaction_name:
             compaction_config = self.config.compaction.model_dump()
-            compaction_config["llm"] = self.config.llm.compaction
+            compaction_config["llm"] = self.config.llm.compaction_name
             client = resolve_compaction_client(self.config)
             if client is not None:
                 compaction_config["_llm_client"] = client
@@ -352,22 +373,48 @@ class FlashAgent:
             ]
         )
 
-        # Runtime context middleware (time + user profile — after cache breakpoint)
-        runtime_context_middleware = RuntimeContextMiddleware(
-            current_time=current_time,
+        # The turn row, the per-thread baseline and the tail envelope. Flash
+        # has no sandbox, so the baseline carries no agent.md tier: what it has
+        # is the user's identity plus the steering the profile component holds,
+        # the user memory index when identity is known, and the skills manifest.
+        # No MCP roster: Flash reaches MCP only through directly bound tools.
+        context = build_context_middleware(
+            now=request_time,
+            guidance=turn.guidance,
+            model_name=turn.name or None,
+            turn_context=turn_context,
             user_profile=user_profile,
-            sandbox_enabled=False,  # Flash has no sandbox/filesystem.
+            user_data_counts=user_data_counts,
+            sandbox_enabled=False,
+            sources=BaselineSources(
+                store=store if user_id else None,
+                memory=(
+                    {
+                        "user": MemoryTierSource(
+                            namespace_factory=lambda: (user_id, "memory"),
+                            display_path=f"{MEMORY_USER_DIR}/{MEMORY_INDEX_FILENAME}",
+                        )
+                    }
+                    if store is not None and user_id
+                    else {}
+                ),
+            ),
+            blocks={
+                "skills": lambda state: skill_loader_middleware.build_manifest(state)
+                or ""
+            },
         )
 
-        # Build final middleware stack
-        # RuntimeContextMiddleware is last (innermost) so it appends after
-        # the cache breakpoint, keeping the static prompt cacheable;
+        # Build final middleware stack. Where each of the three context
+        # middlewares has to sit is on ContextMiddleware;
         # ReasoningCompatibilityMiddleware sits inside model resilience so it
         # sanitizes against the post-fallback model, not the requested one.
         middleware = [
             *shared_middleware,
             *main_middleware,
-            runtime_context_middleware,
+            context.turn,
+            context.baseline,
+            context.tail,
             ReasoningCompatibilityMiddleware(),
         ]
 

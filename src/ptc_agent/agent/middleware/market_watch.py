@@ -1,21 +1,21 @@
 """Market watch middleware: injects live prices for watched tickers.
 
-One ephemeral `<market-watch>` block is appended to each model request's messages
-(``awrap_model_call`` + ``request.override``) — it reaches the provider but never
-enters durable state, so checkpoints, replay, and history stay clean. An in-memory
-throttle re-injects the cached block between refreshes so the model keeps a price
-view without a provider fetch every call, and a skip-when-already-quoted guard
-keeps the fetch off the hot path; any failure degrades to injecting nothing so the
+One `<market-watch>` block is contributed per model request as a row under
+``REQUEST_CALL_UPDATES`` on the request state (``awrap_model_call`` +
+``request.override``), and the tail envelope renders it. That key is
+request-only and never a state channel, so the stamp reaches the provider but
+never enters durable state and checkpoints, replay, and history stay clean. An in-memory throttle
+re-injects the cached block between refreshes so the model keeps a price view
+without a provider fetch every call, and a skip-when-already-quoted guard keeps
+the fetch off the hot path; any failure degrades to contributing nothing so the
 turn is never broken.
 
-For breakpoint-keyed caches (Anthropic always; OpenAI official endpoint with
-``prompt_cache_options``) a cache breakpoint is pinned to the last durable message
-so the ephemeral tail doesn't defeat incremental prompt caching — this middleware
-must therefore sit inside model_resilience (it needs the post-fallback model to
-gate the provider-specific marker).
+This middleware must sit OUTSIDE ``TailEnvelopeMiddleware``, which reads the
+request key it writes, and it owns no cache breakpoint of its own: the envelope
+carries the whole volatile tail and pins the breakpoint there.
 
 Every injection is also attested in the turn's provenance stream (one
-``market_data`` record per watched symbol) — provenance rides sse_events
+``market_data`` record per watched symbol). Provenance rides sse_events
 persistence, so it records what the model saw even though the stamp itself is
 never checkpointed.
 """
@@ -38,19 +38,17 @@ from ptc_agent.agent.middleware.provenance.body_store import (
     schedule_body_write,
     store_body,
 )
-from ptc_agent.agent.middleware.provider_cache import (
-    breakpoint_marker,
-    tag_last_text_block,
+from ptc_agent.agent.middleware.runtime_context import (
+    REQUEST_CALL_UPDATES,
+    RUNTIME_UPDATE_SOURCE,
+    DurableUpdate,
 )
 from ptc_agent.agent.provenance.types import (
     ProvenanceSource,
     build_provenance_event,
     fingerprint_result_with_body,
 )
-from src.config.settings import (
-    get_market_watch_cache_pin,
-    get_market_watch_min_interval,
-)
+from src.config.settings import get_market_watch_min_interval
 from src.data_client.registry import get_market_data_provider
 from src.market_protocol import MarketPhase
 from src.market_protocol.calendars import get_calendar
@@ -63,27 +61,13 @@ logger = logging.getLogger(__name__)
 _STAMP_OPEN = "<market-watch>"
 _STAMP_CLOSE = "</market-watch>"
 _STAMP_NOTE = "Automated live-price feed (not a user message)."
+# Bump when the block's shape changes: a row outlives the code that wrote it.
+_STAMP_SCHEMA_VERSION = 1
 
 # Direct tools whose call already puts a fresh price for the symbol in front of
 # the model; when the current batch has one for a watched ticker we skip the
 # redundant injection. A stale/renamed entry only loses this optimization.
 _QUOTE_TOOL_NAMES = {"get_quote", "get_company_overview"}
-
-
-def _pin_cache_breakpoint(msg: Any, key: str, marker: dict[str, Any]) -> Any:
-    """Request-scoped copy of ``msg`` with ``key: marker`` on its last text block.
-
-    Delegates the str-vs-list tagging to the shared helper; returns ``msg``
-    unchanged when there's no text tail to tag or the copy fails — worse caching,
-    never a bad request.
-    """
-    try:
-        new_content = tag_last_text_block(msg.content, key, marker)
-    except Exception:
-        return msg
-    if new_content is None:
-        return msg
-    return msg.model_copy(update={"content": new_content})
 
 
 def _configurable() -> dict:
@@ -166,25 +150,16 @@ def _batch_quotes_watched(
 class MarketWatchMiddleware(AgentMiddleware):
     """Injects live prices for watched tickers; no-op when the watch list is empty.
 
-    Appends one ephemeral `<market-watch>` HumanMessage per model call via
-    ``request.override`` — nothing is persisted. Any failure (Redis, provider,
-    formatting) degrades to injecting nothing; it must never break the turn.
+    Contributes one `<market-watch>` row per model call via
+    ``request.override``; nothing is persisted. Any failure (Redis, provider,
+    formatting) degrades to contributing nothing; it must never break the turn.
     """
 
-    def __init__(
-        self,
-        min_interval_seconds: int | None = None,
-        cache_breakpoint_pin: bool | None = None,
-    ) -> None:
+    def __init__(self, min_interval_seconds: int | None = None) -> None:
         self._min_interval = (
             min_interval_seconds
             if min_interval_seconds is not None
             else get_market_watch_min_interval()
-        )
-        self._cache_pin = (
-            cache_breakpoint_pin
-            if cache_breakpoint_pin is not None
-            else get_market_watch_cache_pin()
         )
         # awrap_model_call runs once per model call, sequentially — no lock needed.
         self._last_injected_at: float | None = None
@@ -210,24 +185,26 @@ class MarketWatchMiddleware(AgentMiddleware):
         stamp = await self._stamp_for(request.messages, request.runtime)
         if stamp is None:
             return await handler(request)
-        # lc_source lets history projection drop the stamp by tag, not just by
-        # content prefix, if the ephemeral invariant ever regresses.
-        messages = [
-            *request.messages,
-            HumanMessage(
-                content=stamp, additional_kwargs={"lc_source": "market_watch"}
-            ),
+        # Request-scoped state, not a state update: the row is handed to the
+        # tail envelope for this one call and is never written back, which is
+        # what keeps the stamp out of checkpoints, replay, and history.
+        state = dict(getattr(request, "state", None) or {})
+        update = DurableUpdate(
+            kind="market_watch",
+            schema_version=_STAMP_SCHEMA_VERSION,
+            text=stamp,
+            provenance={
+                "source": RUNTIME_UPDATE_SOURCE,
+                "writer": "market_watch",
+                "symbols": sorted(self._last_symbols),
+                "fetched_at": self._last_fetch_ts,
+            },
+        )
+        state[REQUEST_CALL_UPDATES] = [
+            *(state.get(REQUEST_CALL_UPDATES) or []),
+            update.to_dict(),
         ]
-        # Breakpoint-keyed caches (Anthropic; OpenAI explicit mode) write their
-        # incremental entry at the request tail — the ephemeral stamp, a message
-        # the next request doesn't contain at that position — so history would
-        # be re-read uncached on every call. Pin a breakpoint on the last
-        # durable message instead; only the stamp itself stays uncached.
-        if self._cache_pin:
-            marker = breakpoint_marker(getattr(request, "model", None))
-            if marker is not None:
-                messages[-2] = _pin_cache_breakpoint(messages[-2], *marker)
-        return await handler(request.override(messages=messages))
+        return await handler(request.override(state=state))
 
     async def _stamp_for(
         self, messages: list[Any] | None, runtime: Any

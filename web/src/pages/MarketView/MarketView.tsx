@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useToast } from '@/components/ui/use-toast';
 import './MarketView.css';
-import DashboardHeader from '../Dashboard/components/DashboardHeader';
 import StockHeader from './components/StockHeader';
 import MarketChart from './components/MarketChart';
 import type { MarketChartHandle } from './components/MarketChart';
@@ -10,9 +9,11 @@ import ChatInput from '../../components/ui/chat-input';
 import MarketChatPanel from './components/MarketChatPanel';
 import MarketSidebarPanel from './components/MarketSidebarPanel';
 import { INTERVALS } from './utils/chartConstants';
+import { MARKET_VIEW_ROUTE_PARAMS, readMarketViewRoute } from './utils/marketRoute';
 import { useMarketChat } from './hooks/useMarketChat';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import type { Workspace } from '@/types/api';
+import type { StockSearchHit } from '@/lib/marketUtils';
 import { attachmentsToContexts } from '../ChatAgent/utils/fileUpload';
 import { motion, AnimatePresence } from 'framer-motion';
 import CompanyOverviewPanel from './components/CompanyOverviewPanel';
@@ -24,20 +25,13 @@ import { loadPref, savePref } from './utils/prefs';
 import { useIsMobile } from '@/hooks/useIsMobile';
 
 import { useStockData } from './hooks/useStockData';
+import { useStockQuoteModel } from './hooks/useStockQuoteModel';
 import { useChartAnnotationSync } from './hooks/useChartAnnotationSync';
 import { getOrFetchFlashWorkspaceId } from './utils/flashWorkspace';
 import { marketViewAnnotationContext } from './constants/annotationPrompt';
 import { normalizeTimeframe, subscribeLiveAnnotationAdd } from './stores/chartAnnotationStore';
 import { chartSelectionStore, isConfirmedFor, useChartSelections } from './stores/chartSelectionStore';
 import { buildChartSelectionSend } from './utils/selectionSend';
-
-interface SearchResult {
-  name?: string;
-  symbol?: string;
-  exchangeShortName?: string;
-  stockExchange?: string;
-  [key: string]: unknown;
-}
 
 interface DisplayOverride {
   name: string;
@@ -105,7 +99,15 @@ function MarketViewInner() {
   const [searchParams, setSearchParams] = useSearchParams();
   const { toast } = useToast();
   const { prices: wsPrices, connectionStatus: wsStatus, dataLevel: wsDataLevel, ginlixDataEnabled, subscribe: wsSubscribe, unsubscribe: wsUnsubscribe, setPreviousClose, setDayOpen } = useMarketDataWSContext();
-  const [selectedStock, setSelectedStock] = useState<string>(() => loadPref('symbol', 'GOOGL'));
+  // A chart link is the page's opening state, not a correction applied after
+  // it: MarketChatPanel reads a symbol or workspace that changes after its
+  // mount as a scope change the user made, and drops the forwarded `?thread`
+  // for a fresh chat. Seeded here, the effect below re-applies the same values
+  // and React bails, so the link's conversation survives the landing.
+  const [openingRoute] = useState(() => readMarketViewRoute(searchParams));
+  const [selectedStock, setSelectedStock] = useState<string>(
+    () => openingRoute.symbol?.trim().toUpperCase() || loadPref('symbol', 'GOOGL'),
+  );
   const [selectedStockDisplay, setSelectedStockDisplay] = useState<DisplayOverride | null>(null);
 
   const {
@@ -130,6 +132,8 @@ function MarketViewInner() {
   const [selectedInterval, setSelectedInterval] = useState<string>(() => {
     // Sanitize the stored pref: a since-removed interval (e.g. '1s') falls
     // back to the default instead of leaving the chart on an unknown key.
+    const routed = openingRoute.timeframe;
+    if (routed && INTERVALS.some(({ key }) => key === routed)) return routed;
     const stored = loadPref('interval', '1day');
     return INTERVALS.some(({ key }) => key === stored) ? stored : '1day';
   });
@@ -143,11 +147,12 @@ function MarketViewInner() {
 
   const [prefillMessage, setPrefillMessage] = useState<string>('');
   const [mode, setMode] = useState<'fast' | 'ptc'>(() => {
+    if (openingRoute.mode) return openingRoute.mode;
     const stored = loadPref<string>('mode', 'fast');
     return stored === 'ptc' ? 'ptc' : 'fast';
   });
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(
-    () => loadPref<string | null>('selectedWorkspaceId', null),
+    () => openingRoute.workspaceId || loadPref<string | null>('selectedWorkspaceId', null),
   );
 
   useEffect(() => {
@@ -261,15 +266,13 @@ function MarketViewInner() {
   // Handle URL parameters (symbol + returnTo from chat context, and ws + mode
   // when expanding a chart-annotation preview from ChatAgent). Preserve
   // `?thread` so MarketChatPanel can pick it up to resume the right
-  // conversation in the same workspace.
+  // conversation in the same workspace. On the first render the state above is
+  // already seeded from the same route, so this re-applies identical values;
+  // it earns its keep for a link followed while the page is already mounted.
   useEffect(() => {
-    const symbolParam = searchParams.get('symbol');
-    const returnToParam = searchParams.get('returnTo');
-    const wsParam = searchParams.get('ws');
-    const modeParam = searchParams.get('mode');
-    const tfParam = searchParams.get('tf');
-    if (symbolParam) {
-      const symbol = symbolParam.trim().toUpperCase();
+    const route = readMarketViewRoute(searchParams);
+    if (route.symbol) {
+      const symbol = route.symbol.trim().toUpperCase();
       if (symbol && symbol !== selectedStock) {
         setSelectedStock(symbol);
         setSelectedStockDisplay(null);
@@ -280,39 +283,37 @@ function MarketViewInner() {
     // (keyed by symbol:timeframe) show immediately. Validate against the chart's
     // own interval allowlist so a stale/hand-crafted ?tf= can't strand the chart
     // on an unknown interval (empty data + annotations keyed to a dead chart_id).
-    if (tfParam && INTERVALS.some((i) => i.key === tfParam)) {
-      setSelectedInterval(tfParam);
+    if (route.timeframe && INTERVALS.some((i) => i.key === route.timeframe)) {
+      setSelectedInterval(route.timeframe);
     }
     // Apply workspace before mode so MarketChatPanel resolves the right
     // (ptc) workspace when it mounts the forwarded thread.
-    if (wsParam) {
-      setSelectedWorkspaceId(wsParam);
+    if (route.workspaceId) {
+      setSelectedWorkspaceId(route.workspaceId);
     }
-    if (modeParam === 'ptc' || modeParam === 'fast') {
-      setMode(modeParam);
+    if (route.mode) {
+      setMode(route.mode);
     }
-    if (returnToParam) {
-      setChatReturnPath(returnToParam);
+    if (route.returnTo) {
+      setChatReturnPath(route.returnTo);
     }
-    if (symbolParam || returnToParam || wsParam || modeParam || tfParam) {
+    // `thread` stays for MarketChatPanel, which consumes it itself.
+    const consumed = MARKET_VIEW_ROUTE_PARAMS.filter((key) => key !== 'thread' && searchParams.has(key));
+    if (consumed.length > 0) {
       setSearchParams((prev) => {
         const next = new URLSearchParams(prev);
-        next.delete('symbol');
-        next.delete('returnTo');
-        next.delete('ws');
-        next.delete('mode');
-        next.delete('tf');
+        for (const key of consumed) next.delete(key);
         return next;
       }, { replace: true });
     }
   }, [searchParams, selectedStock, setSearchParams]);
 
-  const handleStockSearch = useCallback((symbol: string, searchResult?: SearchResult | null) => {
+  const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
     setSelectedStock(symbol);
     setSelectedStockDisplay(
       searchResult
         ? {
-          name: searchResult.name || searchResult.symbol || symbol,
+          name: searchResult.name || searchResult.symbol,
           exchange: searchResult.exchangeShortName || searchResult.stockExchange || '',
         }
         : null
@@ -332,6 +333,19 @@ function MarketViewInner() {
   // belongs to the current symbol (prevents stale data flash when switching tickers).
   const realTimePriceMatch = realTimePrice?.symbol === selectedStock ? realTimePrice : null;
   const displayPrice = wsPrices.get(selectedStock) || realTimePriceMatch;
+  const wsHasData = !!wsPrices.get(selectedStock);
+  const quote = useStockQuoteModel({
+    symbol: selectedStock,
+    stockInfo,
+    realTimePrice: displayPrice,
+    quoteData: (overviewData as OverviewData | null)?.quote || null,
+    snapshot: snapshotData,
+    marketStatus,
+    wsStatus,
+    wsHasData,
+    marketPhase,
+    displayOverride: selectedStockDisplay,
+  });
 
   // A confirmed chart selection for the live chart rides on send (even with an
   // empty box), so let the mobile input treat it as sendable content.
@@ -376,14 +390,20 @@ function MarketViewInner() {
   // every refetch would clear the selection mid-session on a window focus, and
   // MarketChatPanel reads a workspace change as a scope change the user made
   // and discards the open thread.
+  //
+  // A workspace named by the link is trusted outright: the chart tab built
+  // that link from a workspace that was open seconds earlier, and one older
+  // than the page's fifty is exactly the case this check would misread as
+  // deleted, dropping the thread the link carried.
   const reconciledRef = useRef(false);
   useEffect(() => {
     if (reconciledRef.current || !isFetchedAfterMount || !isSuccess) return;
     reconciledRef.current = true;
+    if (selectedWorkspaceId && selectedWorkspaceId === openingRoute.workspaceId) return;
     if (selectedWorkspaceId && workspaces.some((ws) => ws.workspace_id === selectedWorkspaceId)) return;
     if (selectedWorkspaceId) setMode('fast');
     setSelectedWorkspaceId(workspaces[0]?.workspace_id ?? null);
-  }, [isFetchedAfterMount, isSuccess, workspaces, selectedWorkspaceId]);
+  }, [isFetchedAfterMount, isSuccess, workspaces, selectedWorkspaceId, openingRoute.workspaceId]);
 
   const handleCaptureChart = useCallback(async () => {
     if (!chartRef.current) return;
@@ -604,25 +624,19 @@ function MarketViewInner() {
 
   return (
     <div className="market-center-container">
-      <DashboardHeader onStockSearch={handleStockSearch as any} />
       {isMobile ? (
         <div className="market-mobile-layout">
           <StockHeader
             symbol={selectedStock}
-            stockInfo={stockInfo}
-            realTimePrice={displayPrice}
+            quote={quote}
             chartMeta={chartMeta}
-            displayOverride={selectedStockDisplay}
             onToggleOverview={() => setShowOverview(v => !v)}
+            onSwitchSymbol={handleStockSearch}
             onOpenWatchlist={() => setMobileTab('watchlist')}
             wsStatus={wsStatus}
-            wsHasData={!!wsPrices.get(selectedStock)}
+            wsHasData={wsHasData}
             wsDataLevel={wsDataLevel}
             ginlixDataEnabled={ginlixDataEnabled}
-            quoteData={(overviewData as OverviewData | null)?.quote || null}
-            marketStatus={marketStatus}
-            snapshot={snapshotData}
-            marketPhase={marketPhase}
           />
 
           {/* Chart fills remaining space */}
@@ -644,6 +658,7 @@ function MarketViewInner() {
               liveTick={wsPrices.get(selectedStock)?.barData || null}
               wsStatus={wsStatus}
               marketStatus={marketStatus}
+              selectionTools
             />
           </div>
 
@@ -729,23 +744,22 @@ function MarketViewInner() {
         </div>
       ) : (
         <>
+          {/* The dashboard header used to sit here and double as the titlebar in
+              the desktop shell. The row below is three columns, so one strip
+              above them is the drag region rather than three marked bars. */}
+          <div className="chrome-drag-strip" aria-hidden="true" />
           <div className="market-content-wrapper">
             <div className="market-left-panel">
               <StockHeader
                 symbol={selectedStock}
-                stockInfo={stockInfo}
-                realTimePrice={displayPrice}
+                quote={quote}
                 chartMeta={chartMeta}
-                displayOverride={selectedStockDisplay}
                 onToggleOverview={() => setShowOverview(v => !v)}
+                onSwitchSymbol={handleStockSearch}
                 wsStatus={wsStatus}
-                wsHasData={!!wsPrices.get(selectedStock)}
+                wsHasData={wsHasData}
                 wsDataLevel={wsDataLevel}
                 ginlixDataEnabled={ginlixDataEnabled}
-                quoteData={(overviewData as OverviewData | null)?.quote || null}
-                marketStatus={marketStatus}
-                snapshot={snapshotData}
-                marketPhase={marketPhase}
               />
               <div className="market-chart-area">
                 {showOverview && (
@@ -774,6 +788,7 @@ function MarketViewInner() {
                   liveTick={wsPrices.get(selectedStock)?.barData || null}
                   wsStatus={wsStatus}
                   marketStatus={marketStatus}
+                  selectionTools
                 />
               </div>
             </div>

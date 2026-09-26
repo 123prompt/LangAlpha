@@ -2,13 +2,12 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, RefreshCw, MessageSquare, ScrollText, X } from 'lucide-react';
+import { ArrowLeft, RefreshCw, MessageSquare, ScrollText } from 'lucide-react';
 import { queryKeys } from '@/lib/queryKeys';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { Loader } from '@/components/ui/loader';
 import LogoLoading from '@/components/ui/logo-loading';
 import ChatInput, { type ChatInputHandle } from '@/components/ui/chat-input';
-import { useNarrowContainer } from '@/hooks/useNarrowContainer';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import MessageList from '../../ChatAgent/components/MessageList';
 import { MessageActionsProvider, type MessageActions } from '../../ChatAgent/components/messageList/MessageActionsContext';
@@ -17,21 +16,24 @@ import { ChartSurfaceContext, type ChartSurface } from '../../ChatAgent/contexts
 import { WorkspaceProvider } from '../../ChatAgent/contexts/WorkspaceContext';
 import { useChatMessages } from '../../ChatAgent/hooks/useChatMessages';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
-import { getFlashWorkspace, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
+import { appendPathSuffix, getFlashWorkspace, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
 import { attachmentsToContexts } from '../../ChatAgent/utils/fileUpload';
 import {
   resolveSubagentTelemetry as resolveSubagentTelemetryPure,
   type SubagentHistoryLike,
 } from '../../ChatAgent/session/subagents/resolveSubagentTelemetry';
-import type { ToolCallProcessRecord, SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
+import type { SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
+import { useToolCallLookup } from '../../ChatAgent/components/chatView/toolCallLookup';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
 import type { Workspace } from '@/types/api';
 import MarketChatHistoryButton from './MarketChatHistoryButton';
 import MarketDetailDialog, { type DialogPayload } from './MarketDetailDialog';
 import { getMarketThreadId, setMarketThreadId, clearMarketThreadId } from '../utils/threadPersistence';
+import { readMarketViewRoute } from '../utils/marketRoute';
 import { normalizeTimeframe } from '../stores/chartAnnotationStore';
 import { chartSelectionStore, useChartSelections, isConfirmedFor } from '../stores/chartSelectionStore';
 import { buildChartSelectionSend } from '../utils/selectionSend';
+import { SelectionChips } from './SelectionChips';
 import { marketViewAnnotationContext } from '../constants/annotationPrompt';
 import './MarketPanel.css';
 
@@ -47,18 +49,6 @@ function bannerStyle(background: string): React.CSSProperties {
     color: 'var(--color-text-tertiary)',
     fontSize: '0.75rem',
   };
-}
-
-/** Append a URL path suffix (e.g. "/report.html") to a resolved signed URL. */
-function appendPathSuffix(baseUrl: string, path?: string): string {
-  if (!path) return baseUrl;
-  try {
-    const parsed = new URL(baseUrl);
-    parsed.pathname = parsed.pathname.replace(/\/+$/, '') + path;
-    return parsed.toString();
-  } catch {
-    return baseUrl;
-  }
 }
 
 /** Slash-command shapes emitted by ChatInput (skill/subagent pills, action verbs). */
@@ -135,6 +125,10 @@ export default function MarketChatPanel(props: MarketChatPanelProps): React.Reac
   const activeWorkspaceId = mode === 'fast'
     ? (flashWs as { workspace_id?: string } | undefined)?.workspace_id ?? null
     : selectedWorkspaceId;
+  // The folder the workspace lives in on a shared computer, which the turn
+  // file deck needs to tell the workspace's own notes file from a deliverable.
+  const activeWorkspace = mode === 'fast' ? flashWs : workspaces.find((w) => w.workspace_id === selectedWorkspaceId);
+  const workspaceDirName = activeWorkspace?.dir_name;
 
   // Initial thread resolution. URL `?thread=` wins, then localStorage keyed by
   // (workspace, symbol), then a new chat. This state determines which thread
@@ -142,19 +136,30 @@ export default function MarketChatPanel(props: MarketChatPanelProps): React.Reac
   // engine can re-initialise with a different thread.
   const [searchParams, setSearchParams] = useSearchParams();
   const [activeThreadInit, setActiveThreadInit] = useState<string>(() => {
-    const fromUrl = searchParams.get('thread');
+    const fromUrl = readMarketViewRoute(searchParams).threadId;
     if (fromUrl) return fromUrl;
     return getMarketThreadId(activeWorkspaceId, symbol) ?? '__default__';
   });
 
-  // Re-resolve thread when symbol changes — restore the last-seen thread for
-  // the new symbol in the current workspace (or start a fresh chat if none).
+  // Re-resolve thread when symbol changes: restore the last-seen thread for
+  // the new symbol in the current workspace, or start a fresh chat if none.
+  // A fresh chat also drops `?thread` from the URL; the mirror below rewrites
+  // it for a restored thread but never touches it for a default one, so a
+  // reload would otherwise reopen the previous symbol's conversation and
+  // save it as this symbol's.
   const lastSymbolRef = useRef(symbol);
   useEffect(() => {
     if (lastSymbolRef.current === symbol) return;
     lastSymbolRef.current = symbol;
-    setActiveThreadInit(getMarketThreadId(activeWorkspaceId, symbol) ?? '__default__');
-  }, [symbol, activeWorkspaceId]);
+    const restored = getMarketThreadId(activeWorkspaceId, symbol);
+    setActiveThreadInit(restored ?? '__default__');
+    if (restored) return;
+    setSearchParams((p) => {
+      const next = new URLSearchParams(p);
+      if (next.has('thread')) next.delete('thread');
+      return next;
+    }, { replace: true });
+  }, [symbol, activeWorkspaceId, setSearchParams]);
 
   // Reset to a fresh chat when scope (mode / workspace) changes. The user
   // explicitly chose a different scope — surface a clean slate. localStorage
@@ -218,6 +223,7 @@ export default function MarketChatPanel(props: MarketChatPanelProps): React.Reac
         key={`${activeWorkspaceId}:${activeThreadInit}`}
         {...props}
         activeWorkspaceId={activeWorkspaceId}
+        workspaceDirName={workspaceDirName}
         initialThreadId={activeThreadInit.split('#')[0]}
         ptcWorkspaces={workspaces}
         onSelectThread={handleSelectThread}
@@ -229,6 +235,7 @@ export default function MarketChatPanel(props: MarketChatPanelProps): React.Reac
 
 interface ChatBodyProps extends MarketChatPanelProps {
   activeWorkspaceId: string;
+  workspaceDirName?: string | null;
   initialThreadId: string;
   ptcWorkspaces: Workspace[];
   onSelectThread: (threadId: string) => void;
@@ -243,6 +250,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onModeChange,
     ptcWorkspaces,
     selectedWorkspaceId,
+    workspaceDirName,
     onWorkspaceChange,
     chartImage,
     chartImageDesc,
@@ -277,7 +285,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const [wasStopped, setWasStopped] = useState(false);
 
   const messagesContainerRef = useRef<HTMLDivElement | null>(null);
-  const isNarrowChat = useNarrowContainer(messagesContainerRef, 640);
 
   // The user's confirmed chart selections (region / price level). Render a chip
   // per selection that still matches the live chart instance — selections drawn
@@ -381,7 +388,6 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     messageError,
     threadId,
     threadModels,
-    lastThreadModel,
     handleSendMessage,
     stopWorkflow,
     getSubagentHistory,
@@ -401,6 +407,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
     handleResumeCreditPause,
+    handleApproveToolCall,
+    handleRejectToolCall,
     // Turn/context state — drives the stop button, input gating, and the
     // interrupted / plan-feedback / compaction status banners.
     pendingInterrupt,
@@ -622,8 +630,15 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onNavigateSubagent?.(threadId, info.subagentId);
   }, [threadId, onNavigateSubagent]);
 
-  const handleToolCallDetailClick = useCallback((proc: Record<string, unknown>) => {
-    setDialogPayload({ type: 'toolcall', toolCallProcess: proc as ToolCallProcessRecord });
+  // Main transcript only: the panel keeps no subagent cards (it hands the
+  // chat engine no card updater), so a subagent's own rows never render here
+  // and there is no transcript of theirs to search.
+  const getToolCallProcess = useToolCallLookup(messages);
+
+  // A row whose record the transcript no longer holds still opens the dialog:
+  // it says the call is gone, where a swallowed click reads as a dead row.
+  const handleToolCallDetailClick = useCallback((toolCallId: string) => {
+    setDialogPayload({ type: 'toolcall', toolCallId });
   }, []);
 
   // The panel's transcript action surface. Each member is useStableHandler'd
@@ -645,6 +660,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableApproveSecretaryAction = useStableHandler(handleApproveSecretaryAction);
   const stableRejectSecretaryAction = useStableHandler(handleRejectSecretaryAction);
   const stableResumeCreditPause = useStableHandler(handleResumeCreditPause);
+  const stableApproveToolCall = useStableHandler(handleApproveToolCall);
+  const stableRejectToolCall = useStableHandler(handleRejectToolCall);
   const stableEditMessage = useStableHandler((id: string, content: string) =>
     handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
   const stableRegenerate = useStableHandler((id: string) =>
@@ -675,6 +692,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onApproveSecretaryAction: stableApproveSecretaryAction,
     onRejectSecretaryAction: stableRejectSecretaryAction,
     onResumeCreditPause: stableResumeCreditPause,
+    onApproveToolCall: stableApproveToolCall,
+    onRejectToolCall: stableRejectToolCall,
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
@@ -687,12 +706,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableResumeCreditPause,
+    stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry,
     stableThumbUp, stableThumbDown, stableReportWithAgent, stableWidgetSendPrompt,
   ]);
-
-  const initialModel = lastThreadModel ?? null;
 
   // In fast mode, carry the source thread/workspace into a PTC-agent proposal so
   // its "open in chat" deep-link lands back here. Null in PTC mode. Memoized:
@@ -831,9 +848,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
                     messages={messages as never[]}
                     isLoading={isLoading}
                     isLoadingHistory={isLoadingHistory}
-                    hideAvatar={isNarrowChat}
                     feedbackByTurn={feedbackByTurn}
                     flashContext={flashContext}
+                    workspaceDirName={workspaceDirName}
                   />
                 </MessageActionsProvider>
               </SubagentTelemetryContext.Provider>
@@ -907,81 +924,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         </div>
       )}
 
-      {/* Chart selection chips — the regions / price levels the user picked on
-          the chart, each with its note, ready to attach to the next send. Click
-          a chip to re-open its note editor on the chart; ✕ removes it. Sits
-          directly above the input, matching the status-banner layout. */}
-      {chips.length > 0 && (
-        <div style={{ padding: '0 12px', marginBottom: 6, display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          {chips.map((c) => {
-            const baseLabel = c.selectionType === 'region'
-              ? t('marketView.selection.chipRegion', { symbol: c.symbol, timeframe: c.timeframe })
-              : t('marketView.selection.chipPriceLevel', {
-                  price: Number.isFinite(c.priceLow) ? c.priceLow.toFixed(2) : '—',
-                  symbol: c.symbol,
-                  timeframe: c.timeframe,
-                });
-            const label = c.comment ? `${baseLabel} · "${c.comment}"` : baseLabel;
-            return (
-              <span
-                key={c.id}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 6,
-                  maxWidth: '100%',
-                  padding: '4px 6px 4px 10px',
-                  borderRadius: 6,
-                  background: 'var(--color-bg-surface)',
-                  border: '1px solid var(--color-border-muted)',
-                  color: 'var(--color-text-secondary)',
-                  fontSize: '0.75rem',
-                }}
-              >
-                <button
-                  type="button"
-                  title={t('marketView.selection.editChip')}
-                  onClick={() => chartSelectionStore.openEditor(c.id)}
-                  style={{
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace: 'nowrap',
-                    maxWidth: 240,
-                    border: 'none',
-                    background: 'transparent',
-                    color: 'inherit',
-                    font: 'inherit',
-                    padding: 0,
-                    cursor: 'pointer',
-                  }}
-                >
-                  {label}
-                </button>
-                <button
-                  type="button"
-                  aria-label={t('marketView.selection.removeChip')}
-                  onClick={() => chartSelectionStore.remove(c.id)}
-                  style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    flexShrink: 0,
-                    width: 16,
-                    height: 16,
-                    padding: 0,
-                    border: 'none',
-                    background: 'transparent',
-                    color: 'var(--color-text-tertiary)',
-                    cursor: 'pointer',
-                  }}
-                >
-                  <X style={{ width: 12, height: 12 }} />
-                </button>
-              </span>
-            );
-          })}
-        </div>
-      )}
+      {/* Chart selection chips, directly above the input like the status banners. */}
+      <SelectionChips chips={chips} />
 
       {/* Input */}
       <ChatInput
@@ -1008,12 +952,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
             ? t('chat.placeholderStopped')
             : (placeholder ?? t('marketView.chatPanel.defaultPlaceholder'))
         }
-        initialModel={initialModel}
         threadModels={threadModels}
         tokenUsage={tokenUsage}
       />
 
-      <MarketDetailDialog payload={dialogPayload} onClose={handleCloseDialog} />
+      <MarketDetailDialog payload={dialogPayload} onClose={handleCloseDialog} getToolCallProcess={getToolCallProcess} />
     </div>
   );
 }

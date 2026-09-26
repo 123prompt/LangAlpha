@@ -259,6 +259,42 @@ class NewsPollConfig(BaseModel):
     feeds: List[NewsPollFeedConfig] = Field(default_factory=list)
 
 
+class OrderReconcileConfig(BaseModel):
+    """Order reconciliation sweep -- asks each brokerage what became of an order.
+
+    The two grace windows are the values with teeth. ``submitting_grace_seconds``
+    decides when a call that left the relay and never came back is old enough
+    to be settled on the vendor's word rather than waited on, so it must
+    comfortably exceed the slowest order call a brokerage answers; its floor
+    sits above the relay's 55 s wall clock, so no setting can judge a call the
+    relay is still carrying. ``approved_grace_seconds`` decides when an approval
+    no call spent is refused, so it must exceed the gap between an answer and
+    its tool call. A proposal whose run ended without asking waits the same.
+
+    The other two bound the vendor half. ``max_concurrent_groups`` counts
+    accounts rather than calls, because two accounts are two sets of brokerage
+    credentials and share no rate limit while two reads of one account do, and
+    it bounds one process rather than the fleet, so a deployment running W
+    workers can have W times this many accounts in flight. Its ceiling is set
+    against the app's connection pool, since an account in flight holds an
+    advisory-lock session on top of whatever its writes take.
+    ``group_timeout_seconds`` is the only thing that bounds a pass at all: a
+    listing walks up to twenty calls and the relay gives each one its own wall
+    clock, so the floor is that wall clock, and the value should still clear a
+    full paginated history or a user with a long one is cut off every pass.
+    """
+
+    enabled: bool = Field(default=True)
+    interval_seconds: int = Field(default=60, ge=5)
+    submitting_grace_seconds: int = Field(default=120, ge=90)
+    approved_grace_seconds: int = Field(default=600, ge=60)
+    open_after_seconds: int = Field(default=60, ge=5)
+    batch_limit: int = Field(default=50, ge=1, le=500)
+    match_window_seconds: int = Field(default=900, ge=60)
+    max_concurrent_groups: int = Field(default=8, ge=1, le=16)
+    group_timeout_seconds: int = Field(default=120, ge=60)
+
+
 class FeatureFlagOverride(BaseModel):
     """Deployment override for a code-declared feature (src/config/features.py).
 
@@ -288,13 +324,6 @@ class MarketWatchConfig(BaseModel):
         default=25, ge=5, description="Throttle between injections per thread"
     )
     max_symbols: int = Field(default=10, ge=1, le=50, description="Watch list cap")
-    cache_breakpoint_pin: bool = Field(
-        default=True,
-        description=(
-            "Pin a provider cache breakpoint on the last durable message so the "
-            "ephemeral stamp doesn't break incremental caching"
-        ),
-    )
 
 
 class WorkflowOrchestrationConfig(BaseModel):
@@ -490,4 +519,9 @@ class InfrastructureConfig(BaseModel):
     # RunWorkflow orchestration caps
     workflow: WorkflowOrchestrationConfig = Field(
         default_factory=WorkflowOrchestrationConfig
+    )
+
+    # Order reconciliation sweep
+    order_reconcile: OrderReconcileConfig = Field(
+        default_factory=OrderReconcileConfig
     )

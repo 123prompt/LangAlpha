@@ -184,6 +184,37 @@ class TestBuildFinalizeJobs:
         # START-stamped origin routes the chain to the watching flash thread.
         assert wc.ordering_key == "flash-7"
 
+    def test_an_automation_turn_settles_its_firing_on_every_terminal(self):
+        """The firing ends as its run did, whichever worker finalized it. A
+        run a concurrent one superseded at admission was never the firing's
+        turn: the firing is back in line for the thread instead."""
+        row = {
+            "conversation_response_id": "run-7",
+            "conversation_thread_id": "flash-7",
+            "metadata": {
+                "msg_type": "flash",
+                "user_id": "u-7",
+                "workspace_id": "ws-7",
+                "automation_execution_id": "exec-7",
+                "automation_id": "auto-7",
+            },
+        }
+        for status in ("completed", "interrupted", "error", "cancelled"):
+            jobs = build_finalize_jobs_from_run_row(row)(status)
+            settle = next(j for j in jobs if j.hook_type == "automation_settle")
+            assert settle.idempotency_key == "run-7:automation_settle"
+            assert settle.payload == {
+                "execution_id": "exec-7",
+                "automation_id": "auto-7",
+                "user_id": "u-7",
+                "workspace_id": "ws-7",
+            }
+        superseded = {**row, "metadata": {**row["metadata"], "superseded": True}}
+        assert "automation_settle" not in _types(
+            build_finalize_jobs_from_run_row(superseded)("cancelled")
+        )
+        assert "automation_settle" not in _types(_jobs("completed"))
+
 
 # ---------------------------------------------------------------------------
 # watch_clear executor (replaces BTM._clear_report_back_watch)

@@ -28,6 +28,28 @@ vi.mock('../../../SyntaxHighlighter', () => ({
   oneLight: { __palette: 'light' },
 }));
 
+// The owner's served URL rides a grant and "open in new tab" opens the file's
+// own /a/ page; both come from hooks the viewer reads, mocked here so the
+// test needs no query client. A test can take the grant away or fail it.
+const grant = vi.hoisted(() => ({
+  state: { minted: true, error: null as Error | null },
+  refetch: vi.fn(),
+}));
+vi.mock('@/hooks/useWorkspaceFileGrant', () => ({
+  useWorkspaceFileGrant: (workspaceId: string | null) => ({
+    data: workspaceId && grant.state.minted
+      ? { prefix: '/api/v1/wsfiles/g/grant-1/', expires_in: 12 * 60 * 60 }
+      : undefined,
+    error: workspaceId ? grant.state.error : null,
+    refetch: grant.refetch,
+  }),
+}));
+vi.mock('@/hooks/useShareLink', () => ({
+  useShareLink: (workspaceId: string | null) => ({
+    data: workspaceId ? { code: 'abc123abc123' } : undefined,
+  }),
+}));
+
 const defaultProps = {
   content: '<!DOCTYPE html><html><body><h1>Report</h1></body></html>',
   fileName: 'report.html',
@@ -67,6 +89,9 @@ describe('HtmlViewer', () => {
   beforeEach(() => {
     toastMock.mockClear();
     localStorage.clear();
+    grant.state.minted = true;
+    grant.state.error = null;
+    grant.refetch.mockClear();
   });
 
   it('renders the Preview iframe pointed at the wsfiles served URL with ?inject=theme', () => {
@@ -74,7 +99,7 @@ describe('HtmlViewer', () => {
     const iframe = getPreviewIframe();
     expect(iframe).toBeTruthy();
     expect(iframe.getAttribute('src')).toBe(
-      '/api/v1/wsfiles/ws-1/results/report.html?inject=theme',
+      '/api/v1/wsfiles/g/grant-1/results/report.html?inject=theme',
     );
   });
 
@@ -91,6 +116,87 @@ describe('HtmlViewer', () => {
     const highlighter = screen.getByTestId('syntax-highlighter');
     expect(highlighter).toBeInTheDocument();
     expect(highlighter).toHaveTextContent('<h1>Report</h1>');
+  });
+
+  // A reference into a report asks for a place in the rendered document, and
+  // the Source tab cannot show one. The tab outlives both the file and the
+  // anchor, so without this the click left the reader on the same markup with
+  // nothing to say it had landed.
+  describe('an anchored open', () => {
+    const rerenderWith = (
+      rerender: (ui: ReactElement) => void,
+      props: { anchor?: string | null; anchorSeq?: number | null; filePath?: string },
+    ) => rerender(
+      <ThemeProvider>
+        <ThemeToggle />
+        <HtmlViewer {...defaultProps} {...props} />
+      </ThemeProvider>,
+    );
+
+    it('brings Preview back when a reference arrives while Source is open', () => {
+      const { rerender } = renderViewer(<HtmlViewer {...defaultProps} />);
+      fireEvent.click(screen.getByText('filePanel.htmlSource'));
+      expect(getPreviewIframe()).toBeFalsy();
+
+      rerenderWith(rerender, { anchor: 'risks', anchorSeq: 1 });
+      const iframe = getPreviewIframe();
+      expect(iframe).toBeTruthy();
+      expect(iframe.getAttribute('src')).toContain('#risks');
+    });
+
+    it('counts the same section asked for twice as two requests', () => {
+      const { rerender } = renderViewer(
+        <HtmlViewer {...defaultProps} anchor="risks" anchorSeq={1} />,
+      );
+      fireEvent.click(screen.getByText('filePanel.htmlSource'));
+      expect(getPreviewIframe()).toBeFalsy();
+
+      rerenderWith(rerender, { anchor: 'risks', anchorSeq: 2 });
+      expect(getPreviewIframe()).toBeTruthy();
+    });
+
+    it('leaves Source alone while the same request is still in effect', () => {
+      // The control: the switch follows a request, not the mere presence of an
+      // anchor, so a deliberate move to Source is not undone on the next render.
+      const { rerender } = renderViewer(
+        <HtmlViewer {...defaultProps} anchor="risks" anchorSeq={1} />,
+      );
+      fireEvent.click(screen.getByText('filePanel.htmlSource'));
+      rerenderWith(rerender, { anchor: 'risks', anchorSeq: 1 });
+      expect(getPreviewIframe()).toBeFalsy();
+      expect(screen.getByTestId('syntax-highlighter')).toBeInTheDocument();
+    });
+
+    it('asks the document to scroll when the same section is referenced again', () => {
+      const { rerender } = renderViewer(
+        <HtmlViewer {...defaultProps} anchor="risks" anchorSeq={1} />,
+      );
+      const iframe = getPreviewIframe();
+      const postMessage = vi.fn();
+      Object.defineProperty(iframe, 'contentWindow', {
+        value: { postMessage },
+        configurable: true,
+      });
+
+      rerenderWith(rerender, { anchor: 'risks', anchorSeq: 2 });
+
+      // The URL is the one already loaded, so the browser navigates nowhere and
+      // the fragment cannot land this open. Without the request the second
+      // click moves nothing on screen.
+      expect(iframe.getAttribute('src')).toBe(
+        '/api/v1/wsfiles/g/grant-1/results/report.html?inject=theme#risks',
+      );
+      expect(postMessage).toHaveBeenCalledWith({ type: 'widget:scrollTo', id: 'risks' }, '*');
+    });
+
+    it('leaves Source alone when another file opens with no reference', () => {
+      const { rerender } = renderViewer(
+        <HtmlViewer {...defaultProps} anchor="risks" anchorSeq={1} />,
+      );
+      fireEvent.click(screen.getByText('filePanel.htmlSource'));
+      rerenderWith(rerender, { anchor: null, anchorSeq: null, filePath: 'results/other.html' });
+      expect(getPreviewIframe()).toBeFalsy();
+    });
   });
 
   it('re-themes the Source highlighter when the app theme toggles', () => {
@@ -126,30 +232,52 @@ describe('HtmlViewer', () => {
     const frames = Array.from(document.querySelectorAll('iframe.html-fullscreen-frame'));
     expect(frames).toHaveLength(1);
     expect((frames[0] as HTMLIFrameElement).getAttribute('src')).toBe(
-      '/api/v1/wsfiles/ws-1/results/report.html?inject=theme',
+      '/api/v1/wsfiles/g/grant-1/results/report.html?inject=theme',
     );
   });
 
-  it('points the preview iframe at the servedUrlOverride on the share page', () => {
-    const servedUrlOverride =
-      '/api/v1/public/shared/tok-1/files/serve/results/report.html?inject=theme';
-    renderViewer(<HtmlViewer {...defaultProps} servedUrlOverride={servedUrlOverride} />);
-    expect(getPreviewIframe().getAttribute('src')).toBe(servedUrlOverride);
+  it('keeps fullscreen off until the served URL exists', () => {
+    grant.state.minted = false;
+    renderViewer(<HtmlViewer {...defaultProps} />);
+    expect(screen.getByLabelText('filePanel.fullscreen')).toBeDisabled();
+    expect(getPreviewIframe()).toBeFalsy();
   });
 
-  it('warns before opening the private wsfiles link, then opens on confirm (owner view)', () => {
+  // A grant that never arrived would otherwise leave a spinner up forever.
+  it('shows an error with a retry when the grant cannot be minted', () => {
+    grant.state.minted = false;
+    grant.state.error = new Error('Request failed with status code 500');
+    renderViewer(<HtmlViewer {...defaultProps} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('filePanel.htmlPreviewFailed');
+    fireEvent.click(screen.getByText('common.retry'));
+    expect(grant.refetch).toHaveBeenCalledTimes(1);
+  });
+
+  // A failed renewal keeps the grant the frame is already loading under.
+  it('keeps the preview when a renewal fails behind a grant it already has', () => {
+    grant.state.error = new Error('Request failed with status code 500');
+    renderViewer(<HtmlViewer {...defaultProps} />);
+    expect(getPreviewIframe()).toBeTruthy();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('serves the file under the share page\'s prefix, themed', () => {
+    renderViewer(
+      <HtmlViewer {...defaultProps} servePrefix="/api/v1/public/shared/tok-1/files/serve/" />,
+    );
+    expect(getPreviewIframe().getAttribute('src')).toBe(
+      '/api/v1/public/shared/tok-1/files/serve/results/report.html?inject=theme',
+    );
+  });
+
+  it("opens the file's own share page in a new tab, never the grant URL (owner view)", () => {
     const open = vi.fn();
     vi.stubGlobal('open', open);
     try {
       renderViewer(<HtmlViewer {...defaultProps} />);
       fireEvent.click(screen.getByLabelText('filePanel.openInNewTab'));
-      // No tab opened yet — the warning dialog is shown first.
-      expect(open).not.toHaveBeenCalled();
-      expect(screen.getByText('filePanel.privateLinkWarning')).toBeInTheDocument();
-      // Confirm → opens the byte-faithful wsfiles URL (no ?inject=theme).
-      fireEvent.click(screen.getByText('filePanel.openInNewTab'));
       expect(open).toHaveBeenCalledWith(
-        '/api/v1/wsfiles/ws-1/results/report.html',
+        `${window.location.origin}/a/abc123abc123`,
         '_blank',
         'noopener,noreferrer',
       );
@@ -158,34 +286,21 @@ describe('HtmlViewer', () => {
     }
   });
 
-  it('opens directly without a warning on the share page (revocable served URL)', () => {
+  it('opens the byte-faithful served URL on the share page', () => {
     const open = vi.fn();
     vi.stubGlobal('open', open);
     try {
-      const servedUrlOverride =
-        '/api/v1/public/shared/tok-1/files/serve/results/report.html?inject=theme';
-      renderViewer(<HtmlViewer {...defaultProps} servedUrlOverride={servedUrlOverride} />);
+      renderViewer(
+        <HtmlViewer {...defaultProps} servePrefix="/api/v1/public/shared/tok-1/files/serve/" />,
+      );
       fireEvent.click(screen.getByLabelText('filePanel.openInNewTab'));
       expect(open).toHaveBeenCalledWith(
         '/api/v1/public/shared/tok-1/files/serve/results/report.html',
         '_blank',
         'noopener,noreferrer',
       );
-      expect(screen.queryByText('filePanel.privateLinkWarning')).not.toBeInTheDocument();
     } finally {
       vi.unstubAllGlobals();
     }
-  });
-
-  it('hides the copy-link action by default', () => {
-    renderViewer(<HtmlViewer {...defaultProps} />);
-    expect(screen.queryByLabelText('filePanel.copyShareLink')).not.toBeInTheDocument();
-  });
-
-  it('invokes onCopyShareLink with the file path when the link button is clicked', () => {
-    const onCopyShareLink = vi.fn();
-    renderViewer(<HtmlViewer {...defaultProps} onCopyShareLink={onCopyShareLink} />);
-    fireEvent.click(screen.getByLabelText('filePanel.copyShareLink'));
-    expect(onCopyShareLink).toHaveBeenCalledWith('results/report.html');
   });
 });

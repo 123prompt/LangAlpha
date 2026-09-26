@@ -823,7 +823,7 @@ async def persist_collected_events(
             )
 
             await capture_and_rewrite_images(
-                cleaned, sandbox, thread_id=thread_id,
+                cleaned, sandbox, thread_id=thread_id, workspace_id=workspace_id,
             )
         except Exception:
             logger.warning(

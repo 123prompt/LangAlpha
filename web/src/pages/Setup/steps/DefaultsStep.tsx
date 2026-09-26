@@ -20,7 +20,7 @@ import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
 
 export default function DefaultsStep() {
   const navigate = useNavigate();
-  const { models, modelAccessMap, isLoading } = useAllModels();
+  const { models, metadata, modelAccessMap, isLoading } = useAllModels();
   const { preferences } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const { t } = useTranslation();
@@ -159,6 +159,7 @@ export default function DefaultsStep() {
         onFlashModelChange={setFlashModel}
         showExplainer
         modelAccess={modelAccessMap}
+        metadata={metadata}
       />
 
       {/* Routing models. Folded away because a first run never needs them, and
@@ -196,6 +197,7 @@ export default function DefaultsStep() {
                   models={models}
                   placeholder={t('settings.modelTuning.defaultsToFlash')}
                   modelAccess={modelAccessMap}
+                  metadata={metadata}
                 />
                 <ModelSelector
                   label={t('settings.modelTuning.compactionModel')}
@@ -205,11 +207,13 @@ export default function DefaultsStep() {
                   models={models}
                   placeholder={t('settings.modelTuning.defaultsToFlash')}
                   modelAccess={modelAccessMap}
+                  metadata={metadata}
                 />
                 <FallbackModelsPicker
                   selected={advancedModels.fallbackModels}
                   onChange={(list) => handleAdvancedChange({ fallbackModels: list })}
                   models={models}
+                  metadata={metadata}
                 />
               </div>
             </motion.div>

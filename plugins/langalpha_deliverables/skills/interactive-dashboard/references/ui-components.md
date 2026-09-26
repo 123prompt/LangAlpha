@@ -16,6 +16,10 @@ everything below it with the bridge variables only — never a palette hex.
 /* App token if injected; else OS-adaptive fallback (private --fb-* names can
    never override injected tokens). Component styles below use the bridge names. */
 :root {
+  /* The browser's own chrome (scrollbars, form controls) follows the palette
+     only when the document says so; without this a dark page scrolls on a
+     white track inside the app's preview frame. */
+  color-scheme: light dark;
   --bg-page:      var(--color-bg-page,      var(--fb-bg-page));
   --bg-card:      var(--color-bg-card,      var(--fb-bg-card));
   --bg-elevated:  var(--color-bg-elevated,  var(--fb-bg-elevated));

@@ -1,6 +1,6 @@
 """Tests for output_format steering in the user_profile prompt component.
 
-Renders ``components/user_profile.md.j2`` exactly as RuntimeContextMiddleware
+Renders ``components/user_profile.md.j2`` exactly as ``subagent_base.md.j2``
 does and asserts the HTML-steering block appears iff ``sandbox_enabled`` (PTC,
 not Flash) and ``agent_preference.output_format == "html"``, and never
 double-renders the ``output_format`` key in the generic preference loop.
@@ -17,7 +17,7 @@ SKILL_REFS = (".agents/skills/html-report/SKILL.md", ".agents/skills/ui-design/S
 def _render(agent_preference, sandbox_enabled=True):
     """Render the user_profile component with the given agent_preference dict.
 
-    ``sandbox_enabled`` mirrors RuntimeContextMiddleware: True for PTC (has a
+    ``sandbox_enabled`` mirrors the subagent prompt: True for PTC (has a
     sandbox/filesystem), False for Flash. Defaults to True so the PTC path is
     the baseline.
     """
@@ -48,7 +48,7 @@ class TestHtmlSteeringBlock:
     def test_html_renders_block(self):
         out = _render({"output_format": "html"})
         assert HTML_BLOCK_MARKER in out
-        assert "work/<task>/<name>.html" in out
+        assert "<task>/<name>.html" in out
         for ref in SKILL_REFS:
             assert ref in out
 

@@ -3,8 +3,8 @@
  * service.
  *
  * Fail-open: when the endpoint is unavailable (network error, auth failure),
- * `usePlatformModels()` returns null and `getModelAccess()` treats every model
- * as accessible.
+ * `usePlatformModels()` yields a null `platform` and `getModelAccess()` treats
+ * every model as accessible.
  */
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
@@ -18,11 +18,13 @@ import type { PlatformModelsResponse, ModelAccess } from '@/types/platform';
 /**
  * Fetch the authenticated user's model-access info from the platform service.
  *
- * Returns `null` on any error (fail-open when the endpoint is unavailable).
- * Data is cached for 5 minutes to avoid repeated calls.
+ * `platform` is `null` on any error (fail-open when the endpoint is
+ * unavailable). Data is cached for 5 minutes to avoid repeated calls.
+ * `isLoading` separates "not answered yet" from that fail-open `null`: until
+ * the answer arrives, a locked model reads as reachable.
  */
-export function usePlatformModels(): PlatformModelsResponse | null {
-  const { data } = useQuery<PlatformModelsResponse>({
+export function usePlatformModels(): { platform: PlatformModelsResponse | null; isLoading: boolean } {
+  const { data, isLoading } = useQuery<PlatformModelsResponse>({
     queryKey: queryKeys.platform.models(),
     queryFn: async () => {
       const res = await api.get<PlatformModelsResponse>('/api/auth/models');
@@ -39,8 +41,8 @@ export function usePlatformModels(): PlatformModelsResponse | null {
   });
   // Validate shape — in OSS mode the endpoint may not exist and Vite can
   // return HTML (status 200) which Axios happily hands back as a string.
-  if (!data || !Array.isArray(data.byok_providers)) return null;
-  return data;
+  const platform = data && Array.isArray(data.byok_providers) ? data : null;
+  return { platform, isLoading };
 }
 
 /**

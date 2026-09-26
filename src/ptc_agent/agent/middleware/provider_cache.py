@@ -3,9 +3,9 @@
 The wire markers that key incremental prompt caching (Anthropic ``cache_control``;
 OpenAI explicit ``prompt_cache_breakpoint``) and the str-vs-list "tag the last
 text block" logic are needed by both ``OpenAIPromptCachingMiddleware`` (pins the
-static system prefix) and ``MarketWatchMiddleware`` (pins the last durable
-message so its ephemeral tail doesn't defeat caching). Both live here so the
-provider gate and the tagging are written once.
+static system prefix) and ``TailEnvelopeMiddleware`` (pins the runtime-context
+envelope at the tail). Both live here so the provider gate and the tagging are
+written once.
 """
 
 from typing import Any

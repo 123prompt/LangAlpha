@@ -8,13 +8,13 @@ import {
   ListBoxItem as AriaListBoxItem,
   ListBoxItemProps as AriaListBoxItemProps,
   ListBoxProps as AriaListBoxProps,
-  Section as AriaSection,
+  ListBoxSection as AriaListBoxSection,
   composeRenderProps,
 } from "react-aria-components"
 
 import { cn } from "@/lib/utils"
 
-const ListBoxSection = AriaSection
+const ListBoxSection = AriaListBoxSection
 
 const ListBoxCollection = AriaCollection
 
@@ -52,10 +52,14 @@ const ListBoxItem = <T extends object>({
           "relative flex w-full cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm",
           /* Disabled */
           "data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
-          /* Focused */
-          "data-[focused]:bg-accent data-[focused]:text-accent-foreground",
-          /* Hovered */
-          "data-[hovered]:bg-accent data-[hovered]:text-accent-foreground",
+          /* Focused and hovered: the tint a menu item takes (dropdown-menu's
+             ITEM_HIGHLIGHT), so every floating list marks its row alike */
+          "data-[focused]:bg-accent/15 data-[hovered]:bg-accent/15",
+          /* Keyboard focus: the inward ring tokens.css draws on a focused
+             option. Colored here as well because a list driven from a search
+             field moves a virtual focus, which :focus-visible never sees, and
+             the tint alone would read the same as the row under the mouse */
+          "data-[focus-visible]:outline-current",
           /* Selection */
           "data-[selection-mode]:pl-8",
           className

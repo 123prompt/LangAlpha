@@ -8,6 +8,7 @@ import {
 import { classifyAgentPath, topicFromMemoryKey, type AgentPathInfo } from '../utils/agentPaths';
 import { directToolDisplayName, parseDirectToolName, summarizeDirectToolArgs } from '../utils/directTools';
 import { INTERVAL_LABEL } from '@/lib/bars';
+import { LARGE_TOOL_RESULTS_PREFIX } from './filePanel/fileMeta';
 
 /** Translation function signature compatible with i18next's t() */
 type TFn = (key: string, opts?: Record<string, unknown>) => string;
@@ -156,6 +157,11 @@ function entityLabel(entity: 'portfolio' | 'watchlist' | 'preference'): string {
   if (entity === 'portfolio') return 'Portfolio';
   if (entity === 'watchlist') return 'Watchlist';
   return 'Preference';
+}
+
+/** A subagent spawn, under either spelling the stream has used for it. */
+export function isTaskTool(toolName: string | undefined): boolean {
+  return toolName === 'Task' || toolName === 'task';
 }
 
 export function getToolIcon(rawToolName: string, args?: ToolCallArgs): LucideIcon {
@@ -596,7 +602,8 @@ export function parseTruncatedResult(content: string | null | undefined): ParseT
   if (!content.startsWith('Tool result too large')) return { isTruncated: false };
 
   // Extract the filesystem path
-  const pathMatch = content.match(/saved in the filesystem at this path:\s*(\/large_tool_results\/\S+)/);
+  const prefix = LARGE_TOOL_RESULTS_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pathMatch = content.match(new RegExp(`saved in the filesystem at this path:\\s*(${prefix}\\S+)`));
   const filePath = pathMatch?.[1] || null;
 
   // Extract the preview (everything after the "head and tail" intro line)

@@ -1,5 +1,6 @@
 import { memo } from 'react';
 import { useTheme } from '@/contexts/ThemeContext';
+import { deviceTimezone } from '@/lib/deviceTimezone';
 import { TradingViewEmbed } from '@/pages/Dashboard/widgets/framework/TradingViewEmbed';
 
 // Map our interval keys to TradingView widget interval values
@@ -41,7 +42,7 @@ function TradingViewWidget({ symbol, interval = '1day' }: TradingViewWidgetProps
   const config = {
     symbol,
     interval: TV_INTERVALS[interval] || 'D',
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
+    timezone: deviceTimezone(),
     style: '1',
     isTransparent: false,
     // Literals, not var() — the TV embed is an iframe and can't read our

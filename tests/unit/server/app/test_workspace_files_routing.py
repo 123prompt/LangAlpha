@@ -36,7 +36,7 @@ def _workspace(ws_id: str, user_id: str, status: str) -> dict:
 
 
 @pytest.mark.asyncio
-@patch("src.server.app.workspace_files.crud._get_work_dir", return_value="/home/workspace")
+@patch("src.server.app.workspace_files.crud.owner_work_dir", return_value="/home/workspace")
 @patch("src.server.app.workspace_files.crud.FilePersistenceService")
 @patch("src.server.app.workspace_files.crud.db_get_workspace")
 async def test_starting_status_routes_to_db_fallback(
@@ -70,7 +70,7 @@ async def test_starting_status_routes_to_db_fallback(
 
 
 @pytest.mark.asyncio
-@patch("src.server.app.workspace_files.crud._get_work_dir", return_value="/home/workspace")
+@patch("src.server.app.workspace_files.crud.owner_work_dir", return_value="/home/workspace")
 @patch("src.server.app.workspace_files.crud.FilePersistenceService")
 @patch("src.server.app.workspace_files.crud.db_get_workspace")
 async def test_files_during_concurrent_failing_lazy_init(
@@ -136,3 +136,19 @@ async def test_backup_status_of_a_stopped_workspace_lists_files_only(mock_get_ws
 
     assert set(result["backed_up"]) == {"data/a.csv", "legacy.txt"}
     assert result["total_backed_up_size"] == 7
+
+
+@pytest.mark.asyncio
+async def test_mutation_rejects_shared_agent_root_after_canonicalization():
+    from types import SimpleNamespace
+    from fastapi import HTTPException
+    from src.server.app.workspace_files.crud import _contained_target
+
+    sandbox = SimpleNamespace(validate_path=lambda _path: True)
+    with patch(
+        "src.server.app.workspace_files.crud.contained_sandbox_path",
+        AsyncMock(return_value="/home/workspace/.agents/tools/docs/server.md"),
+    ):
+        with pytest.raises(HTTPException) as error:
+            await _contained_target(sandbox, "linked-doc.md", "/home/workspace/project")
+    assert error.value.status_code == 404

@@ -188,7 +188,7 @@
   color: var(--color-text-muted, #8b8fa3);
 }
 
-.model-selector-trigger:hover:not([data-state=open]) {
+.model-selector-trigger:hover:not([data-state=open]):not(:disabled) {
   background: var(--color-border-muted);
 }
 
@@ -527,6 +527,9 @@
 
 .widget-deck-card {
   position: absolute;
+  /* The whole offset rides `transform`, which is what the transition below
+     animates; a card moved by `top` would jump to its fanned slot. */
+  top: 0;
   left: 0;
   right: 0;
   display: grid;

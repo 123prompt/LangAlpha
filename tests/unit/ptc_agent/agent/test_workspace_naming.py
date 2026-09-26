@@ -38,10 +38,11 @@ async def test_null_columns_read_as_empty_not_as_the_string_none():
 @pytest.mark.asyncio
 async def test_an_unreadable_row_costs_the_block_not_the_turn():
     # The prompt is worth less than the answer: a database that will not
-    # answer must not take the turn down with it.
+    # answer must not take the turn down with it. It answers None, not an
+    # empty name, so the baseline does not file a row saying the name is gone.
     ctx, _ = _patched_row(error=RuntimeError("db down"))
     with ctx:
-        assert await _read_workspace_naming(WS) == ("", "")
+        assert await _read_workspace_naming(WS) == (None, None)
 
 
 @pytest.mark.asyncio

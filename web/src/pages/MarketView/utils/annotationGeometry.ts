@@ -300,7 +300,7 @@ export function buildPrimitiveData(
       });
     } else if (isTrendline(ann) && ann.label) {
       if (!ann.point1 || !ann.point2) continue;
-      // The line itself is drawn natively (addLineSeries); only its label
+      // The line itself is drawn natively (addSeries(LineSeries)); only its label
       // becomes a chip, anchored at the chronologically-later endpoint so it
       // sits at the end of the drawn line instead of stranded on the price
       // axis (LWC's native series `title` floats it to the right gutter).

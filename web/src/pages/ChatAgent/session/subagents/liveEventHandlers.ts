@@ -11,7 +11,7 @@ import {
   type WorkflowLifecycleFrame, type WorkflowRunState,
 } from './workflowRunState';
 import type { MessageRecord, ToolCallRecord, ToolCallResultRecord } from '../../hooks/utils/types';
-import { getOrCreateTaskRefs, extractLastReasoningTitle, nextArrivalSeq } from '../streamRefs';
+import { getOrCreateTaskRefs, nextArrivalSeq } from '../streamRefs';
 import { isTaskAgentId } from '../../utils/agentId';
 import type {
   StreamRefs, TaskRefs, ToolCallChunkRecord, UpdateSubagentCard,
@@ -40,6 +40,7 @@ export function handleSubagentMessageChunk({
   contentType,
   content,
   finishReason,
+  elapsedMs,
   refs,
   updateSubagentCard
 }: {
@@ -48,6 +49,8 @@ export function handleSubagentMessageChunk({
   contentType: string;
   content: string;
   finishReason: string | undefined;
+  /** The server's measured duration on a reasoning complete signal. */
+  elapsedMs?: number;
   refs: StreamRefs;
   updateSubagentCard: UpdateSubagentCard;
 }): boolean {
@@ -114,6 +117,7 @@ export function handleSubagentMessageChunk({
             isReasoning: true,
             reasoningComplete: false,
             order: currentOrder,
+            _startedAt: refs.isReconnect ? undefined : Date.now(),
           },
         },
       };
@@ -131,12 +135,14 @@ export function handleSubagentMessageChunk({
           const prev = updatedMessages[messageIndex];
           const reasoningProcesses = { ...((prev.reasoningProcesses as Record<string, Record<string, unknown>>) || {}) };
           if (reasoningProcesses[reasoningId]) {
+            const startedAt = reasoningProcesses[reasoningId]._startedAt as number | undefined;
+            const completedAt = refs.isReconnect ? 1 : Date.now();
             reasoningProcesses[reasoningId] = {
               ...reasoningProcesses[reasoningId],
               isReasoning: false,
               reasoningComplete: true,
-              reasoningTitle: null,
-              _completedAt: refs.isReconnect ? 1 : Date.now(),
+              _completedAt: completedAt,
+              elapsedMs: elapsedMs ?? (startedAt && !refs.isReconnect ? completedAt - startedAt : undefined),
             };
           }
           updatedMessages[messageIndex] = { ...prev, reasoningProcesses };
@@ -194,12 +200,10 @@ export function handleSubagentMessageChunk({
     const existingContent = (reasoningProcesses[reasoningId]?.content as string) || '';
     const newContent = existingContent + content;
 
-    const reasoningTitle = extractLastReasoningTitle(newContent) ?? (reasoningProcesses[reasoningId].reasoningTitle as string | null) ?? null;
     reasoningProcesses[reasoningId] = {
       ...reasoningProcesses[reasoningId],
       content: newContent,
       isReasoning: true,
-      reasoningTitle,
     };
 
     // Replace the message with a fresh object so ``React.memo`` invalidates;

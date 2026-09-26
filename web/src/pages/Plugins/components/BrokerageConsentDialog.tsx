@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle } from 'lucide-react';
-import { EnabledToggle } from '@/pages/ChatAgent/components/mcp/McpPrimitives';
-import { defaultGrant, type Brokerage } from '../brokerages';
+import { EnabledToggle } from '@/components/mcp/McpPrimitives';
+import { defaultGrant, grantInForce, toggleGrant, type Brokerage } from '../brokerages';
 import { PluginDialog } from './PluginDialog';
 import { RowNote } from './RowNote';
 
@@ -45,21 +45,51 @@ export function BrokerageConsentDialog({
   // that has never been asked. This dialog is also the way an existing grant is
   // narrowed, and opening it on the default re-ticked every group the user had
   // declined -- offering to widen consent while looking like it was showing it.
+  // Narrowed to what can be in force, so a choice remembered from before the
+  // groups were linked does not open on a pair the server would refuse.
   //
   // Seeded once. Re-deriving per render would undo the user's own ticks, and
   // the dialog is mounted for exactly one question, so there is nothing for it
   // to go stale against: the call sites key it by row, so a different row
   // opens a different dialog.
-  const [granted, setGranted] = useState<string[]>(
-    () => current ?? defaultGrant(vendor),
+  const [granted, setGranted] = useState<string[]>(() =>
+    grantInForce(vendor, current ?? defaultGrant(vendor)),
   );
   const label = vendor?.label ?? name;
 
   function toggle(key: string) {
-    setGranted((current) =>
-      current.includes(key) ? current.filter((k) => k !== key) : [...current, key],
-    );
+    setGranted((selected) => toggleGrant(vendor, selected, key));
   }
+
+  const footer = (
+    <div className="flex items-center justify-end gap-2">
+      {/* Live while pending, unlike the toggles and Confirm beside it. The
+          request in flight is a registration at the vendor, not a connect,
+          and backing out of it costs the user nothing; a Cancel that greys
+          out the moment it is pressed leaves a slow vendor holding the
+          dialog open with no way out but the escape key. */}
+      <button
+        type="button"
+        onClick={onCancel}
+        className="px-3 py-1.5 text-xs rounded-md transition-colors hover:bg-foreground/10"
+        style={{ color: 'var(--color-text-tertiary)' }}
+      >
+        {t('plugins.servers.deleteConfirmNo')}
+      </button>
+      <button
+        type="button"
+        onClick={() => onConfirm(granted)}
+        disabled={pending}
+        className="px-3 py-1.5 text-xs rounded-md transition-colors disabled:opacity-50"
+        style={{
+          color: 'var(--color-btn-primary-text)',
+          backgroundColor: 'var(--color-btn-primary-bg)',
+        }}
+      >
+        {pending ? t('common.loading') : t('plugins.oauth.connect')}
+      </button>
+    </div>
+  );
 
   return (
     <PluginDialog
@@ -69,6 +99,7 @@ export function BrokerageConsentDialog({
       // The connect is running and the page is about to leave for the vendor;
       // closing here would strand a flow this dialog can no longer stop.
       dismissable={!pending}
+      footer={footer}
     >
       <div className="flex flex-col gap-4">
         {vendor?.exclusive_connection && (
@@ -96,11 +127,21 @@ export function BrokerageConsentDialog({
                       {groupLabel}
                     </p>
                     <p
-                      className="text-[0.6875rem] mt-0.5"
+                      className="text-xs mt-0.5"
                       style={{ color: 'var(--color-text-tertiary)' }}
                     >
                       {t(`plugins.brokerages.capabilities.${group.key}.desc`)}
                     </p>
+                    {/* Why this switch moves another: ticking it ticks what it
+                        needs, and unticking that unticks this. */}
+                    {(group.requires?.length ?? 0) > 0 && (
+                      <p
+                        className="text-xs mt-0.5"
+                        style={{ color: 'var(--color-text-tertiary)' }}
+                      >
+                        {t(`plugins.brokerages.capabilities.${group.key}.needs`)}
+                      </p>
+                    )}
                   </div>
                   <div className="flex-shrink-0 pt-0.5">
                     <EnabledToggle
@@ -120,33 +161,6 @@ export function BrokerageConsentDialog({
           {t('plugins.brokerages.consent.footnote')}
         </p>
 
-        <div className="flex items-center justify-end gap-2">
-          {/* Live while pending, unlike the toggles and Confirm beside it. The
-              request in flight is a registration at the vendor, not a connect,
-              and backing out of it costs the user nothing; a Cancel that greys
-              out the moment it is pressed leaves a slow vendor holding the
-              dialog open with no way out but the escape key. */}
-          <button
-            type="button"
-            onClick={onCancel}
-            className="px-3 py-1.5 rounded text-xs hover:bg-foreground/10"
-            style={{ color: 'var(--color-text-tertiary)' }}
-          >
-            {t('plugins.servers.deleteConfirmNo')}
-          </button>
-          <button
-            type="button"
-            onClick={() => onConfirm(granted)}
-            disabled={pending}
-            className="px-3 py-1.5 rounded text-xs disabled:opacity-50"
-            style={{
-              color: 'var(--color-btn-primary-text)',
-              backgroundColor: 'var(--color-btn-primary-bg)',
-            }}
-          >
-            {pending ? t('common.loading') : t('plugins.oauth.connect')}
-          </button>
-        </div>
       </div>
     </PluginDialog>
   );

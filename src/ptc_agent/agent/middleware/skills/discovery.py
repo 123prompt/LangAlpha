@@ -243,7 +243,14 @@ async def adiscover_skills(
     """
     result = await backend.als(source_path)  # 1 API call
     items = result.entries or []
-    skill_dirs = [item["path"] for item in items if item.get("is_dir")]
+    # A hidden directory is never a skill (a skill name cannot start with a
+    # dot) and the sync's own staging area lives here as one, so listing it
+    # would present the harness's scratch space as an unconfirmed skill.
+    skill_dirs = [
+        item["path"]
+        for item in items
+        if item.get("is_dir") and not PurePosixPath(item["path"]).name.startswith(".")
+    ]
 
     if not skill_dirs:
         return []

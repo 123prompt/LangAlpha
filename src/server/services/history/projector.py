@@ -31,6 +31,7 @@ from src.server.utils.content_normalizer import normalize_text_content
 from src.server.utils.error_sanitization import (
     sanitize_error_text as _sanitize_error_text,
 )
+from src.server.utils.text_phase import agreed_phase, block_phase
 
 MAIN_AGENT = "main"
 
@@ -60,6 +61,13 @@ _MARKET_WATCH_STAMP_OPEN = "<market-watch>"
 # the record of gate-stopped background tasks injected when a credit-paused
 # turn resumes.
 _CREDIT_GATE_SOURCE = "credit_gate"
+
+# Written by src/ptc_agent/agent/middleware/runtime_context/: the tail
+# envelope carrier and the durable rows it renders. Both are request-scoped and
+# never checkpointed, so neither should reach this projector at all; they are
+# registered because ``plain`` is the fallback and an unregistered stamp would
+# open a run it only landed inside.
+_RUNTIME_CONTEXT_SOURCES = frozenset({"runtime_context", "runtime_update"})
 
 _FILE_OPERATION_TOOLS = {"Write", "Edit"}
 _ARTIFACT_FROM_TOOL_MESSAGE = {
@@ -141,6 +149,8 @@ def history_events_to_sse(
             }
             if event.data.get("finish_reason"):
                 data["finish_reason"] = event.data["finish_reason"]
+            if event.data.get("phase"):
+                data["phase"] = event.data["phase"]
             items.append(_sse("message_chunk", data))
         elif event.kind == "tool-call":
             items.append(
@@ -230,8 +240,8 @@ def _sse(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
 
 def _human_message_kind(message: HumanMessage) -> str:
     """Classify a HumanMessage by its injection stamp: ``market-watch``,
-    ``steering``, ``summarization``, ``credit-gate``, or ``plain`` (real
-    user input).
+    ``steering``, ``summarization``, ``credit-gate``, ``runtime-context``, or
+    ``plain`` (real user input).
 
     Every stamp a writer emits must be registered here. ``plain`` is the
     fallback, and it is load-bearing — it is what ``is_run_boundary_message``
@@ -251,13 +261,15 @@ def _human_message_kind(message: HumanMessage) -> str:
         return "summarization"
     if source == _CREDIT_GATE_SOURCE:
         return "credit-gate"
+    if source in _RUNTIME_CONTEXT_SOURCES:
+        return "runtime-context"
     return "plain"
 
 
 def is_run_boundary_message(message: AnyMessage) -> bool:
     """A plain HumanMessage opens a run in a task namespace (the spawn or
-    resume input); stamped injections (steering, market-watch, summaries)
-    land mid-run and never open one."""
+    resume input); stamped injections (steering, market-watch, runtime
+    context, summaries) land mid-run and never open one."""
     return isinstance(message, HumanMessage) and _human_message_kind(message) == "plain"
 
 
@@ -274,7 +286,7 @@ def _project_human_message(message: HumanMessage, agent: str) -> list[HistoryEve
     content = message.content if isinstance(message.content, str) else ""
     kind = _human_message_kind(message)
 
-    if kind in ("market-watch", "credit-gate"):
+    if kind in ("market-watch", "credit-gate", "runtime-context"):
         # Model-facing only. Returning here rather than falling through also
         # keeps them out of a task namespace's ``user-message`` projection,
         # where the raw reminder would surface as if the user had typed it.
@@ -322,7 +334,7 @@ def _project_ai_message(
 ) -> list[HistoryEvent]:
     events: list[HistoryEvent] = []
     message_id = message.id or "unknown"
-    text, reasoning = _split_content_blocks(message.content)
+    text, reasoning, phase = split_content_blocks(message.content)
     tool_calls = _filter_tool_calls(message.tool_calls or [])
 
     if reasoning:
@@ -337,17 +349,13 @@ def _project_ai_message(
         )
 
     if text:
-        events.append(
-            HistoryEvent(
-                "text",
-                agent,
-                message_id,
-                {
-                    "content": text,
-                    "finish_reason": None if tool_calls else "stop",
-                },
-            )
-        )
+        text_data: dict[str, Any] = {
+            "content": text,
+            "finish_reason": None if tool_calls else "stop",
+        }
+        if phase:
+            text_data["phase"] = phase
+        events.append(HistoryEvent("text", agent, message_id, text_data))
 
     if tool_calls:
         for tool_call in tool_calls:
@@ -505,24 +513,27 @@ def _derive_artifact(
     return None
 
 
-def _split_content_blocks(content: Any) -> tuple[str | None, str | None]:
-    """Split final-message content into (text, reasoning) parts.
+def split_content_blocks(content: Any) -> tuple[str | None, str | None, str | None]:
+    """Split final-message content into (text, reasoning, phase) parts.
 
     Unlike ``extract_content_with_type`` on a whole list (which merges every
     block into one string), replay needs reasoning and text separated so they
-    render in their own channels.
+    render in their own channels. The joined text carries a ``phase`` only
+    when every text block agrees on one, since the join collapses them.
     """
     if content is None:
-        return None, None
+        return None, None, None
     if isinstance(content, str):
-        return (content or None), None
+        return (content or None), None, None
     blocks = content if isinstance(content, list) else [content]
     texts: list[str] = []
     reasonings: list[str] = []
+    phases: list[str | None] = []
     for block in blocks:
         if isinstance(block, str):
             if block:
                 texts.append(block)
+                phases.append(None)
             continue
         extracted, content_type = extract_content_with_type(block)
         if not extracted:
@@ -531,7 +542,13 @@ def _split_content_blocks(content: Any) -> tuple[str | None, str | None]:
             reasonings.append(extracted)
         else:
             texts.append(extracted)
-    return ("".join(texts) or None), ("\n\n".join(reasonings) or None)
+            phases.append(block_phase(block))
+    phase = agreed_phase(phases)
+    return (
+        ("".join(texts) or None),
+        ("\n\n".join(reasonings) or None),
+        phase,
+    )
 
 
 def _filter_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:

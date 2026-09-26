@@ -5,8 +5,8 @@
     "provider": "openai",
     "display_name": "GPT-5.5",
     "visible": true,
-    "speed": 3,
-    "intelligence": 5,
+    "speed": 4,
+    "intelligence": 3,
     "context": 400000,
     "input_modalities": [
       "text",
@@ -37,7 +37,7 @@
     "display_name": "GPT-5.6 Sol",
     "visible": true,
     "speed": 3,
-    "intelligence": 5,
+    "intelligence": 4,
     "context": 1050000,
     "input_modalities": [
       "text",
@@ -71,8 +71,8 @@
     "provider": "openai",
     "display_name": "GPT-5.6 Terra",
     "visible": true,
-    "speed": 4,
-    "intelligence": 5,
+    "speed": 3,
+    "intelligence": 3,
     "context": 1050000,
     "input_modalities": [
       "text",
@@ -106,7 +106,7 @@
     "display_name": "GPT-5.6 Luna",
     "visible": true,
     "speed": 4,
-    "intelligence": 4,
+    "intelligence": 3,
     "context": 1050000,
     "input_modalities": [
       "text",
@@ -168,12 +168,81 @@
       "write": "parameters.reasoning.effort"
     }
   },
+  "gpt-6-sol": {
+    "prompt_guidance": "lean",
+    "model_id": "gpt-6-sol",
+    "provider": "openai",
+    "display_name": "GPT-6 Sol",
+    "visible": true,
+    "speed": 4,
+    "intelligence": 4,
+    "context": 1050000,
+    "input_modalities": [
+      "text",
+      "image",
+      "pdf"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "prompt_cache_options": {
+        "mode": "implicit"
+      }
+    },
+    "reasoning": {
+      "efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "gpt-6-luna": {
+    "model_id": "gpt-6-luna",
+    "provider": "openai",
+    "display_name": "GPT-6 Luna",
+    "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 1050000,
+    "input_modalities": [
+      "text",
+      "image",
+      "pdf"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "prompt_cache_options": {
+        "mode": "implicit"
+      }
+    },
+    "reasoning": {
+      "efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
   "claude-fable-5": {
     "prompt_guidance": "lean",
     "model_id": "claude-fable-5",
     "provider": "anthropic",
     "visible": true,
-    "speed": 3,
+    "speed": 2,
     "intelligence": 5,
     "context": 1000000,
     "input_modalities": [
@@ -232,6 +301,44 @@
       "write": "parameters.output_config.effort"
     }
   },
+  "claude-opus-5-5": {
+    "prompt_guidance": "lean",
+    "model_id": "claude-opus-5-5",
+    "provider": "anthropic",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 1000000,
+    "input_modalities": [
+      "text",
+      "image",
+      "pdf"
+    ],
+    "parameters": {
+      "max_tokens": 128000,
+      "thinking": {
+        "type": "adaptive",
+        "display": "summarized",
+        "block_binding": {
+          "prefix_mismatch_behavior": "drop_block"
+        }
+      }
+    },
+    "additional_betas": [
+      "thinking-binding-controls-2026-08-01"
+    ],
+    "reasoning": {
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium",
+      "write": "parameters.output_config.effort"
+    }
+  },
   "claude-opus-5": {
     "prompt_guidance": "lean",
     "model_id": "claude-opus-5",
@@ -270,7 +377,7 @@
     "provider": "anthropic",
     "visible": true,
     "speed": 3,
-    "intelligence": 5,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -302,7 +409,7 @@
     "provider": "anthropic",
     "visible": true,
     "speed": 2,
-    "intelligence": 5,
+    "intelligence": 3,
     "context": 200000,
     "input_modalities": [
       "text",
@@ -333,7 +440,7 @@
     "provider": "anthropic",
     "visible": true,
     "speed": 2,
-    "intelligence": 3,
+    "intelligence": 2,
     "context": 200000,
     "input_modalities": [
       "text",
@@ -361,7 +468,7 @@
     "model_id": "claude-haiku-4-5-20251001",
     "provider": "anthropic",
     "visible": true,
-    "speed": 3,
+    "speed": 4,
     "intelligence": 1,
     "context": 200000,
     "input_modalities": [
@@ -383,7 +490,7 @@
     "provider": "gemini",
     "visible": true,
     "speed": 4,
-    "intelligence": 3,
+    "intelligence": 2,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -409,7 +516,7 @@
     "provider": "gemini",
     "visible": true,
     "speed": 5,
-    "intelligence": 5,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -435,7 +542,7 @@
     "provider": "gemini",
     "visible": true,
     "speed": 5,
-    "intelligence": 5,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -628,8 +735,8 @@
     "provider": "deepseek",
     "display_name": "DeepSeek-V4.1-Flash",
     "visible": true,
-    "speed": 4,
-    "intelligence": 5,
+    "speed": 5,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -661,7 +768,7 @@
     "provider": "z-ai",
     "visible": true,
     "speed": 3,
-    "intelligence": 4,
+    "intelligence": 2,
     "context": 1000000,
     "parameters": {
       "max_tokens": 128000
@@ -691,8 +798,8 @@
     "model_id": "glm-5.3",
     "provider": "z-ai",
     "visible": true,
-    "speed": 3,
-    "intelligence": 5,
+    "speed": 2,
+    "intelligence": 4,
     "context": 1000000,
     "parameters": {
       "max_tokens": 128000
@@ -721,8 +828,8 @@
     "model_id": "glm-5.3-flash",
     "provider": "z-ai",
     "visible": true,
-    "speed": 1,
-    "intelligence": 5,
+    "speed": 3,
+    "intelligence": 3,
     "context": 1000000,
     "parameters": {
       "max_tokens": 128000
@@ -754,7 +861,7 @@
     "provider": "z-ai-cn",
     "visible": true,
     "speed": 3,
-    "intelligence": 4,
+    "intelligence": 2,
     "context": 1000000,
     "parameters": {
       "max_tokens": 128000
@@ -784,8 +891,8 @@
     "model_id": "glm-5.3",
     "provider": "z-ai-cn",
     "visible": true,
-    "speed": 3,
-    "intelligence": 5,
+    "speed": 2,
+    "intelligence": 4,
     "context": 1000000,
     "parameters": {
       "max_tokens": 128000
@@ -814,8 +921,8 @@
     "model_id": "glm-5.3-flash",
     "provider": "z-ai-cn",
     "visible": true,
-    "speed": 1,
-    "intelligence": 5,
+    "speed": 3,
+    "intelligence": 3,
     "context": 1000000,
     "parameters": {
       "max_tokens": 128000
@@ -846,7 +953,7 @@
     "provider": "minimax",
     "visible": true,
     "speed": 4,
-    "intelligence": 3,
+    "intelligence": 2,
     "context": 512000,
     "parameters": {
       "max_tokens": 128000
@@ -875,7 +982,7 @@
     "provider": "dashscope",
     "visible": true,
     "speed": 1,
-    "intelligence": 5,
+    "intelligence": 4,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -899,8 +1006,8 @@
     "model_id": "qwen3.8-flash",
     "provider": "dashscope",
     "visible": true,
-    "speed": 3,
-    "intelligence": 5,
+    "speed": 2,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -924,8 +1031,8 @@
     "model_id": "qwen3.7-plus",
     "provider": "dashscope",
     "visible": true,
-    "speed": 2,
-    "intelligence": 2,
+    "speed": 3,
+    "intelligence": 1,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -951,7 +1058,7 @@
     "provider": "dashscope-intl",
     "visible": true,
     "speed": 1,
-    "intelligence": 5,
+    "intelligence": 4,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -975,8 +1082,8 @@
     "model_id": "qwen3.8-flash",
     "provider": "dashscope-intl",
     "visible": true,
-    "speed": 3,
-    "intelligence": 5,
+    "speed": 2,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -1000,8 +1107,8 @@
     "model_id": "qwen3.7-plus",
     "provider": "dashscope-intl",
     "visible": true,
-    "speed": 2,
-    "intelligence": 2,
+    "speed": 3,
+    "intelligence": 1,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -1027,7 +1134,7 @@
     "provider": "moonshot",
     "visible": true,
     "speed": 1,
-    "intelligence": 5,
+    "intelligence": 4,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -1049,7 +1156,7 @@
     "provider": "moonshot-coding",
     "visible": true,
     "speed": 1,
-    "intelligence": 5,
+    "intelligence": 4,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -1102,8 +1209,8 @@
     "model_id": "gpt-5.5",
     "provider": "codex-oauth",
     "visible": true,
-    "speed": 3,
-    "intelligence": 5,
+    "speed": 4,
+    "intelligence": 3,
     "context": 400000,
     "input_modalities": [
       "text",
@@ -1137,7 +1244,7 @@
     "provider": "codex-oauth",
     "visible": true,
     "speed": 3,
-    "intelligence": 5,
+    "intelligence": 4,
     "context": 1050000,
     "input_modalities": [
       "text",
@@ -1171,8 +1278,8 @@
     "model_id": "gpt-5.6-terra",
     "provider": "codex-oauth",
     "visible": true,
-    "speed": 4,
-    "intelligence": 5,
+    "speed": 3,
+    "intelligence": 3,
     "context": 1050000,
     "input_modalities": [
       "text",
@@ -1206,7 +1313,7 @@
     "provider": "codex-oauth",
     "visible": true,
     "speed": 4,
-    "intelligence": 4,
+    "intelligence": 3,
     "context": 1050000,
     "input_modalities": [
       "text",
@@ -1269,12 +1376,81 @@
       "write": "parameters.reasoning.effort"
     }
   },
+  "gpt-6-sol-oauth": {
+    "prompt_guidance": "lean",
+    "model_id": "gpt-6-sol",
+    "provider": "codex-oauth",
+    "visible": true,
+    "speed": 4,
+    "intelligence": 4,
+    "context": 1050000,
+    "input_modalities": [
+      "text",
+      "image",
+      "pdf"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "gpt-6-luna-oauth": {
+    "model_id": "gpt-6-luna",
+    "provider": "codex-oauth",
+    "visible": true,
+    "speed": 5,
+    "intelligence": 3,
+    "context": 1050000,
+    "input_modalities": [
+      "text",
+      "image",
+      "pdf"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      },
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "store": false
+    },
+    "reasoning": {
+      "efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium",
+      "write": "parameters.reasoning.effort"
+    }
+  },
   "claude-sonnet-4-6-oauth": {
     "model_id": "claude-sonnet-4-6",
     "provider": "claude-oauth",
     "visible": true,
     "speed": 2,
-    "intelligence": 3,
+    "intelligence": 2,
     "context": 200000,
     "input_modalities": [
       "text",
@@ -1303,7 +1479,7 @@
     "model_id": "claude-fable-5",
     "provider": "claude-oauth",
     "visible": true,
-    "speed": 3,
+    "speed": 2,
     "intelligence": 5,
     "context": 1000000,
     "input_modalities": [
@@ -1362,6 +1538,44 @@
       "write": "parameters.output_config.effort"
     }
   },
+  "claude-opus-5-5-oauth": {
+    "prompt_guidance": "lean",
+    "model_id": "claude-opus-5-5",
+    "provider": "claude-oauth",
+    "visible": true,
+    "speed": 3,
+    "intelligence": 5,
+    "context": 1000000,
+    "input_modalities": [
+      "text",
+      "image",
+      "pdf"
+    ],
+    "parameters": {
+      "max_tokens": 128000,
+      "thinking": {
+        "type": "adaptive",
+        "display": "summarized",
+        "block_binding": {
+          "prefix_mismatch_behavior": "drop_block"
+        }
+      }
+    },
+    "additional_betas": [
+      "thinking-binding-controls-2026-08-01"
+    ],
+    "reasoning": {
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "default": "medium",
+      "write": "parameters.output_config.effort"
+    }
+  },
   "claude-opus-5-oauth": {
     "prompt_guidance": "lean",
     "model_id": "claude-opus-5",
@@ -1400,7 +1614,7 @@
     "provider": "claude-oauth",
     "visible": true,
     "speed": 3,
-    "intelligence": 5,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",
@@ -1432,7 +1646,7 @@
     "provider": "claude-oauth",
     "visible": true,
     "speed": 2,
-    "intelligence": 5,
+    "intelligence": 3,
     "context": 200000,
     "input_modalities": [
       "text",
@@ -1462,7 +1676,7 @@
     "model_id": "claude-haiku-4-5-20251001",
     "provider": "claude-oauth",
     "visible": true,
-    "speed": 3,
+    "speed": 4,
     "intelligence": 1,
     "context": 200000,
     "input_modalities": [
@@ -1484,7 +1698,7 @@
     "provider": "claude-oauth",
     "visible": true,
     "speed": 2,
-    "intelligence": 5,
+    "intelligence": 3,
     "context": 1000000,
     "input_modalities": [
       "text",

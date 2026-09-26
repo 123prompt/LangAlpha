@@ -28,7 +28,43 @@ const EXPECTED = ['index', 'vendor-dnd', 'vendor-motion', 'vendor-react']
 // model's profile to label its trigger before first paint, which puts
 // modelPreferences.ts, useUpdatePreferences.ts and the dropdown primitive on the
 // critical path for +1.9 kB gz. Nothing moved chunks; the eager set is unchanged.
-const MAX_EAGER_KB = 460
+//
+// Raised 460 -> 465 for the Orders page. The nav decides before first paint
+// whether to offer it, and i18n.ts bundles every locale's JSON into the entry,
+// so that check and the page's en-US and zh-CN strings ride the critical path
+// for about +5 kB gz, 4 of it strings. Nothing moved chunks; the eager set is
+// unchanged.
+//
+// Raised 465 -> 470 for header-authenticated MCP servers. The probe verdicts,
+// the one-field add form and the import placeholder step each carry copy in
+// both locales, and i18n.ts still bundles every locale into the entry, so
+// about 4 kB gz of strings ride the critical path; the dialog and sheet
+// keyframes in styles/animations.css add 0.6 kB to the entry stylesheet.
+// Nothing moved chunks; the eager set is unchanged.
+//
+// Raised 470 -> 475 for the workspace tab strip, chart tab and Excel range
+// context. The strip, the chart header and the Excel viewer each carry copy in
+// both locales, so about 1.8 kB gz of strings ride the critical path; the
+// search helpers in lib/marketUtils add a little more. The CI runner's gzip
+// reads about 1.8 kB above a local build of the same tree, so the margin
+// here is read against CI, not a laptop. Nothing moved chunks; the eager set
+// is unchanged.
+//
+// Raised 475 -> 480 for short share links. The share dialog, the link page and
+// the app card carry copy in both locales, and i18n.ts still bundles every
+// locale into the entry, so about 0.9 kB gz of strings ride the critical path;
+// the share-link query keys, formatBytes and retryUnlessClientError add 0.5 kB.
+// CI read 475.2 against 473.8 on main. Nothing moved chunks; the eager set is
+// unchanged.
+//
+// Raised 480 -> 485 for the automations run feed. The feed, the manage view,
+// the attention rail and the timezone picker carry copy in both locales, and
+// i18n.ts still bundles every locale into the entry, so about 3.8 kB gz of
+// strings ride the critical path; the entry stylesheet grows 0.5 kB, and the
+// device-zone read in lib/deviceTimezone, the automations query keys and the
+// lifecycle feed's invalidation add about 0.7 kB. A local build read +4.8 kB
+// against main. Nothing moved chunks; the eager set is unchanged.
+const MAX_EAGER_KB = 485
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')

@@ -39,9 +39,11 @@ async def _resolve_graph_and_state(
         (graph, lg_config, state, messages, backend)
     """
     from src.server.database import conversation as qr_db
+    from src.server.database.workspace import get_workspace
     from src.server.services.workspace_manager import WorkspaceManager
     from ptc_agent.agent.graph import build_ptc_graph_with_session
     from ptc_agent.agent.backends.sandbox import SandboxBackend
+    from ptc_agent.core.paths import SandboxLayout
 
     # Validate thread + workspace
     thread_info = await qr_db.get_thread_with_summary(thread_id)
@@ -75,7 +77,10 @@ async def _resolve_graph_and_state(
     from src.server.app.workspace_sandbox import _set_cached_signed_url
 
     graph = await build_ptc_graph_with_session(
-        session=session, config=effective_config, checkpointer=checkpointer,
+        session=session,
+        tool_view=workspace_manager.tool_view(session, workspace_id),
+        config=effective_config,
+        checkpointer=checkpointer,
         on_signed_url=_set_cached_signed_url,
     )
 
@@ -97,10 +102,17 @@ async def _resolve_graph_and_state(
     if not messages:
         raise HTTPException(status_code=400, detail=f"No messages to {verb}")
 
-    # Backend
+    # Backend. Pinned to the thread's workspace folder because these routes
+    # run outside a turn, where nothing has bound a project: an unpinned
+    # backend would file this thread's offloads on the machine root, which a
+    # later delete of the workspace would leave behind.
     backend = None
     if hasattr(session, "sandbox") and session.sandbox is not None:
-        backend = SandboxBackend(session.sandbox)
+        row = await get_workspace(workspace_id) or {}
+        layout = SandboxLayout(session.sandbox.working_dir).for_workspace(
+            row.get("dir_name")
+        )
+        backend = SandboxBackend(session.sandbox, layout.workspace)
 
     return graph, lg_config, state, messages, backend
 
@@ -153,7 +165,10 @@ async def trigger_compaction(
     so manual /compact matches the auto path.
     """
     try:
-        from ptc_agent.agent.middleware.compaction import compact_messages
+        from ptc_agent.agent.middleware.compaction import (
+            compact_messages,
+            resolve_compaction_client,
+        )
         from src.server.app import setup
 
         # The mutation fence FIRST — before any graph state reads or writes:
@@ -197,22 +212,15 @@ async def trigger_compaction(
             original_count = len(messages)
 
             compaction_cfg = agent_cfg.compaction if agent_cfg else None
-            model_name = (agent_cfg.llm.compaction or "") if agent_cfg and agent_cfg.llm else ""
+            model_name = (agent_cfg.llm.compaction_name or "") if agent_cfg and agent_cfg.llm else ""
 
-            # Mirror PTCAgent.create_agent client priority: subsidiary → main → factory.
-            # Copy before handing the client to compact_messages — it calls
-            # maybe_disable_streaming (src/llms/api_call.py) which sets
-            # streaming=False in-place. Without the copy, the fallback path
-            # (agent_cfg == setup.agent_config) would permanently mutate the
-            # shared main-agent client and break SSE streaming for every
-            # subsequent chat workflow.
-            compaction_client = None
-            if agent_cfg is not None:
-                subsidiary = agent_cfg.subsidiary_llm_clients.get("compaction")
-                if subsidiary is not None:
-                    compaction_client = subsidiary.model_copy()
-                elif agent_cfg.llm_client is not None:
-                    compaction_client = agent_cfg.llm_client.model_copy()
+            # Same resolver as automatic compaction, so a manual /compact runs the
+            # same model: a named compaction model without a role client resolves
+            # by name, not on a copy of the main client. It returns a copy, which
+            # matters because compact_messages sets streaming=False in place.
+            compaction_client = (
+                resolve_compaction_client(agent_cfg) if agent_cfg is not None else None
+            )
 
             # Read previous event from state (for chained compactions).
             # The state key "_summarization_event" is preserved as a wire/storage

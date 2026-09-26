@@ -61,6 +61,17 @@ export interface Workspace {
   resource_tier?: ResourceTier;
   /** Keep the sandbox running (idle auto-stop disabled). Absent on flash / legacy rows. */
   is_always_on?: boolean;
+  /**
+   * The machine this workspace lives on. Absent on flash workspaces and on rows
+   * that predate the split, which is exactly when the per-workspace status
+   * channel stays the only source for this row's state.
+   */
+  computer_id?: string | null;
+  /** Folder name under the computer's root: the workspace's address on disk. */
+  dir_name?: string | null;
+  /** The restore from this workspace's file backup did not finish, so the tree
+   *  is short some files until the next start retries it. */
+  files_restore_incomplete?: boolean;
   created_at?: string;
   updated_at?: string;
   [key: string]: unknown;
@@ -85,6 +96,147 @@ export interface WorkspaceQuota {
   performance: WorkspaceCapacity | null;
   max: WorkspaceCapacity | null;
   always_on: WorkspaceCapacity | null;
+}
+
+// --- Computer ---
+
+/**
+ * Lifecycle of the machine a workspace runs on. `running`, `error` and
+ * `deleted` are the statuses the status stream treats as terminal; the rest
+ * either settle on their own or wait for the user.
+ */
+export type ComputerStatus =
+  | 'creating'
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'stopped'
+  | 'error'
+  | 'deleted';
+
+export interface Computer {
+  computer_id: string;
+  user_id: string;
+  /** Execution backend, e.g. `daytona` or `docker`. */
+  kind: string;
+  name: string;
+  /** Wire value, kept plain: an unrecognized state is real, and
+   *  `computerStatusUi()` fails safe on one. {@link ComputerStatus} types the
+   *  status table instead, so adding a state there forces its copy. */
+  status: string;
+  resource_tier: ResourceTier;
+  is_always_on: boolean;
+  /** The machine a workspace is bound to when it names no other. */
+  is_primary: boolean;
+  /** How many workspaces live on the machine, counted by the server: a list
+   *  page a caller happens to hold is not that number. */
+  workspace_count?: number;
+  root_dir: string;
+  /** Vendor id of the running machine. Owner-only, and null before first boot. */
+  provider_ref?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  last_activity_at?: string | null;
+  stopped_at?: string | null;
+  config?: Record<string, unknown>;
+  /** Last disk reading. Null when never measured, or on a local machine with
+   *  no storage quota, where `df` would report the host's disk. */
+  disk?: ComputerDisk | null;
+  /** The last spec change and how it went. The change runs after its request
+   *  has answered, so this row is where its outcome is read. */
+  spec_change?: ComputerSpecChange | null;
+}
+
+export type SpecChangeState = 'in_progress' | 'succeeded' | 'failed';
+
+/** Why a spec change that was accepted later failed. */
+export type SpecChangeErrorCode =
+  | 'turn_active'
+  | 'backup_incomplete'
+  | 'busy'
+  | 'interrupted'
+  | 'disk_too_small'
+  | 'not_allowed'
+  | 'unknown';
+
+export interface ComputerSpecChangeError {
+  code: SpecChangeErrorCode;
+  /** A user-facing sentence from the server, always present. */
+  message: string;
+  /** The files a backup could not take; may be empty. */
+  files: UnsavedFile[];
+}
+
+export interface ComputerSpecChange {
+  target_tier: ResourceTier;
+  from_tier: ResourceTier;
+  state: SpecChangeState;
+  error?: ComputerSpecChangeError | null;
+  started_at: string;
+  finished_at?: string | null;
+}
+
+/** How close a machine's disk is to full, decided server-side from free bytes. */
+export type ComputerDiskLevel = 'healthy' | 'notice' | 'warning' | 'critical';
+
+export interface ComputerDisk {
+  used_bytes: number;
+  total_bytes: number;
+  free_bytes: number;
+  measured_at: string;
+  level: ComputerDiskLevel;
+}
+
+/** One workspace folder's share of the machine's disk. */
+export interface ComputerStorageWorkspace {
+  workspace_id: string;
+  name: string;
+  dir_name: string | null;
+  bytes: number;
+}
+
+/**
+ * `GET /computers/{id}/storage`. `live` is false when the machine is not
+ * running: the reading is the stored one and the breakdown is empty.
+ */
+export interface ComputerStorage {
+  disk: ComputerDisk | null;
+  workspaces: ComputerStorageWorkspace[];
+  other_bytes: number;
+  live: boolean;
+}
+
+export interface ComputersResponse {
+  computers: Computer[];
+  total?: number;
+}
+
+/**
+ * Payload of a `file_operation` artifact event. `file_path` is workspace
+ * relative, the spelling every path helper classifies; `sandbox_path` is the
+ * one the tool was called with, kept for opening the file where it sits.
+ */
+export interface FileOperationArtifactPayload {
+  operation: 'Write' | 'Edit' | string;
+  file_path: string;
+  sandbox_path?: string;
+  line_count?: number;
+  content?: string;
+  old_string?: string;
+  new_string?: string;
+  error?: string;
+}
+
+export interface ComputerActionResponse {
+  computer_id: string;
+  status: string;
+  message?: string;
+}
+
+/** Request body for `POST /api/v1/computers`. Tier is the machine's, not a workspace's. */
+export interface ComputerCreate {
+  name?: string;
+  resource_tier?: ResourceTier;
 }
 
 export interface ReorderItem {
@@ -166,6 +318,7 @@ export type WorkflowRunStatus =
 export interface ThreadSharePermissions {
   allow_files?: boolean;
   allow_download?: boolean;
+  root_path?: string;
 }
 
 export interface ThreadShareStatus {
@@ -173,6 +326,75 @@ export interface ThreadShareStatus {
   share_token: string;
   share_url: string;
   permissions: ThreadSharePermissions;
+}
+
+// --- Share links (files and apps) ---
+
+export type ShareLinkKind = 'file' | 'app';
+
+interface ShareLinkBase {
+  code: string;
+  /** App-relative, `/a/<code>`. */
+  url: string;
+  title: string | null;
+  shared: boolean;
+  shared_at: string | null;
+  /** The confirmed list while shared, null otherwise. */
+  shared_files: string[] | null;
+  created_at: string;
+}
+
+export interface FileShareLink extends ShareLinkBase {
+  kind: 'file';
+  /** Workspace-relative entry path. */
+  path: string;
+  port: null;
+}
+
+export interface AppShareLink extends ShareLinkBase {
+  kind: 'app';
+  /** The optional entry path on the served app. */
+  path: string | null;
+  port: number;
+}
+
+/** One item's stable `/a/<code>` link. Private unless `shared`. */
+export type ShareLink = FileShareLink | AppShareLink;
+
+export type ShareLinkTarget =
+  | { kind: 'file'; path: string }
+  | { kind: 'app'; port: number };
+
+export type ShareFileReason = 'entry' | 'page' | 'style' | 'markdown' | 'script';
+
+export interface ShareFileEntry {
+  path: string;
+  size: number;
+  reason: ShareFileReason;
+}
+
+export interface ShareLinkDrift {
+  added: string[];
+  removed: string[];
+}
+
+/** The current file list for a file link, with the drift against what was confirmed. */
+export interface ShareLinkFiles {
+  files: ShareFileEntry[];
+  total_size: number;
+  drift: ShareLinkDrift | null;
+}
+
+export interface SharedLinksResponse {
+  links: ShareLink[];
+}
+
+/** A signed, expiring prefix the owner's iframes serve workspace files under. */
+export interface FileGrant {
+  /** `/api/v1/wsfiles/g/<grant>/`, relative to the API base. */
+  prefix: string;
+  /** Seconds the grant has left when it is answered. */
+  expires_in: number;
 }
 
 // --- Workspace Files ---
@@ -206,17 +428,35 @@ export interface WriteFileResponse {
   size: number;
 }
 
+export type UnsavedReason = 'too_large' | 'path_too_long' | 'unreadable' | 'changed' | 'failed';
+
+export interface UnsavedFile {
+  path: string;
+  reason: UnsavedReason;
+  size?: number | null;
+}
+
 export interface BackupResponse {
+  workspace_id: string;
   synced: number;
   skipped: number;
   deleted: number;
   errors: number;
+  oversized: number;
   total_size: number;
+  max_file_bytes: number | null;
+  /** At most the first 100; `unsaved_count` is the full total. */
+  unsaved: UnsavedFile[];
+  unsaved_count: number;
 }
 
 export interface BackupStatusResponse {
-  persisted_files: Record<string, string>;
-  total_size: number;
+  workspace_id: string;
+  backed_up: string[];
+  modified: string[];
+  untracked: string[];
+  total_backed_up_size: number;
+  files_restore_incomplete: boolean;
 }
 
 // --- Subagent ---
@@ -323,5 +563,30 @@ export interface ChatMessageBody {
   llm_model?: string;
   reasoning_effort?: string;
   fast_mode?: true;
-  hitl_response?: Record<string, { decisions: Array<{ type: string }> }>;
+  hitl_response?: HitlResponseBody;
 }
+
+/** One answer on a resume: the verdict, plus the user's own message if they
+ *  typed one. */
+export interface HitlDecisionBody {
+  type: string;
+  message?: string;
+}
+
+/**
+ * What one interrupt is answered with.
+ *
+ * `decisions` stays positional and answers every request the interrupt raised,
+ * in the order it raised them. `order_decisions` answers the keyed ones by
+ * attempt id, and both travel together on a mixed interrupt so neither half
+ * has to be inferred from the other. A keyed request missing from the map is
+ * refused by the server, so the client sends every one of them rather than
+ * letting absence stand for approval.
+ */
+export interface HitlResumeEntry {
+  decisions: HitlDecisionBody[];
+  order_decisions?: Record<string, HitlDecisionBody>;
+}
+
+/** The `hitl_response` map a resume sends, keyed by interrupt id. */
+export type HitlResponseBody = Record<string, HitlResumeEntry>;

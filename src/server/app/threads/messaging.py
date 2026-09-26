@@ -458,6 +458,10 @@ async def _handle_send_message(
                 internal_overrides["origin_dispatch_gen"] = None
             if request.disable_subagents:
                 internal_overrides["disable_subagents"] = None
+            # A channel gateway's field: the text rides the operator role on
+            # providers with a native channel, so a user's own copy is dropped.
+            if request.surface_rules:
+                internal_overrides["surface_rules"] = None
             if internal_overrides:
                 request = request.model_copy(update=internal_overrides)
     except BaseException:

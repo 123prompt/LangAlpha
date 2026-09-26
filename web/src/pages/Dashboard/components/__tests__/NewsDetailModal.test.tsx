@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (k: string, o?: { defaultValue?: string }) => o?.defaultValue ?? k }),
@@ -21,6 +21,13 @@ const IMAGELESS_ARTICLE = {
   tickers: [],
   keywords: [],
   sentiments: null,
+};
+
+// One ticker impact card, so the article has a nested overlay to open.
+const SENTIMENT_ARTICLE = {
+  ...IMAGELESS_ARTICLE,
+  id: 'article-2',
+  sentiments: [{ ticker: 'AAPL', sentiment: 'positive', reasoning: 'Margins held through the quarter.' }],
 };
 
 const getNewsArticle = vi.fn();
@@ -105,5 +112,37 @@ describe('NewsDetailModal — imageless (TickerTick) article', () => {
 
     expect(await screen.findByText(/Article details not available/i)).toBeInTheDocument();
     expect(screen.getByText(/Open article/i)).toBeInTheDocument();
+  });
+
+  it('lets Escape dismiss the sentiment card before the article behind it', async () => {
+    const onClose = vi.fn();
+    getNewsArticle.mockResolvedValue(SENTIMENT_ARTICLE);
+
+    render(<NewsDetailModal newsId="article-2" onClose={onClose} />);
+    fireEvent.click(await screen.findByText('AAPL'));
+    // The impact card and the overlay both print the reasoning, so two of it is
+    // what an open overlay looks like from here.
+    expect(screen.getAllByText(/Margins held/)).toHaveLength(2);
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.getAllByText(/Margins held/)).toHaveLength(1));
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not close on the Escape that abandons an IME composition', async () => {
+    const onClose = vi.fn();
+    getNewsArticle.mockResolvedValue(SENTIMENT_ARTICLE);
+
+    render(<NewsDetailModal newsId="article-2" onClose={onClose} />);
+    await screen.findByText('AAPL');
+
+    fireEvent.keyDown(window, { key: 'Escape', isComposing: true });
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

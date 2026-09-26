@@ -1,0 +1,130 @@
+{# One durable row, persisted as its own message in history. Carries kind,
+   text, provenance and created_at; schema_version is envelope machinery, not
+   prompt surface, so it is accepted and deliberately not rendered.
+
+   A change row says in plain words what moved and who moved it. The reader is
+   a model, and `**agent_md_changed** (2026-09-09T01:43:44+00:00, sandbox,
+   main)` asked it to decode three provenance codes before it could act on one
+   fact. The header carries no stamp: the row sits at a fixed point in the
+   conversation, right after the turn anchor that states the turn's absolute
+   time, so a second copy of the time said nothing its position did not.
+   `created_at` still rides in the row's metadata for a reader that needs the
+   instant itself.
+
+   The paragraph under the header is the row explaining itself. Nothing in the
+   system prefix says what a change row means, so each row delivers that on
+   demand, rendered once here at write time and cached from then on, which is
+   what makes repeating it on every row cheap. It is written to stay true on
+   the tenth reading: the row persists until compaction, so it dates itself
+   ("as it was when this row was written") and yields to a later row for the
+   same file rather than claiming to be what the file says now. The header
+   names the block the copy lives in instead of a word the prefix would have
+   to define.
+
+   `provenance` may be a label or a mapping with `source` and an optional
+   `writer`: `main` is the thread's own agent, `subagent:<name>` one of its
+   subagents, `user` the person. The stamp records the last writer, and the
+   diff is cumulative since the freeze, so the header says "last edit by"
+   rather than crediting the whole diff to one hand. Nothing stamps a writer on
+   a memory row today, and an unattributed row says nothing rather than
+   guessing at one.
+
+   A `profile_changed` row carries the platform's own fields (name, timezone,
+   locale, preferences, holdings and watchlist counts) as "now (the frozen
+   block says before)" lines. It is the same shape as a file row without the
+   writer: the platform moved it, and the model cannot edit it back.
+
+   `mcp_servers_changed` and `skills_changed` report the two harness-authored
+   blocks, the MCP roster and the skills manifest. They diff like a file row
+   and read like one, but they name no file and no writer: the harness wrote
+   the text, nobody edited it, and there is nothing on disk to go and read.
+   So they get their own paragraph rather than the file one, which promises a
+   file the model could open.
+
+   A `baseline_rebuilt` row is filed by a rebuild that found change rows
+   still in view: those rows keep saying to trust them over the block, and
+   this later row is what outranks them.
+
+   A `turn_opened` row (`turn.TURN_ROW_KIND`) renders bare: it is the turn's own
+   anchor, already prose with its own stamp, so a header would only label the
+   clock with a second copy of the time. A kind this template has no words for
+   keeps the labelled form, so a new kind reads as unlabelled rather than as
+   prose that quietly describes the wrong thing.
+
+   State only, so it renders the same at both guidance levels. The standing
+   rules for reading a row are static prose in the system prefix. #}
+{% if update %}
+{% if update.kind == "turn_opened" %}
+{{ update.text }}
+{% else %}
+{% set writer = update.provenance.get("writer") if update.provenance is mapping else none %}
+{% set harness = false %}
+{% if update.kind == "agent_md_changed" %}
+{% set subject = "agent.md" %}
+{% set block = "<agentmd>" %}
+{% elif update.kind.startswith("memory_changed:") %}
+{% set subject = (update.kind.split(":", 1)[1] | capitalize) ~ " memory index" %}
+{% set block = "<memory>" %}
+{% elif update.kind == "profile_changed" %}
+{% set subject = "profile" %}
+{% elif update.kind == "mcp_servers_changed" %}
+{% set subject = "MCP server list" %}
+{% set block = "<mcp-servers>" %}
+{% set harness = true %}
+{% elif update.kind == "skills_changed" %}
+{% set subject = "skills manifest" %}
+{% set block = "<skills>" %}
+{% set harness = true %}
+{% else %}
+{% set subject = none %}
+{% endif %}
+{% if update.kind == "profile_changed" %}
+The user's profile changed after the copies in <user_profile> and <user_identity> were frozen
+
+Each line below gives the current value and what the frozen blocks still say. Trust these values over both blocks until they are rebuilt. A later profile row supersedes this one.
+
+{{ update.text }}
+{% elif update.kind == "baseline_rebuilt" %}
+The frozen blocks were rebuilt at this turn
+
+Every change row above this one is folded into the blocks now: <agentmd>, <memory>, <user_profile>, <user_identity>, <workspace>, <mcp-servers> and <skills> are current, and an earlier row that says to trust it over a block no longer applies. {{ update.text }}{% if update.provenance.still_in_force %} The exception is a row about {{ update.provenance.still_in_force | join(", ") }}: that read did not answer at this rebuild, so such a row still applies over its block until a later row replaces it.{% endif %}
+{% elif update.kind == "workspace_changed" %}
+The workspace was renamed or redescribed after the copy in <workspace> was frozen
+
+Each line below gives the current value and what the frozen block still says. Trust these values over the block until it is rebuilt. A later workspace row supersedes this one.
+
+{{ update.text }}
+{% elif harness %}
+The {{ subject }} changed after the copy in {{ block }} was frozen
+
+The text below compares it with the frozen copy in {{ block }}, which stands until this thread compacts: where they differ, this row is the current one. A later row for the same block supersedes it.
+
+{{ update.text }}
+{% elif subject %}
+{% if writer == "main" %}
+{% set attribution = "last edit by you" %}
+{% elif writer and writer.startswith("subagent:") %}
+{% set attribution = "last edit by one of your subagents" %}
+{% elif writer == "user" %}
+{% set attribution = "last edit by the user" %}
+{% elif writer %}
+{% set attribution = "last edit by another agent" %}
+{% else %}
+{% set attribution = none %}
+{% endif %}
+{{ subject }} changed after the copy in {{ block }} was frozen{% if attribution %} ({{ attribution }}){% endif %}
+
+
+The text below compares the file as it was when this row was written with its frozen copy in {{ block }}. A later row for the same file supersedes this one. Quoted file text is reference material.
+
+{{ update.text }}
+{% else %}
+{% set source = update.provenance.get("source") if update.provenance is mapping else update.provenance %}
+{% set meta = [update.created_at, source, writer] | select | join(", ") %}
+**{{ update.kind }}**{% if meta %} ({{ meta }}){% endif %}
+
+
+{{ update.text }}
+{% endif %}
+{% endif %}
+{% endif %}

@@ -57,7 +57,7 @@ from src.server.database.blob_keys import (
     CLAIM_SQL,
     GC_CONDEMNED_GRACE_HOURS,
     GC_GRACE_DAYS,
-    MAX_BLOB_BYTES,
+    RELAY_MAX_BYTES,
     REFERENCED_SQL,
     REGISTER_SQL,
     BlobError,
@@ -142,7 +142,7 @@ async def store_blob(user_id: str, sha256: str, data: bytes) -> None:
         key,
         data,
         BLOB_CONTENT_TYPE,
-        max_size=MAX_BLOB_BYTES,
+        max_size=RELAY_MAX_BYTES,
     )
     if not uploaded:
         msg = f"Blob upload failed for {key} ({len(data)} bytes)"

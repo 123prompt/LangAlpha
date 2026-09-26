@@ -82,7 +82,7 @@ def build_fallback_pairs(config: Any) -> list[tuple[str, Any]]:
     resolving names via the platform manifest.
     """
     clients = getattr(config, "fallback_llm_clients", None)
-    if clients:
+    if clients is not None:
         names = getattr(config, "fallback_llm_names", None)
         if names and len(names) == len(clients):
             return list(zip(names, clients))

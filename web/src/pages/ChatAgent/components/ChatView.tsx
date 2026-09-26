@@ -5,28 +5,37 @@ import { ArrowLeft, FolderOpen, ScrollText, TextSelect, Minus, Menu, Info, Clock
 import { HoverCard, HoverCardTrigger, HoverCardContent } from '@/components/ui/hover-card';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useStableHandler } from '@/hooks/useStableHandler';
-import { useNarrowContainer } from '@/hooks/useNarrowContainer';
 import { ScrollArea } from '../../../components/ui/scroll-area';
 import { usePreferences } from '@/hooks/usePreferences';
 import { readTurnEndScroll } from '@/lib/turnEndScroll';
+import {
+  readStreamingMode,
+  readTurnDisplay,
+  TranscriptDisplayContext,
+  type TranscriptDisplay,
+} from '@/lib/transcriptDisplay';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 import { modelPrefs } from '@/lib/modelPreferences';
 import { updateCurrentUser } from '../../Dashboard/utils/api';
-import { summarizeThread, offloadThread, getThreadShareStatus, updateThreadSharing, cancelSubagentTask } from '../utils/api';
-import { buildSharedServeUrl, buildWsfilesUrl } from './viewers/html/wsfilesUrl';
-import ShareReportLinkModal from './ShareReportLinkModal';
+import { cardDownloadKey, trackPending } from '../utils/downloadNotice';
+import { summarizeThread, offloadThread, cancelSubagentTask, triggerFileDownload, resolveWorkspaceFile } from '../utils/api';
+import { downloadTarget } from '../utils/fileRefResolver';
 import { toast } from '@/components/ui/use-toast';
 import { mergeWarmingDisplay } from '../utils/warmWorkspace';
 import { useChatMessages } from '../hooks/useChatMessages';
+import { useThreadFeedRunId } from '@/lib/threadLifecycle/store';
+import { QueuedAutomationNotice } from './QueuedAutomationNotice';
 import { saveChatSession, getChatSession, clearChatSession } from '../hooks/utils/chatSessionRestore';
 import type { PreviewData } from '../hooks/utils/types';
 import { useCardState } from '../hooks/useCardState';
 import { useWorkspaceFiles } from '../hooks/useWorkspaceFiles';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { classifyAgentPath } from '../utils/agentPaths';
+import { fileArtifactPath } from '../utils/fileArtifact';
+import type { FileOperationArtifactPayload } from '@/types/api';
 import { taskIdFromAgentId } from '../utils/agentId';
 import {
   routeStopAction,
@@ -39,11 +48,12 @@ import './FilePanel.css';
 import ChatInput, { type ChatInputHandle } from '../../../components/ui/chat-input';
 import { attachmentsToContexts, widgetSnapshotsToContexts, type Attachment } from '../utils/fileUpload';
 import MessageList, { normalizeSubagentText } from './MessageList';
-import { MessageActionsProvider, type MessageActions } from './messageList/MessageActionsContext';
+import { MessageActionsProvider } from './messageList/MessageActionsContext';
 import { SubagentTelemetryContext } from './SubagentTelemetryContext';
 import { WorkflowRunContext } from './WorkflowRunContext';
 import WorkflowRunDetail from './WorkflowRunDetail';
 import { WORKFLOW_TASK_TYPE } from '../session/subagents/workflowRunState';
+import { deriveSubagentStatus, isTerminalStatus } from '../session/subagents/subagentStatus';
 import Markdown from './Markdown';
 import NavigationPanel from './NavigationPanel';
 import NavDisplayOptions from './NavDisplayOptions';
@@ -63,7 +73,7 @@ import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 
 
 
-const RightPanel = React.lazy(() => import('./RightPanel'));
+const FilePanel = React.lazy(() => import('./FilePanel'));
 const DetailPanel = React.lazy(() => import('./DetailPanel'));
 const PreviewViewer = React.lazy(() => import('./viewers/PreviewViewer'));
 
@@ -75,6 +85,7 @@ import {
 import SubagentStatusIndicator from './chatView/SubagentStatusIndicator';
 import { ModelStatusPill } from './chatView/ModelStatusPill';
 import { FallbackSuggestionPill } from './chatView/FallbackSuggestionPill';
+import { ChatDiskWarning } from './chatView/ChatDiskWarning';
 import { useToolCallAnnouncer } from './chatView/useToolCallAnnouncer';
 import { useNavPanel } from './chatView/useNavPanel';
 import { useChatScroll } from './chatView/useChatScroll';
@@ -82,6 +93,9 @@ import { useTurnEndScroll } from './chatView/useTurnEndScroll';
 import { useSubagentTabs } from './chatView/useSubagentTabs';
 import { publishSidebarAgents, clearSidebarAgents } from './sidebarAgentsBridge';
 import { useRightPanel } from './chatView/useRightPanel';
+import { usePanelChartSelections } from './chatView/usePanelChartSelections';
+import { SelectionChips } from '@/pages/MarketView/components/SelectionChips';
+import { useMessageActionBundles } from './chatView/useMessageActionBundles';
 
 
 function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName: initialWorkspaceName, isActive = true, onThreadResolved, warmingState = false }: ChatViewProps): React.ReactElement | null {
@@ -183,6 +197,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     clearSubagentCards,
   } = useCardState();
 
+  // Every subagent's own messages, so a tool row clicked in one of their
+  // transcripts resolves to its live record the way a main-thread row does.
+  const subagentTranscripts = useMemo(
+    () => Object.values(cards).flatMap((card) => (card.subagentData?.messages ? [card.subagentData.messages] : [])),
+    [cards],
+  );
+
   // Sync onboarding_completed via PUT when ChatAgent completes onboarding (risk_preference + stocks)
   const handleOnboardingRelatedToolComplete = useCallback(async () => {
     try {
@@ -220,7 +241,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // truth — same logic the chat row click routing uses.
   const handleFileArtifact = useCallback((event: { payload?: Record<string, unknown> }) => {
     refreshFiles();
-    const filePath = (event?.payload?.file_path as string | undefined) ?? '';
+    const filePath = fileArtifactPath(event?.payload as FileOperationArtifactPayload | undefined);
     if (!filePath) return;
     const info = classifyAgentPath(filePath);
     if (info.kind === 'memory') {
@@ -280,10 +301,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
     handleResumeCreditPause,
+    handleApproveToolCall,
+    handleRejectToolCall,
     tokenUsage,
     threadId: currentThreadId,
     threadModels,
-    lastThreadModel,
     marketWatch,
     isShared: threadIsShared,
     insertNotification,
@@ -294,6 +316,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleThumbDown,
     feedbackByTurn,
     reconnectIfStaleRun,
+    currentRunIdRef,
     getSubagentHistory,
     resolveSubagentIdToAgentId,
     hydrateTaskTranscript,
@@ -384,9 +407,18 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isSubagentNearBottomRef,
     restoredForThreadRef,
     pinToMessage,
+    revealFiles,
     pinTargetRef,
   } = scroll;
   useTurnEndScroll(scroll, { messages, isStreaming, isActiveRef, turnEndScroll: readTurnEndScroll(preferences) });
+
+  // One value for both transcripts below (main thread and subagent tab), so a
+  // flip in Settings reaches them together and neither re-renders on the other's
+  // account.
+  const transcriptDisplay = useMemo<TranscriptDisplay>(
+    () => ({ turnDisplay: readTurnDisplay(preferences), streamingMode: readStreamingMode(preferences) }),
+    [preferences],
+  );
 
   // Subagent tab registry + card refresh (chatView/useSubagentTabs).
   const {
@@ -416,6 +448,16 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     activeAgentIdRef,
     resolvedThreadIdRef,
   });
+
+  // Whether the open subagent's turn is still running. A bubble's own
+  // `isStreaming` goes false between two model calls of one agent loop, so a
+  // transcript that judged liveness by the bubble alone would fold a working
+  // task behind a "Worked for" summary and then unfold it. The task's own
+  // status is the turn-length signal, read through the same derivation the
+  // status indicator above the transcript uses.
+  const subagentTurnLive = activeAgent
+    ? !isTerminalStatus(deriveSubagentStatus({ status: activeAgent.status, messages: activeAgent.messages }))
+    : false;
 
   // Publish this view's subagent registry to the global AppSidebar while it is
   // the visible ChatView. Same thread key as the drawer's `currentThreadId`
@@ -472,6 +514,39 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // desktop the whole data layer is parked: five cached ChatViews would
   // otherwise each run the workspace list, the thread queries and the store
   // subscriptions for a panel that is never shown.
+  // NavigationPanel is memoized, and this node is one of its props: built
+  // inline it was new on every render of this view, which is every streamed
+  // token, and the whole sidebar tree rendered with it.
+  const navHeaderActions = useMemo(() => (
+      <>
+        {/* Sidebar display options (workspace/thread visibility) —
+            pinned to the left edge; margin-right:auto pushes the pin +
+            minimize controls to the right of the header row. */}
+        <div style={{ marginRight: 'auto', display: 'flex', alignItems: 'center' }}>
+          <NavDisplayOptions />
+        </div>
+        {/* Minimize button — closes the drawer */}
+        <button
+          onClick={handleNavMinimize}
+          className="nav-panel-dismiss-btn"
+          style={{
+            padding: 4,
+            background: 'transparent',
+            border: 'none',
+            cursor: 'pointer',
+            borderRadius: 4,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+          title={t('nav.minimize')}
+          aria-label={t('nav.minimize')}
+        >
+          <Minus className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
+        </button>
+      </>
+  ), [handleNavMinimize, t]);
+
   const navTreeProps = useNavTreeProps({
     currentWorkspaceId: workspaceId,
     currentThreadId: sidebarAgentsKey,
@@ -481,70 +556,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     fallbackWorkspaceName: workspaceName,
   });
   navWorkspacesRef.current = navTreeProps.workspaces;
-
-  // Copy-a-link to an HTML report opens a consent chooser; the actual copy runs
-  // in one of the two handlers below depending on the user's pick.
-  const [shareLinkFile, setShareLinkFile] = useState<string | null>(null);
-
-  const handleCopyShareLink = useCallback((filePath: string) => {
-    setShareLinkFile(filePath);
-  }, []);
-
-  // Shareable link: public, revocable, token-scoped. Enables thread sharing
-  // with allow_files on first use (always fetching live status first, so
-  // spreading the current permissions preserves any existing allow_download
-  // rather than clearing it), then copies the public serve URL. Throws on
-  // failure so the chooser stays open.
-  const copyShareableReportLink = useCallback(async () => {
-    const filePath = shareLinkFile;
-    const tid = currentThreadIdRef.current;
-    if (!filePath || !tid) return;
-    try {
-      let status = await getThreadShareStatus(tid);
-      if (!status?.is_shared || !status?.share_token) {
-        status = await updateThreadSharing(tid, {
-          is_shared: true,
-          permissions: { ...(status?.permissions || {}), allow_files: true },
-        });
-      } else if (!status.permissions?.allow_files) {
-        status = await updateThreadSharing(tid, {
-          is_shared: true,
-          permissions: { ...status.permissions, allow_files: true },
-        });
-      }
-      const token = status?.share_token;
-      if (!token) throw new Error('No share token');
-      // buildSharedServeUrl encodes each path segment but preserves slashes, so
-      // relative subresources still resolve. It's relative when the API base is
-      // same-origin (the nginx case); make it absolute for a copyable link.
-      const served = buildSharedServeUrl(token, filePath);
-      const url = /^https?:\/\//i.test(served) ? served : `${window.location.origin}${served}`;
-      await navigator.clipboard.writeText(url);
-      toast({ description: t('filePanel.shareLinkCopied') });
-    } catch (e) {
-      console.error('[ChatView] Copy shareable link failed:', e);
-      toast({ description: t('filePanel.shareLinkFailed'), variant: 'destructive' });
-      throw e;
-    }
-  }, [shareLinkFile, t]);
-
-  // Direct link: the raw wsfiles URL (workspace UUID is the credential). Renders
-  // the file full screen. No sharing is enabled, but the link is not revocable
-  // and reaches the whole workspace. Throws on failure so the chooser stays open.
-  const copyDirectReportLink = useCallback(async () => {
-    const filePath = shareLinkFile;
-    if (!filePath) return;
-    try {
-      const served = buildWsfilesUrl(workspaceId, filePath);
-      const url = /^https?:\/\//i.test(served) ? served : `${window.location.origin}${served}`;
-      await navigator.clipboard.writeText(url);
-      toast({ description: t('filePanel.directLinkCopied') });
-    } catch (e) {
-      console.error('[ChatView] Copy direct link failed:', e);
-      toast({ description: t('filePanel.shareLinkFailed'), variant: 'destructive' });
-      throw e;
-    }
-  }, [shareLinkFile, workspaceId, t]);
 
   // Save chat session on unmount for cross-tab restoration (workspace + thread only).
   // Only the active view saves — evicted hidden views must not overwrite (R1).
@@ -619,6 +630,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
   }, [isCompacting, isLoading, handleStop, stableStopCompaction]);
 
+  const { chips: chartSelectionChips, takeForSend: takeChartSelections } = usePanelChartSelections(isActive);
+
   // Wrapper: converts ChatInput's (message, planMode, attachments, slashCommands) into
   // handleSendMessage(message, planMode, additionalContext, attachmentMeta)
   const handleSendWithAttachments = useCallback((message: string, planMode: boolean, attachments: Attachment[] = [], slashCommands: SlashCommand[] = [], modelOptions: ModelOptions = {}) => {
@@ -668,9 +681,22 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       contexts.push(...(items as unknown as Record<string, unknown>[]));
     }
 
+    // Regions and price levels picked on a panel chart tab.
+    const picked = takeChartSelections(message);
+    if (picked) {
+      contexts.push(...picked.contexts);
+      if (picked.attachments.length > 0) attachmentMeta = [...(attachmentMeta ?? []), ...picked.attachments];
+    }
+
     const additionalContext = contexts.length > 0 ? contexts : null;
-    stableSendMessage(message, planMode, additionalContext, attachmentMeta, modelOptions);
-  }, [marketWatchEnabled, stableSendMessage]);
+    stableSendMessage(
+      picked?.outgoingMessage ?? message,
+      planMode,
+      additionalContext,
+      attachmentMeta,
+      picked ? { ...modelOptions, chartSelections: picked.snapshots } : modelOptions,
+    );
+  }, [marketWatchEnabled, stableSendMessage, takeChartSelections]);
 
   // Handle action-type slash commands (e.g. /compact, /compaction, /offload)
   const handleAction = useCallback((cmd: ActionCommand) => {
@@ -810,11 +836,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
 
 
+  // The route's `__default__` stands for a chat with no thread yet; handing it
+  // to the panel would give every unsent chat in a workspace one shared strip.
+  const liveThreadId = currentThreadId || threadId;
+  const panelThreadId = liveThreadId && liveThreadId !== '__default__' ? liveThreadId : undefined;
+
   // Right-panel controller (chatView/useRightPanel).
   const {
     panelTarget,
-    handleTargetFileHandled,
-    handleTargetDirHandled,
+    handleTargetHandled,
     handleTargetMemoryHandled,
     handleTargetMemoHandled,
     rightPanelType,
@@ -829,118 +859,121 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleOpenFileFromChat,
     handleOpenSourcesFromChat,
     handleOpenStatusFromChat,
-    handleOpenDirFromChat,
     handleToolCallDetailClick,
     handlePlanDetailClick,
     handleCloseDetailPanel,
     handleClosePreview,
     handleRefreshPreview,
     handleToggleFilePanel,
+    handleFilesDirtyChange,
+    handleActiveTabKindChange,
+    activeTabKind,
+    confirmLeaveFiles,
     handleOpenPreview,
+    handleOpenChart,
+    handleOpenInMarketView,
     detailToolCall,
     detailPlanData,
-    sourcesRecords,
-    allSourcesRecords,
+    getToolCallProcess,
+    getSourcesRecords,
+    getAllSourcesRecords,
+    getRecentWritePaths,
+    getWriteLog,
   } = useRightPanel({
     isMobile,
     workspaceId,
+    workspaceDirName: workspaceRecord?.dir_name,
+    threadId: panelThreadId,
     isActive,
     containerRef,
     setFilePanelWorkspaceId,
+    filePanelWorkspaceId,
+    isFlashMode,
     messages,
+    subagentTranscripts,
+    watching: showWatchChip,
   });
 
   // Keep the ref in sync so SSE events (via handleOpenPreviewFromStream) use the latest closure
   openPreviewRef.current = handleOpenPreview;
 
-  // -------------------------------------------------------------------------
-  // Stable handler identities for the memoized message tree. MessageBubble is
-  // memo'd, but the handlers below are recreated upstream on every streamed
-  // chunk (useChatMessages/useRightPanel re-render per chunk) — passing them
-  // straight through would re-render every settled bubble on every chunk.
-  // useStableHandler pins each identity while always invoking the freshest
-  // closure, which is exactly what edit/regenerate need: their turn-index
-  // math must read the current messages array, never a memoized snapshot.
-  const stableOpenFile = useStableHandler(handleOpenFileFromChat);
-  const stableOpenSources = useStableHandler(handleOpenSourcesFromChat);
-  const stableOpenDir = useStableHandler(handleOpenDirFromChat);
-  const stableToolCallDetail = useStableHandler(handleToolCallDetailClick);
-  const stableOpenSubagentTask = useStableHandler(handleOpenSubagentTask);
-  const stableApprovePlan = useStableHandler(handleApproveInterrupt);
-  const stableRejectPlan = useStableHandler(handleRejectInterrupt);
-  const stablePlanDetail = useStableHandler(handlePlanDetailClick);
-  const stableAnswerQuestion = useStableHandler(handleAnswerQuestion);
-  const stableSkipQuestion = useStableHandler(handleSkipQuestion);
-  const stableApproveCreateWorkspace = useStableHandler(handleApproveCreateWorkspace);
-  const stableRejectCreateWorkspace = useStableHandler(handleRejectCreateWorkspace);
-  const stableApproveStartQuestion = useStableHandler(handleApproveStartQuestion);
-  const stableRejectStartQuestion = useStableHandler(handleRejectStartQuestion);
-  const stableApprovePTCAgent = useStableHandler(handleApprovePTCAgent);
-  const stableRejectPTCAgent = useStableHandler(handleRejectPTCAgent);
-  const stableApproveSecretaryAction = useStableHandler(handleApproveSecretaryAction);
-  const stableRejectSecretaryAction = useStableHandler(handleRejectSecretaryAction);
-  const stableResumeCreditPause = useStableHandler(handleResumeCreditPause);
-  const stableEditMessage = useStableHandler((id: string, content: string) =>
-    handleEditMessage(id, content, chatInputRef.current?.getModelOptions?.()));
-  const stableRegenerate = useStableHandler((id: string) =>
-    handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
-  const stableRetry = useStableHandler(() => handleRetry(chatInputRef.current?.getModelOptions?.()));
-  const stableReportWithAgent = useStableHandler((instruction: string) => {
-    handleSendMessage(`/self-improve ${instruction}`);
-  });
-  // Feedback handlers close over the stored ratings, so their raw identity
-  // churns on every load/submit — wrap them or a single thumbs click would
-  // re-render the whole transcript through the context value.
-  const stableThumbUp = useStableHandler(handleThumbUp);
-  const stableThumbDown = useStableHandler(handleThumbDown);
+  // A deliverable card names its own workspace only for a cross-workspace ref;
+  // otherwise the file belongs to the thread's own workspace, which the card
+  // has no way to know.
+  const downloadKeyFor = useCallback(
+    (path: string, targetWorkspaceId?: string) => cardDownloadKey(targetWorkspaceId ?? workspaceId, path),
+    [workspaceId],
+  );
+  const handleDownloadFileFromChat = useCallback((path: string, targetWorkspaceId?: string) => {
+    const wsId = targetWorkspaceId ?? workspaceId;
+    if (!wsId) return;
+    return trackPending(downloadKeyFor(path, targetWorkspaceId), async () => {
+      try {
+        // This thread's writes break ties between namesakes, and they only name
+        // files in its own workspace, so a card pointing elsewhere resolves
+        // without them.
+        const writes = wsId === workspaceId ? getRecentWritePaths() : [];
+        const target = await downloadTarget(
+          path,
+          (candidates, recentWrites) => resolveWorkspaceFile(wsId, candidates, recentWrites),
+          writes,
+        );
+        // The lookup found namesakes and could not pick one, so there is no file
+        // to save and a fetch of the reference as written would 404 in silence.
+        // Open already asks which one the reader meant, so the click goes there.
+        if (!target.placed) {
+          handleOpenFileFromChat(path, targetWorkspaceId);
+          return false;
+        }
+        await triggerFileDownload(wsId, target.path);
+        return true;
+      } catch (err: unknown) {
+        console.error('[ChatView] Download failed:', err);
+        // A card's Download is the whole interaction: nothing opens, nothing
+        // navigates, and the browser shows no save. Without this the click is
+        // indistinguishable from a dead button.
+        toast({ description: t('filePanel.downloadFailed'), variant: 'destructive' });
+        return false;
+      }
+    });
+  }, [workspaceId, downloadKeyFor, getRecentWritePaths, handleOpenFileFromChat, t]);
 
-  // The main transcript's action surface. Every member is identity-stable, so
-  // this object is built once and never re-renders the memoized message tree.
-  const messageActions = useMemo<MessageActions>(() => ({
-    onOpenFile: stableOpenFile,
-    onOpenSources: stableOpenSources,
-    onOpenDir: stableOpenDir,
-    onToolCallDetailClick: stableToolCallDetail,
-    onOpenSubagentTask: stableOpenSubagentTask,
-    onApprovePlan: stableApprovePlan,
-    onRejectPlan: stableRejectPlan,
-    onPlanDetailClick: stablePlanDetail,
-    onAnswerQuestion: stableAnswerQuestion,
-    onSkipQuestion: stableSkipQuestion,
-    onApproveCreateWorkspace: stableApproveCreateWorkspace,
-    onRejectCreateWorkspace: stableRejectCreateWorkspace,
-    onApproveStartQuestion: stableApproveStartQuestion,
-    onRejectStartQuestion: stableRejectStartQuestion,
-    onApprovePTCAgent: stableApprovePTCAgent,
-    onRejectPTCAgent: stableRejectPTCAgent,
-    onApproveSecretaryAction: stableApproveSecretaryAction,
-    onRejectSecretaryAction: stableRejectSecretaryAction,
-    onResumeCreditPause: stableResumeCreditPause,
-    onEditMessage: stableEditMessage,
-    onRegenerate: stableRegenerate,
-    onRetry: stableRetry,
-    onThumbUp: stableThumbUp,
-    onThumbDown: stableThumbDown,
-    onReportWithAgent: stableReportWithAgent,
+  // Identity-stable action bundles for the memoized message tree
+  // (chatView/useMessageActionBundles).
+  const { messageActions, subagentMessageActions } = useMessageActionBundles({
+    onOpenFile: handleOpenFileFromChat,
+    onDownloadFile: handleDownloadFileFromChat,
+    downloadKeyFor,
+    onRevealFiles: revealFiles,
+    onOpenSources: handleOpenSourcesFromChat,
+    onToolCallDetailClick: handleToolCallDetailClick,
+    onOpenChart: handleOpenChart,
+    onOpenSubagentTask: handleOpenSubagentTask,
+    onApprovePlan: handleApproveInterrupt,
+    onRejectPlan: handleRejectInterrupt,
+    onPlanDetailClick: handlePlanDetailClick,
+    onAnswerQuestion: handleAnswerQuestion,
+    onSkipQuestion: handleSkipQuestion,
+    onApproveCreateWorkspace: handleApproveCreateWorkspace,
+    onRejectCreateWorkspace: handleRejectCreateWorkspace,
+    onApproveStartQuestion: handleApproveStartQuestion,
+    onRejectStartQuestion: handleRejectStartQuestion,
+    onApprovePTCAgent: handleApprovePTCAgent,
+    onRejectPTCAgent: handleRejectPTCAgent,
+    onApproveSecretaryAction: handleApproveSecretaryAction,
+    onRejectSecretaryAction: handleRejectSecretaryAction,
+    onResumeCreditPause: handleResumeCreditPause,
+    onApproveToolCall: handleApproveToolCall,
+    onRejectToolCall: handleRejectToolCall,
+    onThumbUp: handleThumbUp,
+    onThumbDown: handleThumbDown,
     onWidgetSendPrompt: stableSendMessage,
-  }), [
-    stableOpenFile, stableOpenSources, stableOpenDir, stableToolCallDetail,
-    stableOpenSubagentTask, stableApprovePlan, stableRejectPlan, stablePlanDetail,
-    stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
-    stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
-    stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableResumeCreditPause,
-    stableEditMessage, stableRegenerate, stableRetry,
-    stableThumbUp, stableThumbDown, stableReportWithAgent, stableSendMessage,
-  ]);
-
-  // The subagent transcript is a DIFFERENT surface: its cards belong to a task,
-  // not to the main thread's turn, so the main thread's approve/reject/edit
-  // handlers must not be reachable from it. Navigation only.
-  const subagentMessageActions = useMemo<MessageActions>(() => ({
-    onOpenFile: stableOpenFile,
-    onToolCallDetailClick: stableToolCallDetail,
-  }), [stableOpenFile, stableToolCallDetail]);
+    onEditMessage: handleEditMessage,
+    onRegenerate: handleRegenerate,
+    onRetry: handleRetry,
+    onSendMessage: handleSendMessage,
+    chatInputRef,
+  });
 
   // Flash-mode deep-link context for PTC-agent proposal cards. Memoized: a
   // fresh object per render would defeat the bubble memo in flash mode.
@@ -985,7 +1018,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // Collapse avatars when the messages column is too narrow to comfortably
   // accommodate them (mobile, side panels, etc.). 640px matches the visual
   // breakpoint where avatar gutters start crowding the message bubble.
-  const isNarrowChat = useNarrowContainer(msgAreaRef, 640);
 
   const handleMessageMouseUp = useCallback(() => {
     // Small delay to let the browser finalize the selection
@@ -1255,6 +1287,33 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     prevIsActiveRef.current = isActive;
   }, [isActive, getScrollContainer, currentThreadId, threadId, pinToBottom, inheritNavOnActivate, skipNavAnimRef, isNearBottomRef, restoredForThreadRef]);
 
+  // A run that starts on this thread from somewhere else (another tab, an
+  // automation that waited for the last turn) is announced on the user feed
+  // and brought in the way a re-shown view catches up. It is held while this
+  // view streams or loads: a waiting automation starts the moment the turn
+  // settles, often before this view's stream has closed. The view's own run
+  // is announced too and can end before its announcement lands, when the turn
+  // watermark (only a lower bound) could take the view for stale and reload
+  // it for nothing, so a run this view streamed is passed over. So is a run
+  // while the report-back watch is armed, since that watch attaches the
+  // thread's report-back runs itself and a reload would race it.
+  const feedThreadId = currentThreadId || threadId;
+  const feedRunId = useThreadFeedRunId(feedThreadId);
+  const lastFeedRunRef = useRef({ threadId: feedThreadId, runId: feedRunId });
+  const pendingFeedRunRef = useRef<string | null>(null);
+  useEffect(() => {
+    const last = lastFeedRunRef.current;
+    lastFeedRunRef.current = { threadId: feedThreadId, runId: feedRunId };
+    // Hidden, the become-active effect above catches up instead.
+    if (last.threadId !== feedThreadId || !isActive) pendingFeedRunRef.current = null;
+    else if (feedRunId && feedRunId !== last.runId) pendingFeedRunRef.current = feedRunId;
+    const pending = pendingFeedRunRef.current;
+    if (!pending || isLoading || isLoadingHistory) return;
+    pendingFeedRunRef.current = null;
+    if (awaitingReportBack || pending === currentRunIdRef.current) return;
+    void reconnectIfStaleRunRef.current();
+  }, [feedThreadId, feedRunId, isActive, isLoading, isLoadingHistory, awaitingReportBack, currentRunIdRef]);
+
   // Early return if workspaceId or threadId is missing
   if (!workspaceId || !threadId) {
     return (
@@ -1287,13 +1346,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       <div aria-live="polite" aria-atomic="false" className="sr-only">
         {recentlyCompletedAnnouncement}
       </div>
-      <ShareReportLinkModal
-        open={shareLinkFile !== null}
-        fileName={shareLinkFile?.split('/').pop() || ''}
-        onCopyShareable={copyShareableReportLink}
-        onCopyDirect={copyDirectReportLink}
-        onClose={() => setShareLinkFile(null)}
-      />
       {/* Left Side: Topbar + Sidebar + Chat Window */}
       <div className="flex flex-col flex-1 min-w-0">
         {/* Top bar */}
@@ -1360,7 +1412,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
           <div className="flex items-center gap-2">
             {currentThreadId && currentThreadId !== '__default__' && (
-              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} />
+              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={isFlashMode ? null : workspaceId} />
             )}
             {(!isFlashMode || filePanelWorkspaceId) && (
               <button
@@ -1422,35 +1474,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   style={{ width: '100%', height: '100%', position: 'absolute', left: 0, top: 0 }}
                 >
                   <NavigationPanel
-                    headerActions={
-                      <>
-                        {/* Sidebar display options (workspace/thread visibility) —
-                            pinned to the left edge; margin-right:auto pushes the pin +
-                            minimize controls to the right of the header row. */}
-                        <div style={{ marginRight: 'auto', display: 'flex', alignItems: 'center' }}>
-                          <NavDisplayOptions />
-                        </div>
-                        {/* Minimize button — closes the drawer */}
-                        <button
-                          onClick={handleNavMinimize}
-                          className="nav-panel-dismiss-btn"
-                          style={{
-                            padding: 4,
-                            background: 'transparent',
-                            border: 'none',
-                            cursor: 'pointer',
-                            borderRadius: 4,
-                            display: 'flex',
-                            alignItems: 'center',
-                            justifyContent: 'center',
-                          }}
-                          title={t('nav.minimize')}
-                          aria-label={t('nav.minimize')}
-                        >
-                          <Minus className="h-4 w-4" style={{ color: 'var(--color-text-tertiary)' }} />
-                        </button>
-                      </>
-                    }
+                    headerActions={navHeaderActions}
                     isActive={isActive}
                     {...navTreeProps}
                   />
@@ -1468,6 +1492,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 MessageContentSegments stay React.memo'd. */}
             <SubagentTelemetryContext.Provider value={resolveSubagentTelemetry}>
             <WorkflowRunContext.Provider value={resolveWorkflowRun}>
+            <TranscriptDisplayContext.Provider value={transcriptDisplay}>
             <div
               ref={msgAreaRef}
               className="flex-1 overflow-hidden"
@@ -1504,9 +1529,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           messages={messages as unknown as MessageRecord[]}
                           isLoading={isLoading}
                           isLoadingHistory={isLoadingHistory}
-                          hideAvatar={isNarrowChat}
                           feedbackByTurn={feedbackByTurn}
                           flashContext={flashContext}
+                          workspaceDirName={workspaceRecord?.dir_name}
                         />
                       </MessageActionsProvider>
                     </div>
@@ -1577,10 +1602,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       {(activeAgent.messages?.length ?? 0) > 0 && (
                         <div style={{ borderTop: '0.5px solid var(--color-border-muted)', paddingTop: '8px' }}>
                           <MessageActionsProvider actions={subagentMessageActions}>
+                            {/* Keyed per agent: which folds are open is one
+                                transcript's state, and every subagent numbers
+                                its turns from 0. */}
                             <MessageList
+                              key={activeAgentId}
                               messages={activeAgent.messages as MessageRecord[]}
                               isSubagentView={true}
-                              hideAvatar={true}
+                              isLoading={subagentTurnLive}
+                              workspaceDirName={workspaceRecord?.dir_name}
                             />
                           </MessageActionsProvider>
                         </div>
@@ -1618,6 +1648,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 />
               )}
             </div>
+            </TranscriptDisplayContext.Provider>
             </WorkflowRunContext.Provider>
             </SubagentTelemetryContext.Provider>
 
@@ -1658,12 +1689,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     {messageError && !isLoading && (
                       <ErrorBanner error={messageError} />
                     )}
+                    {!isFlashMode && workspaceRecord?.computer_id && (
+                      <ChatDiskWarning computerId={workspaceRecord.computer_id} />
+                    )}
                     <ModelStatusPill modelStatus={modelStatus} isLoading={isLoading} />
                     <FallbackSuggestionPill
                       fallbackSuggestion={fallbackSuggestion}
                       isLoading={isLoading}
                       inputModel={inputModel}
-                      lastThreadModel={lastThreadModel}
                       activePreferredModel={activePreferredModel}
                       onSwitchModel={handleSwitchModel}
                       onDismiss={clearFallbackSuggestion}
@@ -1736,9 +1769,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         {t('chat.queuedSend')}
                       </div>
                     )}
+                    <QueuedAutomationNotice threadId={feedThreadId} active={isActive} />
+                    <SelectionChips chips={chartSelectionChips} />
                     <ChatInput
                       ref={chatInputRef}
                       onSend={handleSendWithAttachments}
+                      hasExternalContext={chartSelectionChips.length > 0}
                       disabled={isLoadingHistory || !workspaceId || !!pendingInterrupt}
                       onStop={handleStopButton}
                       isLoading={isLoading}
@@ -1747,7 +1783,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       files={workspaceFiles}
                       tokenUsage={tokenUsage}
                       onAction={handleAction}
-                      initialModel={lastThreadModel}
                       onModelChange={setInputModel}
                       threadModels={threadModels}
                       mode={isFlashMode ? 'fast' : 'ptc'}
@@ -1795,7 +1830,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             <DetailPanel
               toolCallProcess={detailToolCall}
               planData={detailPlanData}
-              onClose={handleCloseDetailPanel}
               onOpenFile={handleOpenFileFromChat}
               onOpenSubagentTask={handleOpenSubagentTask}
             />
@@ -1803,7 +1837,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         </MobileBottomSheet>
       )}
 
-      {/* Mobile preview bottom sheet */}
+      {/* Mobile preview bottom sheet. Desktop shows a running app as a tab in
+          the file panel instead; the sheet has no tab strip to land in. */}
       {isMobile && (
         <MobileBottomSheet
           open={rightPanelType === 'preview' && !!previewData}
@@ -1839,11 +1874,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             initial={{ x: '100%' }}
             animate={{ x: 0 }}
             transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-            drag="x"
+            // A chart pans with the same rightward swipe, so a chart tab closes by its button.
+            drag={activeTabKind === 'chart' ? false : 'x'}
             dragConstraints={{ left: 0, right: 0 }}
             dragElastic={{ left: 0, right: 0.5 }}
             onDragEnd={(_: unknown, info: PanInfo) => {
               if (info.velocity.x > 300 || info.offset.x > 120) {
+                if (!confirmLeaveFiles()) return;
                 setRightPanelType(null);
                 popPanelHistory();
               }
@@ -1854,18 +1891,26 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             <div className="flex-shrink-0 h-full" style={{ width: '100%' }}>
               <Suspense fallback={null}>
                 <WorkspaceProvider workspaceId={effectiveFileWorkspaceId || workspaceId} downloadFile={null}>
-                <RightPanel
+                <FilePanel
                   workspaceId={effectiveFileWorkspaceId || workspaceId}
+                  threadId={panelThreadId}
+                  isActive={isActive}
                   onClose={() => { setRightPanelType(null); popPanelHistory(); }}
-                  panelTarget={panelTarget}
-                  onTargetFileHandled={handleTargetFileHandled}
-                  onTargetDirHandled={handleTargetDirHandled}
+                  onDirtyChange={handleFilesDirtyChange}
+                  onActiveTabKindChange={handleActiveTabKindChange}
+                  target={panelTarget}
+                  onTargetHandled={handleTargetHandled}
                   onTargetMemoryHandled={handleTargetMemoryHandled}
                   onTargetMemoHandled={handleTargetMemoHandled}
-                  sourcesRecords={sourcesRecords}
-                  allSourcesRecords={allSourcesRecords}
+                  onOpenInMarketView={handleOpenInMarketView}
+                  onOpenSubagentTask={handleOpenSubagentTask}
+                  getToolCallProcess={getToolCallProcess}
+                  getSourcesRecords={getSourcesRecords}
+                  getAllSourcesRecords={getAllSourcesRecords}
                   marketWatch={marketWatch}
                   onOpenFile={handleOpenFileFromChat}
+                  getRecentWritePaths={getRecentWritePaths}
+                  getWriteLog={getWriteLog}
                   files={workspaceFiles}
                   filesLoading={filesLoading}
                   filesError={filesError}
@@ -1880,7 +1925,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   }}
                   readOnly={isFlashMode}
                   singleFileMode={isFlashMode && !!filePanelWorkspaceId}
-                  onCopyShareLink={isFlashMode ? null : handleCopyShareLink}
+                  canShare={!isFlashMode}
                 />
                 </WorkspaceProvider>
               </Suspense>
@@ -1913,18 +1958,26 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 <Suspense fallback={null}>
                   {rightPanelType === 'file' ? (
                     <WorkspaceProvider workspaceId={effectiveFileWorkspaceId || workspaceId} downloadFile={null}>
-                    <RightPanel
+                    <FilePanel
                       workspaceId={effectiveFileWorkspaceId || workspaceId}
+                      threadId={panelThreadId}
+                      isActive={isActive}
                       onClose={() => { setRightPanelType(null); popPanelHistory(); }}
-                      panelTarget={panelTarget}
-                      onTargetFileHandled={handleTargetFileHandled}
-                      onTargetDirHandled={handleTargetDirHandled}
+                      onDirtyChange={handleFilesDirtyChange}
+                      onActiveTabKindChange={handleActiveTabKindChange}
+                      target={panelTarget}
+                      onTargetHandled={handleTargetHandled}
                       onTargetMemoryHandled={handleTargetMemoryHandled}
                       onTargetMemoHandled={handleTargetMemoHandled}
-                      sourcesRecords={sourcesRecords}
-                      allSourcesRecords={allSourcesRecords}
+                      onOpenInMarketView={handleOpenInMarketView}
+                      onOpenSubagentTask={handleOpenSubagentTask}
+                      getToolCallProcess={getToolCallProcess}
+                      getSourcesRecords={getSourcesRecords}
+                      getAllSourcesRecords={getAllSourcesRecords}
                       marketWatch={marketWatch}
                       onOpenFile={handleOpenFileFromChat}
+                      getRecentWritePaths={getRecentWritePaths}
+                      getWriteLog={getWriteLog}
                       files={workspaceFiles}
                       filesLoading={filesLoading}
                       filesError={filesError}
@@ -1939,29 +1992,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       }}
                       readOnly={isFlashMode}
                       singleFileMode={isFlashMode && !!filePanelWorkspaceId}
-                      onCopyShareLink={isFlashMode ? null : handleCopyShareLink}
+                      canShare={!isFlashMode}
                     />
                     </WorkspaceProvider>
-                  ) : rightPanelType === 'detail' && (detailToolCall || detailPlanData) ? (
-                    <DetailPanel
-                      toolCallProcess={detailToolCall}
-                      planData={detailPlanData}
-                      onClose={handleCloseDetailPanel}
-                      onOpenFile={handleOpenFileFromChat}
-                      onOpenSubagentTask={handleOpenSubagentTask}
-                    />
-                  ) : rightPanelType === 'preview' && previewData ? (
-                    <PreviewViewer
-                      url={previewData.url}
-                      port={previewData.port}
-                      title={previewData.title}
-                      loading={previewData.loading}
-                      error={previewData.error}
-                      onClose={handleClosePreview}
-                      onRefresh={handleRefreshPreview}
-                      isDragging={isDragging}
-                      reloadToken={previewData.reloadToken}
-                    />
                   ) : null}
                 </Suspense>
               </div>

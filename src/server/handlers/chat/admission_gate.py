@@ -1,7 +1,8 @@
 """Turn admission for chat workflows: admit a new turn, steer, or 409.
 
 ``wait_or_steer`` is the single admission decision for the foreground and
-dispatched paths; ``admission_conflict_detail`` is the single wording
+dispatched paths, and ``steer_allowed`` the single answer to whether a
+request may steer at all; ``admission_conflict_detail`` is the single wording
 source for every in-generator admission 409; ``ADMISSION_CONFLICT_CODES``
 is the closed set of codes ``handle_workflow_error`` treats as protocol
 responses (never persisted, never mark_failed).
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 
 if TYPE_CHECKING:
+    from src.server.models.chat import ChatRequest
     from src.server.services.runs.executor import LocalRunExecutor
 
 
@@ -77,6 +79,19 @@ def admission_conflict_detail(state: str) -> dict:
     }
 
 
+def steer_allowed(
+    request: ChatRequest, *, dispatched: bool, steerable: bool
+) -> bool:
+    """Whether a running turn on the thread may take this request as a steer.
+
+    Foreground turns steer. A dispatched flow, a retry (a /retry that finds
+    another live run is a conflict, not an empty steering message into it)
+    and a non-steerable caller (an automation's instruction is a turn of its
+    own) meet a running peer with a 409 instead.
+    """
+    return steerable and not dispatched and request.retry_of_run_id is None
+
+
 async def wait_or_steer(
     manager: LocalRunExecutor,
     thread_id: str,
@@ -104,7 +119,7 @@ async def wait_or_steer(
     may still go unconsumed — the final drain returns it via
     ``steering_returned`` on the turn stream, not this connection.
 
-    ``can_steer=False`` (dispatched X-Dispatch=background flows) forbids
+    ``can_steer=False`` (whatever ``steer_allowed`` refuses) forbids
     steering entirely: any in-flight run is a hard conflict, never a steer.
 
     Admission states (see ``LocalRunExecutor.wait_for_admission``):
@@ -128,9 +143,9 @@ async def wait_or_steer(
         return True, None
 
     # Only a genuinely-running turn on a steerable path can be steered; every
-    # other non-fresh state — and every dispatched peer (``can_steer=False``) —
-    # is a conflict. Steering mid-stopping would start a second checkpoint
-    # writer; mid-compaction would corrupt the context rewrite.
+    # other non-fresh state, and every request ``steer_allowed`` refuses, is a
+    # conflict. Steering mid-stopping would start a second checkpoint writer;
+    # mid-compaction would corrupt the context rewrite.
     if state != "running" or not can_steer:
         raise HTTPException(
             status_code=409, detail=admission_conflict_detail(state)

@@ -20,11 +20,13 @@ from ptc_agent.agent.prompts import (
     get_loader,
     guidance_template_vars,
     resolve_prompt_guidance,
+    workspace_path_vars,
 )
 from ptc_agent.agent.subagents.definition import SubagentDefinition
 
 if TYPE_CHECKING:
     from ptc_agent.config.agent import AgentConfig
+    from ptc_agent.core.project_context import ProjectContext
 
 logger = structlog.get_logger(__name__)
 
@@ -78,8 +80,17 @@ class SubagentCompiler:
         config: AgentConfig | None = None,
         skill_registry: dict[str, SkillDefinition] | None = None,
         skill_dirs: list[str] | None = None,
+        default_model: Any | None = None,
+        project: ProjectContext | None = None,
     ) -> None:
         self._sandbox = sandbox
+        # A subagent runs in the parent turn's workspace folder, so its copy of
+        # the path table has to name the same one.
+        self._project = project
+        # The model a definition with no model of its own runs on (the
+        # parent's client, which SubAgentMiddleware supplies at run time).
+        # Read here only for the shape its turn stamp takes.
+        self._default_model = default_model
         self._mcp_registry = mcp_registry
         self._tool_sets: dict[str, list[Any]] = tool_sets or {}
         self._user_profile = user_profile
@@ -96,15 +107,9 @@ class SubagentCompiler:
 
     def compile(self, definition: SubagentDefinition) -> dict[str, Any]:
         """Compile a single definition into a ``SubAgent`` TypedDict."""
-        result: dict[str, Any] = {
-            "name": definition.name,
-            "description": definition.description,
-            "system_prompt": self._resolve_prompt(definition),
-            "tools": self._resolve_tools(definition),
-        }
-
         # A credentialed user's resolved client outranks the definition's
-        # string model name.
+        # string model name. Resolved first: the prompt names the shape the
+        # turn stamp takes, which is this model's.
         resolved = (
             self._config.client_for_role(
                 f"subagent:{definition.name}", fallback_to_main=False
@@ -113,6 +118,13 @@ class SubagentCompiler:
             else None
         )
         model = resolved if resolved is not None else definition.model
+        runs_on = model if model is not None else self._default_model
+        result: dict[str, Any] = {
+            "name": definition.name,
+            "description": definition.description,
+            "system_prompt": self._resolve_prompt(definition, runs_on),
+            "tools": self._resolve_tools(definition),
+        }
         if model is not None:
             result["model"] = model
 
@@ -126,7 +138,7 @@ class SubagentCompiler:
 
     # ── Prompt resolution ─────────────────────────────────────────────
 
-    def _resolve_prompt(self, defn: SubagentDefinition) -> str:
+    def _resolve_prompt(self, defn: SubagentDefinition, model: Any = None) -> str:
         """Resolve the system prompt based on priority.
 
         1. ``custom_prompt`` — raw string, used directly.
@@ -148,10 +160,13 @@ class SubagentCompiler:
             **self._tool_gates(defn),
             **guidance_template_vars(self._guidance(defn)),
         }
-        # Pass working_directory so workspace_paths template can use it
+        # Resolve the turn's own folder so workspace_paths renders it
         if self._sandbox is not None and hasattr(self._sandbox, "config"):
-            template_kwargs["working_directory"] = (
-                self._sandbox.config.filesystem.working_directory
+            template_kwargs.update(
+                workspace_path_vars(
+                    self._sandbox.workspace(self._project),
+                    root=self._sandbox.config.filesystem.working_directory,
+                )
             )
 
         # 2. Standalone custom template — render it directly

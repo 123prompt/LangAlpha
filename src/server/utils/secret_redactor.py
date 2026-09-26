@@ -130,8 +130,8 @@ async def get_vault_secrets_for_redaction(workspace_id: str) -> dict[str, str]:
     worker leaves this process holding the RETIRED value, which would scrub the
     dead secret and pass the live one through in cleartext. A failed read
     propagates: an empty dict means the workspace has no secrets, never "the
-    lookup failed" — callers serve file bytes on this answer, one of them on a
-    route whose only credential is the workspace UUID.
+    lookup failed". Callers serve file bytes on this answer, some of them on
+    routes whose only credential is the URL.
     """
     from src.server.database.vault_secrets import get_effective_secrets
 

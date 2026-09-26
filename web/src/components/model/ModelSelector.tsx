@@ -2,6 +2,8 @@ import { useId, useMemo } from "react"
 import { Select } from "@/components/ui/select"
 import type { ProviderModelsData } from "./types"
 import type { ModelAccess } from "@/types/platform"
+import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
+import { modelLabel } from "@/lib/modelLabel"
 
 const ACCESS_LABELS: Record<ModelAccess, string> = {
   platform: "platform",
@@ -29,6 +31,8 @@ export interface ModelSelectorProps {
   required?: boolean
   /** Optional access map: model name → access type. When set, shows badge in option text. */
   modelAccess?: Record<string, ModelAccess>
+  /** Optional model metadata: options print its display_name in place of the key. */
+  metadata?: Record<string, ModelMetadataEntry>
 }
 
 export function ModelSelector({
@@ -41,6 +45,7 @@ export function ModelSelector({
   placeholder = "Select a model...",
   required = false,
   modelAccess,
+  metadata,
 }: ModelSelectorProps) {
   const id = useId()
 
@@ -121,7 +126,7 @@ export function ModelSelector({
                   const suffix = access ? ` (${ACCESS_LABELS[access]})` : ""
                   return (
                     <option key={m} value={m}>
-                      {m}{suffix}
+                      {modelLabel(m, metadata)}{suffix}
                     </option>
                   )
                 })}

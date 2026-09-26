@@ -13,6 +13,7 @@ import pytest
 from fastapi import HTTPException
 
 from src.server.handlers.automation_handler import create_automation, update_automation
+from src.server.models.automation import AutomationCreate
 
 OWNER = "user-owner"
 OTHER = "user-other"
@@ -32,7 +33,7 @@ def _create_data(**overrides):
         "timezone": "UTC",
     }
     data.update(overrides)
-    return data
+    return AutomationCreate(**data)
 
 
 def _current_row(**overrides):

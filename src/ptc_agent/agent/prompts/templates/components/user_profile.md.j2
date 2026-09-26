@@ -2,13 +2,12 @@
 
 - **Name**: {{ user_profile.name | default("User") }}
 - **Timezone**: {{ user_profile.timezone | default("UTC") }}
-- **Locale**: {{ user_profile.locale | default("en-US") }}
-{% if user_profile.locale and not user_profile.locale.startswith("en") %}
+- **Locale**: {{ user_profile.locale | default("en-US", true) }}
 
 ## Response Language
 
-Respond in the language of the user's locale ({{ user_profile.locale }}) unless the user explicitly requests a different language.
-{% endif %}
+Answer in the language the user wrote in.{% if user_profile.locale and not user_profile.locale.startswith("en") %} Default to the user's locale ({{ user_profile.locale }}) when the message gives no signal. A message from an automation or another agent is often in English without meaning it: unless it asks for a language, the user's locale is the safe choice, because the user is who reads the result.{% endif %}
+
 {% if user_profile.agent_preference %}
 
 ## Agent Preferences
@@ -21,7 +20,7 @@ You MUST follow these user preferences when responding:
 
 ### Output Format: Styled HTML
 
-For substantial deliverables (reports, analyses, comparisons), produce a styled HTML document at `work/<task>/<name>.html` instead of plain markdown. Before authoring, you MUST `Read .agents/skills/html-report/SKILL.md` and `Read .agents/skills/ui-design/SKILL.md` to follow the authoring and design conventions. Trivial or short answers stay plain text in chat.
+For substantial deliverables (reports, analyses, comparisons), produce a styled HTML document at `<task>/<name>.html` instead of plain markdown. Before authoring, you MUST `Read .agents/skills/html-report/SKILL.md` and `Read .agents/skills/ui-design/SKILL.md` to follow the authoring and design conventions. Trivial or short answers stay plain text in chat.
 {% endif %}
 {% endif %}
 

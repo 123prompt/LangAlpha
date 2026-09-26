@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
 from src.server.database.workspace_file import (
     WorkspaceSyncBusy,
@@ -24,27 +25,32 @@ from src.server.database.workspace import (
     set_files_restore_incomplete,
     workspace_owner,
 )
-from src.server.database.blob_keys import blob_key
+from src.server.database.blob_keys import RELAY_MAX_BYTES, blob_key
 from src.server.database.workspace_file_blobs import fetch_blob
 from src.server.services.persistence._rows import (
     _has_inline_bytes,
     _mode_int,
-    _transfer_mode,
 )
 from src.server.services.persistence.resolve import (
     FileBytesUnavailable,
     resolve_file_bytes,
 )
 from src.server.services.persistence.transfer import (
+    SYNC_MARKER_NAME,
+    transfer_mode,
+    INPROCESS_MAX_INFLIGHT_BYTES,
+    PACK_MAX_BYTES,
+    ByteBudget,
     all_unreachable,
     pull_direct,
     transfer_timeout_s,
 )
 from src.utils.storage import get_signed_url
 
-# Relayed restore uploads in flight. Higher than RELAY_CONCURRENCY because an
-# upload costs this process nothing but a socket, where a relayed backup also
-# holds the file's bytes in memory while it hashes and stores them.
+# Relayed restore uploads in flight. A restore holds each file's bytes in this
+# process exactly as a relayed backup does: _stage_relayed_file resolves the
+# whole row before it uploads. So this is a count only, and what those files
+# weigh is bounded by INPROCESS_MAX_INFLIGHT_BYTES alongside it.
 RESTORE_UPLOAD_CONCURRENCY = 16
 
 logger = logging.getLogger(__name__)
@@ -68,9 +74,15 @@ logger = logging.getLogger(__name__)
 # this project keeps cross-worker truth, the next sync may run on a worker that
 # never saw the failed restore, and keeping the flag beside the manifest means
 # the flag and the rows it protects fail together rather than independently.
-def _sync_marker_path(work_dir: str) -> str:
-    """Return the sync marker file path for the given working directory."""
-    return f"{work_dir}/.file_sync_marker"
+def _sync_marker_path(layout: WorkspaceLayout) -> str:
+    """The marker for one project folder, not for the machine it sits on.
+
+    Several projects share a computer root now. A marker at that root is a
+    claim about all of them, so the first restore to finish would answer for
+    every sibling, and each of those would skip its own restore and stay
+    empty. The claim belongs where the files it describes are.
+    """
+    return layout.join(SYNC_MARKER_NAME)
 
 
 _FLAG_CLEAR_ATTEMPTS = 3
@@ -101,7 +113,11 @@ async def _clear_restore_flag(workspace_id: str, sandbox: Any, *, conn=None) -> 
 
 
 async def restore_to_sandbox(
-    workspace_id: str, sandbox: Any, *, expected_sandbox_id: Any = ANY_SANDBOX
+    workspace_id: str,
+    sandbox: Any,
+    *,
+    expected_sandbox_id: Any = ANY_SANDBOX,
+    layout: WorkspaceLayout,
 ) -> dict[str, Any]:
     """
     Restore workspace files from the manifest into the sandbox.
@@ -149,7 +165,7 @@ async def restore_to_sandbox(
         raise RestoreIdentityLost(workspace_id)
     try:
         async with workspace_sync_lock(workspace_id) as conn:
-            return await _restore_locked(workspace_id, sandbox, conn)
+            return await _restore_locked(workspace_id, sandbox, conn, layout)
     except WorkspaceSyncBusy:
         logger.warning(f"File restore for workspace {workspace_id} timed out waiting for the sync lock")
         raise
@@ -159,7 +175,7 @@ async def restore_to_sandbox(
 
 
 async def _restore_locked(
-    workspace_id: str, sandbox: Any, conn: Any
+    workspace_id: str, sandbox: Any, conn: Any, layout: WorkspaceLayout
 ) -> dict[str, Any]:
     result = {"restored": 0, "errors": 0}
 
@@ -178,7 +194,7 @@ async def _restore_locked(
     # Object keys are scoped to the owner; read once for the whole restore.
     user_id = await workspace_owner(workspace_id, conn=conn)
 
-    mode = _transfer_mode(sandbox)
+    mode = transfer_mode(sandbox)
     structural: list[dict[str, Any]] = []
     direct: list[dict[str, Any]] = []
     packs: dict[str, list[dict[str, Any]]] = {}
@@ -213,7 +229,10 @@ async def _restore_locked(
         # place under them; that pass closes them. A store the sandbox
         # turns out not to reach reopens them on the same terms.
         results = await pull_direct(
-            sandbox, structural + items, defer_dir_modes=bool(relay)
+            sandbox,
+            structural + items,
+            layout=layout,
+            defer_dir_modes=bool(relay),
         )
         direct_results = {p: r for p, r in results.items() if p in direct_paths}
         unreachable_paths = {
@@ -239,13 +258,15 @@ async def _restore_locked(
         _tally_pull(workspace_id, results, result)
     elif structural:
         results = await pull_direct(
-            sandbox, structural, defer_dir_modes=bool(relay)
+            sandbox, structural, layout=layout, defer_dir_modes=bool(relay)
         )
         _tally_pull(workspace_id, results, result)
 
     if relay:
         dirs = [i for i in structural if i.get("kind") == "dir"]
-        await _restore_relay(user_id, workspace_id, sandbox, relay, result, dirs)
+        await _restore_relay(
+            user_id, workspace_id, sandbox, relay, result, dirs, layout=layout
+        )
 
     complete = result["errors"] == 0
 
@@ -258,7 +279,7 @@ async def _restore_locked(
     # the only outcome left to check — path validation rejected it.
     if complete:
         marker_written = await sandbox.aupload_file_bytes(
-            _sync_marker_path(sandbox.working_dir),
+            _sync_marker_path(layout),
             datetime.now(timezone.utc).isoformat().encode("utf-8"),
         )
         if not marker_written:
@@ -323,7 +344,10 @@ async def _signed_pull_items(
             {
                 "kind": "pack",
                 "sha256": pack_sha256,
-                "size": sum(int(m.get("file_size") or 0) for m in members),
+                # The whole chunk lands on disk, and the rows still naming it
+                # can be a sliver of it once siblings were repacked, so it is
+                # weighed at the most a chunk can hold.
+                "size": PACK_MAX_BYTES,
                 "url": url,
                 "members": [_pack_member_item(m) for m in members],
             }
@@ -341,7 +365,10 @@ def _pull_item(row: dict[str, Any], *, url: str | None) -> dict[str, Any]:
         "path": row["file_path"],
         "kind": row.get("kind", "file"),
         "sha256": row.get("blob_sha256"),
-        "size": int(row.get("file_size") or 0),
+        # Unknown stays unknown: the runtime then charges the item its whole
+        # byte budget, as the relay does, and verifies it by digest alone. A
+        # zero would admit it free and then reject its real bytes as a mismatch.
+        "size": None if row.get("file_size") is None else int(row["file_size"]),
         "url": url,
         "mode": _mode_int(row.get("permissions"), row.get("kind", "file")),
         "mtime_ns": mtime_ns,
@@ -354,7 +381,7 @@ def _pack_member_item(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "path": item["path"],
         "offset": int(row.get("pack_offset") or 0),
-        "size": item["size"],
+        "size": int(item["size"] or 0),
         "sha256": row.get("content_hash"),
         "mode": item["mode"],
         "mtime_ns": item["mtime_ns"],
@@ -382,6 +409,8 @@ async def _restore_relay(
     rows: list[dict[str, Any]],
     result: dict[str, Any],
     dirs: list[dict[str, Any]] | None = None,
+    *,
+    layout: WorkspaceLayout,
 ) -> None:
     """Upload file rows from this process and let the runtime place them.
 
@@ -393,12 +422,31 @@ async def _restore_relay(
     backup. ``dirs`` are the structure pass's directory items, carried again
     so their modes and mtimes are applied after the last file is in.
     """
-    sem = asyncio.Semaphore(RESTORE_UPLOAD_CONCURRENCY)
+    budget = ByteBudget(INPROCESS_MAX_INFLIGHT_BYTES, RESTORE_UPLOAD_CONCURRENCY)
 
     async def _stage(row: dict) -> tuple[dict, tuple[str, str, int] | None]:
-        async with sem:
+        size = row.get("file_size")
+        if size is not None and int(size) > RELAY_MAX_BYTES:
+            # The direct path caps nothing, so a blob this large is normal
+            # until the store turns out to be unreachable and the restore
+            # lands here instead. Resolving it would pull the whole thing
+            # into this process; the budget cannot help, since an item over
+            # the whole budget is admitted anyway rather than deadlocking.
+            # Reported as an error, so the file is retried when the store is
+            # reachable again rather than silently skipped.
+            logger.error(
+                f"Cannot relay {row['file_path']} for workspace "
+                f"{workspace_id}: {size} bytes exceeds the {RELAY_MAX_BYTES} "
+                f"byte relay limit, and object storage was unreachable from "
+                f"the sandbox. The file is left unrestored"
+            )
+            return (row, None)
+        async with budget.hold(size):
             try:
-                return (row, await _stage_relayed_file(user_id, sandbox, row))
+                return (
+                    row,
+                    await _stage_relayed_file(user_id, sandbox, row, layout),
+                )
             except Exception as e:
                 logger.warning(f"Failed to restore {row['file_path']}: {e}")
                 return (row, None)
@@ -431,7 +479,9 @@ async def _restore_relay(
         item.update({"file": name, "sha256": digest, "size": n})
         items.append(item)
     if packs:
-        items += await _relayed_pack_items(user_id, workspace_id, sandbox, packs, result)
+        items += await _relayed_pack_items(
+            user_id, workspace_id, sandbox, packs, result, layout
+        )
     if not items and not dirs:
         return
 
@@ -442,7 +492,9 @@ async def _restore_relay(
         else:
             file_paths.add(i["path"])
     try:
-        outcomes = await pull_direct(sandbox, items + list(dirs or []))
+        outcomes = await pull_direct(
+            sandbox, items + list(dirs or []), layout=layout
+        )
     except Exception as e:
         logger.warning(
             f"Could not place {len(file_paths)} relayed file(s) for workspace "
@@ -477,12 +529,12 @@ def _staging_name() -> str:
 
 
 async def _stage_relayed_file(
-    user_id: str, sandbox: Any, file_record: dict
+    user_id: str, sandbox: Any, file_record: dict, layout: WorkspaceLayout
 ) -> tuple[str, str, int] | None:
     """Upload one row's bytes; returns the staging name, their digest and length.
 
     Byte resolution happens here rather than in the caller so blob fetches
-    run under the restore semaphore: concurrency is bounded for free.
+    run under the caller's byte budget: what this holds is bounded for free.
 
     The digest and length describe the bytes actually sent, not the row's
     ``content_hash`` and ``file_size``. The check they feed asks whether the
@@ -498,7 +550,9 @@ async def _stage_relayed_file(
     if content is None:
         return None
     staged = _staging_name()
-    if not await sandbox.aupload_file_bytes(f"{sandbox.working_dir}/{staged}", content):
+    # The staging name is excluded at the root of the walk, which is the
+    # project folder, so that is also where it has to land.
+    if not await sandbox.aupload_file_bytes(layout.join(staged), content):
         return None
     return staged, hashlib.sha256(content).hexdigest(), len(content)
 
@@ -509,6 +563,7 @@ async def _relayed_pack_items(
     sandbox: Any,
     packs: dict[str, list[dict[str, Any]]],
     result: dict[str, Any],
+    layout: WorkspaceLayout,
 ) -> list[dict[str, Any]]:
     """Relay each chunk whole; returns the pull items that slice them in place.
 
@@ -518,14 +573,13 @@ async def _relayed_pack_items(
     chunk keeps the relay path at the direct path's fidelity, and memory
     at one chunk at a time.
     """
-    work_dir = sandbox.working_dir
     items: list[dict[str, Any]] = []
     for pack_sha256, members in packs.items():
         rel = f".wsfiles-relay-{pack_sha256}"
         try:
             data = await fetch_blob(user_id, pack_sha256)
             size = len(data)
-            ok = await sandbox.aupload_file_bytes(f"{work_dir}/{rel}", data)
+            ok = await sandbox.aupload_file_bytes(layout.join(rel), data)
             del data
         except Exception as e:
             ok = False
@@ -573,15 +627,16 @@ async def _reconcile_flag_beside_marker(workspace_id: str, sandbox: Any) -> None
             await asyncio.sleep(_FLAG_CLEAR_BACKOFF_S * attempt)
 
 
-async def maybe_restore(workspace_id: str, sandbox: Any) -> None:
+async def maybe_restore(
+    workspace_id: str, sandbox: Any, *, layout: WorkspaceLayout
+) -> None:
     """
     Restore files from DB if sandbox was recreated (files lost).
 
     Checks for sync marker file. If absent, files were lost and need restore.
     """
     try:
-        work_dir = sandbox.working_dir
-        sync_marker = _sync_marker_path(work_dir)
+        sync_marker = _sync_marker_path(layout)
         marker = await sandbox.adownload_file_bytes(sync_marker)
         if marker is not None:
             # The marker is written only by a restore that came back clean
@@ -625,7 +680,10 @@ async def maybe_restore(workspace_id: str, sandbox: Any) -> None:
             f"Restoring {len(files)} files from DB."
         )
         await restore_to_sandbox(
-            workspace_id, sandbox, expected_sandbox_id=_identity_of(sandbox)
+            workspace_id,
+            sandbox,
+            expected_sandbox_id=_identity_of(sandbox),
+            layout=layout,
         )
 
     except RestoreGuardUnavailable:

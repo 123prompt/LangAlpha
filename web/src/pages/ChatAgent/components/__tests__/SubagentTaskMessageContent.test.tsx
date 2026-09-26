@@ -270,7 +270,7 @@ describe('SubagentTaskMessageContent — accessibility', () => {
     expect(screen.queryByRole('button', { name: 'View task details' })).toBeNull();
   });
 
-  it('opens the secondary view-details action via an accessible button', () => {
+  it('opens the secondary view-details action via an accessible button, naming the call', () => {
     let captured: unknown = null;
     render(
       <SubagentTaskMessageContent
@@ -285,7 +285,7 @@ describe('SubagentTaskMessageContent — accessibility', () => {
     const viewButton = screen.getByRole('button', { name: 'View task details' });
     expect(viewButton).toBeInTheDocument();
     viewButton.click();
-    expect(captured).toEqual({ toolCallResult: { content: 'output text' } });
+    expect(captured).toBe('tc-output');
   });
 
   it('mouse click on view-details button does not also fire the card click', () => {

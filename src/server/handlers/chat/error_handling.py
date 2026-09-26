@@ -24,6 +24,7 @@ from src.server.database import conversation as qr_db
 from .admission_gate import ADMISSION_CONFLICT_CODES, admission_conflict_detail
 
 if TYPE_CHECKING:
+    from ptc_agent.agent.middleware.runtime_context import TurnContext
     from src.server.models.chat import ChatRequest
     from src.server.services.runs.admission import RunScope
 
@@ -171,7 +172,7 @@ async def handle_workflow_error(
     is_byok: bool,
     msg_type: str,
     log_prefix: str,
-    timezone_str: str | None = None,
+    turn_context: TurnContext | None = None,
 ) -> AsyncGenerator[str, None]:
     """Handle a workflow exception: classify, retry-or-fail, finalize, yield SSE events.
 
@@ -184,7 +185,7 @@ async def handle_workflow_error(
     owns the terminal write (and the durable slot release) from that point.
     ``workspace_id`` accepts ``None`` to guard against the case where the
     error occurred before the workspace was resolved.
-    ``timezone_str`` is the resolved timezone; falls back to ``request.timezone``.
+    ``turn_context`` is None only before START, where nothing is finalized.
     """
     from src.server.database.runs.subagent_runs import TaskRunSlotBusyError
     from src.server.services.runs.coordinator import (
@@ -213,11 +214,8 @@ async def handle_workflow_error(
         persist_metadata["workspace_id"] = request.workspace_id
     if hasattr(request, "locale") and request.locale:
         persist_metadata["locale"] = request.locale
-    # Use the resolved timezone_str (validated/defaulted) when available,
-    # falling back to the raw request field.
-    _tz = timezone_str or getattr(request, "timezone", None)
-    if _tz:
-        persist_metadata["timezone"] = _tz
+    if turn_context is not None:
+        persist_metadata["timezone"] = turn_context.tool_timezone
 
     async def _finalize_error(error_msg: str, extra_metadata: dict) -> bool:
         """Terminal-write the open run as error; CRITICAL on failure (row

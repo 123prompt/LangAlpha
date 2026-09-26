@@ -13,7 +13,10 @@ Covers:
 """
 
 import asyncio
+import contextvars
+import gc
 import logging
+import weakref
 from contextlib import suppress
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -584,6 +587,77 @@ class TestMarkCancelledUserLabeling:
         persist_metadata = await self._run_finalize_cancelled(btm, task_info)
 
         assert persist_metadata["cancelled_by_user"] is False
+
+
+def _model_call_error(status_code):
+    """A model call's exception as ModelResilienceMiddleware leaves it."""
+    exc = RuntimeError("Error code: %d" % status_code)
+    exc.__model_resilience__ = {
+        "model": "primary",
+        "attempted_models": [
+            {"model": "primary", "error": "rejected", "status_code": status_code, "attempts": 1},
+            {"model": "fallback", "error": "down", "status_code": 503, "attempts": 1},
+        ],
+    }
+    return exc
+
+
+class TestFailedRunRecordsItsModelCall:
+    """A run that failed on its model call records the status the primary
+    earned and whether the credential that made the call was the user's, so
+    an automation can tell a rejected key of theirs from one of ours."""
+
+    async def _finalize_failed(self, exc, credential_source):
+        btm = _make_btm()
+        task_info = _make_task_info(thread_id="thread-fail", run_id="run-fail")
+        handler = MagicMock()
+        handler.agent_config.credential_source = credential_source
+        task_info.metadata = {
+            "workspace_id": "ws-1",
+            "user_id": "user-1",
+            "run_handle": MagicMock(),
+            "handler": handler,
+        }
+        btm.executions[(task_info.thread_id, task_info.run_id)] = task_info
+
+        coordinator = MagicMock()
+        coordinator.finalize_run = AsyncMock()
+        fin = "src.server.services.runs.finalization"
+        mod = "src.server.services.runs.executor"
+        with patch(f"{fin}.get_token_usage_from_callback", return_value=(None, [])), \
+             patch(f"{fin}.get_tool_usage_from_handler", return_value={}), \
+             patch(f"{fin}.get_sse_events_from_handler", return_value=[]), \
+             patch(f"{fin}.calculate_execution_time", return_value=1.0), \
+             patch(f"{mod}.release_burst_slot", new_callable=AsyncMock), \
+             patch("src.server.services.runs.coordinator.RunCoordinator") as coord_cls:
+            coord_cls.get_instance.return_value = coordinator
+            await btm._finalize_run(
+                task_info.thread_id, task_info.run_id,
+                kind="failed", error=str(exc), exc=exc,
+            )
+        return coordinator.finalize_run.await_args.args[1].metadata
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "credential_source, owned",
+        [("byok", True), ("oauth", True), ("platform", False)],
+    )
+    async def test_a_rejected_model_call_names_whose_key(
+        self, monkeypatch, credential_source, owned
+    ):
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "platform")
+        metadata = await self._finalize_failed(_model_call_error(401), credential_source)
+        assert metadata["error_status_code"] == 401
+        assert metadata["error_credential_owned"] is owned
+
+    @pytest.mark.asyncio
+    async def test_a_failure_off_the_model_call_records_nothing(self):
+        # A tool's HTTP 401 carries no resilience trace.
+        exc = RuntimeError("Client error '401 Unauthorized'")
+        exc.status_code = 401
+        metadata = await self._finalize_failed(exc, "byok")
+        assert "error_status_code" not in metadata
+        assert "error_credential_owned" not in metadata
 
 
 class TestThrownFinalizeLeavesEntryRunning:
@@ -2080,7 +2154,7 @@ class TestNoPreFinalizeRunEndOnTerminalFlavors:
         async def record_run_end(thread_id, run_id, outcome):
             order.append(f"run_end:{outcome}")
 
-        async def record_finalize(thread_id, run_id, *, kind, error=None):
+        async def record_finalize(thread_id, run_id, *, kind, error=None, exc=None):
             order.append(f"finalize:{kind}")
 
         with patch.object(btm, "_buffer_event_redis", side_effect=record_buffer), \
@@ -2110,7 +2184,7 @@ class TestNoPreFinalizeRunEndOnTerminalFlavors:
         async def record_run_end(thread_id, run_id, outcome):
             order.append(f"run_end:{outcome}")
 
-        async def record_finalize(thread_id, run_id, *, kind, error=None):
+        async def record_finalize(thread_id, run_id, *, kind, error=None, exc=None):
             order.append(f"finalize:{kind}")
 
         with patch.object(btm, "_buffer_event_redis", side_effect=record_buffer), \
@@ -2139,7 +2213,7 @@ class TestNoPreFinalizeRunEndOnTerminalFlavors:
         async def record_run_end(thread_id, run_id, outcome):
             order.append(f"run_end:{outcome}")
 
-        async def record_finalize(thread_id, run_id, *, kind, error=None):
+        async def record_finalize(thread_id, run_id, *, kind, error=None, exc=None):
             order.append(f"finalize:{kind}")
 
         async def set_cancel():
@@ -2365,3 +2439,44 @@ class TestReplayOwnershipRecheck:
         assert ok is True
         contents = [e["data"]["content"] for e in out]
         assert contents == ["LEGACY", "OWN"]
+
+
+# ---------------------------------------------------------------------------
+# A finished run must not pin the request's context
+# ---------------------------------------------------------------------------
+
+class _RequestScoped:
+    pass
+
+
+_request_var: "contextvars.ContextVar[_RequestScoped | None]" = contextvars.ContextVar(
+    "test_request_scoped", default=None
+)
+
+
+class TestFinishedRunReleasesContext:
+
+    @pytest.mark.asyncio
+    async def test_finished_run_drops_task_and_its_context(self):
+        """The entry outlives the run by the result TTL; the task (and the
+        request context it copied) must not, or every object that context
+        references stays alive for that long."""
+        btm = _make_btm()
+
+        async def fake_workflow():
+            yield "event-0"
+
+        async def handler() -> LocalRunExecution:
+            _request_var.set(_RequestScoped())
+            return await btm.start_run("thread-ctx", "run-1", fake_workflow())
+
+        with patch.object(btm, "_finalize_run", new_callable=AsyncMock):
+            info = await asyncio.create_task(handler(), context=contextvars.Context())
+            scoped = weakref.ref(info.task.get_context()[_request_var])
+            await asyncio.wait({info.task})
+            await asyncio.sleep(0)
+
+        assert btm.executions[("thread-ctx", "run-1")] is info
+        assert info.task is None
+        gc.collect()
+        assert scoped() is None

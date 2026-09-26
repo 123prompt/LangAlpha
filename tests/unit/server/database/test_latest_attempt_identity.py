@@ -34,6 +34,19 @@ async def test_get_latest_attempt_orders_by_run_seq_alone(
 
 
 @pytest.mark.asyncio
+async def test_a_fork_predecessor_is_the_latest_attempt_of_an_earlier_turn(
+    mock_db_connection, mock_cursor
+):
+    await tl_db.get_latest_attempt("t-1", before_turn=4)
+
+    sql = _executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "turn_index < %s" in sql
+    assert "ORDER BY run_seq DESC" in sql
+    assert params == ("t-1", 4)
+
+
+@pytest.mark.asyncio
 async def test_batch_variant_picks_per_thread_row_by_run_seq(
     mock_db_connection, mock_cursor
 ):

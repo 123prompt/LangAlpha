@@ -23,6 +23,7 @@ from ptc_agent.agent.backends.langgraph_store import (
     StoreBackend,
     StoreContentTooLargeError,
 )
+from ptc_agent.agent.backends.results import EditTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 
 logger = structlog.get_logger(__name__)
@@ -246,7 +247,7 @@ class WorkflowsBackend:
         new_string: str,
         *,
         replace_all: bool = False,
-    ) -> dict[str, Any]:
+    ) -> EditTextResult:
         # Copy-on-write: editing a shipped script forks it into the user tier
         # rather than failing, mirroring the shadowing rule. Fork and edit land
         # as one write under the store's lock, and the workflow cap rides along

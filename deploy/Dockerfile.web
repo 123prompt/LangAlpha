@@ -1,8 +1,11 @@
 FROM node:20-alpine AS build
-RUN corepack enable && corepack prepare pnpm@latest --activate
 WORKDIR /app
-COPY web/package.json web/pnpm-lock.yaml ./
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 COPY web/patches/ patches/
+# Installed from `packageManager` so this build runs the pnpm the lockfile was
+# written by. Not corepack: Node 25+ no longer bundles it, and a corepack older
+# than 0.34.5 cannot start pnpm 12.
+RUN npm install -g "$(node -p 'require("./package.json").packageManager')"
 RUN pnpm install --frozen-lockfile
 COPY web/ .
 ARG VITE_HOST_MODE="oss"

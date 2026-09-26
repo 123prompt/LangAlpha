@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { chartSecToDateStr, cn, dateStrInTz, utcMsToChartSec, utcMsToETDate, utcMsToETTime, utcOffsetLabel } from '../utils';
+import { chartSecToDateStr, cn, dateStrInTz, utcMsToChartSec, utcMsToETDate, utcMsToETTime } from '../utils';
 
 describe('cn', () => {
   it('merges simple class names', () => {
@@ -89,27 +89,6 @@ describe('dateStrInTz', () => {
     const ms = Date.UTC(2025, 6, 2, 23, 0);
     expect(dateStrInTz(ms, 'Asia/Hong_Kong')).toBe('2025-07-03');
     expect(dateStrInTz(ms, 'America/New_York')).toBe('2025-07-02');
-  });
-});
-
-describe('utcOffsetLabel', () => {
-  const summer = new Date(Date.UTC(2025, 6, 2, 12, 0));
-  const winter = new Date(Date.UTC(2025, 0, 15, 12, 0));
-
-  it('labels whole-hour offsets without minutes', () => {
-    expect(utcOffsetLabel('Asia/Hong_Kong', summer)).toBe('UTC+8');
-    expect(utcOffsetLabel('Asia/Hong_Kong', winter)).toBe('UTC+8'); // no DST
-  });
-
-  it('is DST-aware', () => {
-    expect(utcOffsetLabel('America/New_York', summer)).toBe('UTC-4');
-    expect(utcOffsetLabel('America/New_York', winter)).toBe('UTC-5');
-    expect(utcOffsetLabel('Europe/London', summer)).toBe('UTC+1');
-    expect(utcOffsetLabel('Europe/London', winter)).toBe('UTC');
-  });
-
-  it('keeps minutes for half-hour zones', () => {
-    expect(utcOffsetLabel('Asia/Kolkata', summer)).toBe('UTC+5:30');
   });
 });
 

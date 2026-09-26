@@ -12,8 +12,11 @@ Behavior differs by agent mode:
 - **Flash mode**: Exposes ``LoadSkill`` tool. Embeds SKILL.md content inline
   (Flash has no filesystem). No filesystem scanning.
 
-Both modes inject a combined skill manifest into the system message listing
-all available skills (registry + discovered).
+Both modes build a combined manifest of all available skills (registry +
+discovered). A stack with a runtime-context baseline (the main PTC and Flash
+agents) freezes it into that block once per turn; the subagent stacks, which
+have no baseline, get it appended to the system message per call
+(``inject_manifest``).
 
 Architecture:
 - Tools from all skills are pre-registered with ToolNode at agent creation
@@ -161,8 +164,11 @@ class SkillsMiddleware(AgentMiddleware):
 
     Behavior varies by mode:
     - PTC: Auto-loads skills when agent reads a SKILL.md file. No LoadSkill tool.
-    - Flash: Exposes LoadSkill tool with inline SKILL.md. Injects skill manifest
-      into system message so the agent knows what skills are available.
+    - Flash: Exposes LoadSkill tool with inline SKILL.md.
+
+    Either way the agent is told what skills exist: the manifest goes into the
+    system message per call, or into the runtime-context baseline once per turn
+    (``inject_manifest``).
 
     Attributes:
         skill_registry: Mapping of skill names to SkillDefinition objects
@@ -188,6 +194,7 @@ class SkillsMiddleware(AgentMiddleware):
         known_skills: dict[str, SkillMetadata] | None = None,
         skill_dirs: list[str] | None = None,
         disabled_skills: frozenset[str] | None = None,
+        inject_manifest: bool = True,
     ) -> None:
         """Initialize the middleware.
 
@@ -211,6 +218,12 @@ class SkillsMiddleware(AgentMiddleware):
                 neither the effective registry nor the platform catalog, so
                 without this set its still-on-disk directory would come back
                 through the filesystem door as a user-installed skill.
+            inject_manifest: Whether to append the manifest to the system
+                message on every model call. False where the runtime-context
+                baseline states it instead: the manifest is frozen for the turn
+                either way, and appended here it sits in front of the history
+                and moves whenever a skill is discovered. The main PTC and
+                Flash stacks have a baseline; a subagent does not.
         """
         super().__init__()
         self._mode = mode
@@ -219,6 +232,7 @@ class SkillsMiddleware(AgentMiddleware):
         self._known_skills = known_skills or {}
         self._skill_dirs = skill_dirs
         self._disabled_skills = disabled_skills or frozenset()
+        self._inject_manifest = inject_manifest
         # `is None`, not truthiness: an empty registry is a real answer now that
         # per-user disables can subtract every skill, and falling back there
         # would hand the build back exactly what it removed -- through the
@@ -411,11 +425,13 @@ class SkillsMiddleware(AgentMiddleware):
             )
         return update or None
 
-    def _build_combined_manifest(self, state: Any) -> str | None:
-        """Build a combined skill manifest for the system message.
+    def build_manifest(self, state: Any) -> str | None:
+        """Build a combined skill manifest for this turn.
 
         Merges registry skills and filesystem-discovered skills into a single
-        manifest. Works for both PTC and Flash modes.
+        manifest. Works for both PTC and Flash modes. Public because the
+        runtime-context baseline freezes it as a block of its own rather than
+        having it appended per call.
 
         Args:
             state: Agent state containing discovered_skills
@@ -698,7 +714,8 @@ class SkillsMiddleware(AgentMiddleware):
     def _filter_tools(self, request: ModelRequest) -> ModelRequest:
         """Filter tools based on which skills are loaded.
 
-        Also injects the skill manifest into the system message (Flash mode).
+        Also injects the skill manifest into the system message, unless this
+        stack's baseline states it instead.
 
         Args:
             request: Original ModelRequest
@@ -762,11 +779,13 @@ class SkillsMiddleware(AgentMiddleware):
         # Build filtered request
         filtered = request.override(tools=filtered_tools)
 
-        # Inject combined skill manifest into system message (both PTC and Flash)
-        manifest = self._build_combined_manifest(request.state)
-        if manifest:
-            new_sys = append_to_system_message(filtered.system_message, manifest)
-            filtered = filtered.override(system_message=new_sys)
+        # Inject the combined skill manifest into the system message, unless
+        # this stack's baseline already states it.
+        if self._inject_manifest:
+            manifest = self.build_manifest(request.state)
+            if manifest:
+                new_sys = append_to_system_message(filtered.system_message, manifest)
+                filtered = filtered.override(system_message=new_sys)
 
         return filtered
 

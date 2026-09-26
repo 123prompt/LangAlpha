@@ -18,8 +18,7 @@ import { useArchiveThreadConfirm } from './threadArchiveAction';
 import ChatInput from '../../../components/ui/chat-input';
 import type { ChatInputHandle } from '../../../components/ui/chat-input';
 import { attachmentsToContexts } from '../utils/fileUpload';
-import { SYSTEM_DIR_PREFIXES } from './FilePanel';
-import RightPanel from './RightPanel';
+import FilePanel, { SYSTEM_DIR_PREFIXES } from './FilePanel';
 import { clampPanelWidth as clampPanelWidthUtil } from '@/lib/panelUtils';
 import SandboxSettingsPanel from './SandboxSettingsPanel';
 import { deleteThread, updateThreadTitle, updateThread } from '../utils/api';
@@ -837,11 +836,12 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
               />
             )}
             <div className="flex-shrink-0" style={{ width: isMobile ? '100%' : filePanelWidth }}>
-              <RightPanel
+              <FilePanel
                 workspaceId={workspaceId}
                 onClose={() => setShowFilePanel(false)}
-                panelTarget={filePanelTargetFile ? { kind: 'file', path: filePanelTargetFile } : null}
-                onTargetFileHandled={() => setFilePanelTargetFile(null)}
+                target={filePanelTargetFile ? { kind: 'file', path: filePanelTargetFile } : null}
+                onTargetHandled={() => setFilePanelTargetFile(null)}
+                persistTabs={false}
                 files={panelFiles}
                 filesLoading={panelFilesLoading}
                 filesError={panelFilesError}

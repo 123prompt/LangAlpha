@@ -23,6 +23,7 @@ from collections.abc import Sequence
 from typing import Annotated, Any, cast
 
 from langchain.agents import AgentState
+from langchain.agents.middleware.types import PrivateStateAttr
 from langchain_core.messages import (
     AnyMessage,
     BaseMessage,
@@ -144,3 +145,14 @@ class DeltaAgentState(AgentState):
         ]
     ]
     ui: NotRequired[Annotated[Sequence[AnyUIMessage], ui_message_reducer]]
+
+    # The runtime-context baseline: the per-thread epoch (agent.md + memory/memo
+    # indices + identity), frozen once and re-rendered byte-identically per call
+    # so the cached prefix in front of it stays valid. A plain overwrite is right
+    # because a rebuild replaces the whole epoch. PrivateStateAttr: agent
+    # plumbing, never part of the caller's input or output schema.
+    #
+    # What moved underneath the epoch is not a channel at all: it is written
+    # into ``messages`` as an ordinary runtime-update message, so a row keeps
+    # its place in time and needs no reducer of its own.
+    runtime_baseline: NotRequired[Annotated[dict[str, Any], PrivateStateAttr]]

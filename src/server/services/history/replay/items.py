@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from src.server.database.runs import lifecycle as tl_db
@@ -35,7 +36,37 @@ def _user_message_item(
     # or legacy status must not stamp).
     if response is not None and response.get("status") in tl_db.TERMINAL_STATUSES:
         payload["run_id"] = str(response.get("conversation_response_id"))
+    completed_at = run_completed_at(response)
+    if completed_at is not None:
+        payload["run_completed_at"] = completed_at
     return {"event": "user_message", "data": payload}
+
+
+def run_completed_at(response: dict[str, Any] | None) -> str | None:
+    """When the turn's run settled, paired with the query timestamp to show how
+    long the turn took.
+
+    ``usage_settled_at`` is the terminal CAS's own ``NOW()`` — the settle
+    instant itself. Rows written before that column existed fall back to the
+    run's start plus its measured duration, and a row that knows neither
+    returns None so the client shows no duration rather than a wrong one.
+
+    Public: the shared replay in ``server/app/public.py`` hand-builds its own
+    ``user_message`` payload and needs the same answer. Two copies of the
+    fallback chain would drift the moment one of them learned a new column.
+    """
+    if response is None or response.get("status") not in tl_db.TERMINAL_STATUSES:
+        return None
+    settled = response.get("usage_settled_at")
+    if settled is not None:
+        return settled.isoformat() if hasattr(settled, "isoformat") else str(settled)
+    created_at = response.get("created_at")
+    execution_time = response.get("execution_time")
+    if not hasattr(created_at, "isoformat") or not isinstance(
+        execution_time, (int, float)
+    ):
+        return None
+    return (created_at + timedelta(seconds=float(execution_time))).isoformat()
 
 
 def _interrupt_item(thread_id: str, interrupt: dict[str, Any]) -> dict[str, Any]:
@@ -49,11 +80,13 @@ def _interrupt_item(thread_id: str, interrupt: dict[str, Any]) -> dict[str, Any]
         action_requests = value
     elif isinstance(value, str):
         action_requests = [{"description": value}]
+    kind = value.get("kind") if isinstance(value, dict) else None
     return {
         "event": "interrupt",
         "data": {
             "thread_id": thread_id,
             "interrupt_id": interrupt.get("id"),
+            **({"kind": kind} if isinstance(kind, str) else {}),
             "action_requests": action_requests,
             "role": "assistant",
             "finish_reason": "interrupt",
